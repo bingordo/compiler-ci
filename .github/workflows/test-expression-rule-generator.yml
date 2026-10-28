@@ -89,3 +89,29 @@ jobs:
             exit 1
           fi
           test ! -e "$RUNNER_TEMP/incomplete-guarded.txt"
+      - name: Validate structured rule database and generated compiled matcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/expr-rule-gen"
+          "$bin" --conditional-only --format json --output "$RUNNER_TEMP/rules.json"
+          "$bin" --conditional-only --format json --check "$RUNNER_TEMP/rules.json"
+          python3 - "$RUNNER_TEMP/rules.json" <<'PY'
+          import json, sys
+          with open(sys.argv[1], encoding="utf-8") as f:
+              data = json.load(f)
+          assert data["schema"] == "compiler.expr-rules.v1"
+          assert data["semantics"] == "wrapping-i32"
+          assert data["proof"]["logic"] == "QF_BV"
+          assert data["proof"]["width"] == 32
+          assert len(data["rules"]) >= 50
+          assert all(r["cost"] == "strict-tree-decrease" for r in data["rules"])
+          assert any(r["lhs"]["op"] == "Sub" and r["lhs"]["lhs"]["op"] == "Add"
+                     and r["rhs"]["symbol"] == "x" and r["guard"] == "A == B"
+                     for r in data["rules"])
+          print(f"Validated {len(data['rules'])} structured proven rules")
+          PY
+          "$bin" --conditional-only --format rust --output "$RUNNER_TEMP/generated_matcher.rs"
+          "$bin" --conditional-only --format rust --check "$RUNNER_TEMP/generated_matcher.rs"
+          rustc --edition=2021 -O --test "$RUNNER_TEMP/generated_matcher.rs" -o "$RUNNER_TEMP/generated_matcher_tests"
+          "$RUNNER_TEMP/generated_matcher_tests"
