@@ -1,7 +1,7 @@
 name: Driver native ABI tests (prebuilt)
 on:
   schedule:
-    - cron: '43 1,7,13,19 * * *'
+    - cron: '7,37 * * * *'
   workflow_dispatch:
     inputs:
       expected_source_sha:
@@ -14,7 +14,37 @@ concurrency:
   group: driver-native-tests
   cancel-in-progress: true
 jobs:
+  changed:
+    runs-on: ubuntu-24.04
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+      needs_test: ${{ steps.cache.outputs.cache-hit != 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: expr-rule-gen-binaries
+          path: binary-source
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          sparse-checkout: |
+            dist/driver-native
+      - name: Read published source SHA
+        id: source
+        shell: bash
+        run: |
+          sha="$(cat binary-source/dist/driver-native/source-sha.txt)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v4
+        id: cache
+        with:
+          path: .driver-native-verified
+          key: driver-native-verified-${{ steps.source.outputs.sha }}-v1
+          lookup-only: true
   verify:
+    needs: changed
+    if: ${{ needs.changed.outputs.needs_test == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -48,6 +78,15 @@ jobs:
         shell: bash
         run: |
           "$RUNNER_TEMP/driver-native/driver-native-tests" --nocapture
+      - name: Record passing source SHA
+        shell: bash
+        run: |
+          mkdir -p .driver-native-verified
+          printf '%s\n' '${{ needs.changed.outputs.source_sha }}' > .driver-native-verified/source-sha.txt
+      - uses: actions/cache/save@v4
+        with:
+          path: .driver-native-verified
+          key: driver-native-verified-${{ needs.changed.outputs.source_sha }}-v1
 
   report-failure:
     needs: verify
