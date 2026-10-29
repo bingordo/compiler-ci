@@ -1,0 +1,74 @@
+name: S5 native SSA benchmark — prebuilt binary only
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/test-s5-prebuilt.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: s5-prebuilt-benchmark
+  cancel-in-progress: true
+
+jobs:
+  native-differential:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Fetch binary distribution only (never compiler sources)
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: expr-rule-gen-binaries
+          sparse-checkout: |
+            dist/benchmark
+          path: private-binary
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify binary provenance and integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd private-binary/dist/benchmark
+          sha256sum --check sha256.txt
+          test -s source-sha.txt
+          grep -Eq '^[0-9a-f]{40}$' source-sha.txt
+          tar -tzf expr-rule-s5-linux-x86_64.tar.gz | grep -Fx expr-rule-s5
+          tar -xzf expr-rule-s5-linux-x86_64.tar.gz -C "$RUNNER_TEMP"
+          chmod +x "$RUNNER_TEMP/expr-rule-s5"
+          echo "source commit: $(cat source-sha.txt)"
+      - name: Run bounded native x86 differential and pass-cost comparison
+        shell: bash
+        env:
+          RULE_BENCH_BATCH: 20
+          RULE_BENCH_REPEATS: 5
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/expr-rule-s5" --native | tee "$RUNNER_TEMP/s5-result.csv"
+          grep -Fq 'NATIVE_ORACLE=PASS calls=252' "$RUNNER_TEMP/s5-result.csv"
+          python3 - "$RUNNER_TEMP/s5-result.csv" <<'PY'
+          import csv, sys
+          with open(sys.argv[1], encoding="utf-8") as f:
+              lines = f.read().splitlines()
+          start = next(i for i,line in enumerate(lines) if line.startswith("case,mode,"))
+          end = next(i for i,line in enumerate(lines[start+1:],start+1)
+                     if line.startswith("INCREMENTAL_CASES"))
+          rows = list(csv.DictReader(lines[start:end]))
+          assert len(rows) == 21, f"expected 7 cases * 3 modes, got {len(rows)}"
+          cases = {}
+          for row in rows:
+              cases.setdefault(row["case"], {})[row["mode"]] = row
+              assert int(row["ssa_after_dce"]) <= int(row["ssa_before"])
+              assert int(row["object_bytes"]) > 0
+              assert int(row["pass_median_ns"]) > 0
+          assert all(set(modes) == {"handwritten","generated","combined"}
+                     for modes in cases.values())
+          for name, modes in cases.items():
+              assert int(modes["combined"]["ssa_after_dce"]) <= int(
+                  modes["handwritten"]["ssa_after_dce"]), name
+          print(f"Validated {len(cases)} actual-SSA cases, native oracle and relative quality")
+          PY
