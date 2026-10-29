@@ -1,5 +1,7 @@
 name: Driver native ABI tests (prebuilt)
 on:
+  schedule:
+    - cron: '43 1,7,13,19 * * *'
   workflow_dispatch:
     inputs:
       expected_source_sha:
@@ -46,3 +48,30 @@ jobs:
         shell: bash
         run: |
           "$RUNNER_TEMP/driver-native/driver-native-tests" --nocapture
+
+  report-failure:
+    needs: verify
+    if: ${{ always() && needs.verify.result == 'failure' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: File or update compiler regression issue
+        env:
+          GH_TOKEN: ${{ secrets.COMPILER_ISSUES_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Set COMPILER_ISSUES_TOKEN to a fine-grained token with bingordo/compiler Issues: read/write."
+            exit 1
+          fi
+          title="[CI] Prebuilt driver native ABI verification failing"
+          existing="$(gh api --method GET 'repos/bingordo/compiler/issues' -f state=open -f per_page=100 --jq '.[] | select(.pull_request == null and .title == "[CI] Prebuilt driver native ABI verification failing") | .number' | head -n 1)"
+          if [ -n "$existing" ]; then
+            gh api --method POST "repos/bingordo/compiler/issues/$existing/comments" -f body="Driver verification failed again: $RUN_URL" >/dev/null
+            echo "Updated existing issue #$existing"
+          else
+            gh api --method POST repos/bingordo/compiler/issues -f title="$title" -f body="Automated driver ABI verification failed. Run: $RUN_URL\n\nCheck the verification job logs and the matching publisher run. This issue is reused for subsequent failures." >/dev/null
+            echo "Opened regression issue in bingordo/compiler"
+          fi
