@@ -23,3 +23,13 @@ Keep `bingordo/compiler` PR checks fast. Run expensive validation here against i
 
 ## Measurement
 Compare per-job and per-step durations, cache restore/save timings and cancellation frequency against the October 24–29 billing baseline. Billing runner minutes are not CPU utilization. Prioritize `compiler/core.yml`, `edgcpp-rust/build.yml`, `pmu-tools-tests/audit-tests.yml`, then branch cleanup. Measure before changing test scope.
+
+## Alive-lite operational runbook
+
+1. In `bingordo/compiler`, dispatch `publish-alive-lite.yml` from `main`. This compiles the test harness but does **not** run Z3.
+2. Confirm the publisher succeeded and `expr-rule-gen-binaries:dist/alive-lite/` contains `alive-lite-linux-x86_64.tar.gz`, `sha256.txt` and `source-sha.txt`.
+3. In `bingordo/compiler-ci`, dispatch `verify-alive-lite.yml`. Set `expected_source_sha` to the exact source SHA published in step 2; this prevents validating a stale artifact.
+4. Confirm the Z3 proof job passes and inspect its logs. On failure, download any available reproducer artifact.
+5. Only after a successful end-to-end run, consider deleting the remaining manual Alive-lite step in `compiler/core.yml` and adding an appropriately bounded schedule here.
+
+**Status as of 2026-10-29:** publisher and consumer workflow files merged; no successful publication or proof execution has been verified. Do not count the offload as validated yet.
