@@ -1,0 +1,92 @@
+name: S8 sampled Mini-C native validation - prebuilt only
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/test-s8-sampled-mini-c.yml'
+
+permissions:
+  contents: read
+concurrency:
+  group: sampled-mini-c-s8-prebuilt
+  cancel-in-progress: true
+
+jobs:
+  sampled-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Fetch only verified prebuilt benchmark (no compiler checkout)
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: expr-rule-gen-binaries
+          sparse-checkout: |
+            dist/benchmark
+          path: prebuilt
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify published binary, results and exact source revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd prebuilt/dist/benchmark
+          sha256sum --check mini-c-s7-sha256.txt
+          grep -Eq '^[0-9a-f]{40}$' mini-c-s7-source-sha.txt
+          test -s mini-c-s8-results.csv
+          tar -tzf compiler-mini-c-s7-linux-x86_64.tar.gz | grep -Fx compiler-mini-c-s7
+          tar -xzf compiler-mini-c-s7-linux-x86_64.tar.gz -C "$RUNNER_TEMP"
+          chmod +x "$RUNNER_TEMP/compiler-mini-c-s7"
+          echo "S8 published source SHA: $(cat mini-c-s7-source-sha.txt)"
+      - name: Replay all 48 source-generated cases and compare deterministic measurements
+        shell: bash
+        env:
+          RULE_S8_CASES: '48'
+          RULE_S8_SEED: '1592590374'
+          RULE_S8_REPEATS: '3'
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/compiler-mini-c-s7" --sampled > "$RUNNER_TEMP/s8-replayed.csv"
+          python3 - "$RUNNER_TEMP/s8-replayed.csv" prebuilt/dist/benchmark/mini-c-s8-results.csv <<'PY'
+          import csv,sys,collections
+          def read(path):
+              with open(path,encoding='utf-8') as f: lines=f.read().splitlines()
+              first=next(i for i,s in enumerate(lines) if s.startswith('S8_HEADER,'))
+              end=next(i for i,s in enumerate(lines) if s.startswith('S8_SUMMARY '))
+              keys=lines[first].split(',')[1:]
+              rows=[]
+              for line in lines[first+1:end]:
+                  parts=line.split(',')
+                  assert parts[0]=='S8_ROW' and len(parts)==len(keys)+1,parts
+                  rows.append(dict(zip(keys,parts[1:])))
+              return rows,lines[end]
+          recent,recent_summary=read(sys.argv[1])
+          published,published_summary=read(sys.argv[2])
+          assert len(recent)==len(published)==48
+          stable=('case','shape','source_fnv64','seed','blocks','ssa_hand',
+                  'ssa_fused','arith_hand','arith_fused','applied',
+                  'text_hand_bytes','text_fused_bytes')
+          assert [tuple(row[k] for k in stable) for row in recent] == [
+                 tuple(row[k] for k in stable) for row in published]
+          assert recent_summary==published_summary,(recent_summary,published_summary)
+          shape_counts=collections.Counter(r['shape'] for r in recent)
+          assert len(shape_counts)==8 and set(shape_counts.values())=={6},shape_counts
+          assert all(int(r['text_hand_bytes'])>0 and int(r['text_fused_bytes'])>0
+                     for r in recent)
+          assert 'native_calls=1152' in recent_summary
+          print('S8 identical SSA/machine results, 48 programs, eight balanced strata, 1152 GCC checks')
+          PY
+      - name: Second independent seed - 16 more unfiltered C functions
+        shell: bash
+        env:
+          RULE_S8_CASES: '16'
+          RULE_S8_SEED: '1592590375'
+          RULE_S8_REPEATS: '3'
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/compiler-mini-c-s7" --sampled > "$RUNNER_TEMP/s8-second-seed.csv"
+          grep -Fq 'S8_SUMMARY seed=1592590375 cases=16 ' "$RUNNER_TEMP/s8-second-seed.csv"
+          grep -Fq ' native_calls=384' "$RUNNER_TEMP/s8-second-seed.csv"
+          test "$(grep -c '^S8_ROW,' "$RUNNER_TEMP/s8-second-seed.csv")" -eq 16
+          echo 'S8 second seed: 16 extra native C programs and 384 GCC comparisons passed'
