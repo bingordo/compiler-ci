@@ -1,0 +1,76 @@
+name: S9 pinned real musl C source - binary-only replay
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/test-s9-real-musl.yml'
+
+permissions:
+  contents: read
+concurrency:
+  group: s9-real-musl-binary-replay
+  cancel-in-progress: true
+
+jobs:
+  real-source-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Fetch only compiler binary distribution with existing CI_KEY
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: expr-rule-gen-binaries
+          sparse-checkout: |
+            dist/benchmark
+          path: prebuilt
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify published executable, report, and source revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd prebuilt/dist/benchmark
+          sha256sum --check mini-c-s7-sha256.txt
+          grep -Eq '^[0-9a-f]{40}$' mini-c-s7-source-sha.txt
+          test -s mini-c-s9-results.csv
+          tar -tzf compiler-mini-c-s7-linux-x86_64.tar.gz | grep -Fx compiler-mini-c-s7
+          tar -xzf compiler-mini-c-s7-linux-x86_64.tar.gz -C "$RUNNER_TEMP"
+          chmod +x "$RUNNER_TEMP/compiler-mini-c-s7"
+          printf 'S9 source commit: '; cat mini-c-s7-source-sha.txt
+      - name: Replay all twelve upstream C function bodies, including rejects
+        shell: bash
+        env:
+          RULE_S9_REPEATS: '3'
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/compiler-mini-c-s7" --real-world > "$RUNNER_TEMP/s9-replay.csv"
+          python3 - "$RUNNER_TEMP/s9-replay.csv" prebuilt/dist/benchmark/mini-c-s9-results.csv <<'PY'
+          import sys
+          def read(path):
+              lines=open(path,encoding='utf-8').read().splitlines()
+              h=next(s for s in lines if s.startswith('S9_HEADER,')).split(',')[1:]
+              rows=[dict(zip(h,s.split(',')[1:])) for s in lines if s.startswith('S9_ROW,')]
+              rejects=[s.split(',',3)[:3] for s in lines if s.startswith('S9_UNSUPPORTED,')]
+              summary=next(s for s in lines if s.startswith('S9_SUMMARY '))
+              return rows,rejects,summary
+          live,rejected,summary=read(sys.argv[1])
+          published,old_rejected,old_summary=read(sys.argv[2])
+          assert len(live)+len(rejected)==12, (len(live),len(rejected))
+          assert len(live)==1 and len(rejected)==11
+          assert len(published)==len(live) and len(old_rejected)==len(rejected)
+          cols=('name','compat_mode','source_fnv64','compiled_fnv64',
+                'blocks','ssa_hand','ssa_fused','arith_hand','arith_fused',
+                'applied','text_hand_bytes','text_fused_bytes')
+          assert [tuple(row[k] for k in cols) for row in live] == [
+                 tuple(row[k] for k in cols) for row in published]
+          assert rejected==old_rejected
+          assert summary==old_summary
+          assert live[0]['name']=='isblank'
+          assert live[0]['compat_mode']=='ascii-char-literals'
+          assert int(live[0]['text_hand_bytes'])==84
+          assert int(live[0]['text_fused_bytes'])==84
+          assert 'native_calls=24' in summary
+          print('S9: real musl 12 candidate coverage audit reproducible; 1 ASCII-adapted, 11 unsupported, 24 independent GCC comparisons PASS')
+          PY
