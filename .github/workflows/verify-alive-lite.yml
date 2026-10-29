@@ -1,0 +1,62 @@
+name: Verify prebuilt Alive-lite proofs
+
+# Manual until compiler publishes the dedicated test binary.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: alive-lite-prebuilt
+  cancel-in-progress: true
+
+jobs:
+  prove:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Fetch prebuilt test executable from private compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: expr-rule-gen-binaries
+          path: private-binary
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          sparse-checkout: |
+            dist/alive-lite
+      - name: Verify artifact provenance and integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd private-binary/dist/alive-lite
+          test -s source-sha.txt
+          grep -Eq '^[0-9a-f]{40}$' source-sha.txt
+          sha256sum --check sha256.txt
+          tar -tzf alive-lite-linux-x86_64.tar.gz | grep -Fx alive_lite_tests
+          mkdir -p "$RUNNER_TEMP/alive-lite"
+          tar -xzf alive-lite-linux-x86_64.tar.gz -C "$RUNNER_TEMP/alive-lite"
+          test -x "$RUNNER_TEMP/alive-lite/alive_lite_tests"
+          echo "Compiler source commit: $(cat source-sha.txt)"
+      - name: Install Z3
+        run: |
+          if ! command -v z3 >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends z3
+          fi
+          z3 --version
+      - name: Run actual compiler optimizer proofs
+        env:
+          ALIVE_LITE_FAILURE_DIR: ${{ runner.temp }}/alive-lite-failures
+        run: |
+          mkdir -p "$ALIVE_LITE_FAILURE_DIR"
+          "$RUNNER_TEMP/alive-lite/alive_lite_tests" --ignored --nocapture
+      - name: Upload proof reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: alive-lite-failures
+          path: ${{ runner.temp }}/alive-lite-failures/
+          if-no-files-found: ignore
+          retention-days: 14
