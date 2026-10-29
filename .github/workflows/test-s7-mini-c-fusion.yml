@@ -1,0 +1,74 @@
+name: S7 Mini-C native fusion benchmark - prebuilt only
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/test-s7-mini-c-fusion.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mini-c-s7-prebuilt
+  cancel-in-progress: true
+
+jobs:
+  native-mini-c:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Fetch only prebuilt Mini-C benchmark from compiler binary distribution
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: expr-rule-gen-binaries
+          sparse-checkout: |
+            dist/benchmark
+          path: prebuilt
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify binary checksum and source provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd prebuilt/dist/benchmark
+          sha256sum --check mini-c-s7-sha256.txt
+          grep -Eq '^[0-9a-f]{40}$' mini-c-s7-source-sha.txt
+          test -s mini-c-s7-results.csv
+          tar -tzf compiler-mini-c-s7-linux-x86_64.tar.gz | grep -Fx compiler-mini-c-s7
+          tar -xzf compiler-mini-c-s7-linux-x86_64.tar.gz -C "$RUNNER_TEMP"
+          chmod +x "$RUNNER_TEMP/compiler-mini-c-s7"
+          echo "S7 compiled from: $(cat mini-c-s7-source-sha.txt)"
+      - name: Recheck real frontend produced binary, GCC reference, .text sizes
+        shell: bash
+        env:
+          RULE_S7_REPEATS: '3'
+          RULE_S7_BATCH: '5'
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/compiler-mini-c-s7" | tee "$RUNNER_TEMP/s7-replayed.csv"
+          python3 - "$RUNNER_TEMP/s7-replayed.csv" prebuilt/dist/benchmark/mini-c-s7-results.csv <<'PY'
+          import csv,sys
+          def read(path):
+              with open(path,encoding="utf-8") as f: lines=f.read().splitlines()
+              start=next(i for i,line in enumerate(lines) if line.startswith("case,blocks,"))
+              end=next(i for i,line in enumerate(lines) if line.startswith("S7_SUMMARY"))
+              return list(csv.DictReader(lines[start:end])),lines[end]
+          replay,summary=read(sys.argv[1])
+          published,published_summary=read(sys.argv[2])
+          assert len(replay)==len(published)==12
+          deterministic=("case","blocks","ssa_before","ssa_hand","ssa_fused",
+                         "arith_hand","arith_fused","applied",
+                         "text_hand_bytes","text_fused_bytes")
+          assert [(tuple(row[k] for k in deterministic)) for row in replay] == [
+                  tuple(row[k] for k in deterministic) for row in published], (
+                  "published and replayed machine/SSA outputs differ")
+          assert all(int(row["arith_fused"])<=int(row["arith_hand"]) for row in replay)
+          assert all(int(row["text_fused_bytes"])<=int(row["text_hand_bytes"]) for row in replay)
+          assert all(int(row["full_hand_median_ns"])>0 and
+                     int(row["full_fused_median_ns"])>0 for row in replay)
+          assert "native_calls=288 " in summary
+          assert "native_calls=288 " in published_summary
+          print("Validated 12 Mini-C native cases, 288 GCC oracle calls, source-matched .text and SSA metrics")
+          PY
