@@ -38,6 +38,7 @@ jobs:
           sha256sum --check dist/sha256.txt
           test -s dist/generated/expr_rules.rs
           test -s dist/generated/expr_rules.json
+          test -s dist/generated/expr_fusion.json
           grep -Fq '// DO NOT hand edit.' dist/generated/expr_rules.rs
           cat dist/source-sha.txt
           tar -tzf dist/expr-rule-gen-linux-x86_64.tar.gz | grep -Fx expr-rule-gen
@@ -143,3 +144,29 @@ jobs:
           "$bin" --conditional-only --max-rules 1 --format rust --output "$RUNNER_TEMP/tiny_matcher.rs"
           rustc --edition=2021 -O --test "$RUNNER_TEMP/tiny_matcher.rs" -o "$RUNNER_TEMP/tiny_matcher_tests"
           "$RUNNER_TEMP/tiny_matcher_tests"
+      - name: Verify SMT-proven fused constants and binary reproducibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/expr-rule-gen"
+          "$bin" --fusion-only --format json --output "$RUNNER_TEMP/expr_fusion.json"
+          "$bin" --fusion-only --format json --check "$RUNNER_TEMP/expr_fusion.json"
+          cmp "$RUNNER_TEMP/expr_fusion.json" private-binary/dist/generated/expr_fusion.json
+          python3 - "$RUNNER_TEMP/expr_fusion.json" <<'PY'
+          import json,sys
+          with open(sys.argv[1],encoding="utf-8") as f: data=json.load(f)
+          assert data["schema"]=="compiler.expr-fusion.v1"
+          assert data["generated"] and data["do_not_edit"]
+          assert data["proof"]["width"]==32 and data["proof"]["logic"]=="QF_BV"
+          assert len(data["rules"])==5 and not data["rule_limit_reached"]
+          assert {(r["lhs"]["lhs"]["op"],r["lhs"]["op"]) for r in data["rules"]}=={
+              ("Add","Add"),("Add","Sub"),("Sub","Add"),("Sub","Sub"),("Mul","Mul")}
+          assert all(r["runtime_ops_before"]==2 and r["runtime_ops_after"]==1
+                     and r["compile_time_fold"] for r in data["rules"])
+          print("Five SMT-verified constant-fusion families")
+          PY
+          if "$bin" --fusion-only --max-proofs 1 --format json --output "$RUNNER_TEMP/incomplete-fusion.json"; then
+            echo "incomplete proofs must not authorize publication" >&2
+            exit 1
+          fi
+          test ! -e "$RUNNER_TEMP/incomplete-fusion.json"
