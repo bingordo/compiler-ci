@@ -1,5 +1,11 @@
 name: EDG Cranelift pinned YARPGen differential
 on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/edg-yarpgen.yml'
+  schedule:
+    - cron: '*/30 * * * *'
   workflow_dispatch:
     inputs:
       source_ref:
@@ -24,7 +30,44 @@ concurrency:
   group: edg-yarpgen-${{ inputs.source_ref || 'cranelift-codegen' }}
   cancel-in-progress: true
 jobs:
+  detect:
+    runs-on: ubuntu-24.04
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+      run_tests: ${{ steps.decision.outputs.run_tests }}
+    steps:
+      - name: Resolve current EDG Rust source commit
+        id: source
+        env:
+          SOURCE_REF: ${{ inputs.source_ref || 'cranelift-codegen' }}
+        run: |
+          set -euo pipefail
+          sha=$(git ls-remote https://github.com/bingordo/edgcpp-rust.git "refs/heads/$SOURCE_REF" | cut -f1)
+          if [[ -z "$sha" ]]; then
+            if [[ "$SOURCE_REF" =~ ^[0-9a-f]{40}$ ]]; then sha="$SOURCE_REF"; else exit 1; fi
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Restore completed cohort marker
+        id: completed
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/edg-yarpgen-completed
+          key: edg-yarpgen-v2-${{ steps.source.outputs.sha }}-10-12345
+          lookup-only: true
+      - name: Decide whether to run
+        id: decision
+        env:
+          CACHE_HIT: ${{ steps.completed.outputs.cache-hit }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [[ "$EVENT" == workflow_dispatch || "$EVENT" == push || "$CACHE_HIT" != true ]]; then
+            echo run_tests=true >> "$GITHUB_OUTPUT"
+          else
+            echo run_tests=false >> "$GITHUB_OUTPUT"
+          fi
   differential:
+    needs: detect
+    if: needs.detect.outputs.run_tests == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     container:
@@ -43,7 +86,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/edgcpp-rust
-          ref: ${{ inputs.source_ref || 'cranelift-codegen' }}
+          ref: ${{ needs.detect.outputs.source_sha }}
           path: edgcpp-rust
           persist-credentials: false
 
@@ -180,6 +223,18 @@ jobs:
           print("Accepted:", d["backend_accepted"], "Unsupported:", d["counts"]["unsupported_construct"])
           PY
 
+      - name: Record completed automatic cohort
+        if: ${{ success() && github.event_name == 'schedule' }}
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/edg-yarpgen-completed"
+          printf '%s\n' '${{ needs.detect.outputs.source_sha }}' > "$RUNNER_TEMP/edg-yarpgen-completed/source-sha.txt"
+      - name: Cache completed automatic cohort
+        if: ${{ success() && github.event_name == 'schedule' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/edg-yarpgen-completed
+          key: edg-yarpgen-v2-${{ needs.detect.outputs.source_sha }}-10-12345
       - name: Save incremental Rust cache
         if: ${{ success() && steps.rust-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
