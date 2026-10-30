@@ -1,114 +1,139 @@
-name: Verify prebuilt Alive-lite proofs
+name: Build and verify Alive-lite optimizer proofs
 
-# Periodically check for new published binaries; the checksum cache avoids
-# repeated Z3 work for unchanged artifacts.
 on:
-  schedule:
-    - cron: '17 */6 * * *'
   workflow_dispatch:
     inputs:
-      expected_source_sha:
-        description: 'Exact 40-character compiler source commit SHA (optional)'
+      source_ref:
+        description: Compiler branch, tag or commit
         required: false
+        default: main
         type: string
       force_recheck:
-        description: 'Rerun Z3 even if this exact binary already passed'
+        description: Rerun previously passing Z3 proofs
         required: false
-        type: boolean
         default: false
+        type: boolean
+  schedule:
+    - cron: '17 */6 * * *'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/verify-alive-lite.yml'
 
 permissions:
   contents: read
 
 concurrency:
-  group: alive-lite-prebuilt
+  group: alive-lite-source-${{ inputs.source_ref || 'main' }}
   cancel-in-progress: true
 
 jobs:
   prove:
     runs-on: ubuntu-24.04
-    timeout-minutes: 18
+    timeout-minutes: 25
     steps:
-      - name: Fetch prebuilt test executable from private compiler
+      - name: Checkout exact compiler source
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: expr-rule-gen-binaries
-          path: private-binary
+          ref: ${{ inputs.source_ref || 'main' }}
+          path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-          sparse-checkout: |
-            dist/alive-lite
-      - name: Verify artifact provenance and integrity
-        env:
-          EXPECTED_SHA: ${{ inputs.expected_source_sha }}
+      - name: Identify source revision and proof target
+        id: source
         shell: bash
         run: |
           set -euo pipefail
-          cd private-binary/dist/alive-lite
-          test -s source-sha.txt
-          grep -Eq '^[0-9a-f]{40}$' source-sha.txt
-          if [ -n "$EXPECTED_SHA" ]; then
-            grep -Eq '^[0-9a-f]{40}$' <<< "$EXPECTED_SHA"
-            test "$(cat source-sha.txt)" = "$EXPECTED_SHA"
-          fi
-          sha256sum --check sha256.txt
-          tar -tzf alive-lite-linux-x86_64.tar.gz | grep -Fx alive_lite_tests
-          mkdir -p "$RUNNER_TEMP/alive-lite"
-          tar -xzf alive-lite-linux-x86_64.tar.gz -C "$RUNNER_TEMP/alive-lite"
-          test -x "$RUNNER_TEMP/alive-lite/alive_lite_tests"
-          echo "Compiler source commit: $(cat source-sha.txt)"
-          echo "Source bundle SHA256: $(sha256sum alive-lite-linux-x86_64.tar.gz | awk '{print $1}')"
-      - name: Avoid repeating expensive proofs on an already validated binary
-        id: cache
+          sha="$(git -C compiler rev-parse HEAD)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          test -s compiler/crates/opt/tests/alive_lite.rs
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Compiler revision: $sha" >> "$GITHUB_STEP_SUMMARY"
+      - name: Skip proofs already validated for exact source and workflow
+        id: verified
         uses: actions/cache/restore@v4
         with:
-          path: ${{ runner.temp }}/alive-proof-validated
-          key: alive-lite-proofs-v2-${{ hashFiles('private-binary/dist/alive-lite/sha256.txt') }}
+          path: .alive-lite-verified
+          key: alive-lite-source-v1-${{ hashFiles('.github/workflows/verify-alive-lite.yml') }}-${{ steps.source.outputs.sha }}
+          lookup-only: true
+      - name: Restrict workspace to compiler core
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('compiler/Cargo.toml').write_text('''[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          ''')
+          PY
+      - name: Reuse Rust compilation cache
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: alive-lite-source-v1
+          cache-workspace-crates: 'true'
+      - name: Build Alive-lite proof test binary
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          timeout --signal=TERM --kill-after=10s 12m \
+            cargo test -p compiler-opt --test alive_lite --no-run \
+            2>&1 | tee "$RUNNER_TEMP/alive-lite-build.log"
+          test -n "$(find target/debug/deps -maxdepth 1 -type f -name 'alive_lite-*' -executable -print -quit)"
       - name: Install Z3
-        if: steps.cache.outputs.cache-hit != 'true' || inputs.force_recheck
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
         run: |
           if ! command -v z3 >/dev/null 2>&1; then
             sudo apt-get update -qq
             sudo apt-get install -y -qq --no-install-recommends z3
           fi
           z3 --version
-      - name: Run actual compiler optimizer proofs and require nonempty coverage
-        if: steps.cache.outputs.cache-hit != 'true' || inputs.force_recheck
+      - name: Execute actual Alive-lite proof tests
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
+        shell: bash
         env:
           ALIVE_LITE_FAILURE_DIR: ${{ runner.temp }}/alive-lite-failures
-        shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$ALIVE_LITE_FAILURE_DIR"
-          timeout --signal=TERM --kill-after=15s 12m \
-            "$RUNNER_TEMP/alive-lite/alive_lite_tests" --ignored --nocapture \
-            2>&1 | tee "$RUNNER_TEMP/alive-proof.log"
-          python3 - "$RUNNER_TEMP/alive-proof.log" <<'PY'
+          cd compiler
+          timeout --signal=TERM --kill-after=15s 10m \
+            cargo test -p compiler-opt --test alive_lite -- --ignored --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/alive-lite-proof.log"
+          python3 - "$RUNNER_TEMP/alive-lite-proof.log" <<'PY'
           import pathlib, re, sys
-          log=pathlib.Path(sys.argv[1]).read_text(errors="replace")
+          log=pathlib.Path(sys.argv[1]).read_text(errors='replace')
           passed=sum(map(int,re.findall(r'test result: ok\.\s+(\d+) passed;',log)))
           if passed < 1:
-              raise SystemExit("Refusing false-green proof run: no ignored proof tests executed")
-          print(f"Alive-lite: {passed} actual test cases passed")
+              raise SystemExit('No ignored Alive-lite proofs ran')
+          print(f'Validated {passed} Alive-lite tests')
           PY
-          mkdir -p "$RUNNER_TEMP/alive-proof-validated"
-          cp private-binary/dist/alive-lite/source-sha.txt "$RUNNER_TEMP/alive-proof-validated/source-sha.txt"
-          echo "Validated actual Alive-lite Z3 proofs" >> "$GITHUB_STEP_SUMMARY"
-      - name: Record successful result for the exact binary checksum
-        if: success() && steps.cache.outputs.cache-hit != 'true'
+          mkdir -p "$GITHUB_WORKSPACE/.alive-lite-verified"
+          printf '%s\n' "${{ steps.source.outputs.sha }}" > "$GITHUB_WORKSPACE/.alive-lite-verified/source-sha.txt"
+          echo "Alive-lite Z3 proof tests passed" >> "$GITHUB_STEP_SUMMARY"
+      - name: Cache exact passing source revision
+        if: success() && steps.verified.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          path: ${{ runner.temp }}/alive-proof-validated
-          key: alive-lite-proofs-v2-${{ hashFiles('private-binary/dist/alive-lite/sha256.txt') }}
-      - name: Report a previously verified exact binary
-        if: success() && steps.cache.outputs.cache-hit == 'true' && !inputs.force_recheck
-        run: echo "Skipped redundant solver work; exact binary checksum previously passed" >> "$GITHUB_STEP_SUMMARY"
-      - name: Upload proof reproducers
+          path: .alive-lite-verified
+          key: alive-lite-source-v1-${{ hashFiles('.github/workflows/verify-alive-lite.yml') }}-${{ steps.source.outputs.sha }}
+      - name: Report previously validated revision
+        if: steps.verified.outputs.cache-hit == 'true' && !inputs.force_recheck
+        run: echo "Exact compiler revision previously passed Alive-lite proofs" >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve proof failures and build diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: alive-lite-failures
-          path: ${{ runner.temp }}/alive-lite-failures/
+          name: alive-lite-source-failures
+          path: |
+            ${{ runner.temp }}/alive-lite-build.log
+            ${{ runner.temp }}/alive-lite-proof.log
+            ${{ runner.temp }}/alive-lite-failures/
           if-no-files-found: ignore
           retention-days: 14
