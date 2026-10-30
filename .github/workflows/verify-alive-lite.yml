@@ -1,6 +1,7 @@
 name: Verify prebuilt Alive-lite proofs
 
-# Manual until compiler publishes the dedicated test binary.
+# Manual verification of published binaries. Automatic cross-repo notifications
+# require a separate authorized trigger; do not poll every 15 minutes.
 on:
   workflow_dispatch:
     inputs:
@@ -19,7 +20,7 @@ concurrency:
 jobs:
   prove:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 18
     steps:
       - name: Fetch prebuilt test executable from private compiler
         uses: actions/checkout@v4
@@ -50,19 +51,52 @@ jobs:
           tar -xzf alive-lite-linux-x86_64.tar.gz -C "$RUNNER_TEMP/alive-lite"
           test -x "$RUNNER_TEMP/alive-lite/alive_lite_tests"
           echo "Compiler source commit: $(cat source-sha.txt)"
+          echo "Source bundle SHA256: $(sha256sum alive-lite-linux-x86_64.tar.gz | cut -d\  -f1)"
+      - name: Avoid repeating expensive proofs on an already validated binary
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/alive-proof-validated
+          key: alive-lite-proofs-v2-${{ hashFiles('private-binary/dist/alive-lite/sha256.txt') }}
       - name: Install Z3
+        if: steps.cache.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
         run: |
           if ! command -v z3 >/dev/null 2>&1; then
             sudo apt-get update -qq
             sudo apt-get install -y -qq --no-install-recommends z3
           fi
           z3 --version
-      - name: Run actual compiler optimizer proofs
+      - name: Run actual compiler optimizer proofs and require nonempty coverage
+        if: steps.cache.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
         env:
           ALIVE_LITE_FAILURE_DIR: ${{ runner.temp }}/alive-lite-failures
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p "$ALIVE_LITE_FAILURE_DIR"
-          "$RUNNER_TEMP/alive-lite/alive_lite_tests" --ignored --nocapture
+          timeout --signal=TERM --kill-after=15s 12m \
+            "$RUNNER_TEMP/alive-lite/alive_lite_tests" --ignored --nocapture \
+            | tee "$RUNNER_TEMP/alive-proof.log"
+          python3 - "$RUNNER_TEMP/alive-proof.log" <<'PY'
+          import pathlib, re, sys
+          log=pathlib.Path(sys.argv[1]).read_text(errors="replace")
+          passed=sum(map(int,re.findall(r'test result: ok\.\s+(\d+) passed;',log)))
+          if passed < 1:
+              raise SystemExit("Refusing false-green proof run: no ignored proof tests executed")
+          print(f"Alive-lite: {passed} actual test cases passed")
+          PY
+          mkdir -p "$RUNNER_TEMP/alive-proof-validated"
+          cp private-binary/dist/alive-lite/source-sha.txt "$RUNNER_TEMP/alive-proof-validated/source-sha.txt"
+          echo "Validated actual Alive-lite Z3 proofs" >> "$GITHUB_STEP_SUMMARY"
+      - name: Record successful result for the exact binary checksum
+        if: success() && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/alive-proof-validated
+          key: alive-lite-proofs-v2-${{ hashFiles('private-binary/dist/alive-lite/sha256.txt') }}
+      - name: Report a previously verified exact binary
+        if: success() && steps.cache.outputs.cache-hit == 'true' && github.event_name != 'workflow_dispatch'
+        run: echo "Skipped redundant solver work; exact binary checksum previously passed" >> "$GITHUB_STEP_SUMMARY"
       - name: Upload proof reproducers
         if: failure()
         uses: actions/upload-artifact@v4
