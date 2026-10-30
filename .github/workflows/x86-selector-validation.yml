@@ -44,7 +44,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .x86-selector-validated
-          key: x86-selector-v1-${{ steps.revision.outputs.sha }}
+          key: x86-selector-v2-${{ steps.revision.outputs.sha }}
       - name: Test x86 Python tooling
         if: steps.validated.outputs.cache-hit != 'true'
         working-directory: compiler
@@ -53,10 +53,25 @@ jobs:
           python3 tools/regen_x86_selector_patterns.py --check
           python3 tools/validate_x86_costs.py data/x86_costs_generic.json
           python3 tools/x86_form_inventory.py --json > /tmp/x86-inventory.json
-      - name: Test x86 Rust backend
+      - name: Test x86 Rust backend without private Oberon driver
         if: steps.validated.outputs.cache-hit != 'true'
         working-directory: compiler
-        run: cargo test -p compiler-backend-x86
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Cargo resolves all workspace members, even when -p selects a backend.
+          # Use an isolated temporary workspace containing only the backend's
+          # local dependency closure; never edit the checked-out source.
+          mkdir -p "$RUNNER_TEMP/x86-workspace/crates"
+          for crate in ir opt backend backend-x86; do
+            cp -a "crates/$crate" "$RUNNER_TEMP/x86-workspace/crates/$crate"
+          done
+          cat > "$RUNNER_TEMP/x86-workspace/Cargo.toml" <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          cargo test --manifest-path "$RUNNER_TEMP/x86-workspace/Cargo.toml" -p compiler-backend-x86
       - name: Mark revision validated
         if: steps.validated.outputs.cache-hit != 'true'
         run: echo "${{ steps.revision.outputs.sha }}" > .x86-selector-validated
