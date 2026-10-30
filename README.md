@@ -106,9 +106,14 @@ regressions stay in `edgcpp-rust`.
 validates native-code correctness on the private `bingordo/compiler` source using the existing read-only `CI_KEY` deploy key
 without consuming Actions minutes from `compiler`. It runs the permanent
 `native_cfg_differential`, `loop_trap_semantics`, `memory_execution_oracle`,
-`phi_native`, and backend `division_native` Rust integration tests.
+`phi_native`, and backend `division_native` Rust integration tests, plus the
+`verifier_mutations` IR suite and the `alias_phi_exhaustive`,
+`pre_licm_semantic_matrix`, `induction_native`, `pre_native`, and
+`mem2reg_native` optimization suites.
 
-The tests exercise actual x86 GNU assembly and direct ELF against an
+The expanded gate also tests thousands of invalid SSA mutations, nested and
+multi-latch loops, PRE/LICM interactions, conservative alias reasoning,
+and induction safety. Existing tests exercise x86 GNU assembly and direct ELF against an
 independent C oracle, conditional SIGFPE traps, signed integer edge cases,
 memory ordering and pointer PHIs. This is correctness only; **there are no
 timing benchmarks or performance thresholds**.
@@ -126,3 +131,13 @@ private, so checkout must use `CI_KEY`, not the default `GITHUB_TOKEN`.
 After changes to these tests, inspect the first **real** green Actions run
 and the complete source commit SHA. A successful `compiler` PR merge alone
 is not evidence that the external suite ran.
+
+**Scope and scheduling:** The full 11-target correctness gate is automatically
+checked on an exact compiler source revision by the existing 15-minute
+`compiler-ci` poll. A previously passing source SHA + workflow version
+skips Cargo entirely. Both the core native and expanded IR/optimizer
+targets must pass before evidence is cached. Required test-name checks
+protect against zero-test false greens, and all failure logs are uploaded.
+This is intentionally **not** a general benchmark or full-workspace build:
+new compiler features need targeted regression additions, while
+solver-heavy Alive-lite proofs and Csmith remain separate workflows.

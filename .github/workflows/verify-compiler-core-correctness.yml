@@ -1,4 +1,4 @@
-name: Native compiler CFG correctness (compiler-ci)
+name: Compiler IR and native correctness (compiler-ci)
 
 # The source repository may have no remaining Actions minutes. Check its
 # immutable main SHA here instead; cached successes skip Cargo entirely.
@@ -57,8 +57,21 @@ jobs:
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "Compiler source SHA: $sha"
-          test -f crates/opt/tests/native_cfg_differential.rs
-          test -f crates/opt/tests/loop_trap_semantics.rs
+          # Fail rather than silently accepting a moved/absent test suite.
+          for test_source in \
+            crates/opt/tests/native_cfg_differential.rs \
+            crates/opt/tests/loop_trap_semantics.rs \
+            crates/opt/tests/memory_execution_oracle.rs \
+            crates/opt/tests/phi_native.rs \
+            crates/backend-x86/tests/division_native.rs \
+            crates/ir/tests/verifier_mutations.rs \
+            crates/opt/tests/alias_phi_exhaustive.rs \
+            crates/opt/tests/pre_licm_semantic_matrix.rs \
+            crates/opt/tests/induction_native.rs \
+            crates/opt/tests/pre_native.rs \
+            crates/opt/tests/mem2reg_native.rs; do
+            test -s "$test_source"
+          done
       - name: Skip source revisions already proven by this workflow version
         id: validated
         uses: actions/cache/restore@v4
@@ -111,6 +124,41 @@ jobs:
           cargo test -p compiler-backend-x86 --test division_native --offline -- --nocapture \
             2>&1 | tee "$RUNNER_TEMP/native-division-tests.log"
           grep -F 'test signed_divide_quotient_remainder_and_register_lifetimes ... ok' "$RUNNER_TEMP/native-division-tests.log"
+      - name: Verify SSA structural mutations and invalid IR are rejected
+        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 4m \
+            cargo test -p compiler-ir --test verifier_mutations --offline -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/ssa-verifier-tests.log"
+          grep -F 'test verifier_rejects_deterministic_cfg_corruptions_without_panicking ... ok' "$RUNNER_TEMP/ssa-verifier-tests.log"
+          grep -F 'test pointer_phi_and_allocation_provenance_negative_matrix ... ok' "$RUNNER_TEMP/ssa-verifier-tests.log"
+      - name: Verify loop, alias, PRE, induction, and mem2reg correctness
+        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          # Run the six regression binaries in a single Cargo invocation.
+          # These test IR equivalence, native outputs, and explicit refusal of
+          # unsafe transforms; do not add performance timings to this gate.
+          timeout --signal=TERM --kill-after=10s 9m \
+            cargo test -p compiler-opt \
+              --test alias_phi_exhaustive \
+              --test pre_licm_semantic_matrix \
+              --test induction_native \
+              --test pre_native \
+              --test mem2reg_native \
+              --offline -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/extended-opt-tests.log"
+          grep -F 'test exhaustive_small_phi_hulls_never_miss_real_may_alias ... ok' "$RUNNER_TEMP/extended-opt-tests.log"
+          grep -F 'test pre_licm_mixed_order_semantics_matrix ... ok' "$RUNNER_TEMP/extended-opt-tests.log"
+          grep -F 'optimizer_preserves_nested_and_multilatch_oracles ... ok' "$RUNNER_TEMP/extended-opt-tests.log"
+          grep -F 'test native_assembly_and_elf_match_independent_unsigned_c_reference ... ok' "$RUNNER_TEMP/extended-opt-tests.log"
+          grep -F 'test native_asm_and_direct_elf_match_unoptimized_and_wrapping_c ... ok' "$RUNNER_TEMP/extended-opt-tests.log"
+          grep -F 'test promoted_loop_and_mixed_array_execute_identically_from_both_native_formats ... ok' "$RUNNER_TEMP/extended-opt-tests.log"
       - name: Record successful exact source SHA
         if: success() && (steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck)
         shell: bash
@@ -119,7 +167,7 @@ jobs:
         run: |
           mkdir -p .compiler-native-validated
           printf '%s\n' "$SOURCE_SHA" > .compiler-native-validated/source-sha.txt
-          printf 'Native CFG, loop trap, pointer PHI, memory and signed division verified: %s\n' "$SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
+          printf 'SSA verifier, alias PHIs, nested/loop PRE, induction, mem2reg, CFG traps, pointer PHIs, signed division verified: %s\n' "$SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
       - name: Cache successful evidence for the exact source revision
         if: success() && steps.validated.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
@@ -134,6 +182,8 @@ jobs:
           path: |
             ${{ runner.temp }}/native-cfg-tests.log
             ${{ runner.temp }}/native-division-tests.log
+            ${{ runner.temp }}/ssa-verifier-tests.log
+            ${{ runner.temp }}/extended-opt-tests.log
             /tmp/compiler-native-cfg-differential-*/
           if-no-files-found: ignore
           retention-days: 14
