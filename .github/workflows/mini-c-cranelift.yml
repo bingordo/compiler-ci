@@ -1,0 +1,80 @@
+name: Mini-C Cranelift targeted validation
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17,47 * * * *'
+  push:
+    paths:
+      - '.github/workflows/mini-c-cranelift.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mini-c-cranelift
+  cancel-in-progress: true
+
+jobs:
+  check-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      changed: ${{ steps.source.outputs.changed }}
+    steps:
+      - name: Read current Mini-C source revision
+        id: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha="$(git ls-remote https://github.com/bingordo/mini-c.git refs/heads/main | cut -f1)"
+          test "${#sha}" -eq 40
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "Mini-C revision: $sha"
+
+  native:
+    needs: check-source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_INCREMENTAL: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: ${{ needs.check-source.outputs.sha }}
+          path: mini-c
+          persist-credentials: false
+      - name: Cache Rust dependencies and debug build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            mini-c/target/debug
+          key: mini-c-native-${{ runner.os }}-${{ hashFiles('mini-c/Cargo.lock') }}-${{ needs.check-source.outputs.sha }}
+          restore-keys: |
+            mini-c-native-${{ runner.os }}-${{ hashFiles('mini-c/Cargo.lock') }}-
+      - name: Targeted Cranelift tests
+        working-directory: mini-c
+        run: cargo test -p mini-c-cranelift
+      - name: Clippy backend
+        working-directory: mini-c
+        run: cargo clippy -p mini-c-cranelift --all-targets -- -D warnings
+      - name: Build backend and fuzzer
+        working-directory: mini-c
+        run: cargo build -p mini-c-cranelift -p mini-c-fuzz
+      - name: GCC differential execution including globals and mixed objects
+        working-directory: mini-c
+        run: python3 tools/test_cranelift.py --seed-count 4 --steps 100
+      - name: Upload failure reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mini-c-cranelift-failures
+          path: mini-c/target/cranelift-failures/
+          if-no-files-found: ignore
+          retention-days: 14
