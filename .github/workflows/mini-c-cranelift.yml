@@ -1,6 +1,8 @@
 name: Mini-C Cranelift targeted validation
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '*/15 * * * *'
   push:
     paths:
       - '.github/workflows/mini-c-cranelift.yml'
@@ -18,6 +20,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       sha: ${{ steps.source.outputs.sha }}
+      already_passed: ${{ steps.passed.outputs.cache-hit }}
     steps:
       - name: Read current Mini-C source revision
         id: source
@@ -29,12 +32,19 @@ jobs:
           umask 077
           printf '%s\n' "$MINI_C_DEPLOY_KEY" > "$RUNNER_TEMP/mini-c-ci-key"
           trap 'rm -f "$RUNNER_TEMP/mini-c-ci-key"' EXIT
-          sha="$(GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=accept-new -i "$RUNNER_TEMP/mini-c-ci-key"' git ls-remote git@github.com:bingordo/mini-c.git refs/heads/main | cut -f1)"
+          sha="$(GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new -i $RUNNER_TEMP/mini-c-ci-key" git ls-remote git@github.com:bingordo/mini-c.git refs/heads/main | cut -f1)"
           test "${#sha}" -eq 40
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "Mini-C revision: $sha"
+      - name: Check previously successful source revision
+        id: passed
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/mini-c-passed
+          key: mini-c-cranelift-passed-v1-${{ steps.source.outputs.sha }}
 
   native:
+    if: github.event_name != 'schedule' || needs.check-source.outputs.already_passed != 'true'
     needs: check-source
     runs-on: ubuntu-24.04
     timeout-minutes: 25
@@ -70,6 +80,18 @@ jobs:
       - name: GCC differential execution including globals and mixed objects
         working-directory: mini-c
         run: python3 tools/test_cranelift.py --seed-count 4 --steps 100
+      - name: Mark successfully validated source revision
+        if: success()
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/mini-c-passed"
+          printf '%s\n' '${{ needs.check-source.outputs.sha }}' > "$RUNNER_TEMP/mini-c-passed/source-sha"
+      - name: Save successful source marker
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/mini-c-passed
+          key: mini-c-cranelift-passed-v1-${{ needs.check-source.outputs.sha }}
       - name: Upload failure reproducers
         if: failure()
         uses: actions/upload-artifact@v4
