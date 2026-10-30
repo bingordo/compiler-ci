@@ -12,6 +12,11 @@ on:
         required: false
         default: '6'
         type: string
+      force_recheck:
+        description: 'Re-run fixed and seeded C/GCC comparisons even when the exact binary already passed'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -54,17 +59,46 @@ jobs:
           test -x "$RUNNER_TEMP/mini-c-differential/compiler-mini-c"
           test -s "$RUNNER_TEMP/mini-c-differential/differential.py"
           echo "Compiler source SHA: $(cat source-sha.txt)"
+      - name: Validate bounded seed budget
+        env:
+          SEED_COUNT: ${{ inputs.seed_count }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SEED_COUNT" =~ ^[0-9]+$ ]]
+          (( SEED_COUNT >= 1 && SEED_COUNT <= 64 ))
+          echo "C/GCC differential seeds requested: $SEED_COUNT"
+      - name: Reuse verified exact binary and seed-corpus result
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/mini-c-validated
+          key: mini-c-gcc-v2-${{ hashFiles('private-binary/dist/mini-c-differential/sha256.txt') }}-seeds-${{ inputs.seed_count }}
       - name: Compare prebuilt Mini-C compiler with GCC
+        if: steps.cache.outputs.cache-hit != 'true' || inputs.force_recheck
         shell: bash
         env:
           SEED_COUNT: ${{ inputs.seed_count }}
         run: |
           set -euo pipefail
-          [[ "$SEED_COUNT" =~ ^[0-9]+$ ]] && (( SEED_COUNT <= 64 ))
-          python3 "$RUNNER_TEMP/mini-c-differential/differential.py" \
+          timeout --signal=TERM --kill-after=15s 16m \
+            python3 "$RUNNER_TEMP/mini-c-differential/differential.py" \
             --compiler "$RUNNER_TEMP/mini-c-differential/compiler-mini-c" \
-            --seed-count "$SEED_COUNT" --steps 120 \
-            --artifacts "$RUNNER_TEMP/mini-c-failures"
+            --seed-count "$SEED_COUNT" --steps 120 --timeout 15 \
+            --artifacts "$RUNNER_TEMP/mini-c-failures" | tee "$RUNNER_TEMP/mini-c-differential.log"
+          grep -Eq "^PASS: [1-9][0-9]* fixtures, $SEED_COUNT seeds, mixed ABI calls and negative cases$" "$RUNNER_TEMP/mini-c-differential.log"
+          mkdir -p "$RUNNER_TEMP/mini-c-validated"
+          cp private-binary/dist/mini-c-differential/source-sha.txt "$RUNNER_TEMP/mini-c-validated/source-sha.txt"
+          echo "Verified fixed cases, $SEED_COUNT generated seeds, mixed ABI and negative cases" >> "$GITHUB_STEP_SUMMARY"
+      - name: Cache only actual successful differential comparisons
+        if: success() && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/mini-c-validated
+          key: mini-c-gcc-v2-${{ hashFiles('private-binary/dist/mini-c-differential/sha256.txt') }}-seeds-${{ inputs.seed_count }}
+      - name: Report previously verified exact corpus
+        if: success() && steps.cache.outputs.cache-hit == 'true' && !inputs.force_recheck
+        run: echo "Exact binary and seed range already passed; skipped redundant compilation" >> "$GITHUB_STEP_SUMMARY"
       - name: Upload failed differential cases
         if: failure()
         uses: actions/upload-artifact@v4
