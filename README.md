@@ -37,23 +37,12 @@ SHA-256 and source commit, and runs bounded, **nonempty** Z3 tests. Successful
 proof results are cached by exact binary checksum, and `force_recheck` can
 bypass the cache for manual regression confirmation.
 
-**Mini-C differential consumer:** [verify-mini-c-differential.yml](.github/workflows/verify-mini-c-differential.yml)
-downloads the checksummed Mini-C driver **and matching test harness** from
-`dist/mini-c-differential/`, then runs fixed, seeded, mixed-ABI and negative
-GCC oracles. It does **not** fetch private compiler sources, invoke Cargo or
-need the Mini-C/Oberon frontend deploy keys. Seed count (1–64), per-process
-timeouts, a job budget, and failure artifact retention bound CPU cost.
+**Mini-C source-build differential:** [verify-mini-c-differential.yml](.github/workflows/verify-mini-c-differential.yml) checks out the compiler with the existing read-only CI_KEY, builds its independent Mini-C driver workspace on compiler-ci runners (using the public Mini-C dependency), and executes fixed, seeded, mixed-ABI and negative GCC oracles. It runs every six hours or manually; exact source SHA, workflow version and seed count cache successful results. This no longer depends on publishing a binary through exhausted compiler-repository Actions minutes. Builds and tests have separate timeouts and preserve failure logs.
 
-**Automatic consumer polling:** Alive-lite checks published bundles every six hours (minute 17); Mini-C checks every six hours (minute 43) using six seeds. Exact artifact checksums are used to skip previously successful campaigns. Scheduled checks do not prove the publisher has produced a usable bundle; the first real publisher-to-consumer green run is still the acceptance gate.
-
-**Live status:** The source publisher workflows and both consumers are
-configured, but an end-to-end proof/GCC publication→consumption cycle is
-**not yet verified**. On October 30, 2026, the source-side Alive-lite
+**Live status:** The Alive-lite binary publisher/consumer handoff remains unverified. Mini-C now builds directly here, and its first successful end-to-end source-build differential run remains to be confirmed. On October 30, 2026, the source-side Alive-lite
 publisher [failed before any job step executed](https://github.com/bingordo/compiler/actions/runs/41010696186),
 while unrelated source workflows showed the same pre-step failure.
-Do not claim these offloads pass or start scheduled heavy checks until
-published binaries exist and external verification succeeds. Manual
-consumer workflows remain available for that acceptance gate.
+Do not claim either test gate passes until a real successful run has been inspected.
 
 ## Future Csmith whole-program compiler tests (planned; not enabled)
 
