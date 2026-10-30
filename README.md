@@ -98,3 +98,31 @@ programs against GCC and Clang. It does not rebuild the EDG frontend library.
 The result artifact contains provenance, per-seed classification and failure
 reproducers. Unsupported cases are **not** counted as passing. The workflow automatically checks the `cranelift-codegen` branch every 15 minutes. A lightweight preflight compares the current source commit against a completed-cohort cache marker, so unchanged commits skip the expensive job. New commits run a 10-seed differential cohort; 100 seeds remain manual. Changes to the workflow also trigger a run. This is polling, not a cross-repository webhook, and GitHub schedules may be delayed. The cache marker is written only after a successful scheduled campaign; failed campaigns are retried. Routine targeted native
 regressions stay in `edgcpp-rust`.
+
+
+## Native CFG correctness offload
+
+[`verify-compiler-core-correctness.yml`](.github/workflows/verify-compiler-core-correctness.yml)
+validates native-code correctness on the private `bingordo/compiler` source using the existing read-only `CI_KEY` deploy key
+without consuming Actions minutes from `compiler`. It runs the permanent
+`native_cfg_differential`, `loop_trap_semantics`, `memory_execution_oracle`,
+`phi_native`, and backend `division_native` Rust integration tests.
+
+The tests exercise actual x86 GNU assembly and direct ELF against an
+independent C oracle, conditional SIGFPE traps, signed integer edge cases,
+memory ordering and pointer PHIs. This is correctness only; **there are no
+timing benchmarks or performance thresholds**.
+
+The workflow checks `compiler`'s `main` every 15 minutes, but only runs
+Cargo if the exact source SHA has not previously passed this workflow
+version. Manual dispatch can select a different branch/SHA or force a
+recheck. A changed workflow is also verified before merging. Cached core
+Rust artifacts are reused, and test logs plus native reproducers are saved
+on failure. This builds only the dependency-free IR/optimizer/backend crate
+closure from a temporary checkout: it does not need or fetch the private
+Oberon frontend or a compiler-source Actions workflow. The source itself is
+private, so checkout must use `CI_KEY`, not the default `GITHUB_TOKEN`.
+
+After changes to these tests, inspect the first **real** green Actions run
+and the complete source commit SHA. A successful `compiler` PR merge alone
+is not evidence that the external suite ran.

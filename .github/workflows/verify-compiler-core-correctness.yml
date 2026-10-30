@@ -1,0 +1,139 @@
+name: Native compiler CFG correctness (compiler-ci)
+
+# The source repository may have no remaining Actions minutes. Check its
+# immutable main SHA here instead; cached successes skip Cargo entirely.
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Compiler source ref (commit SHA, branch or tag)'
+        required: false
+        default: 'main'
+        type: string
+      force_recheck:
+        description: 'Rerun tests even if this source and workflow passed'
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: '9,24,39,54 * * * *'
+  pull_request:
+    paths:
+      - '.github/workflows/verify-compiler-core-correctness.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/verify-compiler-core-correctness.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compiler-native-correctness-${{ github.event.inputs.source_ref || 'main' }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout workflow for cache-key versioning
+        uses: actions/checkout@v4
+      - name: Checkout private compiler source using read-only CI deploy key
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || 'main' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record exact source revision
+        id: source
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Compiler source SHA: $sha"
+          test -f crates/opt/tests/native_cfg_differential.rs
+          test -f crates/opt/tests/loop_trap_semantics.rs
+      - name: Skip source revisions already proven by this workflow version
+        id: validated
+        uses: actions/cache/restore@v4
+        with:
+          path: .compiler-native-validated
+          key: compiler-native-v1-${{ hashFiles('.github/workflows/verify-compiler-core-correctness.yml') }}-${{ steps.source.outputs.sha }}
+          lookup-only: true
+      - name: Report existing passing evidence
+        if: steps.validated.outputs.cache-hit == 'true' && !inputs.force_recheck
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: echo "Unchanged source commit $SOURCE_SHA already passed all native CFG correctness checks." >> "$GITHUB_STEP_SUMMARY"
+      - name: Use credential-independent source workspace
+        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          # The source Cargo workspace otherwise resolves private Oberon even
+          # for -p compiler-opt. This modifies only the runner checkout.
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          """)
+          PY
+      - name: Reuse Rust compiler core object files
+        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: native-cfg-correctness-v1
+          cache-workspace-crates: 'true'
+      - name: Run native CFG and trap correctness tests
+        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt \
+            --test native_cfg_differential \
+            --test loop_trap_semantics \
+            --test memory_execution_oracle \
+            --test phi_native --offline -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/native-cfg-tests.log"
+          # Avoid reporting false-green jobs that executed zero meaningful tests.
+          grep -F 'test direct_elf_and_assembly_match_independent_trap_and_pointer_phi_oracles ... ok' "$RUNNER_TEMP/native-cfg-tests.log"
+          grep -F 'test actual_optimizer_passes_preserve_loop_trap_semantics ... ok' "$RUNNER_TEMP/native-cfg-tests.log"
+          cargo test -p compiler-backend-x86 --test division_native --offline -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/native-division-tests.log"
+          grep -F 'test signed_divide_quotient_remainder_and_register_lifetimes ... ok' "$RUNNER_TEMP/native-division-tests.log"
+      - name: Record successful exact source SHA
+        if: success() && (steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck)
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          mkdir -p .compiler-native-validated
+          printf '%s\n' "$SOURCE_SHA" > .compiler-native-validated/source-sha.txt
+          printf 'Native CFG, loop trap, pointer PHI, memory and signed division verified: %s\n' "$SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
+      - name: Cache successful evidence for the exact source revision
+        if: success() && steps.validated.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .compiler-native-validated
+          key: compiler-native-v1-${{ hashFiles('.github/workflows/verify-compiler-core-correctness.yml') }}-${{ steps.source.outputs.sha }}
+      - name: Preserve native differential failure logs and reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiler-native-cfg-failures
+          path: |
+            ${{ runner.temp }}/native-cfg-tests.log
+            ${{ runner.temp }}/native-division-tests.log
+            /tmp/compiler-native-cfg-differential-*/
+          if-no-files-found: ignore
+          retention-days: 14
