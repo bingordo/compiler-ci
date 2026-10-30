@@ -103,7 +103,7 @@ regressions stay in `edgcpp-rust`.
 ## Native CFG correctness offload
 
 [`verify-compiler-core-correctness.yml`](.github/workflows/verify-compiler-core-correctness.yml)
-validates native-code correctness on the public `bingordo/compiler` source
+validates native-code correctness on the private `bingordo/compiler` source using the existing read-only `CI_KEY` deploy key
 without consuming Actions minutes from `compiler`. It runs the permanent
 `native_cfg_differential`, `loop_trap_semantics`, `memory_execution_oracle`,
 `phi_native`, and backend `division_native` Rust integration tests.
@@ -120,7 +120,8 @@ recheck. A changed workflow is also verified before merging. Cached core
 Rust artifacts are reused, and test logs plus native reproducers are saved
 on failure. This builds only the dependency-free IR/optimizer/backend crate
 closure from a temporary checkout: it does not need or fetch the private
-Oberon frontend or a compiler-source Actions workflow.
+Oberon frontend or a compiler-source Actions workflow. The source itself is
+private, so checkout must use `CI_KEY`, not the default `GITHUB_TOKEN`.
 
 After changes to these tests, inspect the first **real** green Actions run
 and the complete source commit SHA. A successful `compiler` PR merge alone
