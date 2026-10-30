@@ -1,0 +1,203 @@
+name: EDG Cranelift pinned YARPGen differential
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: EDG Rust source branch, tag or SHA
+        required: false
+        default: cranelift-codegen
+        type: string
+      count:
+        description: Number of generated seeds (10 or 100)
+        required: true
+        default: '10'
+        type: choice
+        options: ['10', '100']
+      start_seed:
+        description: First seed
+        required: false
+        default: '12345'
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: edg-yarpgen-${{ inputs.source_ref || 'cranelift-codegen' }}
+  cancel-in-progress: true
+jobs:
+  differential:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    container:
+      image: ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8
+    defaults:
+      run:
+        shell: edg-container-exec "bash -eo pipefail {0}"
+    env:
+      EDG_SOURCE_SHA: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+      EDG_RELEASE_TAG: edgcpfe-ci-799603e0b5ab
+      EDG_RELEASE_SHA256: fa769825e70766fbefe017806816b2338acd03daa93bb5562369c293972ce64c
+      CARGO_PROFILE_DEV_DEBUG: 0
+      RUST_TOOLCHAIN_VERSION: 1.99.1
+    steps:
+      - name: Check out Rust bindings
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/edgcpp-rust
+          ref: ${{ inputs.source_ref || 'cranelift-codegen' }}
+          path: edgcpp-rust
+          persist-credentials: false
+
+      - name: Check out exact EDG headers/configuration sources
+        uses: actions/checkout@v4
+        with:
+          repository: bingundu/edgcpp
+          ref: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+          path: edgcpp
+          persist-credentials: false
+
+      - name: Verify checkout matches the pinned EDG binary
+        working-directory: edgcpp
+        run: |
+          test "$(git rev-parse HEAD)" = "$EDG_SOURCE_SHA"
+
+      # GitHub's cache entries are immutable, so restore the newest matching
+      # prior cache; only new development-branch builds save a replacement snapshot.
+      - name: Restore Rust/Cargo incremental compilation cache
+        id: rust-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            edgcpp-rust/target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: rust-edgcpp-cranelift-v1-${{ env.EDG_SOURCE_SHA }}-rust${{ env.RUST_TOOLCHAIN_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('edgcpp-rust/Cargo.toml', 'edgcpp-rust/Cargo.lock', 'edgcpp-rust/build.rs', 'edgcpp-rust/cpp/bridge.cpp', 'edgcpp-rust/tools/build_bridge.py') }}-${{ github.sha }}
+          restore-keys: |
+            rust-edgcpp-cranelift-v1-${{ env.EDG_SOURCE_SHA }}-rust${{ env.RUST_TOOLCHAIN_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('edgcpp-rust/Cargo.toml', 'edgcpp-rust/Cargo.lock', 'edgcpp-rust/build.rs', 'edgcpp-rust/cpp/bridge.cpp', 'edgcpp-rust/tools/build_bridge.py') }}-
+            rust-edgcpp-cranelift-v1-${{ env.EDG_SOURCE_SHA }}-rust${{ env.RUST_TOOLCHAIN_VERSION }}-${{ runner.os }}-${{ runner.arch }}-
+
+      # EDG's IL layout depends on compile-time macros. CMake configure is
+      # cheap and generates matching compile_commands.json and environment.sh.
+      # Do not build the native archive here; download its tested binary.
+      - name: Configure metadata for EDG bridge compilation (no native build)
+        env:
+          EDG_BASE: ${{ github.workspace }}/edgcpp/bases/docker/dev-env/gcc
+        working-directory: edgcpp
+        run: |
+          cmake --preset linux-gcc-release \
+            -DEDG_BUILD_LIB=OFF \
+            -DEDG_BUILD_CALLABLE_LIBRARY=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+      # EDG generates two error-message headers through a tiny host tool.
+      # Building this named target does NOT build the EDG front-end library.
+      - name: Generate EDG error headers (small host-tool target only)
+        working-directory: edgcpp
+        run: |
+          cmake --build build/gcc-release --target error-info --parallel 2
+          test -s build/gcc-release/src/includes/err_codes.h
+          test -s build/gcc-release/src/includes/err_data.h
+
+      - name: Download pinned, prebuilt EDG archive
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          url="https://github.com/bingundu/edgcpp/releases/download/$EDG_RELEASE_TAG/edgcpfe-ci-x86_64-callable-release-linux-x86_64.tar.gz"
+          mkdir -p build/gcc-release/lib build/prebuilt-edg
+          curl --fail --location --silent --show-error \
+            --retry 4 --retry-delay 2 \
+            "$url" --output build/prebuilt-edg/archive.tar.gz
+          printf '%s  %s\n' "$EDG_RELEASE_SHA256" build/prebuilt-edg/archive.tar.gz | sha256sum --check --status
+          tar -xzf build/prebuilt-edg/archive.tar.gz -C build/prebuilt-edg
+          grep -Fx "commit=$EDG_SOURCE_SHA" build/prebuilt-edg/BUILD-INFO.txt
+          grep -Fx 'platform=linux-x86_64' build/prebuilt-edg/BUILD-INFO.txt
+          test -s build/prebuilt-edg/lib/libedgcpfe.a
+          cp build/prebuilt-edg/lib/libedgcpfe.a build/gcc-release/lib/libedgcpfe.a
+          echo "Using prebuilt EDG $EDG_SOURCE_SHA; no EDG native compilation"
+
+      - name: Install pinned Rust toolchain
+        run: |
+          if ! command -v cargo >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN_VERSION"
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install "$RUST_TOOLCHAIN_VERSION" --profile minimal
+          rustup component add clippy --toolchain "$RUST_TOOLCHAIN_VERSION"
+          rustup default "$RUST_TOOLCHAIN_VERSION"
+
+      - name: Build EDG/Cranelift codegen once
+        working-directory: edgcpp-rust
+        env:
+          EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+          EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+          EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+          EDGCPP_EDG_REVISION: ${{ env.EDG_SOURCE_SHA }}
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo build --features codegen --example codegen
+      - name: Run pinned YARPGen differential cohort
+        working-directory: edgcpp-rust
+        env:
+          EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+          EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+          EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+          EDGCPP_EDG_REVISION: ${{ env.EDG_SOURCE_SHA }}
+        run: |
+          set -euo pipefail
+          mkdir -p tools/prebuilt-yarpgen
+          curl --proto '=https' --tlsv1.2 --fail --location --retry 3 --silent --show-error \
+            "https://github.com/bingundu/yarpgen/releases/download/yarpgen-binary-20261028-1/yarpgen-linux-x86_64.tar.gz" \
+            -o tools/prebuilt-yarpgen/archive.tar.gz
+          printf '%s  %s\n' \
+            fc3c7c80c10c67782c03f9d8b70c426f942332e78701397a14a5edff81cbc2e8 \
+            tools/prebuilt-yarpgen/archive.tar.gz | sha256sum -c -
+          tar -xzf tools/prebuilt-yarpgen/archive.tar.gz -C tools/prebuilt-yarpgen
+          python3 tools/yarpgen_smoke.py \
+            --generator "$PWD/tools/prebuilt-yarpgen/yarpgen-linux-x86_64/yarpgen" \
+            --codegen "$PWD/target/debug/examples/codegen" \
+            --codegen-cwd "$PWD/../edgcpp/build/gcc-release" \
+            --edg-environment "$PWD/../edgcpp/build/gcc-release/environment.sh" \
+            --edg-option=--c11 \
+            --edg-option=--gcc \
+            --out "$PWD/m6-yarpgen-report" \
+            --start-seed "${{ inputs.start_seed || '12345' }}" --count "${{ inputs.count || '10' }}" \
+            --clang clang --timeout 45 --memory-mb 2048 \
+            --generator-option=--inp-as-args=none \
+            --generator-option=--emit-pragmas=none \
+            --generator-option=--emit-align-attr=none \
+            --generator-option=--omp-simd=off \
+            --generator-option=--max-array-dims=2
+          python3 - <<'PY'
+          import json
+          d=json.load(open('m6-yarpgen-report/summary.json'))
+          print("M6 focused 10-seed results:",d)
+          if d["generated"] != int("${{ inputs.count || '10' }}") or d["oracle_valid"] != int("${{ inputs.count || '10' }}"):
+              raise SystemExit("M6 triage failed to establish requested valid GCC/Clang oracles")
+          if d["counts"]["wrong_output"] or d["counts"]["link_failure"] or d["counts"]["runtime_failure"]:
+              raise SystemExit("M6 triage detected wrong output/link/runtime failure; inspect artifacts")
+          # Unsupported constructs remain categorized, not counted as passes.
+          # A diagnostic cohort may be entirely unsupported; do not call that success.
+          print("Accepted:", d["backend_accepted"], "Unsupported:", d["counts"]["unsupported_construct"])
+          PY
+
+      - name: Save incremental Rust cache
+        if: ${{ success() && steps.rust-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            edgcpp-rust/target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
+      - name: Upload differential report and failing seeds
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: edg-yarpgen-report
+          path: |
+            edgcpp-rust/m6-yarpgen-report/summary.json
+            edgcpp-rust/m6-yarpgen-report/results.jsonl
+            edgcpp-rust/m6-yarpgen-report/provenance.json
+            edgcpp-rust/m6-yarpgen-report/seed-*/
+          if-no-files-found: ignore
+          retention-days: 14
