@@ -1,0 +1,48 @@
+name: Validate Memory SSA from compiler branch
+
+on:
+  workflow_dispatch:
+    inputs:
+      compiler_ref:
+        description: 'Compiler branch or exact commit to validate'
+        required: true
+        default: 'feature/m6-egraph-engine'
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/verify-memory-ssa.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: memory-ssa-${{ github.event.inputs.compiler_ref || 'default' }}
+  cancel-in-progress: true
+
+jobs:
+  memory-ssa:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout compiler source with CI key
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.compiler_ref || 'feature/m6-egraph-engine' }}
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Use runner Rust toolchain
+        run: rustc --version && cargo --version
+      - name: Cache target artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: memory-ssa
+      - name: Test Memory SSA and opt-in redundant loads
+        run: |
+          cargo test -p compiler-opt memory_ssa::tests:: --locked
+          cargo test -p compiler-opt memory_ssa_loads::tests:: --locked
+      - name: Test SSA egraph adapter
+        run: cargo test -p compiler-opt egraph_ssa --locked
+      - name: Strict lint of compiler optimizer
+        run: cargo clippy -p compiler-opt --all-targets --locked -- -D warnings
