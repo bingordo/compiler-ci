@@ -55,3 +55,20 @@ generated programs are unsupported.
 
 Keep everyday compiler PR validation targeted and short. Full Csmith
 campaigns belong here rather than on each `bingordo/compiler` push.
+
+
+## EDG/Cranelift YARPGen differential campaigns
+
+[edg-yarpgen.yml](.github/workflows/edg-yarpgen.yml) owns the expensive
+EDG/Cranelift YARPGen runs formerly embedded in `bingordo/edgcpp-rust`.
+Use **Actions → EDG Cranelift pinned YARPGen differential → Run workflow**,
+select `source_ref` (defaults to `cranelift-codegen`), `count` (10 or 100),
+and `start_seed`. It downloads the pinned EDG and YARPGen releases, builds
+only the Rust Cranelift driver once with Cargo caching, then compares generated
+programs against GCC and Clang. It does not rebuild the EDG frontend library.
+
+The result artifact contains provenance, per-seed classification and failure
+reproducers. Unsupported cases are **not** counted as passing. The workflow
+is manual-only until a tested binary publication/trigger path exists; there
+is no automatic cross-repository dispatch yet. Routine targeted native
+regressions stay in `edgcpp-rust`.
