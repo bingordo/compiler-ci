@@ -1,111 +1,136 @@
-name: Mini-C prebuilt GCC differential tests
+name: Mini-C source-build GCC differential tests
 
 on:
-  schedule:
-    - cron: '43 */6 * * *'
   workflow_dispatch:
     inputs:
-      expected_source_sha:
-        description: 'Expected compiler commit SHA (optional)'
+      source_ref:
+        description: 'Compiler branch, tag or commit'
         required: false
+        default: main
         type: string
       seed_count:
-        description: 'Generated seed count'
+        description: 'Generated seed count (1-64)'
         required: false
         default: '6'
         type: string
       force_recheck:
-        description: 'Re-run fixed and seeded C/GCC comparisons even when the exact binary already passed'
+        description: 'Repeat previously passing cohort'
         required: false
         default: false
         type: boolean
+  schedule:
+    - cron: '43 */6 * * *'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/verify-mini-c-differential.yml'
 
 permissions:
   contents: read
 
 concurrency:
-  group: mini-c-differential
+  group: mini-c-differential-${{ inputs.source_ref || 'main' }}
   cancel-in-progress: true
 
 jobs:
   differential:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
-      - name: Download only prebuilt Mini-C bundle
+      - name: Checkout compiler source using existing read-only deploy key
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: expr-rule-gen-binaries
-          path: private-binary
+          ref: ${{ inputs.source_ref || 'main' }}
+          path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-          sparse-checkout: |
-            dist/mini-c-differential
-      - name: Verify checksum and source commit
+      - name: Identify exact source and validate cohort size
+        id: source
         shell: bash
-        run: |
-          set -euo pipefail
-          cd private-binary/dist/mini-c-differential
-          grep -Eq '^[0-9a-f]{40}$' source-sha.txt
-          expected="${{ inputs.expected_source_sha }}"
-          if [ -n "$expected" ]; then
-            grep -Eq '^[0-9a-f]{40}$' <<< "$expected"
-            test "$(cat source-sha.txt)" = "$expected"
-          fi
-          sha256sum --check sha256.txt
-          tar -tzf mini-c-differential-linux-x86_64.tar.gz | grep -Fx compiler-mini-c
-          tar -tzf mini-c-differential-linux-x86_64.tar.gz | grep -Fx differential.py
-          mkdir -p "$RUNNER_TEMP/mini-c-differential"
-          tar -xzf mini-c-differential-linux-x86_64.tar.gz -C "$RUNNER_TEMP/mini-c-differential"
-          test -x "$RUNNER_TEMP/mini-c-differential/compiler-mini-c"
-          test -s "$RUNNER_TEMP/mini-c-differential/differential.py"
-          echo "Compiler source SHA: $(cat source-sha.txt)"
-      - name: Validate bounded seed budget
         env:
           SEED_COUNT: ${{ inputs.seed_count || '6' }}
-        shell: bash
         run: |
           set -euo pipefail
+          sha="$(git -C compiler rev-parse HEAD)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
           [[ "$SEED_COUNT" =~ ^[0-9]+$ ]]
-          (( SEED_COUNT >= 1 && SEED_COUNT <= 64 ))
-          echo "C/GCC differential seeds requested: $SEED_COUNT"
-      - name: Reuse verified exact binary and seed-corpus result
-        id: cache
+          (( 10#$SEED_COUNT >= 1 && 10#$SEED_COUNT <= 64 ))
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          test -s compiler/tools/mini-c-driver/tests/differential.py
+          test -s compiler/tools/mini-c-driver/Cargo.toml
+          echo "Compiler revision: $sha" >> "$GITHUB_STEP_SUMMARY"
+      - name: Check for previously successful source and cohort
+        id: verified
         uses: actions/cache/restore@v4
         with:
-          path: ${{ runner.temp }}/mini-c-validated
-          key: mini-c-gcc-v2-${{ hashFiles('private-binary/dist/mini-c-differential/sha256.txt') }}-seeds-${{ inputs.seed_count || '6' }}
-      - name: Compare prebuilt Mini-C compiler with GCC
-        if: steps.cache.outputs.cache-hit != 'true' || inputs.force_recheck
+          path: .mini-c-verified
+          key: mini-c-source-v1-${{ hashFiles('.github/workflows/verify-mini-c-differential.yml') }}-${{ steps.source.outputs.sha }}-${{ inputs.seed_count || '6' }}
+          lookup-only: true
+      - name: Make public Mini-C dependency accessible without another deploy key
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          manifest=Path('compiler/tools/mini-c-driver/Cargo.toml')
+          text=manifest.read_text()
+          old='ssh://git@github.com/bingordo/mini-c.git'
+          assert text.count(old)==2, 'Mini-C dependency declaration changed'
+          manifest.write_text(text.replace(old,'https://github.com/bingordo/mini-c.git'))
+          PY
+      - name: Cache Rust objects and dependencies
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: mini-c-source-differential-v1
+          cache-workspace-crates: 'true'
+      - name: Build compiler-mini-c once
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 12m cargo build \
+            --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --bin compiler-mini-c \
+            2>&1 | tee "$RUNNER_TEMP/mini-c-build.log"
+          test -x compiler/tools/mini-c-driver/target/debug/compiler-mini-c
+      - name: Compare compiled Mini-C against GCC
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
         shell: bash
         env:
           SEED_COUNT: ${{ inputs.seed_count || '6' }}
         run: |
           set -euo pipefail
-          timeout --signal=TERM --kill-after=15s 16m \
-            python3 "$RUNNER_TEMP/mini-c-differential/differential.py" \
-            --compiler "$RUNNER_TEMP/mini-c-differential/compiler-mini-c" \
+          timeout --signal=TERM --kill-after=10s 10m python3 \
+            compiler/tools/mini-c-driver/tests/differential.py \
+            --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" \
             --seed-count "$SEED_COUNT" --steps 120 --timeout 15 \
-            --artifacts "$RUNNER_TEMP/mini-c-failures" | tee "$RUNNER_TEMP/mini-c-differential.log"
+            --artifacts "$RUNNER_TEMP/mini-c-failures" \
+            2>&1 | tee "$RUNNER_TEMP/mini-c-differential.log"
           grep -Eq "^PASS: [1-9][0-9]* fixtures, $SEED_COUNT seeds, mixed ABI calls and negative cases$" "$RUNNER_TEMP/mini-c-differential.log"
-          mkdir -p "$RUNNER_TEMP/mini-c-validated"
-          cp private-binary/dist/mini-c-differential/source-sha.txt "$RUNNER_TEMP/mini-c-validated/source-sha.txt"
-          echo "Verified fixed cases, $SEED_COUNT generated seeds, mixed ABI and negative cases" >> "$GITHUB_STEP_SUMMARY"
-      - name: Cache only actual successful differential comparisons
-        if: success() && steps.cache.outputs.cache-hit != 'true'
+          mkdir -p .mini-c-verified
+          printf '%s\n' "${{ steps.source.outputs.sha }}" > .mini-c-verified/source-sha.txt
+          echo "Passed fixed, seeded, ABI and negative GCC oracles" >> "$GITHUB_STEP_SUMMARY"
+      - name: Save successful exact revision evidence
+        if: success() && steps.verified.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          path: ${{ runner.temp }}/mini-c-validated
-          key: mini-c-gcc-v2-${{ hashFiles('private-binary/dist/mini-c-differential/sha256.txt') }}-seeds-${{ inputs.seed_count || '6' }}
-      - name: Report previously verified exact corpus
-        if: success() && steps.cache.outputs.cache-hit == 'true' && !inputs.force_recheck
-        run: echo "Exact binary and seed range already passed; skipped redundant compilation" >> "$GITHUB_STEP_SUMMARY"
-      - name: Upload failed differential cases
+          path: .mini-c-verified
+          key: mini-c-source-v1-${{ hashFiles('.github/workflows/verify-mini-c-differential.yml') }}-${{ steps.source.outputs.sha }}-${{ inputs.seed_count || '6' }}
+      - name: Report cached result
+        if: steps.verified.outputs.cache-hit == 'true' && !inputs.force_recheck
+        run: echo "Exact compiler revision and seed cohort previously passed" >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve build logs and failing test cases
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: mini-c-differential-failures
-          path: ${{ runner.temp }}/mini-c-failures/
+          name: mini-c-source-differential-failures
+          path: |
+            ${{ runner.temp }}/mini-c-build.log
+            ${{ runner.temp }}/mini-c-differential.log
+            ${{ runner.temp }}/mini-c-failures/
           if-no-files-found: ignore
           retention-days: 14
