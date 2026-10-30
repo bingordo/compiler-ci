@@ -44,6 +44,8 @@ GCC oracles. It does **not** fetch private compiler sources, invoke Cargo or
 need the Mini-C/Oberon frontend deploy keys. Seed count (1–64), per-process
 timeouts, a job budget, and failure artifact retention bound CPU cost.
 
+**Automatic consumer polling:** Alive-lite checks published bundles every six hours (minute 17); Mini-C checks every six hours (minute 43) using six seeds. Exact artifact checksums are used to skip previously successful campaigns. Scheduled checks do not prove the publisher has produced a usable bundle; the first real publisher-to-consumer green run is still the acceptance gate.
+
 **Live status:** The source publisher workflows and both consumers are
 configured, but an end-to-end proof/GCC publication→consumption cycle is
 **not yet verified**. On October 30, 2026, the source-side Alive-lite
