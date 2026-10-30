@@ -25,6 +25,34 @@ corresponding unconditional transformations. The generator remains a
 research experiment; none of these rules is enabled in production optimization.
 
 
+## Existing compiler correctness checks — binary-only heavy test offload
+
+The [migration runbook](docs/heavy-validation-migration.md) distinguishes
+fast source-repository tests from the longer independent proof/GCC campaigns.
+
+**Alive-lite proof consumer:** [verify-alive-lite.yml](.github/workflows/verify-alive-lite.yml)
+fetches the actual compiled SSA/CFG optimizer test executable from
+`expr-rule-gen-binaries/dist/alive-lite/` using `CI_KEY`, verifies the binary
+SHA-256 and source commit, and runs bounded, **nonempty** Z3 tests. Successful
+proof results are cached by exact binary checksum, and `force_recheck` can
+bypass the cache for manual regression confirmation.
+
+**Mini-C differential consumer:** [verify-mini-c-differential.yml](.github/workflows/verify-mini-c-differential.yml)
+downloads the checksummed Mini-C driver **and matching test harness** from
+`dist/mini-c-differential/`, then runs fixed, seeded, mixed-ABI and negative
+GCC oracles. It does **not** fetch private compiler sources, invoke Cargo or
+need the Mini-C/Oberon frontend deploy keys. Seed count (1–64), per-process
+timeouts, a job budget, and failure artifact retention bound CPU cost.
+
+**Live status:** The source publisher workflows and both consumers are
+configured, but an end-to-end proof/GCC publication→consumption cycle is
+**not yet verified**. On October 30, 2026, the source-side Alive-lite
+publisher [failed before any job step executed](https://github.com/bingordo/compiler/actions/runs/41010696186),
+while unrelated source workflows showed the same pre-step failure.
+Do not claim these offloads pass or start scheduled heavy checks until
+published binaries exist and external verification succeeds. Manual
+consumer workflows remain available for that acceptance gate.
+
 ## Future Csmith whole-program compiler tests (planned; not enabled)
 
 The compiler's [M10 Csmith validation plan](https://github.com/bingordo/compiler/blob/main/docs/Csmith_Validation.md)
