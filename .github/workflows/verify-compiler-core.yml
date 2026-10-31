@@ -7,13 +7,46 @@ on:
         required: true
         default: research/if-conversion-cost-model
         type: string
+  schedule:
+    - cron: '7,22,37,52 * * * *'
   push:
     branches: [main]
     paths: ['.github/workflows/verify-compiler-core.yml']
 permissions:
   contents: read
+concurrency:
+  group: compiler-core-${{ github.event.inputs.source_ref || 'poll' }}
+  cancel-in-progress: true
 jobs:
+  discover:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      refs: ${{ steps.refs.outputs.refs }}
+    steps:
+      - name: Discover open compiler PR heads
+        id: refs
+        env:
+          GH_TOKEN: ${{ secrets.CI_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # GitHub REST allows anonymous reads for public PR metadata; checkout
+          # below continues to use the existing read-only deploy key.
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, urllib.request
+          url='https://api.github.com/repos/bingordo/compiler/pulls?state=open&per_page=100'
+          req=urllib.request.Request(url,headers={'Accept':'application/vnd.github+json','User-Agent':'compiler-ci'})
+          with urllib.request.urlopen(req,timeout=20) as response:
+              prs=json.load(response)
+          # Only same-repository heads can be fetched with our deploy key.
+          shas=sorted({p['head']['sha'] for p in prs if p['head']['repo'] and p['head']['repo']['full_name']=='bingordo/compiler'})
+          print('refs='+json.dumps(shas,separators=(',',':')))
+          PY
   core:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -42,3 +75,15 @@ jobs:
       - name: Verify core and x86 backend
         working-directory: compiler
         run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+
+  pr-core:
+    needs: discover
+    if: github.event_name == 'schedule' && needs.discover.outputs.refs != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        source_ref: ${{ fromJSON(needs.discover.outputs.refs) }}
+    uses: ./.github/workflows/verify-compiler-pr-head.yml
+    with:
+      source_ref: ${{ matrix.source_ref }}
+    secrets: inherit
