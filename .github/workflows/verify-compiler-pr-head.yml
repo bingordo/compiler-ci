@@ -21,7 +21,18 @@ jobs:
           persist-credentials: false
       - name: Verify exact revision
         run: test "$(git -C compiler rev-parse HEAD)" = "${{ inputs.source_ref }}"
+      - uses: actions/checkout@v4
+        with:
+          path: ci-workflow
+      - name: Check successful SHA cache
+        id: passed
+        uses: actions/cache/restore@v4
+        with:
+          path: .verified-compiler-pr
+          key: compiler-pr-passed-v1-${{ hashFiles('ci-workflow/.github/workflows/verify-compiler-pr-head.yml') }}-${{ inputs.source_ref }}
+          lookup-only: true
       - name: Restrict workspace to core crates
+        if: steps.passed.outputs.cache-hit != 'true'
         shell: bash
         run: |
           cat > compiler/Cargo.toml <<'EOF'
@@ -31,11 +42,24 @@ jobs:
           EOF
           rm -f compiler/Cargo.lock
       - uses: Swatinem/rust-cache@v2
+        if: steps.passed.outputs.cache-hit != 'true'
         with:
           workspaces: compiler -> target
           key: external-pr-core
       - name: Run core and experimental generated-rule tests
+        if: steps.passed.outputs.cache-hit != 'true'
         working-directory: compiler
         run: |
           cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
           cargo test -p compiler-opt --features experimental-generated-rules
+      - name: Record passing source
+        if: steps.passed.outputs.cache-hit != 'true' && success()
+        run: |
+          mkdir -p .verified-compiler-pr
+          printf '%s\n' "${{ inputs.source_ref }}" > .verified-compiler-pr/sha
+      - name: Cache passing source
+        if: steps.passed.outputs.cache-hit != 'true' && success()
+        uses: actions/cache/save@v4
+        with:
+          path: .verified-compiler-pr
+          key: compiler-pr-passed-v1-${{ hashFiles('ci-workflow/.github/workflows/verify-compiler-pr-head.yml') }}-${{ inputs.source_ref }}
