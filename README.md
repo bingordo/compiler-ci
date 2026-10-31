@@ -1,8 +1,7 @@
-# Offline expression rule generator verification
+# Compiler correctness validation runners
 
-This public repository contains only the **test workflow** for the
-prebuilt `expr-rule-gen` executable; implementation stays in the private
-[`bingordo/compiler`](https://github.com/bingordo/compiler) repository.
+This public repository runs compiler correctness tests against the private
+[`bingordo/compiler`](https://github.com/bingordo/compiler) source, using a read-only deploy key. It also verifies prebuilt expression-rule generator artifacts.
 
 The source repository builds a standalone Linux x86-64 generator binary when
 the generator changes, then stores an archive, checksum and generating commit
@@ -30,21 +29,11 @@ research experiment; none of these rules is enabled in production optimization.
 The [migration runbook](docs/heavy-validation-migration.md) distinguishes
 fast source-repository tests from the longer independent proof/GCC campaigns.
 
-**Alive-lite proof consumer:** [verify-alive-lite.yml](.github/workflows/verify-alive-lite.yml)
-fetches the actual compiled SSA/CFG optimizer test executable from
-`expr-rule-gen-binaries/dist/alive-lite/` using `CI_KEY`, verifies the binary
-SHA-256 and source commit, and runs bounded, **nonempty** Z3 tests. Successful
-proof results are cached by exact binary checksum, and `force_recheck` can
-bypass the cache for manual regression confirmation.
+**Alive-lite source-build verification:** [verify-alive-lite.yml](.github/workflows/verify-alive-lite.yml) now checks out the exact compiler source using CI_KEY, compiles the independent compiler core in this repository's runner, installs Z3, and executes the ignored proof tests with nonzero coverage validation. It runs every 15 minutes or manually and caches successful results by source SHA and workflow hash. No source-repository Actions publisher is needed. A green end-to-end run is still required for acceptance.
 
-**Alive-lite source-build verification:** [verify-alive-lite.yml](.github/workflows/verify-alive-lite.yml) now checks out the exact compiler source using CI_KEY, compiles the independent compiler core in this repository's runner, installs Z3, and executes the ignored proof tests with nonzero coverage validation. It runs every six hours or manually and caches successful results by source SHA and workflow hash. No source-repository Actions publisher is needed. A green end-to-end run is still required for acceptance.
+**Mini-C source-build differential:** [verify-mini-c-differential.yml](.github/workflows/verify-mini-c-differential.yml) checks out the compiler with the existing read-only CI_KEY, builds its independent Mini-C driver workspace on compiler-ci runners (using the public Mini-C dependency), and executes fixed, seeded, mixed-ABI and negative GCC oracles. It runs every 15 minutes or manually; exact source SHA, workflow version and seed count cache successful results. This no longer depends on publishing a binary through exhausted compiler-repository Actions minutes. Builds and tests have separate timeouts and preserve failure logs.
 
-**Mini-C source-build differential:** [verify-mini-c-differential.yml](.github/workflows/verify-mini-c-differential.yml) checks out the compiler with the existing read-only CI_KEY, builds its independent Mini-C driver workspace on compiler-ci runners (using the public Mini-C dependency), and executes fixed, seeded, mixed-ABI and negative GCC oracles. It runs every six hours or manually; exact source SHA, workflow version and seed count cache successful results. This no longer depends on publishing a binary through exhausted compiler-repository Actions minutes. Builds and tests have separate timeouts and preserve failure logs.
-
-**Live status:** The Alive-lite binary publisher/consumer handoff remains unverified. Mini-C now builds directly here, and its first successful end-to-end source-build differential run remains to be confirmed. On October 30, 2026, the source-side Alive-lite
-publisher [failed before any job step executed](https://github.com/bingordo/compiler/actions/runs/41010696186),
-while unrelated source workflows showed the same pre-step failure.
-Do not claim either test gate passes until a real successful run has been inspected.
+**Validation status:** Mini-C and Alive-lite source-build workflows have been reported green. Both poll for source changes every 15 minutes, skipping exact revisions already validated by the corresponding workflow version. The older source-side binary publishers are no longer prerequisites for these two gates. Check individual Actions runs for exact source SHA and test counts.
 
 ## Future Csmith whole-program compiler tests (planned; not enabled)
 
