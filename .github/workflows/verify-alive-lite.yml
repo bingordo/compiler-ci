@@ -222,6 +222,38 @@ jobs:
           with open('../alive-lite-proofs.jsonl', 'w') as out:
               for shape, seed, name, changed, status in proofs:
                   out.write(__import__('json').dumps(dict(shape=int(shape),seed=int(seed),pass_name=name,changed=changed=='true',status=status,source_sha='${{ steps.source.outputs.sha }}'))+'\n')
+          # Keep bounded concrete local-memory claims separate from the
+          # strict exact-word SMT proof subset.
+          for test in (
+              't5_exact_local_memory_proofs_and_negative_controls',
+              't5_exact_local_memory_actual_pass_proofs',
+          ):
+              if not re.search(r'test alive_lite_memory::'+test+r' \.\.\. ok', log):
+                  raise SystemExit(f'Missing exact-word memory SMT test: {test}')
+          records = re.findall(
+              r'T5_MEMORY_PROOF fixture=(\w+) pass=(\w+) changed=(true|false) status=(\w+)', log
+          )
+          expected = {(f,p) for f in ('overwrite','forward_join','pointer_phi','bulk_zero')
+                              for p in ('forward','dse','pipeline')}
+          if len(records) != 12 or {(f,p) for f,p,_,_ in records} != expected:
+              raise SystemExit('Incomplete exact-word SMT memory proof matrix')
+          if any((changed == 'true') != (status == 'PROVEN') for _,_,changed,status in records):
+              raise SystemExit('Exact-word memory SMT record incorrectly classified')
+          proven = sum(changed == 'true' for _,_,changed,_ in records)
+          if proven < 1:
+              raise SystemExit('No changed local-memory optimization proved by SMT')
+          if 'T5_MEMORY_NEGATIVE_SMT status=COUNTEREXAMPLE cases=3' not in log:
+              raise SystemExit('Missing exact-word SMT negative controls')
+          import json
+          with open('../alive-lite-memory-proofs.jsonl','w') as out:
+              for fixture,name,changed,status in records:
+                  out.write(json.dumps(dict(
+                      scope='exact_local_i32_words',fixture=fixture,pass_name=name,
+                      changed=(changed=='true'),status=status,
+                      smt_proven=(status=='PROVEN'),
+                      source_sha='${{ steps.source.outputs.sha }}',
+                  ),sort_keys=True)+'\n')
+          print(f'Validated {proven} exact-word memory transformations with SMT proofs')
           print(f'Validated {passed} Alive-lite tests and {len(proofs)} per-pass proof records')
           PY
           mkdir -p "$GITHUB_WORKSPACE/.alive-lite-verified"
@@ -237,6 +269,7 @@ jobs:
             alive-lite-coverage.jsonl
             alive-lite-proofs.jsonl
             alive-lite-memory.jsonl
+            alive-lite-memory-proofs.jsonl
           retention-days: 14
       - name: Cache exact passing source revision
         if: success() && steps.verified.outputs.cache-hit != 'true'
