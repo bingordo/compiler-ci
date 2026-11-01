@@ -73,6 +73,7 @@ jobs:
           python3 -m compileall -q tools/x86_isl_symbolic.py tools/test_x86_effect_proofs.py
           python3 -m compileall -q tools/x86_pattern_discovery.py tools/test_x86_pattern_discovery.py
           python3 -m compileall -q tools/x86_bit_scan_discovery.py tools/test_x86_bit_scan_discovery.py
+          python3 -m compileall -q tools/x86_ctz_discovery.py tools/test_x86_ctz_discovery.py
       - name: Install Z3 for symbolic smoke proofs
         if: steps.verified.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
         run: |
@@ -111,7 +112,7 @@ jobs:
           stats = report["stats"]
           assert stats["proven"] > 1 and stats["unknown"] == 0
           assert report["selection_code_emitted"] is False
-          assert report["scope"] == "compiler-ir single-block i32 Add/Sub/Mul/And"
+          assert report["scope"] == "compiler-ir single-block i32 Add/Sub/Mul/And/Ctz"
           assert len(report["semantic_git_blob_sha1"]) == 40
           assert stats["proven"] == len(report["patterns"])
           assert all(p["proof"]["status"] == "proven" and p["lowering"] == "not_generated"
@@ -123,6 +124,34 @@ jobs:
                             f"{stats['proven']} verified patterns, "
                             f"{stats['unknown']} unknown proofs.\\n")
           PY
+      - name: Verify total CTZ idiom discovery over production SSA
+        if: steps.verified.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
+        env:
+          INTEL_ISL_DIR: /tmp/intel-isl
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools -p 'test_x86_ctz_discovery.py' -v
+          python3 tools/x86_ctz_discovery.py --intel-dir /tmp/intel-isl --max-nodes 3 --max-terms 20000 --max-proofs 100 --output /tmp/x86-x3-ctz.json
+          python3 - <<'PY'
+          import json
+          with open("/tmp/x86-x3-ctz.json") as file:
+              report = json.load(file)
+          assert report["hardware_source_correction"]["status"] == "proven"
+          assert report["stats"]["proved"] > 1 and report["stats"]["unknown"] == 0
+          assert all(p["compiler_ir_supported"] is True and
+                     p["proof"]["status"] == "proven" and
+                     p["lowering"] == "not_generated" and p["zero_result"] == 32
+                     for p in report["patterns"])
+          assert report["selection_code_emitted"] is False
+          print("Production SSA CTZ proof patterns:", report["stats"]["proved"])
+          PY
+      - name: Archive production SSA CTZ proof report
+        if: success() && (steps.verified.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch')
+        uses: actions/upload-artifact@v4
+        with:
+          name: x86-x3-ctz-production
+          path: /tmp/x86-x3-ctz.json
+          retention-days: 14
       - name: Verify research-only BSF identity discovery
         if: steps.verified.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
         env:
