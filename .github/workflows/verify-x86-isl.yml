@@ -14,7 +14,7 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
         with:
@@ -38,6 +38,32 @@ jobs:
       - name: Report cached validation
         if: steps.verified.outputs.cache-hit == 'true' && github.event_name != 'workflow_dispatch'
         run: echo "Already verified the exact source/workflow pair; skipped expensive steps." >> "$GITHUB_STEP_SUMMARY"
+      - name: Restrict Rust workspace to compiler core (no frontend credentials)
+        if: steps.verified.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text(
+              '[workspace]\\nresolver = "2"\\nmembers = '
+              '["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]\\n'
+          )
+          PY
+      - name: Reuse core Rust build cache
+        if: steps.verified.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: x86-x3-ir-and
+          cache-workspace-crates: 'true'
+      - name: Test generic AND SSA and both x86 code sinks
+        if: steps.verified.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          python3 tools/regen_x86_forms.py --check
+          python3 tools/regen_x86_selector_patterns.py --check
+          cargo test -p compiler-ir --test semantic_export
+          cargo test -p compiler-opt --test bitwise_and
+          cargo test -p compiler-backend-x86 --test and_native
+          cargo test --lib -p compiler-ir -p compiler-opt -p compiler-backend-x86
       - name: Check proof and discovery module syntax
         if: steps.verified.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
         run: |
