@@ -71,7 +71,10 @@ jobs:
             compiler-generator/tools/regen_x86_selector_patterns.py \
             compiler-generator/crates/backend-x86/src/generated_selector_patterns.rs \
             compiler-generator/crates/backend-x86/tests/and_native.rs \
-            compiler-generator/crates/backend-x86/tests/ctz_native.rs; do
+            compiler-generator/crates/backend-x86/tests/ctz_native.rs \
+            compiler-generator/crates/backend-x86/tests/dag_native.rs \
+            compiler-generator/data/x86_x4_proven_dag_rules.json \
+            compiler-generator/crates/backend-x86/src/generated_dag_patterns.rs; do
             test -s "$path" || { echo "Missing required file: $path"; exit 1; }
           done
           {
@@ -140,7 +143,7 @@ jobs:
             cargo test -p compiler-backend-x86 --test t5_x86_generator_bridge \
               -- --nocapture --test-threads=1 \
             2>&1 | tee "$RUNNER_TEMP/x86-t5-bridge-rust.log"
-          grep -F 'T5_BRIDGE_SUMMARY generated_metadata_rules_exercised=7 executable_dag_rules_proven=0' \
+          grep -F 'T5_BRIDGE_SUMMARY generated_metadata_rules_exercised=7 catalog_executable_dag_rules_proven=0' \
             "$RUNNER_TEMP/x86-t5-bridge-rust.log"
           grep -F 'T5_BRIDGE_NEGATIVE status=DETECTED cases=2 fallback=MANUAL' \
             "$RUNNER_TEMP/x86-t5-bridge-rust.log"
@@ -168,6 +171,41 @@ jobs:
           grep -F 'test and_encoding_matches_c_oracle_in_gas_and_direct_elf ... ok' "$RUNNER_TEMP/x86-t5-generator-native.log"
           grep -F 'test total_ctz_matches_c_in_both_machine_code_sinks ... ok' "$RUNNER_TEMP/x86-t5-generator-native.log"
           grep -F 'test signed_divide_quotient_remainder_and_register_lifetimes ... ok' "$RUNNER_TEMP/x86-t5-generator-native.log"
+      - name: Validate generator X4 executable DAG matches against native hardware
+        if: steps.accepted.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          spec=json.loads(Path('compiler-generator/data/x86_x4_proven_dag_rules.json').read_text())
+          expected={'CTZ_LOWBIT_ISOLATE','CTZ_NEGATE'}
+          rules=spec.get('rules',[])
+          if len(rules)!=2 or {r['id'] for r in rules}!=expected:
+              raise SystemExit('Unreviewed X4 DAG rule set: update T5 bridge acceptance')
+          if any(r.get('target')!='Ctz32' or r.get('flags_dead') is not True for r in rules):
+              raise SystemExit('Unreviewed generated DAG target or live effects')
+          generated=Path('compiler-generator/crates/backend-x86/src/generated_dag_patterns.rs').read_text()
+          for name in expected:
+              if generated.count('id: "'+name+'"')!=1:
+                  raise SystemExit(f'Missing exactly one generated executable rule {name}')
+          print('T5_BRIDGE_X4 rules=2 status=SOURCE_REQUIRES_SEPARATE_PROOF_GATE')
+          PY
+          cd compiler-generator
+          timeout --signal=TERM --kill-after=10s 4m \
+            cargo test -p compiler-backend-x86 --lib dag_match::tests \
+              -- --nocapture --test-threads=1 \
+            2>&1 | tee "$RUNNER_TEMP/x86-t5-dag-matcher.log"
+          timeout --signal=TERM --kill-after=10s 4m \
+            cargo test -p compiler-backend-x86 --test dag_native \
+              -- --nocapture --test-threads=1 \
+            2>&1 | tee "$RUNNER_TEMP/x86-t5-dag-native.log"
+          grep -F 'test verified_dag_rule_removes_only_dead_nodes_in_gas_and_elf ... ok' \
+            "$RUNNER_TEMP/x86-t5-dag-native.log"
+          grep -E 'test result: ok\\. [0-9]+ passed; 0 failed;' \
+            "$RUNNER_TEMP/x86-t5-dag-matcher.log"
+          echo 'T5_BRIDGE_X4_NATIVE rules=2 status=PASS proof_rechecked_here=false'
       - name: Install solver for stable T5.5 independent semantics
         if: steps.accepted.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
         shell: bash
@@ -217,11 +255,20 @@ jobs:
           from pathlib import Path
           path=Path('x86-t5-catalog-evidence.json')
           result=json.loads(path.read_text())
-          assert len(result['rules'])==7 and result['executable_dag_rules_proven']==0
+          assert len(result['rules'])==7 and result['catalog_executable_dag_rules_proven']==0
           result['selection_status']='PASSED_REAL_GENERATOR_BRANCH_RUST_TESTS'
           result['generator_native_status']='PASSED_AND_CTZ_DIV_ELF_GAS'
           result['main_t5_native_status']='PASSED_FOUR_NATIVE_FORMATS'
           result['main_t5_smt_status']='PASSED_INDEPENDENT_SELECTED_OP_CONTRACTS'
+          # The X4 source-pinned proofs are enforced by the separate
+          # verify-x86-isl workflow, not silently re-certified by metadata.
+          spec=json.loads(Path('compiler-generator/data/x86_x4_proven_dag_rules.json').read_text())
+          ids=sorted(r['id'] for r in spec['rules'])
+          assert ids==['CTZ_LOWBIT_ISOLATE','CTZ_NEGATE']
+          result['x4_executable_dag_rules_native_validated']=ids
+          result['x4_dag_native_sinks']=['direct_elf','gas']
+          result['x4_intel_source_proof_rechecked_in_this_workflow']=False
+          result['x4_intel_source_proof_workflow']='verify-x86-isl.yml'
           result['cross_branch_x4_executable_dag_proven']=False
           result['status']='PASS_SEPARATE_PROOF_DOMAINS'
           path.write_text(json.dumps(result,sort_keys=True,indent=2)+'\n')
@@ -230,7 +277,9 @@ jobs:
             echo "T5/X3 cross-branch validation: PASS"
             echo "7 reviewed metadata rules exercise real branch selector."
             echo "Generator: native AND/CTZ/IDIV. Main: independent native and Z3 T5.5."
-            echo "Executable synthesized DAG matchers: NOT CLAIMED."
+            echo "X4: two executable CTZ DAG rules exercised with independent native ELF/GAS oracle."
+            echo "Intel source and Z3 admissibility proofs remain enforced by verify-x86-isl.yml."
+            echo "This bridge does not itself claim Intel-source proof freshness."
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload T5/X3 bridge evidence
         if: success() && (steps.accepted.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push')
@@ -242,6 +291,8 @@ jobs:
             ${{ runner.temp }}/x86-t5-bridge-python.log
             ${{ runner.temp }}/x86-t5-bridge-rust.log
             ${{ runner.temp }}/x86-t5-generator-native.log
+            ${{ runner.temp }}/x86-t5-dag-matcher.log
+            ${{ runner.temp }}/x86-t5-dag-native.log
             ${{ runner.temp }}/x86-t5-main-native.log
             ${{ runner.temp }}/x86-t5-main-smt.log
           retention-days: 14
@@ -269,6 +320,8 @@ jobs:
             ${{ runner.temp }}/x86-t5-bridge-python.log
             ${{ runner.temp }}/x86-t5-bridge-rust.log
             ${{ runner.temp }}/x86-t5-generator-native.log
+            ${{ runner.temp }}/x86-t5-dag-matcher.log
+            ${{ runner.temp }}/x86-t5-dag-native.log
             ${{ runner.temp }}/x86-t5-main-native.log
             ${{ runner.temp }}/x86-t5-main-smt.log
           if-no-files-found: ignore
