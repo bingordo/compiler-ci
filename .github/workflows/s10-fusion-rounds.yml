@@ -1,0 +1,59 @@
+name: S10 Mini-C fusion round comparison
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/s10-fusion-rounds.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout compiler benchmark branch
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: expr-fusion-constant-reuse
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record exact compiler commit
+        run: git -C compiler rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Configure Git SSH for pinned Mini-C dependency
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: s10-mini-c-fusion
+      - name: Build benchmark
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+        run: |
+          cargo build --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --features experimental-fusion-benchmark \
+            --example benchmark_generated_fusion
+      - name: Compare single and multi-round fusion with native GCC oracle
+        env:
+          RULE_S8_CASES: '48'
+          RULE_S8_SEED: '1592590374'
+        run: |
+          set -euo pipefail
+          compiler/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion \
+            --sampled --compare-rounds | tee s10-results.csv
+          grep -q '^S10_SUMMARY cases=48 ' s10-results.csv
+          grep -q 'native_calls=1152' s10-results.csv
+          cat s10-results.csv >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: s10-results
+          path: s10-results.csv
+          if-no-files-found: ignore
