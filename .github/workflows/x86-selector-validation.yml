@@ -23,6 +23,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 12
     steps:
+      - name: Checkout CI workflow sources for versioned keys
+        uses: actions/checkout@v4
       - name: Fetch private compiler source
         uses: actions/checkout@v4
         with:
@@ -88,7 +90,30 @@ jobs:
           resolver = "2"
           members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
           EOF
-          cargo test --manifest-path "$RUNNER_TEMP/x86-workspace/Cargo.toml" -p compiler-backend-x86
+          cargo test --manifest-path "$RUNNER_TEMP/x86-workspace/Cargo.toml" -p compiler-backend-x86 \
+            -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/x86-all-backend-tests.log"
+      - name: T5.5 audit 64-bit native C reference matrix
+        if: steps.validated.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/x86-all-backend-tests.log" <<'PY'
+          import json,pathlib,re,sys
+          log=pathlib.Path(sys.argv[1]).read_text(errors='replace')
+          if not re.search(r'test typed_scalar_integer_operations_match_gcc_for_elf_and_gas \.\.\.',log):
+              raise SystemExit('M4 i64 native C reference suite did not run')
+          pairs=re.findall(r'T5_X86_I64_NATIVE_FORMAT mode=(\w+) format=(\w+) status=PASS',log)
+          expected={(mode,fmt) for mode in ('framed','frameless') for fmt in ('gas','elf')}
+          if len(pairs)!=4 or set(pairs)!=expected:
+              raise SystemExit(f'Incomplete I64 ELF/GAS native reference matrix: {pairs}')
+          rows=[dict(scope='x86_i64_native_differential',mode=mode,format=fmt,
+                     status='NATIVE_DIFFERENTIAL_PASS',smt_proven=False,
+                     source_sha='${{ steps.revision.outputs.sha }}')
+                for mode,fmt in sorted(pairs)]
+          pathlib.Path('x86-t5-i64-native.jsonl').write_text(
+              ''.join(json.dumps(row,sort_keys=True)+'\n' for row in rows))
+          print('Validated four I64 native GCC matrix variants')
+          PY
       - name: T5.5 native selection semantics and negative controls
         if: steps.validated.outputs.cache-hit != 'true'
         shell: bash
@@ -146,15 +171,19 @@ jobs:
           timeout --signal=TERM --kill-after=10s 5m \
             cargo test --manifest-path "$RUNNER_TEMP/x86-workspace/Cargo.toml" \
               -p compiler-backend-x86 --test t5_x86_semantics \
-              t5_selected_x86_symbolic_flags_widths_and_addresses \
               -- --ignored --nocapture --test-threads=1 \
               2>&1 | tee "$RUNNER_TEMP/x86-t5-smt.log"
           python3 - "$RUNNER_TEMP/x86-t5-smt.log" <<'PY'
           import json, pathlib, re, sys
           log=pathlib.Path(sys.argv[1]).read_text(errors='replace')
-          if 'test t5_selected_x86_symbolic_flags_widths_and_addresses ...' not in log:
-              raise SystemExit('No x86 SMT semantics test ran')
-          if not re.search(r'test result: ok\.\s+1 passed; 0 failed;',log):
+          expected_tests = {
+              't5_selected_x86_symbolic_flags_widths_and_addresses',
+              't5_selected_i64_scalar_smt_flags_shifts_casts',
+          }
+          for name in expected_tests:
+              if not re.search(r'test '+name+r' \.\.\.',log):
+                  raise SystemExit(f'Missing x86 SMT test: {name}')
+          if not re.search(r'test result: ok\.\s+2 passed; 0 failed;',log):
               raise SystemExit('Z3 x86 semantic obligations did not pass')
           match=re.search(r'T5_X86_SMT status=PROVEN obligations=(\d+) mutants=(\d+)',log)
           if not match or (int(match[1]),int(match[2]))!=(16,5):
@@ -164,7 +193,16 @@ jobs:
                    mutant_counterexamples=5,
                    source_sha='${{ steps.revision.outputs.sha }}')
           pathlib.Path('x86-t5-smt.jsonl').write_text(json.dumps(row,sort_keys=True)+'\n')
-          print('Validated 16 selected-op SMT obligations and 5 negative controls')
+          m64=re.search(r'T5_X86_I64_SMT status=PROVEN obligations=(\d+) mutants=(\d+)',log)
+          if not m64 or (int(m64[1]),int(m64[2]))!=(23,5):
+              raise SystemExit('Incomplete I64 selected-op proofs and negative controls')
+          row64=dict(scope='selected_x86_i64_operation_semantics',smt_proven=True,
+                     native_binary_formally_proven=False,proof_obligations=23,
+                     mutant_counterexamples=5,
+                     source_sha='${{ steps.revision.outputs.sha }}')
+          pathlib.Path('x86-t5-i64-smt.jsonl').write_text(
+              json.dumps(row64,sort_keys=True)+'\n')
+          print('Validated 16 I32 and 23 I64 selected-op SMT obligations with 10 mutants')
           PY
       - name: Upload T5.5 native semantic evidence
         if: success() && steps.validated.outputs.cache-hit != 'true'
@@ -174,6 +212,9 @@ jobs:
           path: |
             x86-t5-semantics.jsonl
             x86-t5-smt.jsonl
+            x86-t5-i64-native.jsonl
+            x86-t5-i64-smt.jsonl
+            ${{ runner.temp }}/x86-all-backend-tests.log
             ${{ runner.temp }}/x86-t5-semantics.log
           retention-days: 14
       - name: Preserve T5.5 semantic failures
@@ -184,6 +225,7 @@ jobs:
           path: |
             ${{ runner.temp }}/x86-t5-semantics.log
             ${{ runner.temp }}/x86-t5-smt.log
+            ${{ runner.temp }}/x86-all-backend-tests.log
           if-no-files-found: ignore
           retention-days: 14
       - name: Mark revision validated
