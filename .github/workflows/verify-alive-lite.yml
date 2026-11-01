@@ -199,7 +199,7 @@ jobs:
           mkdir -p "$ALIVE_LITE_FAILURE_DIR"
           cd compiler
           timeout --signal=TERM --kill-after=15s 10m \
-            cargo test -p compiler-opt --test alive_lite -- --ignored --nocapture \
+            cargo test -p compiler-opt --test alive_lite -- --ignored --nocapture --test-threads=1 \
             2>&1 | tee "$RUNNER_TEMP/alive-lite-proof.log"
           python3 - "$RUNNER_TEMP/alive-lite-proof.log" <<'PY'
           import pathlib, re, sys
@@ -209,6 +209,28 @@ jobs:
               raise SystemExit('No ignored Alive-lite proofs ran')
           if not re.search(r'test t5_comparisons_and_boolean_branches_have_correct_smt_semantics \.\.\. ok', log):
               raise SystemExit('Missing SMT comparison and boolean CFG semantics check')
+          memory_proofs = re.findall(
+              r'T5_MEMORY_SMT pass=(\w+) changed=(true|false) status=(\w+)', log
+          )
+          expected_memory_passes = {'local','dse','pipeline'}
+          if len(memory_proofs) != 3 or {p[0] for p in memory_proofs} != expected_memory_passes:
+              raise SystemExit('Missing exact-slot memory SMT pass results')
+          if any(p[2] != 'PROVEN' for p in memory_proofs):
+              raise SystemExit('Unexpected local-memory SMT status')
+          if not any(p[1] == 'true' for p in memory_proofs):
+              raise SystemExit('No local-memory optimizer transformation was exercised')
+          for test in ('prove_exact_local_memory_load_store_passes',
+                       'local_memory_smt_rejects_wrong_alias_and_store_order'):
+              if not re.search(r'test ' + test + r' \.\.\.', log):
+                  raise SystemExit(f'Missing memory SMT test: {test}')
+          with open('../alive-lite-memory-smt.jsonl','w') as out:
+              for name,changed,status in memory_proofs:
+                  out.write(__import__('json').dumps(dict(
+                      scope='straight_line_exact_local_i32',
+                      pass_name=name,changed=changed=='true',
+                      status=status,smt_proven=True,
+                      source_sha='${{ steps.source.outputs.sha }}'
+                  ))+'\n')
           proofs = re.findall(r'T5_PROOF shape=(\d+) seed=(\d+) pass=(\w+) changed=(true|false) concrete_tested=true status=(\w+)', log)
           if not proofs:
               raise SystemExit('Missing per-pass T5 proof results')
@@ -261,6 +283,7 @@ jobs:
           PY
           mkdir -p "$GITHUB_WORKSPACE/.alive-lite-verified"
           cp "$GITHUB_WORKSPACE/alive-lite-coverage.jsonl" "$GITHUB_WORKSPACE/alive-lite-proofs.jsonl" "$GITHUB_WORKSPACE/.alive-lite-verified/"
+          cp "$GITHUB_WORKSPACE/alive-lite-memory-smt.jsonl" "$GITHUB_WORKSPACE/.alive-lite-verified/"
           printf '%s\n' "${{ steps.source.outputs.sha }}" > "$GITHUB_WORKSPACE/.alive-lite-verified/source-sha.txt"
           echo "Alive-lite Z3 proof tests passed" >> "$GITHUB_STEP_SUMMARY"
       - name: Upload coverage and proof evidence
@@ -272,6 +295,7 @@ jobs:
             alive-lite-coverage.jsonl
             alive-lite-proofs.jsonl
             alive-lite-memory.jsonl
+            alive-lite-memory-smt.jsonl
             alive-lite-memory-proofs.jsonl
           retention-days: 14
       - name: Cache exact passing source revision
