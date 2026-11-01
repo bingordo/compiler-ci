@@ -123,6 +123,45 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/alive-lite-bounded-loops.log"
           grep -F 'test t5_bounded_loop_classification_is_fail_closed ... ok' \
             "$RUNNER_TEMP/alive-lite-bounded-loops.log"
+      - name: Check bounded local memory effects and fail-closed verdicts
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          timeout --signal=TERM --kill-after=10s 3m \
+            cargo test -p compiler-opt --test memory_execution_oracle t5_memory_ -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/alive-lite-memory.log"
+          python3 - "$RUNNER_TEMP/alive-lite-memory.log" <<'PY'
+          import json, pathlib, re, sys
+          log = pathlib.Path(sys.argv[1]).read_text(errors='replace')
+          expected = {
+              't5_memory_alias_effect_and_trap_negative_controls',
+              't5_memory_unknowns_are_fail_closed',
+              't5_memory_actual_passes_are_bounded_only',
+          }
+          tests = set(re.findall(r'test (t5_memory_\w+) \.\.\. ok', log))
+          if not expected <= tests:
+              raise SystemExit(f'Missing bounded memory controls: {sorted(expected-tests)}')
+          rows = []
+          for fixture, name, cases in re.findall(
+              r'T5_MEMORY status=BOUNDED_ONLY fixture=(\w+) pass=(\w+) cases=(\d+)', log
+          ):
+              rows.append(dict(scope='bounded_local_memory', fixture=fixture,
+                               pass_name=name, cases=int(cases), status='BOUNDED_ONLY',
+                               smt_proven=False))
+          expected_pairs = {(f,p) for f in ('pointer_phi','overlap_zero','loop_memory')
+                                  for p in ('forward','dse','pipeline')}
+          if {(r['fixture'],r['pass_name']) for r in rows} != expected_pairs or len(rows) != 9:
+              raise SystemExit('Missing per-pass bounded memory coverage')
+          if 'T5_MEMORY_NEGATIVE status=COUNTEREXAMPLE cases=4' not in log:
+              raise SystemExit('Missing memory negative controls')
+          if 'T5_MEMORY_UNKNOWN status=UNKNOWN_UNSUPPORTED_OR_BOUNDED cases=4' not in log:
+              raise SystemExit('Missing fail-closed memory unknown controls')
+          out = pathlib.Path('..') / 'alive-lite-memory.jsonl'
+          out.write_text(''.join(json.dumps(r,sort_keys=True)+'\n' for r in rows))
+          print(f'Validated {len(rows)} bounded-only memory cases with negative/unknown controls')
+          PY
       - name: Install Z3
         if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
         run: |
@@ -178,6 +217,7 @@ jobs:
           path: |
             alive-lite-coverage.jsonl
             alive-lite-proofs.jsonl
+            alive-lite-memory.jsonl
           retention-days: 14
       - name: Cache exact passing source revision
         if: success() && steps.verified.outputs.cache-hit != 'true'
@@ -203,6 +243,7 @@ jobs:
             ${{ runner.temp }}/alive-lite-concrete.log
             ${{ runner.temp }}/alive-lite-build.log
             ${{ runner.temp }}/alive-lite-bounded-loops.log
+            ${{ runner.temp }}/alive-lite-memory.log
             ${{ runner.temp }}/alive-lite-proof.log
             ${{ runner.temp }}/alive-lite-failures/
           if-no-files-found: ignore
