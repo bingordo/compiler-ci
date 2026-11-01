@@ -96,7 +96,34 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m unittest discover -s tools -p 'test_x86_dag_rules.py' -v
-          python3 tools/regen_x86_dag_patterns.py --check --intel-dir /tmp/intel-isl
+          python3 tools/regen_x86_dag_patterns.py --check --intel-dir /tmp/intel-isl \
+            | tee "$RUNNER_TEMP/x86-x4-proof-admission.log"
+          grep -Fx 'X4: verified 2 executable DAG rules from source-pinned X3 proofs' \
+            "$RUNNER_TEMP/x86-x4-proof-admission.log"
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path('data/x86_x4_proven_dag_rules.json').read_text())
+          ids={r['id'] for r in data['rules']}
+          assert ids=={'CTZ_LOWBIT_ISOLATE','CTZ_NEGATE'}, ids
+          assert all(r['target']=='Ctz32' and r['flags_dead'] is True for r in data['rules'])
+          record={'schema_version':1,'scope':'x4_executable_local_dag',
+                  'rule_count':len(ids),'verified_ids':sorted(ids),
+                  'source_pinned_intel_proofs_rechecked':True,
+                  'native_and_elf_checked_separately':True,
+                  'other_x86_patterns_covered':False}
+          Path('x86-x4-proof-admission.json').write_text(
+              json.dumps(record,sort_keys=True,indent=2)+'\\n')
+          PY
+      - name: Archive X4.2 source-backed executable DAG admission
+        if: success() && (steps.verified.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch')
+        uses: actions/upload-artifact@v4
+        with:
+          name: x86-x4-executable-dag-admission
+          path: |
+            x86-x4-proof-admission.json
+            ${{ runner.temp }}/x86-x4-proof-admission.log
+          retention-days: 14
       - name: Test X1 semantics and X2 proofs
         if: steps.verified.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
         env:
