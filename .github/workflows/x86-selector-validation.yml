@@ -9,6 +9,10 @@ on:
         type: string
   schedule:
     - cron: '7,22,37,52 * * * *'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/x86-selector-validation.yml'
 permissions:
   contents: read
 concurrency:
@@ -44,7 +48,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .x86-selector-validated
-          key: x86-selector-v3-${{ steps.revision.outputs.sha }}
+          key: x86-selector-v4-${{ hashFiles('.github/workflows/x86-selector-validation.yml') }}-${{ steps.revision.outputs.sha }}
       - name: Test x86 Python tooling
         if: steps.validated.outputs.cache-hit != 'true'
         working-directory: compiler
@@ -85,6 +89,49 @@ jobs:
           members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
           EOF
           cargo test --manifest-path "$RUNNER_TEMP/x86-workspace/Cargo.toml" -p compiler-backend-x86
+      - name: T5.5 native selection semantics and negative controls
+        if: steps.validated.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 5m \
+            cargo test --manifest-path "$RUNNER_TEMP/x86-workspace/Cargo.toml" \
+              -p compiler-backend-x86 --test t5_x86_semantics -- --nocapture --test-threads=1 \
+              2>&1 | tee "$RUNNER_TEMP/x86-t5-semantics.log"
+          python3 - "$RUNNER_TEMP/x86-t5-semantics.log" <<'PY'
+          import json, pathlib, re, sys
+          log=pathlib.Path(sys.argv[1]).read_text(errors='replace')
+          tests={
+              't5_selected_cmp_flags_and_register_widths',
+              't5_machine_negative_controls_are_detectable',
+              't5_selected_native_elf_and_assembly_match_independent_c',
+          }
+          passed=set(re.findall(r'test (t5_\w+) \.\.\. ok',log))
+          if not tests <= passed:
+              raise SystemExit(f'Missing x86 semantic validation tests: {sorted(tests-passed)}')
+          if not re.search(r'T5_X86_SELECTED status=PASS kinds=18 widths=32,64,8,16 flags=6',log):
+              raise SystemExit('No selected width/flags verification')
+          if not re.search(r'T5_X86_NEGATIVE status=PASS flags_mutants=[1-9][0-9]* addressing_mutants=3',log):
+              raise SystemExit('No x86 negative mutant verification')
+          pairs=re.findall(r'T5_X86_NATIVE_FORMAT mode=(\w+) format=(\w+) status=PASS',log)
+          if set(pairs)!={(mode,fmt) for mode in ('framed','frameless') for fmt in ('elf','gas')} or len(pairs)!=4:
+              raise SystemExit('Native x86 ELF/GAS coverage incomplete')
+          rows=[dict(scope='x86_selection_native', mode=m, format=f,
+                     status='NATIVE_DIFFERENTIAL_PASS', smt_proven=False)
+                for m,f in sorted(pairs)]
+          pathlib.Path('x86-t5-semantics.jsonl').write_text(
+              ''.join(json.dumps(r,sort_keys=True)+'\n' for r in rows))
+          print('Validated 4 native x86 formats and independent negative controls')
+          PY
+      - name: Upload T5.5 native semantic evidence
+        if: success() && steps.validated.outputs.cache-hit != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: x86-t5-semantics
+          path: |
+            x86-t5-semantics.jsonl
+            ${{ runner.temp }}/x86-t5-semantics.log
+          retention-days: 14
       - name: Mark revision validated
         if: steps.validated.outputs.cache-hit != 'true'
         run: echo "${{ steps.revision.outputs.sha }}" > .x86-selector-validated
@@ -93,4 +140,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .x86-selector-validated
-          key: x86-selector-v3-${{ steps.revision.outputs.sha }}
+          key: x86-selector-v4-${{ hashFiles('.github/workflows/x86-selector-validation.yml') }}-${{ steps.revision.outputs.sha }}
