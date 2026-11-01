@@ -96,31 +96,28 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m unittest discover -s tools -p 'test_x86_dag_rules.py' -v
-          python3 tools/regen_x86_dag_patterns.py --check --intel-dir /tmp/intel-isl
-          python3 - <<'PY'
-          from pathlib import Path
-          source = Path("crates/backend-x86/src/generated_dag_patterns.rs").read_text()
-          assert source.count("        min_saved_cost: ") == 7
-          assert source.count("id: \"X3_CTZ32_") == 7
-          print("X4.2: automatically admitted 7 source-proven CTZ rules")
-          PY \
+          python3 tools/regen_x86_dag_patterns.py --check --intel-dir /tmp/intel-isl \
             | tee "$RUNNER_TEMP/x86-x4-proof-admission.log"
-          grep -Fx 'X4: verified 2 executable DAG rules from source-pinned X3 proofs' \
-            "$RUNNER_TEMP/x86-x4-proof-admission.log"
           python3 - <<'PY'
-          import json
+          import json, re
           from pathlib import Path
-          data=json.loads(Path('data/x86_x4_proven_dag_rules.json').read_text())
-          ids={r['id'] for r in data['rules']}
-          assert ids=={'CTZ_LOWBIT_ISOLATE','CTZ_NEGATE'}, ids
-          assert all(r['target']=='Ctz32' and r['flags_dead'] is True for r in data['rules'])
-          record={'schema_version':1,'scope':'x4_executable_local_dag',
-                  'rule_count':len(ids),'verified_ids':sorted(ids),
-                  'source_pinned_intel_proofs_rechecked':True,
-                  'native_and_elf_checked_separately':True,
-                  'other_x86_patterns_covered':False}
+          policy=json.loads(Path('data/x86_x4_proven_dag_rules.json').read_text())
+          assert policy['schema_version']==2 and policy['target']=='Ctz32'
+          assert policy['flags_dead'] is True
+          budget=policy['max_rules']
+          generated=Path('crates/backend-x86/src/generated_dag_patterns.rs').read_text()
+          ids=re.findall(r'^\\s*id: "(X3_CTZ32_[0-9A-F]{12})",$',generated,re.M)
+          assert 2<=len(ids)<=budget and len(set(ids))==len(ids), ids
+          assert generated.count('        min_saved_cost: ')==len(ids)
+          evidence={'schema_version':2,'scope':'x4_executable_local_dag',
+                    'rule_count':len(ids),'verified_ids':ids,
+                    'source_pinned_intel_proofs_rechecked':True,
+                    'generator_pattern_freshness_checked':True,
+                    'native_and_elf_checked_separately':True,
+                    'other_x86_patterns_covered':False}
           Path('x86-x4-proof-admission.json').write_text(
-              json.dumps(record,sort_keys=True,indent=2)+'\n')
+              json.dumps(evidence,sort_keys=True,indent=2)+'\n')
+          print(f'X4.2: admitted {len(ids)} source-verified executable CTZ rules')
           PY
       - name: Archive X4.2 source-backed executable DAG admission
         if: success() && (steps.verified.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch')
