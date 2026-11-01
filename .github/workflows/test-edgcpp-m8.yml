@@ -1,0 +1,128 @@
+name: EDG M8 differential (compiler-ci)
+
+on:
+  push:
+    paths:
+      - .github/workflows/test-edgcpp-m8.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  m8:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    container:
+      image: ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8
+    defaults:
+      run:
+        shell: edg-container-exec "bash -eo pipefail {0}"
+    env:
+      EDG_SOURCE_SHA: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+      EDG_RELEASE_TAG: edgcpfe-ci-799603e0b5ab
+      EDG_RELEASE_SHA256: fa769825e70766fbefe017806816b2338acd03daa93bb5562369c293972ce64c
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      RUST_TOOLCHAIN_VERSION: 1.99.1
+    steps:
+      - name: Check out EDG Rust codegen
+        uses: actions/checkout@v7
+        with:
+          repository: bingordo/edgcpp-rust
+          ref: cranelift-codegen
+          path: edgcpp-rust
+          persist-credentials: false
+      - name: Check out pinned EDG sources
+        uses: actions/checkout@v7
+        with:
+          repository: bingundu/edgcpp
+          ref: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+          path: edgcpp
+          persist-credentials: false
+      - name: Verify EDG checkout matches binary revision
+        working-directory: edgcpp
+        run: |
+          test "$(git rev-parse HEAD)" = "$EDG_SOURCE_SHA"
+      - name: Configure metadata for EDG bridge compilation (no native build)
+        env:
+          EDG_BASE: ${{ github.workspace }}/edgcpp/bases/docker/dev-env/gcc
+        working-directory: edgcpp
+        run: |
+          cmake --preset linux-gcc-release \
+            -DEDG_BUILD_LIB=OFF \
+            -DEDG_BUILD_CALLABLE_LIBRARY=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+      # EDG generates two error-message headers through a tiny host tool.
+      # Building this named target does NOT build the EDG front-end library.
+      - name: Generate EDG error headers (small host-tool target only)
+        working-directory: edgcpp
+        run: |
+          cmake --build build/gcc-release --target error-info --parallel 2
+          test -s build/gcc-release/src/includes/err_codes.h
+          test -s build/gcc-release/src/includes/err_data.h
+      - name: Download pinned, prebuilt EDG archive
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          url="https://github.com/bingundu/edgcpp/releases/download/$EDG_RELEASE_TAG/edgcpfe-ci-x86_64-callable-release-linux-x86_64.tar.gz"
+          mkdir -p build/gcc-release/lib build/prebuilt-edg
+          curl --fail --location --silent --show-error \
+            --retry 4 --retry-delay 2 \
+            "$url" --output build/prebuilt-edg/archive.tar.gz
+          printf '%s  %s\n' "$EDG_RELEASE_SHA256" build/prebuilt-edg/archive.tar.gz | sha256sum --check --status
+          tar -xzf build/prebuilt-edg/archive.tar.gz -C build/prebuilt-edg
+          grep -Fx "commit=$EDG_SOURCE_SHA" build/prebuilt-edg/BUILD-INFO.txt
+          grep -Fx 'platform=linux-x86_64' build/prebuilt-edg/BUILD-INFO.txt
+          test -s build/prebuilt-edg/lib/libedgcpfe.a
+          cp build/prebuilt-edg/lib/libedgcpfe.a build/gcc-release/lib/libedgcpfe.a
+          echo "Using prebuilt EDG $EDG_SOURCE_SHA; no EDG native compilation"
+      - name: Install pinned Rust toolchain
+        run: |
+          if ! command -v cargo >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN_VERSION"
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install "$RUST_TOOLCHAIN_VERSION" --profile minimal
+          rustup component add clippy --toolchain "$RUST_TOOLCHAIN_VERSION"
+          rustup default "$RUST_TOOLCHAIN_VERSION"
+      - name: Build M8 test codegen binary
+        working-directory: edgcpp-rust
+        env:
+          EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+          EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+          EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+          EDGCPP_EDG_REVISION: ${{ env.EDG_SOURCE_SHA }}
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test --lib --features codegen
+          cargo build --features codegen --example codegen
+      - name: M8 native C11 struct field differential
+        working-directory: edgcpp-rust
+        env:
+          EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+          EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+          EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+          EDGCPP_EDG_REVISION: ${{ env.EDG_SOURCE_SHA }}
+        run: |
+          set -euo pipefail
+          cp tests/fixtures/m8_struct_fields.c ../edgcpp/build/gcc-release/
+          cp tests/fixtures/m8_struct_driver.c ../edgcpp/build/gcc-release/
+          (
+            cd ../edgcpp/build/gcc-release
+            source environment.sh
+            ../../../edgcpp-rust/target/debug/examples/codegen edg_m8_struct.o --c11 m8_struct_fields.c
+            gcc -std=c11 -O2 m8_struct_fields.c m8_struct_driver.c -o gcc_m8_struct
+            gcc -std=c11 -O2 edg_m8_struct.o m8_struct_driver.c -o cranelift_m8_struct
+            baseline=$(./gcc_m8_struct)
+            generated=$(./cranelift_m8_struct)
+            if [ "$baseline" != "$generated" ]; then
+              echo "M8 EDG/Cranelift struct field mismatch"
+              printf 'GCC: %s\n' "$baseline"
+              printf 'EDG: %s\n' "$generated"
+              exit 1
+            fi
+            echo "M8 native layout and field differential passed"
+          )
