@@ -179,18 +179,21 @@ jobs:
           python3 - <<'PY'
           import json
           from pathlib import Path
+          import re
           spec=json.loads(Path('compiler-generator/data/x86_x4_proven_dag_rules.json').read_text())
-          expected={'CTZ_LOWBIT_ISOLATE','CTZ_NEGATE'}
-          rules=spec.get('rules',[])
-          if len(rules)!=2 or {r['id'] for r in rules}!=expected:
-              raise SystemExit('Unreviewed X4 DAG rule set: update T5 bridge acceptance')
-          if any(r.get('target')!='Ctz32' or r.get('flags_dead') is not True for r in rules):
-              raise SystemExit('Unreviewed generated DAG target or live effects')
+          if (spec.get('schema_version')!=2 or spec.get('target')!='Ctz32'
+                  or spec.get('flags_dead') is not True):
+              raise SystemExit('Unsupported X4 automated admission policy')
+          budget=spec.get('max_rules')
+          if type(budget) is not int or not 1<=budget<=16:
+              raise SystemExit('Invalid or unbounded generated rule budget')
           generated=Path('compiler-generator/crates/backend-x86/src/generated_dag_patterns.rs').read_text()
-          for name in expected:
-              if generated.count('id: "'+name+'"')!=1:
-                  raise SystemExit(f'Missing exactly one generated executable rule {name}')
-          print('T5_BRIDGE_X4 rules=2 status=SOURCE_REQUIRES_SEPARATE_PROOF_GATE')
+          names=re.findall(r'^\\s*id: "(X3_CTZ32_[0-9A-F]{12})",$',generated,re.M)
+          if not 1<=len(names)<=budget or len(names)!=len(set(names)):
+              raise SystemExit('Missing, duplicate or unbounded generated DAG rule IDs')
+          if generated.count('min_saved_cost:')!=len(names):
+              raise SystemExit('Generated DAG costs are not explicit for all rules')
+          print(f'T5_BRIDGE_X4 rules={len(names)} status=ADMISSION_POLICY_NEEDS_SEPARATE_SOURCE_PROOF')
           PY
           cd compiler-generator
           timeout --signal=TERM --kill-after=10s 4m \
@@ -260,13 +263,18 @@ jobs:
           result['generator_native_status']='PASSED_AND_CTZ_DIV_ELF_GAS'
           result['main_t5_native_status']='PASSED_FOUR_NATIVE_FORMATS'
           result['main_t5_smt_status']='PASSED_INDEPENDENT_SELECTED_OP_CONTRACTS'
-          # The X4 source-pinned proofs are enforced by the separate
-          # verify-x86-isl workflow, not silently re-certified by metadata.
-          spec=json.loads(Path('compiler-generator/data/x86_x4_proven_dag_rules.json').read_text())
-          ids=sorted(r['id'] for r in spec['rules'])
-          assert ids==['CTZ_LOWBIT_ISOLATE','CTZ_NEGATE']
-          result['x4_executable_dag_rules_native_validated']=ids
-          result['x4_dag_native_sinks']=['direct_elf','gas']
+          # The source-pinned X4 Z3 proofs are enforced by verify-x86-isl.
+          # This bridge independently checks *native smoke fixtures* only,
+          # not one native test for every automatically discovered rule.
+          import re
+          generated=Path('compiler-generator/crates/backend-x86/src/generated_dag_patterns.rs').read_text()
+          ids=re.findall(r'^\\s*id: "(X3_CTZ32_[0-9A-F]{12})",$',generated,re.M)
+          budget=json.loads(Path('compiler-generator/data/x86_x4_proven_dag_rules.json').read_text())['max_rules']
+          assert 1<=len(ids)<=budget and len(set(ids))==len(ids)
+          result['x4_generated_dag_rule_ids']=ids
+          result['x4_generated_dag_rule_count']=len(ids)
+          result['x4_native_smoke_sinks']=['direct_elf','gas']
+          result['x4_every_generated_rule_individually_native_tested']=False
           result['x4_intel_source_proof_rechecked_in_this_workflow']=False
           result['x4_intel_source_proof_workflow']='verify-x86-isl.yml'
           result['cross_branch_x4_executable_dag_proven']=False
@@ -277,7 +285,7 @@ jobs:
             echo "T5/X3 cross-branch validation: PASS"
             echo "7 reviewed metadata rules exercise real branch selector."
             echo "Generator: native AND/CTZ/IDIV. Main: independent native and Z3 T5.5."
-            echo "X4: two executable CTZ DAG rules exercised with independent native ELF/GAS oracle."
+            echo "X4: dynamic generated CTZ DAG inventory compiled; representative native ELF/GAS oracle passed."
             echo "Intel source and Z3 admissibility proofs remain enforced by verify-x86-isl.yml."
             echo "This bridge does not itself claim Intel-source proof freshness."
           } >> "$GITHUB_STEP_SUMMARY"
