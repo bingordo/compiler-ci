@@ -98,6 +98,9 @@ jobs:
           python3 -m unittest discover -s tools -p 'test_x86_dag_rules.py' -v
           python3 tools/regen_x86_dag_patterns.py --check --intel-dir /tmp/intel-isl \
             | tee "$RUNNER_TEMP/x86-x4-proof-admission.log"
+          python3 -m unittest discover -s tools -p 'test_x86_add_dag_rules.py' -v
+          python3 tools/regen_x86_add_dag_patterns.py --check --intel-dir /tmp/intel-isl \
+            | tee "$RUNNER_TEMP/x86-x4-add-proof-admission.log"
           python3 - <<'PY'
           import json, re
           from pathlib import Path
@@ -155,7 +158,29 @@ jobs:
                 for name in ids]
           pathlib.Path('x86-x4-all-rules-native.jsonl').write_text(
               ''.join(json.dumps(row,sort_keys=True)+chr(10) for row in rows))
-          print(f'Validated every one of {len(ids)} generated DAG patterns in ELF/GAS')
+          # Independently require native coverage of the new source-backed
+          # ADD family as well as the original seven CTZ rules.
+          add_src=pathlib.Path('crates/backend-x86/src/generated_add_dag_patterns.rs').read_text()
+          add_ids=[line.split('"')[1] for line in add_src.splitlines()
+                   if line.strip().startswith('id: "X3_ADD32_')]
+          if len(add_ids)!=4 or len(set(add_ids))!=4:
+              raise SystemExit('Unreviewed or missing ADD32 admission')
+          add_ssa=re.findall(r'X4_ADD_SSA id=(X3_ADD32_[0-9A-F]{12}) status=MATCHED',log)
+          add_native=re.findall(r'X4_ADD_NATIVE id=(X3_ADD32_[0-9A-F]{12}) sink=(gas|elf) status=PASS',log)
+          required={(name,sink) for name in add_ids for sink in ('gas','elf')}
+          if len(add_ssa)!=len(add_ids) or set(add_ssa)!=set(add_ids):
+              raise SystemExit('Not every ADD32 rule matched real SSA')
+          if len(add_native)!=len(required) or set(add_native)!=required:
+              raise SystemExit('Not every ADD32 rule passed direct ELF and GAS native execution')
+          if 'X4_ADD_NATIVE_SUMMARY rules=4 sinks=2 inputs_per_rule=2372 status=PASS' not in log:
+              raise SystemExit('Missing ADD32 differential reference summary')
+          add_rows=[dict(scope='x4_generated_add_dag_native',rule_id=name,
+                         ssa_matched=True,gas_native_pass=True,elf_native_pass=True,
+                         samples_per_sink=2372,smt_proven_in_this_stage=False)
+                    for name in add_ids]
+          pathlib.Path('x86-x4-add-all-rules-native.jsonl').write_text(
+              ''.join(json.dumps(row,sort_keys=True)+chr(10) for row in add_rows))
+          print(f'Validated every one of {len(ids)} CTZ and {len(add_ids)} ADD DAGs natively')
           PY
       - name: Archive X4.2 source-backed executable DAG admission
         if: success() && (steps.verified.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch')
@@ -165,7 +190,9 @@ jobs:
           path: |
             x86-x4-proof-admission.json
             x86-x4-all-rules-native.jsonl
+            x86-x4-add-all-rules-native.jsonl
             ${{ runner.temp }}/x86-x4-proof-admission.log
+            ${{ runner.temp }}/x86-x4-add-proof-admission.log
             ${{ runner.temp }}/x86-x4-all-rules-native.log
           retention-days: 14
       - name: Test X1 semantics and X2 proofs
