@@ -91,6 +91,17 @@ jobs:
       - name: Verify reviewed Intel source metadata
         if: steps.verified.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
         run: python3 tools/import_intel_isl_subset.py /tmp/intel-isl
+      - name: Check X4 target cost profile and generated Rust table
+        if: steps.verified.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools -p 'test_x86_match_costs.py' -v
+          python3 tools/regen_x86_match_costs.py --check \
+            | tee "$RUNNER_TEMP/x86-x4-match-cost-profile.log"
+          python3 tools/validate_x86_costs.py data/x86_costs_generic.json
+          grep -Fx 'X4_COST_PROFILE target=generic-x86-64 basis=heuristic status=CHECKED' \
+            "$RUNNER_TEMP/x86-x4-match-cost-profile.log"
       - name: Verify generated X4 executable DAG rules against Intel BSF and X3 discovery
         if: steps.verified.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
         env:
@@ -154,6 +165,12 @@ jobs:
               raise SystemExit('Missing native differential summary')
           if not re.search(r'test result: ok[.] [0-9]+ passed; 0 failed;', log):
               raise SystemExit('Matcher/native Rust tests did not pass')
+          cost_controls=re.findall(r'X4_COST_SELECTION case=(\w+) status=PASS',log)
+          if len(cost_controls)!=3 or set(cost_controls)!={
+              'root_and_break_even','shared_constants_and_minimum_gain',
+              'invalid_removed_values'
+          }:
+              raise SystemExit('Missing target-cost and fallback regression controls')
           rows=[dict(scope='x4_generated_dag_native',rule_id=name,
                      ssa_matched=True,gas_native_pass=True,elf_native_pass=True,
                      samples_per_sink=4114,smt_proven_in_this_stage=False)
@@ -193,6 +210,7 @@ jobs:
             x86-x4-proof-admission.json
             x86-x4-all-rules-native.jsonl
             x86-x4-add-all-rules-native.jsonl
+            ${{ runner.temp }}/x86-x4-match-cost-profile.log
             ${{ runner.temp }}/x86-x4-proof-admission.log
             ${{ runner.temp }}/x86-x4-add-proof-admission.log
             ${{ runner.temp }}/x86-x4-all-rules-native.log
