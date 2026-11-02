@@ -1,0 +1,152 @@
+name: Larger-source end-to-end compiler and memory profile
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/source-cli-memory-profile.yml'
+  workflow_dispatch:
+    inputs:
+      compiler_ref:
+        description: Compiler branch or exact commit
+        required: true
+        type: string
+        default: main
+      samples:
+        description: Fresh compiler processes per case (3-21)
+        required: false
+        type: string
+        default: '5'
+permissions:
+  contents: read
+concurrency:
+  group: source-cli-memory-profile
+  cancel-in-progress: true
+jobs:
+  oberon:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.compiler_ref || 'perf/source-end-to-end-memory-corpus' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Fetch pinned public Oberon frontend over HTTPS
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: source-cli-memory-oberon
+      - name: Build release Oberon compiler
+        run: cargo build --release --manifest-path compiler/Cargo.toml -p compiler --bin compiler
+      - name: Compile checked-source stress cases and sample peak process RSS
+        env:
+          BENCH_SAMPLES: ${{ inputs.samples || '5' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x /usr/bin/time
+          python3 compiler/tools/source_compile_corpus.py --out corpus
+          mkdir -p results
+          git -C compiler rev-parse HEAD | tee results/oberon-source-sha.txt
+          rustc --version | tee results/oberon-toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\(s\)):' | tee -a results/oberon-toolchain.txt
+          python3 compiler/tools/source_cli_profile.py \
+            --corpus corpus --compiler compiler/target/release/compiler \
+            --language oberon --samples "$BENCH_SAMPLES" \
+            --output results/oberon-cli.csv
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: source-cli-oberon
+          path: |
+            results/oberon-cli.csv
+            results/oberon-source-sha.txt
+            results/oberon-toolchain.txt
+            corpus/manifest.csv
+          overwrite: true
+          retention-days: 30
+  mini-c:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.compiler_ref || 'perf/source-end-to-end-memory-corpus' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Fetch pinned public Mini-C frontend over HTTPS
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: source-cli-memory-mini-c
+      - name: Build release Mini-C compiler
+        run: cargo build --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+      - name: Compile checked-source stress cases and sample peak process RSS
+        env:
+          BENCH_SAMPLES: ${{ inputs.samples || '5' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x /usr/bin/time
+          python3 compiler/tools/source_compile_corpus.py --out corpus
+          mkdir -p results
+          git -C compiler rev-parse HEAD | tee results/mini-c-source-sha.txt
+          rustc --version | tee results/mini-c-toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\(s\)):' | tee -a results/mini-c-toolchain.txt
+          python3 compiler/tools/source_cli_profile.py \
+            --corpus corpus --compiler compiler/tools/mini-c-driver/target/release/compiler-mini-c \
+            --language mini_c --samples "$BENCH_SAMPLES" \
+            --output results/mini-c-cli.csv
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: source-cli-mini-c
+          path: |
+            results/mini-c-cli.csv
+            results/mini-c-source-sha.txt
+            results/mini-c-toolchain.txt
+          overwrite: true
+          retention-days: 30
+  summarize:
+    needs: [oberon, mini-c]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.compiler_ref || 'perf/source-end-to-end-memory-corpus' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: source-cli-*
+          merge-multiple: true
+          path: collected
+      - name: Validate the two compiler profiles and generate report
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(cat collected/oberon-source-sha.txt)" = "$(cat collected/mini-c-source-sha.txt)"
+          python3 compiler/tools/source_cli_profile_summary.py \
+            --oberon collected/oberon-cli.csv --mini-c collected/mini-c-cli.csv \
+            --output collected/source-cli-summary.md | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source-cli-summary
+          path: collected/
+          overwrite: true
+          retention-days: 30
