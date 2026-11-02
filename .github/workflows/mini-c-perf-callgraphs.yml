@@ -1,0 +1,107 @@
+name: Mini-C compile scaling Linux perf call graphs
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/mini-c-perf-callgraphs.yml'
+  workflow_dispatch:
+    inputs:
+      compiler_ref:
+        description: Compiler ref to measure (branch or immutable SHA)
+        required: false
+        type: string
+        default: main
+permissions:
+  contents: read
+concurrency:
+  group: mini-c-perf-callgraphs
+  cancel-in-progress: true
+jobs:
+  record:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      RUSTFLAGS: '-C debuginfo=1 -C force-frame-pointers=yes'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.compiler_ref || 'perf/perf-record-compile-scaling' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Configure pinned public Mini-C dependency
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: mini-c-perf-sampled-callgraphs
+      - name: Verify perf, allow user-space CPU sampling, and capture provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C compiler rev-parse HEAD | tee results/revision.txt
+          rustc --version | tee results/toolchain.txt
+          uname -a | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\(s\)):' | tee -a results/toolchain.txt || true
+          perf --version | tee -a results/toolchain.txt
+          echo "Original paranoid=$(cat /proc/sys/kernel/perf_event_paranoid)" | tee -a results/toolchain.txt
+          sudo sysctl -w kernel.perf_event_paranoid=1
+          perf stat -e task-clock -- /bin/true 2>&1 | tee results/perf-probe.txt
+      - name: Build optimized Mini-C driver with debug symbols and frame pointers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release \
+            --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --bin compiler-mini-c
+          file compiler/tools/mini-c-driver/target/release/compiler-mini-c
+      - name: Generate original checked sources and record compiler call graphs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/source_compile_corpus.py --out corpus
+          python3 -m py_compile compiler/tools/perf_repeat_compile.py
+          COMPILER="$PWD/compiler/tools/mini-c-driver/target/release/compiler-mini-c"
+          for entry in "branch_chain 24 120" "branch_chain 48 150" \
+                       "array_loop 24 120" "array_loop 48 150" \
+                       "call_graph 48 240"; do
+            read -r kind scale count <<< "$entry"
+            case_id="${kind}_${scale}"
+            source="$PWD/corpus/mini_c/${case_id}.c"
+            echo "::group::Sampling ${case_id} (${count} fresh compilers)"
+            perf record --quiet -e cpu-clock:u -F 499 \
+              -g --call-graph fp \
+              -o "results/${case_id}.perf.data" -- \
+              python3 compiler/tools/perf_repeat_compile.py \
+                --compiler "$COMPILER" --source "$source" \
+                --count "$count" > "results/${case_id}.json"
+            perf report -i "results/${case_id}.perf.data" \
+              --stdio --no-children --sort comm,dso,symbol \
+              --percent-limit 0.3 > "results/${case_id}.leaf.txt"
+            perf report -i "results/${case_id}.perf.data" \
+              --stdio --children --sort comm,dso,symbol \
+              --percent-limit 0.5 > "results/${case_id}.stacks.txt"
+            perf stat -e task-clock,context-switches,page-faults \
+              -o "results/${case_id}.stat.txt" -- \
+              python3 compiler/tools/perf_repeat_compile.py \
+                --compiler "$COMPILER" --source "$source" \
+                --count 25 > "results/${case_id}.stat.json"
+            cat "results/${case_id}.json"
+            echo "Top leaf samples:"
+            grep -E '^[[:space:]]*[0-9]+[.][0-9]+%.*compiler-mini-c' \
+              "results/${case_id}.leaf.txt" | head -n 25 || true
+            echo "::endgroup::"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mini-c-compiler-perf-24-vs-48
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
+          compression-level: 3
+          overwrite: true
