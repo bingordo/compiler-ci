@@ -90,6 +90,17 @@ jobs:
           source_sha="$(tr -d '\r\n' < "$src/source-sha.txt")"
           [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]]
           git -C compiler cat-file -e "$source_sha^{commit}"
+          # The frontend revision must come from the *published compiler
+          # revision*, not a hardcoded or moving main-branch assumption.
+          frontend_sha="$(git -C compiler show "$source_sha:tools/mini-c-driver/Cargo.toml" | python3 -c '
+          import re,sys
+          manifest=sys.stdin.read()
+          commits=re.findall(r"(?m)^mini-c-(?:syntax|sema)\\s*=.*?rev\\s*=\\s*\\\"([0-9a-f]{40})\\\"",manifest)
+          if len(commits)!=2 or len(set(commits))!=1:
+              raise SystemExit("Unknown or conflicting pinned Mini-C frontend revisions")
+          print(commits[0])
+          ')"
+          [[ "$frontend_sha" =~ ^[0-9a-f]{40}$ ]]
           python3 - "$src/mini-c-differential-linux-x86_64.tar.gz" <<'PY'
           import sys,tarfile
           with tarfile.open(sys.argv[1],"r:gz") as tar:
@@ -101,7 +112,8 @@ jobs:
           tar -xzf "$src/mini-c-differential-linux-x86_64.tar.gz" -C "$RUNNER_TEMP/csmith-bin"
           test -x "$RUNNER_TEMP/csmith-bin/compiler-mini-c"
           echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
-          echo "Prebuilt compiler SHA $source_sha; no private sources rebuilt" >> "$GITHUB_STEP_SUMMARY"
+          echo "frontend_sha=$frontend_sha" >> "$GITHUB_OUTPUT"
+          echo "Prebuilt compiler SHA $source_sha, pinned Mini-C SHA $frontend_sha; no private sources rebuilt" >> "$GITHUB_STEP_SUMMARY"
       - name: Install Csmith 2.3 and independent C compilers
         shell: bash
         run: |
@@ -142,7 +154,7 @@ jobs:
               --include-dir "$CSMITH_INCLUDE" \
               --driver "$RUNNER_TEMP/csmith-bin/compiler-mini-c" \
               --compiler-sha "${{ steps.compiler.outputs.source_sha }}" \
-              --frontend-sha 8444b8ee3cac2ea91a1b4c2dbb9e55529987db8d \
+              --frontend-sha "${{ steps.compiler.outputs.frontend_sha }}" \
               --minimum-native "$MIN_NATIVE" \
             | tee "$RUNNER_TEMP/csmith-probe.log"
           python3 - "$RUNNER_TEMP/csmith-results/summary.json" <<'PY'
