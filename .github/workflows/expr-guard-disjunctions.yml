@@ -14,7 +14,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: c8004833074349646cbae1a0a0222430a5b9c03e
+          ref: c4c44942ec0335e292ede5a31d9c2a7fb4faccbd
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -69,3 +69,44 @@ jobs:
           print('Generalized guard rules:',n,'of',len(gen['rules']),
                 'additional solver checks:',g['additional_checks'])
           PY
+      - name: Discover genuinely conjunctive guard rules and compare matchers
+        run: |
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --max-rules 250 --max-proofs 2000 \
+            --format json --output /tmp/base-conjunction.json
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --compose-guards --max-rules 250 --max-proofs 2000 \
+            --format json --output /tmp/composed.json
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --compose-guards --max-rules 250 --max-proofs 2000 \
+            --format json --check /tmp/composed.json
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --compose-guards --max-rules 250 --max-proofs 2000 \
+            --format rust --output /tmp/composed.rs
+          rustc --edition=2021 -O --test /tmp/composed.rs -o /tmp/composed-tests
+          /tmp/composed-tests
+          python3 - <<'PY'
+          import json
+          baseline=json.load(open('/tmp/base-conjunction.json'))
+          composed=json.load(open('/tmp/composed.json'))
+          m=composed['composition']
+          assert m['added_rules'] > 0, 'no two-condition rule was discovered'
+          assert composed['rule_limit_reached'] == (len(composed['rules']) >= 250)
+          assert composed['proof']['checks'] == m['discovery_checks'] + m['additional_checks']
+          assert composed['rules'][:len(baseline['rules'])] == baseline['rules']
+          assert m['added_rules'] == len(composed['rules']) - len(baseline['rules'])
+          assert all(x['guard']['op']=='and' and len(x['guard']['args'])==2
+              for x in composed['rules'][len(baseline['rules']):])
+          print('Conjunctive rules discovered:',m['added_rules'],'total:',len(composed['rules']),
+                'additional SMT checks:',m['additional_checks'],
+                'cap reached:',composed['rule_limit_reached'])
+          PY
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --max-rules 250 --max-proofs 2000 \
+            --format rust --output /tmp/base-conjunction.rs
+          ORIGINAL_MATCHER=/tmp/base-conjunction.rs \
+          REDUCED_MATCHER=/tmp/composed.rs \
+            rustc --edition=2021 -O \
+            compiler/tools/expr-rule-gen/harness/compare_generalized.rs \
+            -o /tmp/compare-conjunctive
+          /tmp/compare-conjunctive
