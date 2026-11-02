@@ -15,6 +15,10 @@ on:
         type: string
         default: '12345'
         required: false
+      profile:
+        type: string
+        default: constrained
+        required: false
   push:
     branches: [main]
     paths:
@@ -39,10 +43,16 @@ on:
         required: false
         default: '12345'
         type: string
+      profile:
+        description: YARPGen C generation feature profile
+        required: true
+        default: constrained
+        type: choice
+        options: ['constrained', 'default']
 permissions:
   contents: read
 concurrency:
-  group: edg-yarpgen-${{ inputs.source_ref || 'cranelift-codegen' }}-${{ inputs.count || '10' }}-${{ inputs.start_seed || '12345' }}
+  group: edg-yarpgen-${{ inputs.source_ref || 'cranelift-codegen' }}-${{ inputs.count || '10' }}-${{ inputs.start_seed || '12345' }}-${{ inputs.profile || 'constrained' }}
   cancel-in-progress: true
 jobs:
   detect:
@@ -67,7 +77,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/edg-yarpgen-completed
-          key: edg-yarpgen-v2-${{ steps.source.outputs.sha }}-${{ inputs.count || '10' }}-${{ inputs.start_seed || '12345' }}
+          key: edg-yarpgen-v3-${{ steps.source.outputs.sha }}-${{ inputs.count || '10' }}-${{ inputs.start_seed || '12345' }}-${{ inputs.profile || 'constrained' }}
           lookup-only: true
       - name: Decide whether to run
         id: decision
@@ -210,6 +220,25 @@ jobs:
             fc3c7c80c10c67782c03f9d8b70c426f942332e78701397a14a5edff81cbc2e8 \
             tools/prebuilt-yarpgen/archive.tar.gz | sha256sum -c -
           tar -xzf tools/prebuilt-yarpgen/archive.tar.gz -C tools/prebuilt-yarpgen
+          # Unconstrained C profile deliberately does not override
+          # YARPGen's feature-generation flags. Retain fixed seed, resource
+          # limits, --c11 and independent GCC/Clang reference compilers.
+          profile="${{ inputs.profile || 'constrained' }}"
+          generator_options=()
+          case "$profile" in
+            constrained)
+              generator_options=(
+                --generator-option=--inp-as-args=none
+                --generator-option=--emit-pragmas=none
+                --generator-option=--emit-align-attr=none
+                --generator-option=--omp-simd=off
+                --generator-option=--max-array-dims=2
+              )
+              ;;
+            default) ;;
+            *) echo "invalid YARPGen profile $profile" >&2; exit 2 ;;
+          esac
+          printf 'YARPGen profile: %s, count: %s\n' "$profile" "${{ inputs.count || '10' }}"
           python3 tools/yarpgen_smoke.py \
             --generator "$PWD/tools/prebuilt-yarpgen/yarpgen-linux-x86_64/yarpgen" \
             --codegen "$PWD/target/debug/examples/codegen" \
@@ -220,15 +249,11 @@ jobs:
             --out "$PWD/m6-yarpgen-report" \
             --start-seed "${{ inputs.start_seed || '12345' }}" --count "${{ inputs.count || '10' }}" \
             --clang clang --timeout 45 --memory-mb 2048 \
-            --generator-option=--inp-as-args=none \
-            --generator-option=--emit-pragmas=none \
-            --generator-option=--emit-align-attr=none \
-            --generator-option=--omp-simd=off \
-            --generator-option=--max-array-dims=2
+            "${generator_options[@]}"
           python3 - <<'PY'
           import json
           d=json.load(open('m6-yarpgen-report/summary.json'))
-          print("EDG Cranelift requested YARPGen cohort:",d)
+          print("EDG Cranelift YARPGen profile ${{ inputs.profile || 'constrained' }}:",d)
           if d["generated"] != int("${{ inputs.count || '10' }}") or d["oracle_valid"] != int("${{ inputs.count || '10' }}"):
               raise SystemExit("M6 triage failed to establish requested valid GCC/Clang oracles")
           if any(d["counts"].get(category, 0) for category in ("wrong_output", "link_failure", "runtime_failure", "codegen_failure", "frontend_error", "baseline_disagree", "baseline_failure", "generator_failure")):
@@ -253,7 +278,7 @@ jobs:
           else:
               data = json.loads(summary.read_text())
               with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as out:
-                  print("## EDG Cranelift YARPGen coverage", file=out)
+                  print("## EDG Cranelift YARPGen coverage (${{ inputs.profile || 'constrained' }})", file=out)
                   print(f"Generated: {data['generated']}; oracle-valid: {data['oracle_valid']}; backend-accepted: {data['backend_accepted']}; passed: {data['counts'].get('pass', 0)}", file=out)
                   print("\n### Most frequent nonpassing diagnoses\n", file=out)
                   print("| Count | Classification | Diagnostic |\n| ---: | --- | --- |", file=out)
@@ -273,7 +298,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/edg-yarpgen-completed
-          key: edg-yarpgen-v2-${{ needs.detect.outputs.source_sha }}-${{ inputs.count || '10' }}-${{ inputs.start_seed || '12345' }}
+          key: edg-yarpgen-v3-${{ needs.detect.outputs.source_sha }}-${{ inputs.count || '10' }}-${{ inputs.start_seed || '12345' }}-${{ inputs.profile || 'constrained' }}
       - name: Save incremental Rust cache
         if: ${{ success() && steps.rust-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
