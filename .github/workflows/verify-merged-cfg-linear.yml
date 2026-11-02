@@ -1,0 +1,46 @@
+name: Verify merged perf-guided CFG linear fusion
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/verify-merged-cfg-linear.yml'
+permissions:
+  contents: read
+jobs:
+  compiler:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ae444c3b42b6402a7e95519bf9893a320de55b7e
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Configure public Git dependencies over HTTPS
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: cfg-linear-merged-ci
+      - name: Restrict workspace to core crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C compiler rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Run all optimizer IR and x86 backend regressions
+        run: cargo test --manifest-path compiler/Cargo.toml -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+      - name: Run Mini-C frontend and end-to-end native regression tests
+        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib
+      - name: Verify benchmark helper syntax
+        run: python3 -m py_compile compiler/tools/perf_repeat_compile.py
