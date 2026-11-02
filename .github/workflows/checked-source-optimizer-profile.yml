@@ -1,0 +1,110 @@
+name: Checked Oberon and Mini-C optimizer stage profile
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/checked-source-optimizer-profile.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: checked-source-optimizer-profile
+  cancel-in-progress: true
+jobs:
+  oberon:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      OPT_PROFILE_REPETITIONS: '7'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: perf/source-optimizer-stage-profile
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Fetch public pinned Oberon dependency over HTTPS
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: checked-oberon-stage-profile
+      - name: Profile checked Oberon source through optimizer and native emitter
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C compiler rev-parse HEAD | tee results/compiler-sha.txt
+          cargo test --manifest-path compiler/Cargo.toml -p compiler --bin compiler full_optimizer_stage_profile_oberon -- --ignored --nocapture 2>&1 | tee results/oberon.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: checked-oberon-profile
+          path: results/
+          retention-days: 30
+  mini-c:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      OPT_PROFILE_REPETITIONS: '7'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: perf/source-optimizer-stage-profile
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Fetch public pinned Mini-C dependency over HTTPS
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: checked-mini-c-stage-profile
+      - name: Profile checked Mini-C source through optimizer and native emitter
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C compiler rev-parse HEAD | tee results/compiler-sha-mini-c.txt
+          cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib full_optimizer_stage_profile_mini_c -- --ignored --nocapture 2>&1 | tee results/mini_c.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: checked-mini-c-profile
+          path: results/
+          retention-days: 30
+  summarize:
+    needs: [oberon, mini-c]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: perf/source-optimizer-stage-profile
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: checked-*-profile
+          merge-multiple: true
+          path: results
+      - name: Produce checked-source summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/source_optimizer_profile_summary.py \
+            --oberon results/oberon.log --mini-c results/mini_c.log \
+            --output results/optimizer-source-profile.md | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checked-source-optimizer-summary
+          path: results/
+          retention-days: 30
