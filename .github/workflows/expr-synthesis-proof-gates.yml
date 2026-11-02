@@ -14,7 +14,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: d1aff5692252233614eb995bafa276cfab88035a
+          ref: bd954b1acf83fb14c6197036256f2351ed0bb329
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -88,4 +88,37 @@ jobs:
           print('Guarded rules:',len(original['rules']),'->',len(reduced['rules']),
                 'removed',meta['removed_rules'],
                 'reduction/coverage proofs',meta['guard_proofs'],meta['coverage_proofs'])
+          PY
+      - name: Infer new symbolic guard conditions and validate generated matcher
+        run: |
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --max-proofs 2000 --max-rules 200 \
+            --format json --output /tmp/inferred-rules.json
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --max-proofs 2000 --max-rules 200 \
+            --format json --check /tmp/inferred-rules.json
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --max-proofs 2000 --max-rules 200 \
+            --format rust --output /tmp/inferred-rules.rs
+          rustc --edition=2021 -O --test /tmp/inferred-rules.rs -o /tmp/inferred-rules-tests
+          /tmp/inferred-rules-tests
+          python3 - <<'PY'
+          import json
+          data=json.load(open('/tmp/inferred-rules.json'))
+          assert data['schema']=='compiler.inferred-guards.v1'
+          assert data['proof']['checks']>0
+          def expected(r):
+              lhs=r['lhs']; guard=r['guard']
+              return (lhs.get('op')=='Add'
+                and lhs['lhs'].get('op')=='Add'
+                and r['rhs'].get('symbol')=='x'
+                and guard.get('op')=='eq'
+                and guard['lhs'].get('op')=='+'
+                and guard['lhs']['lhs'].get('symbol')=='A'
+                and guard['lhs']['rhs'].get('symbol')=='B'
+                and guard['rhs'].get('constant')==0)
+          assert any(expected(r) for r in data['rules']), 'missing newly inferred A+B==0 cancellation guard'
+          print('Inferred conditional rules:',len(data['rules']),
+                'Z3 proofs:',data['proof']['checks'],
+                'discovery capped:',data['rule_limit_reached'])
           PY
