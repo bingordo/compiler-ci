@@ -1,0 +1,89 @@
+name: S14 inferred Boolean guard basis reduction
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/expr-guard-basis-s14.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify-basis:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out compiler S14
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7382bdb8691b755c4c108a501c7e4105b34c484c
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Install SMT solver
+        run: sudo apt-get update -qq && sudo apt-get install -y z3
+      - name: Unit and existing prover self tests
+        run: |
+          cargo test --manifest-path compiler/tools/expr-rule-gen/Cargo.toml
+          cargo run --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- --self-test
+      - name: Produce full and minimized S13 databases
+        run: |
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --compose-guards --max-proofs 2000 --max-rules 500 \
+            --format json --output /tmp/full.json
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --compose-guards --minimize-rules --max-proofs 2000 --max-rules 500 \
+            --format json --output /tmp/basis.json
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --compose-guards --minimize-rules --max-proofs 2000 --max-rules 500 \
+            --format json --check /tmp/basis.json
+          python3 - <<'PY'
+          import json
+          full=json.load(open('/tmp/full.json'))
+          basis=json.load(open('/tmp/basis.json'))
+          m=basis['basis']
+          assert len(full['rules']) == 345, len(full['rules'])
+          assert m['original_rules']==len(full['rules'])
+          assert m['retained_rules']==len(basis['rules'])
+          assert m['removed_rules']==len(full['rules'])-len(basis['rules'])
+          assert basis['schema']==full['schema']=='compiler.inferred-guards.v2'
+          assert basis['dispatch_policy']=='min-tree-cost-first'
+          assert full['rule_limit_reached']==basis['rule_limit_reached']==False
+          assert basis['proof']['checks']== (
+             full['proof']['checks']+m['reduction_checks']+m['verification_checks'])
+          assert all(r in full['rules'] for r in basis['rules'])
+          assert basis['composition']['added_rules']==full['composition']['added_rules']==237
+          print('S14 minimized database:',
+             len(full['rules']), '->', len(basis['rules']),
+             'removed:',m['removed_rules'],
+             'reduction checks:',m['reduction_checks'],
+             'independent coverage checks:',m['verification_checks'])
+          PY
+      - name: Compile both matchers and compare exact coverage and cost
+        run: |
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --compose-guards --max-proofs 2000 --max-rules 500 \
+            --format rust --output /tmp/full.rs
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --compose-guards --minimize-rules --max-proofs 2000 --max-rules 500 \
+            --format rust --output /tmp/basis.rs
+          rustc --edition=2021 -O --test /tmp/basis.rs -o /tmp/basis-tests
+          /tmp/basis-tests
+          ORIGINAL_MATCHER=/tmp/full.rs REDUCED_MATCHER=/tmp/basis.rs \
+            rustc --edition=2021 -O \
+            compiler/tools/expr-rule-gen/harness/compare_generalized.rs \
+            -o /tmp/compare-basis
+          /tmp/compare-basis --same-coverage
+      - name: Preserve capped-search metadata after minimization
+        run: |
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --compose-guards --minimize-rules \
+            --max-proofs 2000 --max-rules 200 \
+            --format json --output /tmp/capped.json
+          python3 - <<'PY'
+          import json
+          data=json.load(open('/tmp/capped.json'))
+          assert data['rule_limit_reached']==True
+          assert data['basis']['original_rules']==200
+          print('Capped search metadata correctly retained; basis:',
+                data['basis']['retained_rules'])
+          PY
