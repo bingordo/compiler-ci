@@ -1,0 +1,58 @@
+name: Verify counterexample-guided inferred simplification guards
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/expr-guard-cegis.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify-cegis:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out experimental compiler branch
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f199d17ec242b2502d26bb7fe383cf4c3826c0ce
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Install Z3
+        run: sudo apt-get update -qq && sudo apt-get install -y z3
+      - name: Check generator and counterexample extraction
+        run: |
+          cargo test --manifest-path compiler/tools/expr-rule-gen/Cargo.toml
+          cargo run --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- --self-test
+      - name: Compare standard and CEGIS inferred-guard synthesis
+        run: |
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --max-proofs 2000 --max-rules 200 \
+            --format json --output /tmp/baseline.json
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --cegis --max-proofs 2000 --max-rules 200 \
+            --format json --output /tmp/cegis.json
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --cegis --max-proofs 2000 --max-rules 200 \
+            --format json --check /tmp/cegis.json
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --cegis --max-proofs 2000 --max-rules 200 \
+            --format rust --output /tmp/cegis.rs
+          rustc --edition=2021 -O --test /tmp/cegis.rs -o /tmp/cegis-tests
+          /tmp/cegis-tests
+          python3 - <<'PY'
+          import json
+          base=json.load(open('/tmp/baseline.json'))
+          cegis=json.load(open('/tmp/cegis.json'))
+          assert base['rules'] == cegis['rules'], 'CEGIS changed proven rule selection'
+          assert base['rule_limit_reached'] == cegis['rule_limit_reached']
+          m=cegis['cegis']
+          assert m['solver_checks'] == cegis['proof']['checks']
+          assert m['model_refutations'] > 0, 'no counterexample learning occurred'
+          assert m['candidates_pruned'] > 0, 'counterexamples did not prune candidates'
+          assert len(cegis['rules']) == 108
+          print(f"CEGIS rules={len(cegis['rules'])}, old SMT={base['proof']['checks']},"
+                f" new SMT={m['solver_checks']}, witnesses={m['model_refutations']},"
+                f" pruned={m['candidates_pruned']}")
+          PY
