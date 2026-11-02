@@ -131,7 +131,33 @@ jobs:
           python3 - "$RUNNER_TEMP/x86-x4-all-rules-native.log" <<'PY'
           import json, pathlib, re, sys
           source = pathlib.Path('crates/backend-x86/src/generated_dag_patterns.rs').read_text()
-          ids = re.findall(r'^\s*id: "(X3_CTZ32_[0-9A-F]{12})",
+          ids = [line.split('"')[1] for line in source.splitlines()
+                 if line.strip().startswith('id: "X3_CTZ32_')]
+          if not ids or len(ids) != len(set(ids)) or any(
+                  not re.fullmatch(r'X3_CTZ32_[0-9A-F]{12}', name) for name in ids):
+              raise SystemExit('Generated X4 rules missing or invalid')
+          log = pathlib.Path(sys.argv[1]).read_text(errors='replace')
+          ssa = re.findall(r'X4_RULE_SSA id=(X3_CTZ32_[0-9A-F]{12}) status=MATCHED', log)
+          native = re.findall(r'X4_RULE_NATIVE id=(X3_CTZ32_[0-9A-F]{12}) sink=(gas|elf) status=PASS', log)
+          expected = {(name,sink) for name in ids for sink in ('gas','elf')}
+          if len(ssa) != len(ids) or set(ssa) != set(ids):
+              raise SystemExit(f'Unexercised SSA patterns: {set(ids)-set(ssa)}')
+          if len(native) != len(expected) or set(native) != expected:
+              raise SystemExit(f'Incomplete native patterns: {expected-set(native)}')
+          marker=f'X4_RULE_NATIVE_SUMMARY rules={len(ids)} sinks=2 inputs_per_rule=4114 status=PASS'
+          if marker not in log:
+              raise SystemExit('Missing native differential summary')
+          if not re.search(r'test result: ok[.] [0-9]+ passed; 0 failed;', log):
+              raise SystemExit('Matcher/native Rust tests did not pass')
+          rows=[dict(scope='x4_generated_dag_native',rule_id=name,
+                     ssa_matched=True,gas_native_pass=True,elf_native_pass=True,
+                     samples_per_sink=4114,smt_proven_in_this_stage=False)
+                for name in ids]
+          pathlib.Path('x86-x4-all-rules-native.jsonl').write_text(
+              ''.join(json.dumps(row,sort_keys=True)+chr(10) for row in rows))
+          print(f'Validated every one of {len(ids)} generated DAG patterns in ELF/GAS')
+          PY
+      - name: Archive X4.2 source-backed executable DAG admission
         if: success() && (steps.verified.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch')
         uses: actions/upload-artifact@v4
         with:
@@ -141,158 +167,6 @@ jobs:
             x86-x4-all-rules-native.jsonl
             ${{ runner.temp }}/x86-x4-proof-admission.log
             ${{ runner.temp }}/x86-x4-all-rules-native.log
-          retention-days: 14
-      - name: Test X1 semantics and X2 proofs
-        if: steps.verified.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
-        env:
-          INTEL_ISL_DIR: /tmp/intel-isl
-        run: |
-          python3 -m unittest discover -s tools -p 'test_import_intel_isl_subset.py' -v
-          python3 -m unittest discover -s tools -p 'test_x86_instruction_effects.py' -v
-          python3 -m unittest discover -s tools -p 'test_x86_semantics.py' -v
-          python3 -m unittest discover -s tools -p 'test_x86_ssa_adapter.py' -v
-          python3 -m unittest discover -s tools -p 'test_x86_isl_*.py' -v
-          python3 -m unittest discover -s tools -p 'test_x86_effect_proofs.py' -v
-      - name: Verify bounded X3 ADD discovery
-        if: steps.verified.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
-        env:
-          INTEL_ISL_DIR: /tmp/intel-isl
-        run: |
-          set -euo pipefail
-          python3 -m unittest discover -s tools -p 'test_x86_pattern_discovery.py' -v
-          python3 tools/x86_pattern_discovery.py --intel-dir /tmp/intel-isl --max-nodes 2 --max-terms 20000 --max-proofs 100 --recheck --output /tmp/x86-x3-add.json
-          python3 - <<'PY'
-          import json
-          with open("/tmp/x86-x3-add.json") as file:
-              report = json.load(file)
-          stats = report["stats"]
-          assert stats["proven"] > 1 and stats["unknown"] == 0
-          assert report["selection_code_emitted"] is False
-          assert report["scope"] == "compiler-ir single-block i32 Add/Sub/Mul/And/Ctz"
-          assert len(report["semantic_git_blob_sha1"]) == 40
-          assert stats["proven"] == len(report["patterns"])
-          assert all(p["proof"]["status"] == "proven" and p["lowering"] == "not_generated"
-                     and p["requires"]["unobserved_flags"] for p in report["patterns"])
-          print("X3 proved candidates:", stats["proven"])
-          import os
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
-              summary.write(f"X3 ADD: {stats['enumerated']} expressions, "
-                            f"{stats['proven']} verified patterns, "
-                            f"{stats['unknown']} unknown proofs.\\n")
-          PY
-      - name: Verify total CTZ idiom discovery over production SSA
-        if: steps.verified.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
-        env:
-          INTEL_ISL_DIR: /tmp/intel-isl
-        run: |
-          set -euo pipefail
-          python3 -m unittest discover -s tools -p 'test_x86_ctz_discovery.py' -v
-          python3 tools/x86_ctz_discovery.py --intel-dir /tmp/intel-isl --max-nodes 3 --max-terms 20000 --max-proofs 100 --recheck --output /tmp/x86-x3-ctz.json
-          python3 - <<'PY'
-          import json
-          with open("/tmp/x86-x3-ctz.json") as file:
-              report = json.load(file)
-          assert report["hardware_source_correction"]["status"] == "proven"
-          assert report["stats"]["proved"] > 1 and report["stats"]["unknown"] == 0
-          assert all(p["compiler_ir_supported"] is True and
-                     p["proof"]["status"] == "proven" and
-                     p["lowering"] == "not_generated" and p["zero_result"] == 32
-                     for p in report["patterns"])
-          assert report["selection_code_emitted"] is False
-          print("Production SSA CTZ proof patterns:", report["stats"]["proved"])
-          PY
-      - name: Archive production SSA CTZ proof report
-        if: success() && (steps.verified.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch')
-        uses: actions/upload-artifact@v4
-        with:
-          name: x86-x3-ctz-production
-          path: /tmp/x86-x3-ctz.json
-          retention-days: 14
-      - name: Verify research-only BSF identity discovery
-        if: steps.verified.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
-        env:
-          INTEL_ISL_DIR: /tmp/intel-isl
-        run: |
-          set -euo pipefail
-          python3 -m unittest discover -s tools -p 'test_x86_bit_scan_discovery.py' -v
-          python3 tools/x86_bit_scan_discovery.py --intel-dir /tmp/intel-isl --max-nodes 3 --max-terms 20000 --max-proofs 100 --output /tmp/x86-x3-bsf.json
-          python3 - <<'PY'
-          import json
-          with open("/tmp/x86-x3-bsf.json") as file:
-              report = json.load(file)
-          assert report["stats"]["proved_all_widths"] > 1
-          assert report["stats"]["unknown"] == 0
-          assert all(p["compiler_ir_supported"] is False for p in report["patterns"])
-          assert all(len(p["value_and_definedness_proofs"]) == 3
-                     and all(q["status"] == "proven"
-                             for q in p["value_and_definedness_proofs"])
-                     for p in report["patterns"])
-          assert len(report["source_git_blob_sha1"]) == 40
-          assert report["selection_code_emitted"] is False
-          print("X3 research-only BSF identities:", report["stats"]["proved_all_widths"])
-          import os
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
-              stats = report["stats"]
-              summary.write(f"X3 BSF research: {stats['enumerated']} expressions, "
-                            f"{stats['proved_all_widths']} identities verified at "
-                            f"16/32/64 bits, {stats['unknown']} unknown proofs.\\n")
-          PY
-      - name: Archive X3 BSF research proof report
-        if: success() && (steps.verified.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch')
-        uses: actions/upload-artifact@v4
-        with:
-          name: x86-x3-bsf-research
-          path: /tmp/x86-x3-bsf.json
-          retention-days: 14
-      - name: Archive X3 proof report
-        if: success() && (steps.verified.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch')
-        uses: actions/upload-artifact@v4
-        with:
-          name: x86-x3-add-discovery
-          path: /tmp/x86-x3-add.json
-          retention-days: 14
-      - name: Mark passing compiler source
-        if: success() && (steps.verified.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch')
-        run: |
-          printf '%s\n' "${{ steps.source.outputs.sha }}" > .x86-isl-verified
-      - name: Cache successful exact source/workflow pair
-        if: success() && steps.verified.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: .x86-isl-verified
-          key: x86-isl-v1-${{ github.workflow_sha }}-${{ steps.source.outputs.sha }}
-, source, re.M)
-          if not ids or len(ids) != len(set(ids)):
-              raise SystemExit('No unique executable generated X4 patterns')
-          log = pathlib.Path(sys.argv[1]).read_text(errors='replace')
-          ssa = re.findall(r'X4_RULE_SSA id=(X3_CTZ32_[0-9A-F]{12}) status=MATCHED', log)
-          native = re.findall(r'X4_RULE_NATIVE id=(X3_CTZ32_[0-9A-F]{12}) sink=(gas|elf) status=PASS', log)
-          expected = {(i,s) for i in ids for s in ('gas','elf')}
-          if len(ssa) != len(ids) or set(ssa) != set(ids):
-              raise SystemExit(f'Unexercised executable SSA pattern(s): {set(ids)-set(ssa)}')
-          if len(native) != 2*len(ids) or set(native) != expected:
-              raise SystemExit(f'Incomplete per-rule native coverage: {expected-set(native)}')
-          marker=f'X4_RULE_NATIVE_SUMMARY rules={len(ids)} sinks=2 inputs_per_rule=4114 status=PASS'
-          if marker not in log:
-              raise SystemExit('Missing per-rule native differential test summary')
-          if not re.search(r'test result: ok\.\s+\d+ passed; 0 failed;', log):
-              raise SystemExit('Generated DAG matcher/native Rust test binary did not pass')
-          evidence=[dict(scope='x4_generated_dag_native',rule_id=i,
-                        ssa_matched=True,gas_native_pass=True,elf_native_pass=True,
-                        samples_per_sink=4114,smt_proven_in_this_stage=False)
-                    for i in ids]
-          pathlib.Path('x86-x4-all-rules-native.jsonl').write_text(
-              ''.join(json.dumps(row,sort_keys=True)+'\n' for row in evidence))
-          print(f'Validated all {len(ids)} generated DAG patterns in both native sinks')
-          PY
-      - name: Archive X4.2 source-backed executable DAG admission
-        if: success() && (steps.verified.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch')
-        uses: actions/upload-artifact@v4
-        with:
-          name: x86-x4-executable-dag-admission
-          path: |
-            x86-x4-proof-admission.json
-            ${{ runner.temp }}/x86-x4-proof-admission.log
           retention-days: 14
       - name: Test X1 semantics and X2 proofs
         if: steps.verified.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
