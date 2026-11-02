@@ -1,0 +1,115 @@
+name: Benchmark if-conversion pass before and after batching
+on:
+  workflow_dispatch:
+    inputs:
+      before_ref:
+        description: Before-batching compiler commit
+        type: string
+        required: true
+        default: afbc9c484c891a9481c169e7a50c3f508b92b768
+      after_ref:
+        description: Batched compiler commit
+        type: string
+        required: true
+        default: 690e075105ace47664d2947a4e1cbeefb690813e
+      samples:
+        description: Samples per case in each ABBA pass (3-31)
+        type: string
+        required: true
+        default: '9'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/if-conversion-profile.yml'
+permissions:
+  contents: read
+concurrency:
+  group: if-conversion-profile
+  cancel-in-progress: false
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: perf/if-conversion-benchmark
+          path: profile
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.before_ref || 'afbc9c484c891a9481c169e7a50c3f508b92b768' }}
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.after_ref || '690e075105ace47664d2947a4e1cbeefb690813e' }}
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record pins, runner and compiler versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "### Revisions (one runner; same benchmark source)"
+            for d in profile before after; do echo "$d: $(git -C "$d" rev-parse HEAD)"; done
+            rustc --version
+            cargo --version
+            lscpu | grep -E '^(Architecture|Model name|CPU\(s\)):' || true
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Install identical benchmark source in both revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          for d in before after; do
+            mkdir -p "$d/crates/opt/examples"
+            cp profile/crates/opt/examples/if_conversion_profile.rs "$d/crates/opt/examples/if_conversion_profile.rs"
+            cat > "$d/Cargo.toml" <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt"]
+          EOF
+            rm -f "$d/Cargo.lock"
+          done
+          mkdir -p results
+          sha256sum before/crates/opt/examples/if_conversion_profile.rs after/crates/opt/examples/if_conversion_profile.rs
+          cmp before/crates/opt/examples/if_conversion_profile.rs after/crates/opt/examples/if_conversion_profile.rs
+      - name: Compile both benchmarks in release mode
+        shell: bash
+        env:
+          CARGO_INCREMENTAL: '0'
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path before/Cargo.toml -p compiler-opt --example if_conversion_profile
+          cargo build --release --manifest-path after/Cargo.toml -p compiler-opt --example if_conversion_profile
+      - name: Collect paired ABBA samples
+        shell: bash
+        env:
+          BENCH_SAMPLES: ${{ inputs.samples || '9' }}
+        run: |
+          set -euo pipefail
+          before/target/release/examples/if_conversion_profile --samples "$BENCH_SAMPLES" > results/before-1.csv
+          after/target/release/examples/if_conversion_profile --samples "$BENCH_SAMPLES" > results/after-1.csv
+          after/target/release/examples/if_conversion_profile --samples "$BENCH_SAMPLES" > results/after-2.csv
+          before/target/release/examples/if_conversion_profile --samples "$BENCH_SAMPLES" > results/before-2.csv
+      - name: Validate output equivalence and summarize relative timings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 profile/tools/if_conversion_profile_summary.py \
+            --before results/before-1.csv results/before-2.csv \
+            --after results/after-1.csv results/after-2.csv \
+            --output results/summary.md | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: if-conversion-profile-csv-and-report
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
