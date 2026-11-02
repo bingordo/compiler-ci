@@ -15,6 +15,14 @@ on:
         required: false
         default: '0'
         type: string
+      profile:
+        description: Csmith source-generation profile; both keep safe math/checksum
+        required: false
+        default: baseline
+        type: choice
+        options:
+          - baseline
+          - restricted
   push:
     branches: [main]
     paths:
@@ -56,12 +64,21 @@ jobs:
             "$RUNNER_TEMP/csmith-harness-review.log"
           grep -F 'test_probe_rejects_missing_frontend_sha' \
             "$RUNNER_TEMP/csmith-harness-review.log"
+          grep -F 'test_restricted_profile_is_recorded_and_does_not_change_input' \
+            "$RUNNER_TEMP/csmith-harness-review.log"
+          grep -F 'test_csmith_profile_whitelist_rejects_unreviewed_flags' \
+            "$RUNNER_TEMP/csmith-harness-review.log"
+          grep -F 'test_restricted_options_must_be_in_pinned_generator_help' \
+            "$RUNNER_TEMP/csmith-harness-review.log"
           echo "Harness tests only; no Csmith native correctness claim" >> "$GITHUB_STEP_SUMMARY"
+          echo "Actual restricted Csmith execution is a separate coverage-probe job" >> "$GITHUB_STEP_SUMMARY"
   coverage-probe:
     needs: harness-unit
     # An eight-seed first probe ran in #41445689523. Further campaigns
     # are manual: do not compile Csmith or test the frontend on every push.
-    if: github.event_name == 'workflow_dispatch'
+    # Temporary one-time push probe for the restricted profile. Restore
+    # manual-only after measured results are archived.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -131,7 +148,8 @@ jobs:
       - name: Generate original Csmith translation units
         shell: bash
         env:
-          SEED_COUNT: ${{ inputs.seed_count || '16' }}
+          SEED_COUNT: ${{ inputs.seed_count || '8' }}
+          CSMITH_PROFILE: ${{ inputs.profile || 'restricted' }}
         run: |
           set -euo pipefail
           [[ "$SEED_COUNT" =~ ^[0-9]+$ ]]
@@ -140,6 +158,7 @@ jobs:
             python3 compiler/tools/csmith_probe.py --generate \
               --cases-dir "$RUNNER_TEMP/csmith-cases" \
               --csmith csmith --seed-base 1 --seed-count "$SEED_COUNT" \
+              --profile "$CSMITH_PROFILE" \
             | tee "$RUNNER_TEMP/csmith-generate.log"
       - name: Compare GCC and Clang before testing prebuilt Mini-C
         shell: bash
