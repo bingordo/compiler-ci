@@ -1,0 +1,71 @@
+name: Verify inferred guard disjunctions
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/expr-guard-disjunctions.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c8004833074349646cbae1a0a0222430a5b9c03e
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Install Z3
+        run: sudo apt-get update -qq && sudo apt-get install -y z3
+      - name: Run generator and solver unit tests
+        run: |
+          cargo test --manifest-path compiler/tools/expr-rule-gen/Cargo.toml
+          cargo run --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- --self-test
+      - name: Generate original and generalized rules
+        run: |
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --max-rules 200 --max-proofs 2000 \
+            --format json --output /tmp/base-guards.json
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --generalize-guards --max-rules 200 --max-proofs 2000 \
+            --format json --output /tmp/general-guards.json
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --generalize-guards --max-rules 200 --max-proofs 2000 \
+            --format json --check /tmp/general-guards.json
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --max-rules 200 --max-proofs 2000 \
+            --format rust --output /tmp/base-guards.rs
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --generalize-guards --max-rules 200 --max-proofs 2000 \
+            --format rust --output /tmp/general-guards.rs
+          rustc --edition=2021 -O --test /tmp/general-guards.rs -o /tmp/general-guards-tests
+          /tmp/general-guards-tests
+          ORIGINAL_MATCHER=/tmp/base-guards.rs \
+          REDUCED_MATCHER=/tmp/general-guards.rs \
+            rustc --edition=2021 -O \
+            compiler/tools/expr-rule-gen/harness/compare_generalized.rs \
+            -o /tmp/compare-generalized
+          /tmp/compare-generalized
+          python3 - <<'PY'
+          import json
+          base=json.load(open('/tmp/base-guards.json'))
+          gen=json.load(open('/tmp/general-guards.json'))
+          assert len(base['rules'])==len(gen['rules'])==108
+          assert base['rule_limit_reached']==gen['rule_limit_reached']
+          assert all(a['lhs']==b['lhs'] and a['rhs']==b['rhs']
+                     for a,b in zip(base['rules'], gen['rules']))
+          g=gen['generalization']
+          assert g['base_rules']==108
+          assert g['discovery_checks']==base['proof']['checks']
+          assert gen['proof']['checks']==g['discovery_checks']+g['additional_checks']
+          n=sum(x['guard'].get('op')=='or' for x in gen['rules'])
+          assert n==g['generalized_rules']
+          assert all(x['guard']['args'][0]==y['guard']
+              for x,y in zip(gen['rules'],base['rules'])
+              if x['guard'].get('op')=='or')
+          print('Generalized guard rules:',n,'of',len(gen['rules']),
+                'additional solver checks:',g['additional_checks'])
+          PY
