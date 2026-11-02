@@ -1,0 +1,156 @@
+name: M10 Csmith unmodified C coverage probe
+
+# Coverage-only is not evidence of native compiler correctness. Expensive
+# Csmith generation is manual; source push verifies harness negative controls.
+on:
+  workflow_dispatch:
+    inputs:
+      seed_count:
+        description: Number of unmodified Csmith cases (1-16)
+        required: false
+        default: '16'
+        type: string
+      min_native:
+        description: Native cases required for correctness (0 = coverage-only)
+        required: false
+        default: '0'
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/verify-csmith-coverage.yml'
+permissions:
+  contents: read
+concurrency:
+  group: csmith-m10-coverage
+  cancel-in-progress: true
+jobs:
+  harness-unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout harness from compiler main
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: main
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Run fail-closed harness unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s compiler/tools -p 'test_csmith_probe.py' -v
+          python3 -m py_compile compiler/tools/csmith_probe.py
+          echo "Harness tests only; no Csmith native correctness claim" >> "$GITHUB_STEP_SUMMARY"
+  coverage-probe:
+    needs: harness-unit
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout exact compiler harness source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: main
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Fetch only the prebuilt Mini-C distribution
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: expr-rule-gen-binaries
+          path: distribution
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          sparse-checkout: |
+            dist/mini-c-differential
+      - name: Verify SHA-256 and immutable source provenance
+        id: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          src=distribution/dist/mini-c-differential
+          (cd "$src" && sha256sum -c sha256.txt)
+          source_sha="$(tr -d '\r\n' < "$src/source-sha.txt")"
+          [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]]
+          git -C compiler cat-file -e "$source_sha^{commit}"
+          python3 - "$src/mini-c-differential-linux-x86_64.tar.gz" <<'PY'
+          import sys,tarfile
+          with tarfile.open(sys.argv[1],"r:gz") as tar:
+              members=tar.getmembers()
+              if sorted(m.name for m in members)!=["compiler-mini-c","differential.py"] or any(not m.isfile() for m in members):
+                  raise SystemExit("Unexpected prebuilt bundle content")
+          PY
+          mkdir -p "$RUNNER_TEMP/csmith-bin"
+          tar -xzf "$src/mini-c-differential-linux-x86_64.tar.gz" -C "$RUNNER_TEMP/csmith-bin"
+          test -x "$RUNNER_TEMP/csmith-bin/compiler-mini-c"
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+          echo "Prebuilt compiler SHA $source_sha; no private sources rebuilt" >> "$GITHUB_STEP_SUMMARY"
+      - name: Install Csmith 2.3 and independent C compilers
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y --no-install-recommends csmith libcsmith-dev gcc clang
+          version="$(dpkg-query -W csmith | awk '{print $2}')"
+          [[ "$version" == 2.3.0-* ]] || { echo "::error::Unexpected Csmith $version"; exit 1; }
+          header="$(dpkg -L libcsmith-dev | grep '/csmith.h$' | head -n1)"
+          test -s "$header"
+          echo "CSMITH_INCLUDE=$(dirname "$header")" >> "$GITHUB_ENV"
+          echo "Csmith package $version" >> "$GITHUB_STEP_SUMMARY"
+      - name: Generate original Csmith translation units
+        shell: bash
+        env:
+          SEED_COUNT: ${{ inputs.seed_count || '16' }}
+        run: |
+          set -euo pipefail
+          [[ "$SEED_COUNT" =~ ^[0-9]+$ ]]
+          (( 10#$SEED_COUNT >= 1 && 10#$SEED_COUNT <= 16 ))
+          timeout --signal=TERM --kill-after=5s 3m \
+            python3 compiler/tools/csmith_probe.py --generate \
+              --cases-dir "$RUNNER_TEMP/csmith-cases" \
+              --csmith csmith --seed-base 1 --seed-count "$SEED_COUNT" \
+            | tee "$RUNNER_TEMP/csmith-generate.log"
+      - name: Compare GCC and Clang before testing prebuilt Mini-C
+        shell: bash
+        env:
+          MIN_NATIVE: ${{ inputs.min_native || '0' }}
+        run: |
+          set -euo pipefail
+          [[ "$MIN_NATIVE" =~ ^[0-9]+$ ]]
+          (( 10#$MIN_NATIVE >= 0 && 10#$MIN_NATIVE <= 16 ))
+          timeout --signal=TERM --kill-after=5s 8m \
+            python3 compiler/tools/csmith_probe.py --probe \
+              --cases-dir "$RUNNER_TEMP/csmith-cases" \
+              --artifacts-dir "$RUNNER_TEMP/csmith-results" \
+              --include-dir "$CSMITH_INCLUDE" \
+              --driver "$RUNNER_TEMP/csmith-bin/compiler-mini-c" \
+              --compiler-sha "${{ steps.compiler.outputs.source_sha }}" \
+              --frontend-sha 8444b8ee3cac2ea91a1b4c2dbb9e55529987db8d \
+              --minimum-native "$MIN_NATIVE" \
+            | tee "$RUNNER_TEMP/csmith-probe.log"
+          python3 - "$RUNNER_TEMP/csmith-results/summary.json" <<'PY'
+          import json,os,sys
+          d=json.load(open(sys.argv[1]))
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as out:
+              out.write(f"Seeds {d['total_seeds']}; GCC/Clang agree {d['reference_agreed']}; native accepted {d['native_accepted']}; passing {d['passed']}\n")
+              if d['native_accepted']==0:
+                  out.write("**COVERAGE ONLY: zero native acceptance; NOT compiler correctness validation.**\n")
+          print("CSMITH_COVERAGE_ACCEPTED",d['native_accepted'],"of",d['total_seeds'])
+          PY
+      - name: Preserve unmodified source and full evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: csmith-coverage-evidence
+          path: |
+            ${{ runner.temp }}/csmith-cases/
+            ${{ runner.temp }}/csmith-results/
+            ${{ runner.temp }}/csmith-generate.log
+            ${{ runner.temp }}/csmith-probe.log
+          if-no-files-found: ignore
+          retention-days: 14
