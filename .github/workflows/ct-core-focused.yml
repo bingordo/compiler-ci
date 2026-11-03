@@ -1,0 +1,54 @@
+name: CT compiler IR and optimizer focused gate
+on:
+  workflow_dispatch:
+    inputs:
+      compiler_ref:
+        description: Exact compiler commit or branch to verify
+        required: true
+        type: string
+        default: main
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct-core-focused.yml'
+permissions:
+  contents: read
+concurrency:
+  group: ct-core-focused-${{ inputs.compiler_ref || 'bootstrap' }}
+  cancel-in-progress: true
+jobs:
+  compiler-ir-opt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.compiler_ref || '42d3fe4d4f951098095f197fb719c7b2d7049e5d' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm tested compiler revision
+        shell: bash
+        run: |
+          git -C compiler rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
+          rustc --version | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Restrict workspace to independent verifier and optimizer
+        shell: bash
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: focused-ct-ir-opt
+      - name: Run all IR and optimizer unit/integration tests
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt
+      - name: Verify strict Clippy on IR and optimizer
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt --all-targets -- -D warnings
