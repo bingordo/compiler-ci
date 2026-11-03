@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """CT-05c single-variable 512 vs 1024 if-conversion cap experiment.
 
-Same-runner ABBA compilation of real checked Mini-C 48/72/96-branch programs
-and a looped branch program. Compare whole-process time/RSS and ELF .text
-size, and verify BOTH compiler outputs against independent GCC C semantics.
+Same-runner ABBA compilation of 48/72/96/120/144/180-branch Mini-C programs
+and a looped branch program. Compare full compile time/RSS and ELF .text,
+check both outputs against independent GCC C semantics, and collect
+exploratory executable throughput timing for the generated native programs.
 No timing or code-size CI threshold; this experiment never alters main.
 """
 import argparse
@@ -17,7 +18,9 @@ import time
 from pathlib import Path
 
 CASES = (("branches", 48, 1), ("branches", 72, 1),
-         ("branches", 96, 1), ("loop", 24, 4))
+         ("branches", 96, 1), ("branches", 120, 1),
+         ("branches", 144, 1), ("branches", 180, 1),
+         ("loop", 24, 4))
 VALUES = tuple(range(-30, 31))
 FIELDS = ("case", "branches", "loops", "variant", "round", "order",
           "wall_ns", "user_s", "sys_s", "peak_rss_kb",
@@ -64,7 +67,7 @@ def oracle_host(branches, loops):
         '    }\n'
         '  }\n'
         '  volatile int checksum=0;\n'
-        '  for(int i=0; i<30000; ++i) checksum += kernel(i%61-30);\n'
+        '  for(int i=0; i<300000; ++i) checksum += kernel(i%61-30);\n'
         '  if(checksum==0) return 8;\n'
         '  return 0;\n'
         '}\n'
@@ -111,7 +114,7 @@ def main():
             raise FileNotFoundError(binary)
     out = args.results.resolve()
     out.mkdir(parents=True, exist_ok=True)
-    rows, summaries = [], []
+    rows, summaries, native_rows, native_summaries = [], [], [], []
     with tempfile.TemporaryDirectory(prefix="ct05c-") as temp:
         timing = Path(temp) / "time.txt"
         for case, branches, loops in CASES:
@@ -146,6 +149,44 @@ def main():
                     })
             # Validate the *final* objects too; not just their warmup outputs.
             native_verify(source, host, folder, args.cc, objects, one_compile)
+            # Exploratory native throughput: the same GCC-built C oracle
+            # harness, separately linked to each object. Interleaved
+            # process measurements help reduce order drift; they are not
+            # a cycle-accurate target CPU profitability model.
+            for round_index in range(args.rounds):
+                order = ("before", "after", "after", "before")
+                if round_index % 2:
+                    order = tuple(reversed(order))
+                for position, variant in enumerate(order):
+                    started = time.perf_counter_ns()
+                    checked([folder / f"{variant}.exe"], timeout=90)
+                    native_rows.append({
+                        "case": case, "branches": branches, "loops": loops,
+                        "variant": variant, "round": round_index,
+                        "order": position,
+                        "runtime_wall_ns": time.perf_counter_ns() - started,
+                    })
+                started = time.perf_counter_ns()
+                checked([folder / "gcc.exe"], timeout=90)
+                native_rows.append({
+                    "case": case, "branches": branches, "loops": loops,
+                    "variant": "gcc", "round": round_index,
+                    "order": 4,
+                    "runtime_wall_ns": time.perf_counter_ns() - started,
+                })
+            def runtime_median(variant):
+                return statistics.median(
+                    row["runtime_wall_ns"] for row in native_rows
+                    if row["case"] == case and row["branches"] == branches
+                    and row["variant"] == variant
+                ) / 1e6
+            rt_before = runtime_median("before")
+            rt_after = runtime_median("after")
+            rt_gcc = runtime_median("gcc")
+            native_summaries.append(
+                f"| {name} | {rt_before:.2f} | {rt_after:.2f} "
+                f"| {rt_gcc:.2f} | {rt_before/rt_after:.2f}x |"
+            )
             def med(variant, key):
                 return statistics.median(
                     row[key] for row in rows if row["case"] == case
@@ -178,6 +219,15 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
 
+    with (out / "native_runtime_samples.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as fp:
+        writer = csv.DictWriter(fp, fieldnames=(
+            "case", "branches", "loops", "variant", "round", "order", "runtime_wall_ns"
+        ))
+        writer.writeheader()
+        writer.writerows(native_rows)
+
     report = [
         "# CT-05c: if-conversion 512 vs 1024 CFG block cap",
         "",
@@ -187,7 +237,7 @@ def main():
         "Both variants build on a *single* Actions runner. Native objects are",
         "linked with an independent C oracle and executed for 61 integer inputs;",
         "GCC -O2 compiles the same C function as a further control.",
-        "Each native executable additionally evaluates 30,000 changing inputs.",
+        "Each native executable additionally evaluates 300,000 changing inputs.",
         "No timing/size CI threshold. GCC .text size is a reference, not",
         "an apples-to-apples instruction-quality comparison.",
         "",
@@ -195,9 +245,20 @@ def main():
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|",
         *summaries,
         "",
-        "Each measurement is full CLI wall time (startup, check/lower, optimize,",
-        "backend ELF emission, write), with peak process RSS from GNU time.",
-        "No native runtime performance claim is derived from correctness checks.",
+        "## Exploratory native executable timing (process ms)",
+        "",
+        "Same GCC-compiled C host, separately linked to each native object.",
+        "Every process checks 61 input values and runs 300,000 changing-input",
+        "calls; timing includes process startup and checksum validation.",
+        "These times depend on runner CPU scheduling and are *not* target",
+        "uop/branch-prediction profitability estimates.",
+        "",
+        "| Source | 512-cap median ms | 1024-cap median ms | GCC -O2 median ms | 512/1024 speedup |",
+        "|---|---:|---:|---:|---:|",
+        *native_summaries,
+        "",
+        "Each compile measurement is full CLI wall time (startup, check/lower,",
+        "optimize, backend ELF emission, write), with peak RSS from GNU time.",
         "The sources, objects, executable oracles, hashes, and raw timing",
         "samples are retained as the CI artifact. This is a bounded",
         "synthetic but real checked-source experiment, not a policy change.",
