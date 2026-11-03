@@ -15,7 +15,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 53ce01a8911733675f6423370f672155b04ec5fc
+          ref: 5761a414409b1922275929a43cb8d6c22e8bb49a
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -47,6 +47,40 @@ jobs:
               counts[kind][0]+=1
               counts[kind][1]+=(hit=='hit')
           print('S15_BASELINE by category:',counts)
+          PY
+      - name: Quantify commutative matcher improvement without changing proof basis
+        run: |
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --compose-guards --minimize-rules --commute-inferred \
+            --max-proofs 2000 --max-rules 500 --format rust \
+            --output /tmp/s15_commuted.rs
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --compose-guards --minimize-rules --commute-inferred \
+            --max-proofs 2000 --max-rules 500 --format rust \
+            --check /tmp/s15_commuted.rs
+          rustc --edition=2021 -O --test /tmp/s15_commuted.rs -o /tmp/s15-generated-tests
+          /tmp/s15-generated-tests
+          MATCHER_FILE=/tmp/s15_commuted.rs \
+            rustc --edition=2021 -O \
+            compiler/tools/expr-rule-gen/harness/reference_patterns.rs \
+            -o /tmp/s15_reference_commuted
+          /tmp/s15_reference_commuted --require-commuted | tee /tmp/s15-commuted-patterns.tsv
+          python3 - <<'PY'
+          from pathlib import Path
+          def read(path):
+              rows=[s.split('\t') for s in Path(path).read_text().splitlines()
+                    if s.startswith('S15_CASE\t')]
+              assert len(rows)==19
+              return {name: status for _,name,origin,kind,status,*rest in rows}
+          base=read('/tmp/s15-patterns.tsv')
+          new=read('/tmp/s15-commuted-patterns.tsv')
+          gained={k for k in base if base[k]=='miss' and new[k]=='hit'}
+          lost={k for k in base if base[k]=='hit' and new[k]=='miss'}
+          assert gained=={'gcc_and_commuted_inner','gcc_and_commuted_outer'},gained
+          assert lost==set(),lost
+          assert sum(v=='hit' for v in base.values())==8
+          assert sum(v=='hit' for v in new.values())==10
+          print('S15_GAIN matched 8 -> 10; newly-covered:',sorted(gained),'lost:',sorted(lost))
           PY
       - name: Compile C reference corpus with both independent compilers
         run: |
@@ -92,5 +126,6 @@ jobs:
           if-no-files-found: error
           path: |
             /tmp/s15-patterns.tsv
+            /tmp/s15-commuted-patterns.tsv
             /tmp/s15-llvm.ll
             /tmp/s15-optimized-gimple.txt
