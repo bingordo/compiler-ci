@@ -1,0 +1,104 @@
+name: CT-05d normal Mini-C corpus eight-select policy A/B
+on:
+  workflow_dispatch:
+    inputs:
+      before_ref:
+        description: Exact compiler commit before the isolated change
+        required: true
+        type: string
+        default: '1519841b2a203497a3759ba4da1291c21481be17'
+      after_ref:
+        description: Exact compiler commit after the isolated change
+        required: true
+        type: string
+        default: '1ddefa7474f60ed91f1b453b4448f01b7b82755c'
+      samples:
+        description: ABBA rounds per checked-source case (3-12)
+        required: true
+        type: string
+        default: '5'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct05d-normal-source-abba.yml'
+      - 'tools/ct06_abba.py'
+permissions:
+  contents: read
+concurrency:
+  group: ct05d-normal-source-abba
+  cancel-in-progress: true
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Checkout before compiler revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.before_ref || '1519841b2a203497a3759ba4da1291c21481be17' }}
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout after compiler revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.after_ref || '1ddefa7474f60ed91f1b453b4448f01b7b82755c' }}
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record exact test provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C before rev-parse HEAD | tee results/before-sha.txt
+          git -C after rev-parse HEAD | tee results/after-sha.txt
+          rustc --version | tee results/toolchain.txt
+          cargo --version | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\\(s\\)):' | tee -a results/toolchain.txt || true
+          python3 -m py_compile harness/tools/ct06_abba.py after/tools/source_cli_profile.py
+      - name: Configure public pinned Mini-C frontend
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before/tools/mini-c-driver -> target
+            after/tools/mini-c-driver -> target
+          key: ct05d-normal-source-abba
+      - name: Build both optimized Mini-C compiler revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path before/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+          cargo build --release --manifest-path after/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+      - name: Generate checked source corpus and compare ABBA
+        shell: bash
+        env:
+          CT06_SAMPLES: ${{ inputs.samples || '5' }}
+        run: |
+          set -euo pipefail
+          test -x /usr/bin/time
+          python3 after/tools/source_compile_corpus.py --out corpus
+          cp corpus/manifest.csv results/manifest.csv
+          python3 harness/tools/ct06_abba.py \
+            --helpers after/tools --corpus corpus \
+            --before before/tools/mini-c-driver/target/release/compiler-mini-c \
+            --after after/tools/mini-c-driver/target/release/compiler-mini-c \
+            --samples "$CT06_SAMPLES" \
+            --raw results/ct06-raw.csv --report results/ct06-report.md
+          cat results/ct06-report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ct05d-normal-source-abba
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
