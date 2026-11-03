@@ -32,6 +32,16 @@ CASES = {
         ("phi_wide", 256, 4),
         ("phi_wide", 512, 2),
     ],
+    # CT-04c compares the independent-phi fast path with its exact parent
+    # while retaining all dependent reverse-chain regression controls.
+    "ct04c": [
+        ("phi_reverse", 64, 8),
+        ("phi_reverse", 128, 4),
+        ("phi_reverse", 256, 2),
+        ("phi_wide", 128, 8),
+        ("phi_wide", 256, 4),
+        ("phi_wide", 512, 2),
+    ],
 }
 FIELDS = (
     "pair", "case", "size", "round", "order", "variant", "iterations",
