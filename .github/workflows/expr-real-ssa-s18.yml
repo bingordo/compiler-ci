@@ -1,0 +1,110 @@
+name: S18 real SSA generated matcher coverage
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/expr-real-ssa-s18.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  real-ssa-census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out exact S18 source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a59bac36dfe98962a3ed4ae4e5bcce160f3bac6c
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Use public Mini-C frontend pin over HTTPS on CI runner
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('compiler/tools/mini-c-driver/Cargo.toml')
+          s=p.read_text()
+          old='ssh://git@github.com/bingordo/mini-c.git'
+          assert s.count(old)==2
+          p.write_text(s.replace(old,'https://github.com/bingordo/mini-c.git'))
+          PY
+      - name: Cache Rust objects
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: s18-ssa-census
+      - name: Compile held-out source harness
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 12m cargo build --release \
+            --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            --features experimental-fusion-benchmark \
+            --example benchmark_generated_fusion
+      - name: Test embedded SSA audit including negative cases
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('compiler/Cargo.toml').write_text(
+              '[workspace]\nresolver = "2"\nmembers = ["crates/ir","crates/opt"]\n')
+          PY
+          cargo test --manifest-path compiler/Cargo.toml \
+            -p compiler-opt --features experimental-generated-rules \
+            s18_audit -- --nocapture | tee /tmp/s18-unit.log
+          grep -F 's18_audit_is_read_only_and_distinguishes_shared_ssa ... ok' /tmp/s18-unit.log
+          grep -F 's18_audit_recognizes_single_use_and_is_noop_after_handwritten ... ok' /tmp/s18-unit.log
+          grep -F 's18_audit_rejects_nonconstant_and_commuted_chains ... ok' /tmp/s18-unit.log
+      - name: Execute unchanged musl C through real Mini-C SSA and GCC
+        run: |
+          set -euo pipefail
+          RULE_S9_REPEATS=3 timeout --signal=TERM --kill-after=10s 9m \
+            compiler/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion \
+            --real-world | tee /tmp/s18-real-ssa.log
+      - name: Verify exact per-case audit census with no missing functions
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          lines=Path('/tmp/s18-real-ssa.log').read_text().splitlines()
+          rows=[s.split(',') for s in lines if s.startswith('S18_ROW,')]
+          summaries=[s for s in lines if s.startswith('S18_SUMMARY ')]
+          s9=[s for s in lines if s.startswith('S9_SUMMARY ')]
+          assert len(s9)==1 and len(rows)==24 and len(summaries)==2
+          names={s.split(',')[1] for s in lines if s.startswith('S9_ROW,')}
+          assert len(names)==12
+          seen=set()
+          totals={}
+          for r in rows:
+              assert len(r)==9,r
+              _,name,stage,*fields=r
+              assert name in names and stage in ('raw','optimized')
+              assert (name,stage) not in seen
+              seen.add((name,stage))
+              values=list(map(int,fields))
+              arithmetic,candidates,matches,representable,shared,eligible=values
+              assert 0<=eligible<=representable<=matches<=candidates<=arithmetic, r
+              assert shared<=matches
+              totals.setdefault(stage,[0]*6)
+              totals[stage]=[a+b for a,b in zip(totals[stage],values)]
+          for line in summaries:
+              fields=dict(item.split('=',1) for item in line.split()[1:])
+              stage=fields.pop('stage')
+              assert stage in totals
+              assert fields.pop('embedded_rules')=='62'
+              assert (int(fields.pop('attempted')),int(fields.pop('accepted')),
+                      int(fields.pop('rejected')))==(12,12,0)
+              assert fields==dict(zip(
+                  ('arithmetic','candidates','matches','representable','shared_inner','eligible'),
+                  map(str,totals[stage])))
+          print('S18_CENSUS_OK',totals)
+          PY
+      - name: Publish complete census
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s18-real-ssa-coverage
+          if-no-files-found: warn
+          path: |
+            /tmp/s18-real-ssa.log
+            /tmp/s18-unit.log
