@@ -1,0 +1,94 @@
+name: CT-04 Mini-C pointer phi native GCC differential
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact bingordo/compiler SHA or branch
+        required: true
+        type: string
+        default: main
+      seed_count:
+        description: Number of deterministic generated CT-04 cases (0-64)
+        required: true
+        type: string
+        default: '12'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct04-native-oracle.yml'
+permissions:
+  contents: read
+concurrency:
+  group: ct04-native-${{ inputs.source_ref || 'initial-gate' }}
+  cancel-in-progress: true
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout CT-04 candidate compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || 'ct04d-generated-phi-parity' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record source provenance and validate fixture runner
+        shell: bash
+        env:
+          SEED_COUNT: ${{ inputs.seed_count || '12' }}
+        run: |
+          set -euo pipefail
+          sha="$(git -C compiler rev-parse HEAD)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          echo "CT-04 compiler SHA: $sha" >> "$GITHUB_STEP_SUMMARY"
+          rustc --version | tee -a "$GITHUB_STEP_SUMMARY"
+          cc --version | head -n1 | tee -a "$GITHUB_STEP_SUMMARY"
+          test -s compiler/tools/mini-c-driver/tests/ct04_native_oracle.py
+          test -s compiler/tools/mini-c-driver/tests/differential.py
+          python3 -m py_compile compiler/tools/mini-c-driver/tests/ct04_native_oracle.py               compiler/tools/mini-c-driver/tests/differential.py
+          [[ "$SEED_COUNT" =~ ^[0-9]+$ ]]
+          (( 10#$SEED_COUNT <= 64 ))
+      - name: Use public Mini-C dependency over HTTPS
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          file = Path("compiler/tools/mini-c-driver/Cargo.toml")
+          text = file.read_text()
+          old = "ssh://git@github.com/bingordo/mini-c.git"
+          assert text.count(old) == 2
+          file.write_text(text.replace(old, "https://github.com/bingordo/mini-c.git"))
+          PY
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: ct04-native-mini-c-v1
+      - name: Build optimized Mini-C source compiler once
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml             -p compiler-mini-c --bin compiler-mini-c
+          test -x compiler/tools/mini-c-driver/target/release/compiler-mini-c
+      - name: Compare pointer-phi Mini-C through ELF and GAS to GCC
+        shell: bash
+        env:
+          SEED_COUNT: ${{ inputs.seed_count || '12' }}
+        run: |
+          set -euo pipefail
+          mkdir -p results/reproducers
+          python3 compiler/tools/mini-c-driver/tests/ct04_native_oracle.py             --compiler "$PWD/compiler/tools/mini-c-driver/target/release/compiler-mini-c"             --seed-count "$SEED_COUNT" --timeout 30             --artifacts "$PWD/results/reproducers"             2>&1 | tee results/native.log
+          grep -Eq '^CT04_NATIVE_PASS: [1-9][0-9]* fixed \+ [0-9]+ generated pointer/phi source cases, direct ELF \+ GAS \+ GCC -O2$' results/native.log
+          echo "CT-04 native ELF, GAS and GCC oracles passed" >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain failing native fixtures and provenance
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ct04-native-differential-failure
+          path: results/
+          retention-days: 21
+          if-no-files-found: ignore
