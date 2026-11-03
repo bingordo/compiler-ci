@@ -1,0 +1,131 @@
+name: CT-05b checked source analysis and edit counters
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Compiler branch or exact commit to profile
+        required: true
+        type: string
+        default: eea99cfec205a953d5251c83b9f72e378bf4335d
+      repetitions:
+        description: Timed samples per checked source (3-21)
+        required: false
+        type: string
+        default: '7'
+  # Run once when the opt-in profiling workflow itself changes, so the
+  # current compiler main revision has fresh baseline stage timings.
+  # The workflow still has no recurring/scheduled profiling trigger.
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct05b-source-count-profile.yml'
+permissions:
+  contents: read
+concurrency:
+  group: ct05b-source-count-profile
+  cancel-in-progress: true
+jobs:
+  oberon:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      OPT_PROFILE_REPETITIONS: ${{ inputs.repetitions || '7' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || 'eea99cfec205a953d5251c83b9f72e378bf4335d' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Fetch public pinned Oberon dependency over HTTPS
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ct05b-checked-oberon
+      - name: Profile checked Oberon source through optimizer and native emitter (release)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          rustc --version
+          lscpu | grep -E '^(Model name|CPU\\(s\\)):' || true
+          git -C compiler rev-parse HEAD | tee results/compiler-sha.txt
+          cargo test --release --manifest-path compiler/Cargo.toml -p compiler --bin compiler full_optimizer_stage_profile_oberon -- --ignored --nocapture 2>&1 | tee results/oberon.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ct05b-checked-oberon-profile
+          path: results/
+          retention-days: 30
+          overwrite: true
+  mini-c:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      OPT_PROFILE_REPETITIONS: ${{ inputs.repetitions || '7' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || 'eea99cfec205a953d5251c83b9f72e378bf4335d' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Fetch public pinned Mini-C dependency over HTTPS
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: ct05b-checked-mini-c
+      - name: Profile checked Mini-C source through optimizer and native emitter (release)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          rustc --version
+          lscpu | grep -E '^(Model name|CPU\\(s\\)):' || true
+          git -C compiler rev-parse HEAD | tee results/compiler-sha-mini-c.txt
+          cargo test --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib full_optimizer_stage_profile_mini_c -- --ignored --nocapture 2>&1 | tee results/mini_c.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ct05b-checked-mini-c-profile
+          path: results/
+          retention-days: 30
+          overwrite: true
+  summarize:
+    needs: [oberon, mini-c]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || 'eea99cfec205a953d5251c83b9f72e378bf4335d' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ct05b-checked-*-profile
+          merge-multiple: true
+          path: results
+      - name: Produce checked-source summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/source_optimizer_profile_summary.py \
+            --oberon results/oberon.log --mini-c results/mini_c.log \
+            --output results/optimizer-source-profile.md | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ct05b-checked-source-optimizer-summary
+          path: results/
+          retention-days: 30
+          overwrite: true
