@@ -1,0 +1,84 @@
+name: Verify X7.2 parsed ISL loop inventory
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-x7-loop-inventory.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  syntax:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: feature/x7-isl-loop-inventory-20261103
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record exact compiler main commit
+        run: git rev-parse HEAD
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: 5.4.1
+      - name: Clone exact Intel parser and build standalone AST exporter
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libgmp-dev pkg-config cmake libz3-dev
+          git clone --filter=blob:none https://github.com/IntelLabs/isa-tools.git /tmp/isa-tools
+          git -C /tmp/isa-tools checkout 16260979137c38339743a04b7fd5d9f0fa8a6ee5
+          git -C /tmp/isa-tools submodule update --init --recursive
+          cp tools/x86_isl_ast_export.ml tools/x86_isl_ast_json.ml /tmp/isa-tools/bin/
+          cat >> /tmp/isa-tools/bin/dune <<'EOF'
+          (executable
+           (name x86_isl_ast_export)
+           (modules x86_isl_ast_export x86_isl_ast_json)
+           (libraries libISA yojson))
+          EOF
+          cd /tmp/isa-tools
+          opam install --switch="$GITHUB_WORKSPACE" . --deps-only --yes
+          opam exec --switch="$GITHUB_WORKSPACE" -- dune build bin/x86_isl_ast_export.exe
+          test -x _build/default/bin/x86_isl_ast_export.exe
+      - name: Validate parser AST protocol and failure accounting
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools -p 'test_x86_isl_corpus.py' -v
+          python3 -m unittest discover -s tools -p 'test_x86_isl_loop_inventory.py' -v
+          python3 tools/verify_x86_isl_ast_examples.py --parser /tmp/isa-tools/_build/default/bin/x86_isl_ast_export.exe
+      - name: Fetch pinned complete Intel instruction corpus
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --sparse https://github.com/intel/SDM.git /tmp/intel-sdm
+          git -C /tmp/intel-sdm fetch --depth 1 origin 35eface1b7ee003a1cda95005ec5fd83de658a64
+          git -C /tmp/intel-sdm checkout 35eface1b7ee003a1cda95005ec5fd83de658a64
+          git -C /tmp/intel-sdm sparse-checkout set data/instruction
+      - name: Survey syntax coverage over pinned Intel XML bodies
+        run: |
+          set -euo pipefail
+          python3 tools/x86_isl_corpus.py --xml-dir /tmp/intel-sdm/data/instruction \
+            --parser /tmp/isa-tools/_build/default/bin/x86_isl_ast_export.exe \
+            --out /tmp/x7-isl-coverage.json --loop-report /tmp/x7-loop-inventory.json --require-parsed 1641 \
+            --parser-revision 16260979137c38339743a04b7fd5d9f0fa8a6ee5 \
+            --corpus-revision 35eface1b7ee003a1cda95005ec5fd83de658a64
+          python3 - <<'PY'
+          import json
+          d=json.load(open('/tmp/x7-isl-coverage.json'))
+          print("X7_CORPUS_STATUS", d["summary"])
+          assert d["summary"]["operations"] == 1641
+          assert d["summary"]["syntax_accepted"] == 1641
+          assert d["summary"]["status_counts"] == {"parsed":1641}
+          loops=json.load(open('/tmp/x7-loop-inventory.json'))
+          assert loops["operations_scanned"] == 1641
+          print("X7_LOOP_STATUS", {k:loops[k] for k in
+                ("total_loops","loop_kinds","for_directions","map_like_shape_candidates")})
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-intel-isl-loop-inventory
+          path: |
+            /tmp/x7-isl-coverage.json
+            /tmp/x7-loop-inventory.json
+          if-no-files-found: ignore
