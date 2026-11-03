@@ -1,0 +1,106 @@
+name: CT-05e Mini-C direct typed comparison branch A/B
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct05e-direct-compare-abba.yml'
+      - 'tools/ct05e_direct_compare.py'
+permissions:
+  contents: read
+concurrency:
+  group: ct05e-direct-compare-abba
+  cancel-in-progress: true
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Checkout exact baseline Mini-C integer boolean round-trip
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5c9cb8a2cad8414e76c90d2b15ef4d3f07aee5f0
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact direct Mini-C comparison branch candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 60455032f9e5d9132f69432d4dc0d47d203007ff
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record exact provenance and direct branch change
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C before rev-parse HEAD | tee results/before-sha.txt
+          git -C after rev-parse HEAD | tee results/after-sha.txt
+          rustc --version | tee results/toolchain.txt
+          cargo --version | tee -a results/toolchain.txt
+          cc --version | head -1 | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\(s\)):' | tee -a results/toolchain.txt || true
+          if diff -u before/crates/opt/src/if_conversion.rs \
+                    after/crates/opt/src/if_conversion.rs \
+                    > results/cap-diff.txt; then
+            echo "expected exactly one ifconv cap change" >&2
+            exit 1
+          fi
+          cat results/cap-diff.txt
+          grep -q 'fn comparison_predicate(' results/cap-diff.txt
+          python3 -m py_compile harness/tools/ct05e_direct_compare.py \
+             after/tools/source_cli_profile.py
+          test -x /usr/bin/time
+          command -v size
+      - name: Configure pinned public Mini-C frontend over HTTPS
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before/tools/mini-c-driver -> target
+            after/tools/mini-c-driver -> target
+          key: ct05e-direct-branch-v1
+      - name: Build both release Mini-C compilers on one runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path before/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --bin compiler-mini-c
+          cargo build --release --manifest-path after/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --bin compiler-mini-c
+      - name: Compare real source compilation and independent native semantics
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct05e_direct_compare.py \
+            --helpers after/tools \
+            --before before/tools/mini-c-driver/target/release/compiler-mini-c \
+            --after after/tools/mini-c-driver/target/release/compiler-mini-c \
+            --rounds 5 --results results/cases
+          cat results/cases/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve exact disassemblies for generated objects
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results/disassembly
+          for obj in results/cases/*/*.o; do
+            case_name=$(basename "$(dirname "$obj")")
+            variant=$(basename "$obj" .o)
+            objdump -drwC -M intel "$obj" > "results/disassembly/${case_name}-${variant}.txt"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ct05e-direct-compare-native-abba
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
