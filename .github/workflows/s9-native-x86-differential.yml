@@ -1,0 +1,81 @@
+name: S9 exact musl native x86 ELF/GAS differential
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Compiler branch or SHA to validate
+        required: false
+        default: feature/s9-native-musl-parity
+        type: string
+  push:
+    branches: [main]
+    paths: ['.github/workflows/s9-native-x86-differential.yml']
+permissions:
+  contents: read
+concurrency:
+  group: s9-native-x86-${{ inputs.source_ref || 'feature-s9-native-musl-parity' }}
+  cancel-in-progress: true
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout pinned compiler branch with existing CI_KEY
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || 'feature/s9-native-musl-parity' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record exact source revision and verify required tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C compiler rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
+          test -s compiler/tools/mini-c-driver/tests/s9_native_exact.py
+          python3 -m py_compile compiler/tools/mini-c-driver/tests/s9_native_exact.py
+      - name: Use HTTPS for public Mini-C frontend, retaining the pinned SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path=Path('compiler/tools/mini-c-driver/Cargo.toml')
+          source=path.read_text()
+          old='ssh://git@github.com/bingordo/mini-c.git'
+          assert source.count(old)==2
+          path.write_text(source.replace(old,'https://github.com/bingordo/mini-c.git'))
+          PY
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: mini-c-s9-native-x86
+      - name: Build native compiler driver
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          cargo build --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml --bin compiler-mini-c \
+            2>&1 | tee results/build.log
+      - name: Run exact source x86 ELF and GAS against GCC
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/mini-c-driver/tests/s9_native_exact.py \
+            --compiler "$PWD/compiler/tools/mini-c-driver/target/release/compiler-mini-c" \
+            --artifacts "$PWD/results/reproducers" \
+            --report "$PWD/results/s9-native-results.json" \
+            2>&1 | tee results/compare.log
+          grep -Fx 'S9_NATIVE_PARITY: 24/24 verified pairs; report: /' results/compare.log >/dev/null || \
+            grep -Eq '^S9_NATIVE_PARITY: 24/24 verified pairs;' results/compare.log
+      - name: Preserve per-function results and failing reproducers
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s9-native-x86-differential
+          path: results/
+          if-no-files-found: warn
+          retention-days: 14
