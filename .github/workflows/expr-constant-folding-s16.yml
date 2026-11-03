@@ -1,0 +1,68 @@
+name: S16 generated simplification constant folding audit
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/expr-constant-folding-s16.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  reference-folding-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out exact S16 source revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 562c8dbeefc711d0c9fa493345cd5551b7d91141
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Install proof solver
+        run: sudo apt-get update -qq && sudo apt-get install -y z3
+      - name: Unit test generator
+        run: cargo test --manifest-path compiler/tools/expr-rule-gen/Cargo.toml
+      - name: Generate and verify deterministic 152-rule matcher
+        run: |
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --compose-guards --minimize-rules --commute-inferred \
+            --max-proofs 2000 --max-rules 500 --format rust --output /tmp/s16.rs
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --compose-guards --minimize-rules --commute-inferred \
+            --max-proofs 2000 --max-rules 500 --format rust --check /tmp/s16.rs
+          rustc --edition=2021 -O --test /tmp/s16.rs -o /tmp/s16-tests
+          /tmp/s16-tests
+      - name: Verify reference matcher baseline and opt-in folding
+        run: |
+          MATCHER_FILE=/tmp/s16.rs rustc --edition=2021 -O \
+            compiler/tools/expr-rule-gen/harness/reference_patterns.rs -o /tmp/s16-reference
+          /tmp/s16-reference --require-commuted | tee /tmp/s16-baseline.tsv
+          /tmp/s16-reference --require-commuted --require-folding | tee /tmp/s16-folded.tsv
+          python3 - <<'PY'
+          from pathlib import Path
+          def load(path):
+              rows=[line.split('\t') for line in Path(path).read_text().splitlines()
+                    if line.startswith('S15_CASE\t')]
+              assert len(rows)==19, len(rows)
+              return {r[1]:r[4] for r in rows}
+          before=load('/tmp/s16-baseline.tsv')
+          after=load('/tmp/s16-folded.tsv')
+          gained={k for k in before if before[k]=='miss' and after[k]=='hit'}
+          lost={k for k in before if before[k]=='hit' and after[k]=='miss'}
+          expected={'gcc_and_chain','gcc_or_chain','gcc_xor_chain','llvm_add_fold'}
+          assert gained==expected, (gained,expected)
+          assert not lost, lost
+          assert sum(x=='hit' for x in before.values())==10
+          assert sum(x=='hit' for x in after.values())==14
+          print('S16 verified: 10 -> 14 hits; four algebraic constant folds; zero lost')
+          PY
+      - name: Publish differential reference audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s16-simplification-folding
+          path: |
+            /tmp/s16-baseline.tsv
+            /tmp/s16-folded.tsv
+          if-no-files-found: warn
