@@ -1,0 +1,97 @@
+name: CT-05 redundant branch fold same-runner ABBA
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct05-identical-branch-abba.yml'
+      - 'tools/ct05_identical_branch_bench.rs'
+      - 'tools/ct05_identical_branch_compare.py'
+permissions:
+  contents: read
+concurrency:
+  group: ct05-redundant-branch-abba
+  cancel-in-progress: true
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Checkout exact pre-batch revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 682fb4f882d1a065ceea24dec6131804a9b53cca
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact CT-05 batch PR revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 8b919f652f74ec3efcf721f09125186ff2396ee9
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record provenance and install identical benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C before rev-parse HEAD | tee results/before-sha.txt
+          git -C after rev-parse HEAD | tee results/after-sha.txt
+          rustc --version | tee results/toolchain.txt
+          cargo --version | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\(s\)):' | tee -a results/toolchain.txt || true
+          python3 -m py_compile harness/tools/ct05_identical_branch_compare.py
+          for checkout in before after; do
+            mkdir -p "$checkout/crates/opt/examples"
+            cp harness/tools/ct05_identical_branch_bench.rs \
+               "$checkout/crates/opt/examples/ct05_identical_branch_bench.rs"
+            cat > "$checkout/Cargo.toml" <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+            rm -f "$checkout/Cargo.lock"
+          done
+          sha256sum before/crates/opt/examples/ct05_identical_branch_bench.rs \
+            after/crates/opt/examples/ct05_identical_branch_bench.rs \
+            | tee results/fixture-sha256.txt
+          cmp before/crates/opt/examples/ct05_identical_branch_bench.rs \
+              after/crates/opt/examples/ct05_identical_branch_bench.rs
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before -> target
+            after -> target
+          key: ct05-identical-abba-v1
+      - name: Release build identical benchmarks on one runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --offline --manifest-path before/Cargo.toml \
+            -p compiler-opt --example ct05_identical_branch_bench
+          cargo build --release --offline --manifest-path after/Cargo.toml \
+            -p compiler-opt --example ct05_identical_branch_bench
+      - name: Five paired ABBA rounds, structural parity and RSS
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct05_identical_branch_compare.py \
+            --before before/target/release/examples/ct05_identical_branch_bench \
+            --after after/target/release/examples/ct05_identical_branch_bench \
+            --rounds 5 --csv results/raw.csv --report results/report.md
+          cat results/report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ct05-identical-branch-abba
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
