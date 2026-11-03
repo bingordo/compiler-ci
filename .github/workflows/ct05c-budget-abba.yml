@@ -1,0 +1,94 @@
+name: CT-05c bounded ifconv block budget experiment
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct05c-budget-abba.yml'
+      - 'tools/ct05c_budget_compare.py'
+permissions:
+  contents: read
+concurrency:
+  group: ct05c-budget-abba
+  cancel-in-progress: true
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Checkout exact current default 512-block baseline
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 8e0c6610d556e1d7fb30cf62343792c9e7c58b40
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact experimental 1024-block branch
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b696d1db9415efc70a951575a956d6260ee165f0
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record exact provenance, verify one-production-constant patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C before rev-parse HEAD | tee results/before-sha.txt
+          git -C after rev-parse HEAD | tee results/after-sha.txt
+          rustc --version | tee results/toolchain.txt
+          cargo --version | tee -a results/toolchain.txt
+          cc --version | head -1 | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\(s\)):' | tee -a results/toolchain.txt || true
+          git -C after diff --no-ext-diff \
+            8e0c6610d556e1d7fb30cf62343792c9e7c58b40 \
+            b696d1db9415efc70a951575a956d6260ee165f0 \
+            -- crates/opt/src/if_conversion.rs > results/cap-diff.txt
+          cat results/cap-diff.txt
+          test -s results/cap-diff.txt
+          python3 -m py_compile harness/tools/ct05c_budget_compare.py \
+             after/tools/source_cli_profile.py
+          test -x /usr/bin/time
+          command -v size
+      - name: Configure pinned public Mini-C frontend over HTTPS
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before/tools/mini-c-driver -> target
+            after/tools/mini-c-driver -> target
+          key: ct05c-budget-policy-v1
+      - name: Build both release Mini-C compilers on one runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path before/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --bin compiler-mini-c
+          cargo build --release --manifest-path after/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --bin compiler-mini-c
+      - name: Compare real source compilation and independent native semantics
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct05c_budget_compare.py \
+            --helpers after/tools \
+            --before before/tools/mini-c-driver/target/release/compiler-mini-c \
+            --after after/tools/mini-c-driver/target/release/compiler-mini-c \
+            --rounds 5 --results results/cases
+          cat results/cases/report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ct05c-512-vs-1024-cap-native-abba
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
