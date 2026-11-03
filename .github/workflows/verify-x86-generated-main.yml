@@ -1,0 +1,65 @@
+name: Verify merged generated x86 X4 ADD and X5
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-x86-generated-main.yml']
+  workflow_dispatch:
+  schedule:
+    - cron: '53 3 * * *'
+permissions:
+  contents: read
+concurrency:
+  group: x86-generated-main-regression
+  cancel-in-progress: true
+jobs:
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: main
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record exact merged main revision
+        run: |
+          sha=$(git rev-parse HEAD)
+          echo "Compiler main SHA: $sha" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Validate X5 generation and cost profile
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools -p 'test_x86_lea_patterns.py' -v
+          python3 tools/regen_x86_lea_patterns.py --check
+          python3 tools/validate_x86_costs.py data/x86_costs_generic.json
+      - name: Install pinned-proof dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq z3
+          python3 tools/fetch_x86_isl_subset.py /tmp/intel-isl
+          python3 tools/import_intel_isl_subset.py /tmp/intel-isl
+      - name: Verify X4 executable generated ADD against pinned Intel source
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools -p 'test_x86_add_dag_rules.py' -v
+          python3 tools/regen_x86_add_dag_patterns.py --check --intel-dir /tmp/intel-isl
+      - name: Prepare isolated core workspace
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: x86-x4-x5-main-combined
+      - name: Test integrated compiler core and both output sinks
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+          cargo test -p compiler-backend-x86 --test dag_add_integration_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test lea_patterns_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test lea_indexed_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test lea_memory_native -- --nocapture
+          echo 'GENERATED_X86_MAIN status=PASS' | tee -a "$GITHUB_STEP_SUMMARY"
