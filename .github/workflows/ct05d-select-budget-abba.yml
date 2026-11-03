@@ -1,0 +1,96 @@
+name: CT-05d bounded eight-select budget experiment
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct05d-select-budget-abba.yml'
+      - 'tools/ct05d_select_budget_compare.py'
+permissions:
+  contents: read
+concurrency:
+  group: ct05d-select-budget-abba
+  cancel-in-progress: true
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Checkout exact current unbounded scalar-select baseline
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1519841b2a203497a3759ba4da1291c21481be17
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact candidate eight-select per-function budget
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 40cd798bc6c9191bdf3723b0d67db424bcf0fb67
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record exact provenance and experimental policy diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C before rev-parse HEAD | tee results/before-sha.txt
+          git -C after rev-parse HEAD | tee results/after-sha.txt
+          rustc --version | tee results/toolchain.txt
+          cargo --version | tee -a results/toolchain.txt
+          cc --version | head -1 | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\(s\)):' | tee -a results/toolchain.txt || true
+          if diff -u before/crates/opt/src/if_conversion.rs \
+                    after/crates/opt/src/if_conversion.rs \
+                    > results/cap-diff.txt; then
+            echo "expected exactly one ifconv cap change" >&2
+            exit 1
+          fi
+          cat results/cap-diff.txt
+          grep -q 'MAX_SCALAR_SELECTS_PER_FUNCTION: usize = 8' results/cap-diff.txt
+          python3 -m py_compile harness/tools/ct05d_select_budget_compare.py \
+             after/tools/source_cli_profile.py
+          test -x /usr/bin/time
+          command -v size
+      - name: Configure pinned public Mini-C frontend over HTTPS
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before/tools/mini-c-driver -> target
+            after/tools/mini-c-driver -> target
+          key: ct05d-bounded-select-v1
+      - name: Build both release Mini-C compilers on one runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path before/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --bin compiler-mini-c
+          cargo build --release --manifest-path after/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --bin compiler-mini-c
+      - name: Compare real source compilation and independent native semantics
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct05d_select_budget_compare.py \
+            --helpers after/tools \
+            --before before/tools/mini-c-driver/target/release/compiler-mini-c \
+            --after after/tools/mini-c-driver/target/release/compiler-mini-c \
+            --rounds 5 --results results/cases
+          cat results/cases/report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ct05d-eight-select-budget-native-abba
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
