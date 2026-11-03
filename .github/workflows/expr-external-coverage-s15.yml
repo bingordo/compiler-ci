@@ -1,0 +1,96 @@
+name: S15 GCC LLVM pattern coverage audit
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/expr-external-coverage-s15.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  reference-pattern-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out pinned compiler branch
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 53ce01a8911733675f6423370f672155b04ec5fc
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Install proof solver
+        run: sudo apt-get update -qq && sudo apt-get install -y z3
+      - name: Generator unit tests
+        run: cargo test --manifest-path compiler/tools/expr-rule-gen/Cargo.toml
+      - name: Generate proof-verified S14 baseline and audit 19 patterns
+        run: |
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --compose-guards --minimize-rules \
+            --max-proofs 2000 --max-rules 500 --format rust \
+            --output /tmp/s15_matcher.rs
+          MATCHER_FILE=/tmp/s15_matcher.rs \
+            rustc --edition=2021 -O \
+            compiler/tools/expr-rule-gen/harness/reference_patterns.rs \
+            -o /tmp/s15_reference
+          /tmp/s15_reference | tee /tmp/s15-patterns.tsv
+          python3 - <<'PY'
+          from pathlib import Path
+          rows=[s.split('\t') for s in Path('/tmp/s15-patterns.tsv').read_text().splitlines()
+                if s.startswith('S15_CASE\t')]
+          assert len(rows)==19,(len(rows),rows)
+          counts={}
+          for _,name,origin,kind,hit,src,dst in rows:
+              assert hit in ('hit','miss')
+              assert origin in ('gcc','llvm')
+              counts.setdefault(kind,[0,0])
+              counts[kind][0]+=1
+              counts[kind][1]+=(hit=='hit')
+          print('S15_BASELINE by category:',counts)
+          PY
+      - name: Compile C reference corpus with both independent compilers
+        run: |
+          gcc --version | head -1
+          clang --version | head -1
+          for compiler in gcc clang; do
+            for level in 0 2; do
+              "$compiler" -std=c11 -O"$level" -fwrapv -Wall -Wextra \
+                compiler/tools/expr-rule-gen/harness/reference_kernels.c \
+                -o /tmp/s15-"$compiler"-O"$level"
+              /tmp/s15-"$compiler"-O"$level"
+            done
+          done
+      - name: Capture optimized LLVM IR and GCC GIMPLE for all 19 source kernels
+        run: |
+          clang -std=c11 -O2 -fwrapv -S -emit-llvm \
+            compiler/tools/expr-rule-gen/harness/reference_kernels.c \
+            -o /tmp/s15-llvm.ll
+          gcc -std=c11 -O2 -fwrapv -fdump-tree-optimized \
+            -c compiler/tools/expr-rule-gen/harness/reference_kernels.c \
+            -o /tmp/s15-gcc.o
+          python3 - <<'PY'
+          import glob,re
+          from pathlib import Path
+          c=Path('compiler/tools/expr-rule-gen/harness/reference_kernels.c').read_text()
+          names=re.findall(r'NOINLINE uint32_t f_([a-z0-9_]+)\(',c)
+          assert len(names)==19,len(names)
+          llvm=Path('/tmp/s15-llvm.ll').read_text()
+          assert all(re.search(r'^\s*define\b[^\n]*@f_'+name+r'\(',llvm,re.M)
+                     for name in names), 'LLVM IR missing a reference function'
+          files=glob.glob('/tmp/*.optimized')
+          assert files, 'GCC optimized GIMPLE dump not found'
+          gimple=Path(files[0]).read_text()
+          assert all(';; Function f_'+name+' ' in gimple for name in names), \
+             'GCC GIMPLE missing a reference function'
+          Path('/tmp/s15-optimized-gimple.txt').write_text(gimple)
+          print('S15_IR_VERIFIED gcc_functions=19 llvm_functions=19')
+          PY
+      - name: Publish audit and optimized reference IR
+        uses: actions/upload-artifact@v4
+        with:
+          name: s15-gcc-llvm-reference-audit
+          if-no-files-found: error
+          path: |
+            /tmp/s15-patterns.tsv
+            /tmp/s15-llvm.ll
+            /tmp/s15-optimized-gimple.txt
