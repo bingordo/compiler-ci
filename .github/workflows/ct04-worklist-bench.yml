@@ -1,0 +1,106 @@
+name: CT-04 same-runner isolated SSA worklist benchmarks
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct04-worklist-bench.yml'
+      - 'tools/ct04_hotspot_bench.rs'
+      - 'tools/ct04_hotspot_compare.py'
+permissions:
+  contents: read
+concurrency:
+  group: ct04-ssa-worklist-benchmark
+  cancel-in-progress: true
+jobs:
+  compare:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pair: ct04a
+            before_ref: eb6490c17afa222b21030ad332b1d2f44ef88b1c
+            after_ref: 9add8294b7fd829c9ad53dc404739883931ae8c0
+          - pair: ct04b
+            before_ref: 6239ec81fc90031576dfaf78a9d088687ff76f46
+            after_ref: 25bff4e91d10c6f2355bd0578b75b5b90416d053
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Checkout exact before revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: \${{ matrix.before_ref }}
+          path: before
+          ssh-key: \${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact after revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: \${{ matrix.after_ref }}
+          path: after
+          ssh-key: \${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record provenance and prepare identical fixture in both revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C before rev-parse HEAD | tee results/before-sha.txt
+          git -C after rev-parse HEAD | tee results/after-sha.txt
+          rustc --version | tee results/toolchain.txt
+          cargo --version | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\(s\)):' | tee -a results/toolchain.txt || true
+          python3 -m py_compile harness/tools/ct04_hotspot_compare.py
+          for checkout in before after; do
+            mkdir -p "$checkout/crates/opt/examples"
+            cp harness/tools/ct04_hotspot_bench.rs \
+              "$checkout/crates/opt/examples/ct04_hotspot_bench.rs"
+            cat > "$checkout/Cargo.toml" <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+            rm -f "$checkout/Cargo.lock"
+          done
+          sha256sum before/crates/opt/examples/ct04_hotspot_bench.rs \
+            after/crates/opt/examples/ct04_hotspot_bench.rs | tee results/fixture-sha256.txt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before -> target
+            after -> target
+          key: ct04-ssa-worklist-\${{ matrix.pair }}
+      - name: Build release IR/optimizer hotspot binaries on one runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --offline --manifest-path before/Cargo.toml \
+            -p compiler-opt --example ct04_hotspot_bench
+          cargo build --release --offline --manifest-path after/Cargo.toml \
+            -p compiler-opt --example ct04_hotspot_bench
+      - name: Run 5 ABBA rounds and validate output signature parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct04_hotspot_compare.py \
+            --pair '\${{ matrix.pair }}' \
+            --before before/target/release/examples/ct04_hotspot_bench \
+            --after after/target/release/examples/ct04_hotspot_bench \
+            --rounds 5 \
+            --raw results/raw.csv --report results/report.md
+          cat results/report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ct04-worklist-\${{ matrix.pair }}
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
