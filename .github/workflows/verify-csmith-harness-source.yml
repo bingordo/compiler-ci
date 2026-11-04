@@ -1,0 +1,60 @@
+name: Verify compiler Csmith harness (source-only)
+
+# Small Python-only correctness gate. Full Csmith corpora are separate and
+# remain manual. The source ref can be selected for pending compiler PRs.
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Compiler source branch, tag, or SHA
+        required: false
+        type: string
+        default: main
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/verify-csmith-harness-source.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  harness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout exact compiler harness source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || 'test/m10-campaign-budget-accounting' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          sparse-checkout: |
+            tools/csmith_probe.py
+            tools/test_csmith_probe.py
+            tools/mini-c-driver/Cargo.toml
+      - name: Run focused fail-closed harness suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C compiler rev-parse HEAD | tee "$RUNNER_TEMP/csmith-source-sha"
+          python3 -m py_compile compiler/tools/csmith_probe.py compiler/tools/test_csmith_probe.py
+          python3 -m unittest discover -s compiler/tools -p 'test_csmith_probe.py' -v \
+            2>&1 | tee "$RUNNER_TEMP/csmith-harness.log"
+          grep -F 'test_campaign_budget_records_unstarted_seeds_and_fails_closed' \
+            "$RUNNER_TEMP/csmith-harness.log"
+          grep -F 'test_campaign_budget_rejects_invalid_limits' \
+            "$RUNNER_TEMP/csmith-harness.log"
+          echo "Python harness gate only: no whole-program Csmith native passes claimed" >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve source SHA and harness log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: csmith-harness-source-log
+          path: |
+            ${{ runner.temp }}/csmith-source-sha
+            ${{ runner.temp }}/csmith-harness.log
+          if-no-files-found: ignore
+          retention-days: 7
