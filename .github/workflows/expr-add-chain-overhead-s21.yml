@@ -1,0 +1,129 @@
+name: S21 ADD/ADD incremental and source-to-ELF overhead
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/expr-add-chain-overhead-s21.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compile-cost:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Pin exact compiler source revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5612f82d02fd7f22bcbd833fb8f21d42752375eb
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Allow read-only public Mini-C repository
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("compiler/tools/mini-c-driver/Cargo.toml")
+          contents=p.read_text()
+          original="ssh://git@github.com/bingordo/mini-c.git"
+          assert contents.count(original)==2
+          p.write_text(contents.replace(original,"https://github.com/bingordo/mini-c.git"))
+          PY
+      - name: Cache Rust deps
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: s21-compile-overhead
+      - name: Check isolated ADD/ADD transactional unit tests
+        run: |
+          set -euo pipefail
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt"]
+          EOF
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt \
+            --features experimental-generated-rules s21_add_add_ -- --nocapture \
+            2>&1 | tee /tmp/s21ct-tests.log
+          grep -F 's21_add_add_isolated_fusion_is_proven_and_bounded ... ok' /tmp/s21ct-tests.log
+          grep -F 's21_add_add_does_not_change_non_add_or_shared_producers ... ok' /tmp/s21ct-tests.log
+          grep -F 's21_add_add_failure_is_transactional ... ok' /tmp/s21ct-tests.log
+      - name: Build experimental Mini-C measurement
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            --features experimental-fusion-benchmark --example benchmark_generated_fusion
+      - name: Benchmark paired full compile and incremental pass, with independent native oracle
+        run: |
+          set -euo pipefail
+          rustc --version | tee /tmp/s21ct-environment.log
+          uname -a | tee -a /tmp/s21ct-environment.log
+          grep -m1 'model name' /proc/cpuinfo | tee -a /tmp/s21ct-environment.log
+          RULE_S21_CT_REPEATS=3 RULE_S21_CT_BATCH=3 RULE_S21_CT_PASS_BATCH=32 \
+            timeout --signal=TERM --kill-after=10s 11m \
+            compiler/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion \
+            --add-chain-timing | tee /tmp/s21ct-measurements.log
+      - name: Independently validate source denominators and all measurements
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          d=Path('/tmp/s21ct-measurements.log').read_text().splitlines()
+          rows=[q.split(',') for q in d if q.startswith('S21CT_ROW,')]
+          reject=[q.split(',') for q in d if q.startswith('S21CT_REJECT,')]
+          summaries=[q for q in d if q.startswith('S21CT_SUMMARY ')]
+          info=[q for q in d if q.startswith('S21CT_INFO ')]
+          assert len(info)==1 and len(summaries)==2
+          assert len(rows)+len(reject)==60
+          expected={'synthetic':48,'real':12}
+          for group,num in expected.items():
+              good=[r for r in rows if r[1]==group]
+              bad=[r for r in reject if r[1]==group]
+              assert len(good)+len(bad)==num
+              assert len({r[2] for r in good+bad})==num
+              values=dict(attempted=num,accepted=len(good),rejected=len(bad),
+                          applied=0,improved=0,unchanged=0,regressed=0,
+                          baseline_bytes=0,trial_bytes=0,native_calls=0,
+                          sum_baseline_full_medians_ns=0,
+                          sum_trial_full_medians_ns=0,
+                          sum_incremental_pass_medians_ns=0)
+              for r in good:
+                  assert len(r)==11,r
+                  _,g,name,hashv,*ns=r
+                  assert len(hashv)==16 and name
+                  count,old,new,base_ns,trial_ns,pass_ns,calls=map(int,ns)
+                  assert 0<=count and old>0 and new>0
+                  assert base_ns>0 and trial_ns>0 and pass_ns>0 and calls==24
+                  for key,val in [('applied',count),('baseline_bytes',old),
+                                  ('trial_bytes',new),('native_calls',calls),
+                                  ('sum_baseline_full_medians_ns',base_ns),
+                                  ('sum_trial_full_medians_ns',trial_ns),
+                                  ('sum_incremental_pass_medians_ns',pass_ns)]:
+                      values[key]+=val
+                  values['improved']+=(new<old)
+                  values['regressed']+=(new>old)
+                  values['unchanged']+=(new==old)
+              for r in bad:
+                  assert len(r)==6,r
+                  assert r[4] in ('frontend','function_count') and r[5]
+              m=next((s for s in summaries if 'group='+group+' ' in s),None)
+              assert m is not None
+              meta=dict(x.split('=',1) for x in m.split()[1:])
+              for k,v in values.items():
+                  assert int(meta[k])==v,(group,k,meta[k],v)
+              if group=='synthetic':
+                  assert len(good)==48 and values['applied']>0
+                  assert values['improved']>0
+              else:
+                  assert len(good)==12
+              print('S21CT_VALIDATED',group,values)
+          PY
+      - name: Upload timing and oracle logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s21-add-add-compile-overhead
+          if-no-files-found: warn
+          path: |
+            /tmp/s21ct-measurements.log
+            /tmp/s21ct-environment.log
+            /tmp/s21ct-tests.log
