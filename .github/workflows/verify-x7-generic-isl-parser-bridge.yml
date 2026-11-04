@@ -1,0 +1,50 @@
+name: Verify X7 generic Intel parser-semantic bridge
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-x7-generic-isl-parser-bridge.yml']
+permissions:
+  contents: read
+jobs:
+  parser-bridge:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 940cd127cc70cf9b5c7a7f8bbd71d619f11c6581
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record exact source and standalone unit tests
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          python3 -m unittest discover -s tools -p 'test_x86_isl_bit_primitives.py' -v
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: 5.4.1
+      - name: Build pinned upstream Intel AST exporter
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libgmp-dev pkg-config cmake libz3-dev
+          git clone --filter=blob:none https://github.com/IntelLabs/isa-tools.git /tmp/isa-tools
+          git -C /tmp/isa-tools checkout 16260979137c38339743a04b7fd5d9f0fa8a6ee5
+          git -C /tmp/isa-tools submodule update --init --recursive
+          cp tools/x86_isl_ast_export.ml tools/x86_isl_ast_json.ml /tmp/isa-tools/bin/
+          cat >> /tmp/isa-tools/bin/dune <<'EOF'
+          (executable
+           (name x86_isl_ast_export)
+           (modules x86_isl_ast_export x86_isl_ast_json)
+           (libraries libISA yojson))
+          EOF
+          cd /tmp/isa-tools
+          opam install --switch="$GITHUB_WORKSPACE" . --deps-only --yes
+          opam exec --switch="$GITHUB_WORKSPACE" -- dune build bin/x86_isl_ast_export.exe
+      - name: Execute actual parsed Intel ISL examples
+        run: |
+          set -euo pipefail
+          python3 tools/verify_x86_isl_generic_examples.py \
+            --parser /tmp/isa-tools/_build/default/bin/x86_isl_ast_export.exe
