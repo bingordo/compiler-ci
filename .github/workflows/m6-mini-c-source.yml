@@ -1,0 +1,62 @@
+name: M6 Mini-C source corpus diagnostic
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Compiler branch, tag, or exact SHA"
+        required: true
+        type: string
+        default: main
+  push:
+    branches: [ci/m6-mini-c-source-validation]
+    paths: [.github/workflows/m6-mini-c-source.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  mini-c-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || '9393011ef720b6e456e08e48496ad3b7a59d8549' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm source revision
+        run: git -C compiler rev-parse HEAD
+      - name: Use public pinned Mini-C dependency
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: m6-mini-c-checked-source-v1
+      - name: Run checked Mini-C source corpus and GCC differential oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --lib \
+            m6_source::m6_real_checked_mini_c_source_vs_gcc -- --nocapture \
+            2>&1 | tee results/m6-mini-c-source.log
+          grep '^M6_MINIC,' results/m6-mini-c-source.log | tee -a "$GITHUB_STEP_SUMMARY"
+          grep '^M6_MINIC_SUMMARY,' results/m6-mini-c-source.log | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$(grep -c '^M6_MINIC,' results/m6-mini-c-source.log)" -eq 9
+      - name: Check strict Mini-C Clippy
+        run: cargo clippy --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --all-targets -- -D warnings
+      - name: Save diagnostic log
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: m6-mini-c-source-corpus
+          path: results/m6-mini-c-source.log
+          if-no-files-found: ignore
+          retention-days: 14
