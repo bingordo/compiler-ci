@@ -1,0 +1,78 @@
+name: Verify T5 mixed typed optimizer pass oracle
+
+# Manual/single-workflow-change gate. Never runs heavy Rust builds on a
+# schedule or compiler-main polling; this is a focused PR/milestone check.
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Compiler source branch or SHA
+        required: false
+        type: string
+        default: main
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/verify-t5-typed-pass-interactions.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  typed-oracle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout compiler source (exact branch under test)
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || 'test/t5-typed-dse-mem2reg-interactions' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Limit workspace to public-independent compiler core
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD | tee "$RUNNER_TEMP/t5-source-sha"
+          test -s crates/opt/tests/typed_native_parity.rs
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          """)
+          PY
+      - name: Reuse compiler core Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: t5-typed-oracle
+      - name: Check typed mixed pass correctness and coverage
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 10m \
+            cargo test -p compiler-opt --test typed_native_parity -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/t5-typed-oracle.log"
+          grep -F 'test typed_pipeline_semantics_match_independent_reference_across_pass_orders ... ok' \
+            "$RUNNER_TEMP/t5-typed-oracle.log"
+          grep -E 'T5_TYPED_PIPELINE .*dse=[1-9][0-9]* .*mem2reg=[1-9][0-9]*' \
+            "$RUNNER_TEMP/t5-typed-oracle.log"
+          cargo clippy -p compiler-opt --test typed_native_parity -- -D warnings \
+            2>&1 | tee "$RUNNER_TEMP/t5-typed-clippy.log"
+          echo "T5 bounded TypeId oracle passed on $(cat "$RUNNER_TEMP/t5-source-sha")" >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve source and relevant test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: t5-typed-oracle-evidence
+          path: |
+            ${{ runner.temp }}/t5-source-sha
+            ${{ runner.temp }}/t5-typed-oracle.log
+            ${{ runner.temp }}/t5-typed-clippy.log
+          if-no-files-found: ignore
+          retention-days: 7
