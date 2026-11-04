@@ -124,6 +124,75 @@ jobs:
           mkdir -p .mini-c-verified
           printf '%s\n' "${{ steps.source.outputs.sha }}" > .mini-c-verified/source-sha.txt
           echo "Passed fixed, seeded, ABI and negative GCC oracles" >> "$GITHUB_STEP_SUMMARY"
+      - name: Probe eight unmodified checksum-bearing Csmith TUs (coverage only)
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y --no-install-recommends csmith libcsmith-dev clang gcc
+          version="$(dpkg-query -W csmith | awk '{print $2}')"
+          [[ "$version" == 2.3.0-* ]] || { echo "::error::Unexpected Csmith version $version"; exit 1; }
+          header="$(dpkg -L libcsmith-dev | grep '/csmith.h
+        if: success() && steps.verified.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .mini-c-verified
+          key: mini-c-source-v1-${{ hashFiles('.github/workflows/verify-mini-c-differential.yml') }}-${{ steps.source.outputs.sha }}-${{ inputs.seed_count || '6' }}
+      - name: Report cached result
+        if: steps.verified.outputs.cache-hit == 'true' && !inputs.force_recheck
+        run: echo "Exact compiler revision and seed cohort previously passed" >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve build logs and failing test cases
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mini-c-source-differential-failures
+          path: |
+            ${{ runner.temp }}/mini-c-build.log
+            ${{ runner.temp }}/mini-c-differential.log
+            ${{ runner.temp }}/mini-c-failures/
+          if-no-files-found: ignore
+          retention-days: 14
+ | head -n1)"
+          test -s "$header"
+          frontend_sha="$(python3 - <<'PY'
+          import sys
+          sys.path.insert(0, 'compiler/tools')
+          from csmith_probe import pinned_frontend_revision
+          print(pinned_frontend_revision(open('compiler/tools/mini-c-driver/Cargo.toml').read()))
+          PY
+          )"
+          test "$frontend_sha" = 2f2d4457c4cf86bbc10479ddd5c0cf7cfa5080e1
+          python3 compiler/tools/csmith_probe.py --generate \
+            --cases-dir "$RUNNER_TEMP/m10-cases" --csmith csmith \
+            --profile restricted-observable --seed-base 1 --seed-count 8
+          python3 compiler/tools/csmith_probe.py --probe --preprocess-c \
+            --cases-dir "$RUNNER_TEMP/m10-cases" \
+            --artifacts-dir "$RUNNER_TEMP/m10-results" \
+            --include-dir "$(dirname "$header")" \
+            --driver "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" \
+            --compiler-sha "44d4ef44e5d9e6d38ffd562596fa9f84e0204dbb" \
+            --frontend-sha "$frontend_sha" --minimum-native 0 \
+            --compile-timeout 15 --run-timeout 3
+          python3 - "$RUNNER_TEMP/m10-results/summary.json" <<'PY'
+          import json,sys
+          summary=json.load(open(sys.argv[1]))
+          print("M10_ORIGINAL_CSMITH",json.dumps({k:summary[k] for k in (
+              "compiler_sha","frontend_sha","reference_agreed","native_accepted",
+              "total_seeds","counts","frontend_blockers","status")},sort_keys=True))
+          assert summary['compiler_sha']=="44d4ef44e5d9e6d38ffd562596fa9f84e0204dbb"
+          assert summary['frontend_sha']=="2f2d4457c4cf86bbc10479ddd5c0cf7cfa5080e1"
+          PY
+      - name: Preserve original Csmith seeds and full evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m10-float-prototype-original-csmith
+          path: |
+            ${{ runner.temp }}/m10-cases/
+            ${{ runner.temp }}/m10-results/
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Save successful exact revision evidence
         if: success() && steps.verified.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
