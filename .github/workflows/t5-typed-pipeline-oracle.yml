@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       source_ref:
-        description: "Compiler commit/branch to test (default: main)"
+        description: "Compiler commit/branch to test (default: T5 proof PR)"
         required: false
         type: string
   push:
@@ -26,7 +26,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ inputs.source_ref || 'main' }}
+          ref: ${{ inputs.source_ref || 'cbb3b386b2452452a4dfa91b5daa044c3617cd10' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -65,18 +65,50 @@ jobs:
           grep -F 'test typed_pipeline_oracle_detects_wrong_values_and_dropped_traps ... ok' "$RUNNER_TEMP/t5-typed-pipeline.log"
           grep -F 'T5_TYPED_PIPELINE samples=28800 pass_orders=3' "$RUNNER_TEMP/t5-typed-pipeline.log"
           echo 'T5 bounded reference comparison: passed; no SMT claim' >> "$GITHUB_STEP_SUMMARY"
-      - name: Check test and optimizer with strict Clippy
+      - name: Verify typed-pipeline exact-memory scope without Z3
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 3m \
+            cargo test -p compiler-opt --test alive_lite \
+              t5_typed_pipeline_memory_scope_and_mutation_controls -- --exact --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/t5-typeid-smt-scope.log"
+          grep -E 'test alive_lite_typed_pipeline::t5_typed_pipeline_memory_scope_and_mutation_controls \.\.\. ok' "$RUNNER_TEMP/t5-typeid-smt-scope.log"
+      - name: Install Z3 for the selected TypeId chain proofs
+        run: |
+          if ! command -v z3 >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends z3
+          fi
+          z3 --version
+      - name: Prove composed TypeId pass sequences and SMT negative controls
         shell: bash
         working-directory: compiler
         run: |
           set -euo pipefail
           timeout --signal=TERM --kill-after=10s 4m \
-            cargo clippy -p compiler-opt --test typed_native_parity -- -D warnings
+            cargo test -p compiler-opt --test alive_lite \
+              t5_typed_pipeline_smt_proves_pass_compositions_and_negatives \
+              -- --ignored --nocapture --test-threads=1 \
+            2>&1 | tee "$RUNNER_TEMP/t5-typeid-smt-proof.log"
+          grep -E 'test alive_lite_typed_pipeline::t5_typed_pipeline_smt_proves_pass_compositions_and_negatives \.\.\. ok' "$RUNNER_TEMP/t5-typeid-smt-proof.log"
+          grep -E 'T5_TYPED_CHAIN_SMT fixtures=5 orders=3 proofs=15 changed=[1-9][0-9]* negative=2 status=PROVEN' "$RUNNER_TEMP/t5-typeid-smt-proof.log"
+      - name: Check both test suites with strict Clippy
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 4m \
+            cargo clippy -p compiler-opt --test typed_native_parity --test alive_lite -- -D warnings
       - name: Preserve failure diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: t5-typed-pipeline-failure
-          path: ${{ runner.temp }}/t5-typed-pipeline.log
+          path: |
+            ${{ runner.temp }}/t5-typed-pipeline.log
+            ${{ runner.temp }}/t5-typeid-smt-scope.log
+            ${{ runner.temp }}/t5-typeid-smt-proof.log
           if-no-files-found: ignore
           retention-days: 7
