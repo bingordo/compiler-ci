@@ -1,0 +1,48 @@
+name: Verify compiler PR327 typed mem2reg on external minutes
+on:
+  push:
+    branches: [test/typed-mem2reg-pr327]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact compiler PR head
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f8c9260ddc372e745a28ebaebdaaf78ebdf6d059
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require pinned SHA and test source
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = f8c9260ddc372e745a28ebaebdaaf78ebdf6d059
+          test -s compiler/crates/opt/tests/typed_mem2reg.rs
+      - name: Restrict workspace to self-contained compiler crates
+        shell: bash
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typed-mem2reg-pr327
+      - name: Run focused typed and legacy promotion tests
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typed_mem2reg -- --nocapture
+          cargo test -p compiler-opt --test mem2reg_native -- --nocapture
+      - name: Test all self-contained compiler crates
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+      - name: Strict optimizer Clippy including integration tests
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt --all-targets -- -D warnings
