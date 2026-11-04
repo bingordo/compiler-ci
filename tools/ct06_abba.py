@@ -23,6 +23,12 @@ FIELDS = (
 def rounded_median(values):
     return statistics.median(values)
 
+
+def median_absolute_deviation(values):
+    """Median absolute deviation in the input units (robust to outliers)."""
+    center = rounded_median(values)
+    return rounded_median([abs(value - center) for value in values])
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--helpers", required=True, type=Path,
@@ -96,9 +102,13 @@ def main():
         "Different cross-variant ELF hashes are not alone a correctness failure;",
         "they require semantic/native validation.",
         "",
-        "| Case | Scale | Before median ms | After median ms | Speedup | Before RSS MiB | After RSS MiB | ELF hashes |",
-        "|---|---:|---:|---:|---:|---:|---:|---|",
+        "MAD below is median absolute deviation, not a confidence interval.",
+        "",
+        "| Case | Scale | Before median ms | After median ms | Speedup | Before MAD ms | After MAD ms | Before RSS MiB | After RSS MiB | ELF hashes |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
+    medians = {}
+    exact_elf_parity = 0
     for item in entries:
         case = item["case"]
         scale = int(item["scale"])
@@ -111,14 +121,27 @@ def main():
         after = select("after")
         baseline = rounded_median([r["wall_ns"] for r in before]) / 1e6
         revised = rounded_median([r["wall_ns"] for r in after]) / 1e6
+        before_mad = median_absolute_deviation([r["wall_ns"] for r in before]) / 1e6
+        after_mad = median_absolute_deviation([r["wall_ns"] for r in after]) / 1e6
+        medians[(case, scale)] = (baseline, revised)
         before_rss = rounded_median([r["peak_rss_kb"] for r in before]) / 1024
         after_rss = rounded_median([r["peak_rss_kb"] for r in after]) / 1024
         same = before[0]["object_sha256"] == after[0]["object_sha256"]
+        exact_elf_parity += int(same)
         report.append(
             f"| {case} | {scale} | {baseline:.3f} | {revised:.3f} | "
-            f"{baseline / revised:.2f}x | {before_rss:.1f} | "
+            f"{baseline / revised:.2f}x | {before_mad:.3f} | {after_mad:.3f} | {before_rss:.1f} | "
             f"{after_rss:.1f} | {'same' if same else 'different'} |"
         )
+    report.extend(["", f"Exact cross-variant ELF hashes: {exact_elf_parity}/{len(entries)} source cases.", "",
+        "### Scaling ratios (48-step median / 24-step median)",
+        "", "| Case | Before 48/24 | After 48/24 |",
+        "|---|---:|---:|"])
+    for case in ("branch_chain", "array_loop", "call_graph"):
+        if (case, 48) in medians and (case, 24) in medians:
+            before48, after48 = medians[(case, 48)]
+            before24, after24 = medians[(case, 24)]
+            report.append(f"| {case} | {before48 / before24:.2f}x | {after48 / after24:.2f}x |")
     report.extend([
         "", "Full source SHA, toolchain/CPU information, raw subprocess CPU/RSS,",
         "source hash and emitted ELF sizes/hashes are retained alongside this report.",
