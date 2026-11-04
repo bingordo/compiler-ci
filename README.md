@@ -37,36 +37,15 @@ The Alive-lite job additionally runs `tools/validate_alive_lite_evidence.py` on 
 
 **Validation status:** Mini-C and Alive-lite source-build workflows have been reported green. Both poll for source changes every 15 minutes, skipping exact revisions already validated by the corresponding workflow version. The older source-side binary publishers are no longer prerequisites for these two gates. Check individual Actions runs for exact source SHA and test counts.
 
-## Future Csmith whole-program compiler tests (planned; not enabled)
+## M10 Csmith coverage and harness correctness (manual native campaign)
 
-The compiler's [M10 Csmith validation plan](https://github.com/bingordo/compiler/blob/main/docs/Csmith_Validation.md)
-reserves **this repository** for larger, slower compiler differential campaigns.
-It is a *future goal*; no Csmith workflow, accepted Csmith corpus or passing
-Csmith correctness gate exists here yet. Csmith normally generates programs
-using language/runtime features that the current Mini-C compiler does not
-fully implement.
+The compiler's [M10 Csmith plan](https://github.com/bingordo/compiler/blob/main/docs/Csmith_Validation.md) tracks unmodified Csmith-generated translation units. The [manual coverage workflow](.github/workflows/verify-csmith-coverage.yml) downloads a SHA-256-verified, source-commit-pinned **compiled Mini-C driver binary**; it does not rebuild private compiler sources here. It records original source hashes, standard C preprocessing, agreeing GCC/Clang reference outputs, first unsupported frontend diagnostics and native outcomes separately. Its options include the reviewed `restricted-observable` and `restricted-compound` profiles. A source-push event runs only lightweight harness regressions; the expensive Csmith corpus runs **only** on manual dispatch.
 
-When the source compiler can compile unmodified Csmith translation units,
-the source repository will publish **only a pinned compiled compiler/driver
-binary**, with its source commit and SHA-256 checksum, to the private
-distribution branch. This repository's already configured read-only
-`CI_KEY` will fetch **only the binary artifacts**—not private compiler
-source, not Cargo dependencies, not any frontend deploy keys.
+The current measured [eight-seed run #41851768161](https://github.com/bingordo/compiler-ci/actions/runs/41851768161) had **8/8 agreeing reference executions and 0/8 native Mini-C executions**, blocked on hosted floating-point declarations. This is frontend coverage measurement, **not a compiler correctness pass**. See [M10 issue #316](https://github.com/bingordo/compiler/issues/316) for exit criteria before increasing the corpus.
 
-Planned progression: start with manually triggered **8–16 fixed seeds** and
-GCC+Clang-agreed native output; after real acceptance, add **64-seed
-manual milestone tests**, with bounded 20–30 minute jobs, a single active
-campaign and a verified seed replay. Introduce weekly campaigns only if
-the manually run corpus produces useful validation. Cache one pinned Csmith
-generator/runtime installation and precomputed reference outputs rather than
-rebuilding either compiler or generator per seed. Enforce per-compiler and
-per-executable timeouts; record unsupported C, wrong-code, crashes,
-timeouts, and reference disagreement separately. Report acceptance ratios
-and successful comparisons, **not** a misleading green result when all
-generated programs are unsupported.
+The [small source-only harness workflow](.github/workflows/verify-csmith-harness-source.yml) can be manually given an exact compiler source branch/SHA; a change to its own workflow tests compiler `main`. It checks out only the Python harness and pinned Mini-C manifest over the existing read-only `CI_KEY`, compiles both Python files and runs the fail-closed regression suite. [Run #41861539819](https://github.com/bingordo/compiler-ci/actions/runs/41861539819) passed **32 tests** on compiler commit `bea3b5b42e29b6d3cafd4438a5e34ff75a99feeb`, including campaign deadline accounting. No Csmith generator or compiler code build is used in this short gate.
 
-Keep everyday compiler PR validation targeted and short. Full Csmith
-campaigns belong here rather than on each `bingordo/compiler` push.
+A manual native probe has a **360-second soft budget**, evaluated before starting each seed, followed by the existing 8-minute outer hard timeout. On soft-budget exhaustion, each unstarted seed gets an immutable source hash and replay entry with `budget-exhausted`; the campaign returns a nonzero result and `INCOMPLETE_BUDGET` rather than reporting partial success. An already running seed may finish beyond the soft budget, subject to its individual subprocess limits and the hard workflow timeout. Evidence is uploaded even if the probe fails. Native acceptance remains zero until unmodified Csmith programs compile, link, execute and match both references.
 
 
 ## EDG/Cranelift YARPGen differential campaigns
