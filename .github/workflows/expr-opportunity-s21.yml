@@ -1,0 +1,130 @@
+name: S21 synthetic opportunity census pilot
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/expr-opportunity-s21.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  independent-s14:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Read exact compiler S21 revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2ee213ef601a7114ea78ff88518a33d22d4385ff
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Install Z3
+        run: sudo apt-get update -qq && sudo apt-get install -y z3
+      - name: Regenerate and independently check complete S14 rule set
+        run: |
+          set -euo pipefail
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --compose-guards --minimize-rules --commute-inferred \
+            --max-proofs 2000 --max-rules 500 --format rust --output /tmp/s14-s21.rs
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --compose-guards --minimize-rules --commute-inferred \
+            --max-proofs 2000 --max-rules 500 --format rust --check /tmp/s14-s21.rs
+          grep -q 'pub const RULE_COUNT: usize = 152;' /tmp/s14-s21.rs
+          grep -q 'pub const RULE_LIMIT_REACHED: bool = false;' /tmp/s14-s21.rs
+          rustc --edition=2021 -O --test /tmp/s14-s21.rs -o /tmp/s14-s19-tests
+          /tmp/s14-s19-tests
+      - name: Allow read-only public Mini-C frontend
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path=Path('compiler/tools/mini-c-driver/Cargo.toml')
+          data=path.read_text()
+          old='ssh://git@github.com/bingordo/mini-c.git'
+          assert data.count(old)==2
+          path.write_text(data.replace(old,'https://github.com/bingordo/mini-c.git'))
+          PY
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: s21-opportunity-pilot
+      - name: Build actual Mini-C benchmark with fresh 152-rule matcher
+        env:
+          S14_MATCHER_FILE: /tmp/s14-s21.rs
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 12m cargo build --release \
+            --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            --features s14-ssa-audit --example benchmark_generated_fusion
+      - name: Check S14 typed-SSA bitwise and negative regressions
+        env:
+          S14_MATCHER_FILE: /tmp/s14-s21.rs
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('compiler/Cargo.toml').write_text(
+              '[workspace]\nresolver = "2"\nmembers = ["crates/ir","crates/opt"]\n')
+          PY
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt \
+            --features experimental-s14-audit s19_ -- --nocapture \
+            2>&1 | tee /tmp/s21-unit.log
+          grep -F 's19_proven_bitwise_rules_audit_real_typed_i32_ssa_without_mutation ... ok' /tmp/s21-unit.log
+          grep -F 's19_excludes_trapping_and_64_bit_operations ... ok' /tmp/s21-unit.log
+      - name: Execute full deterministic eight-stratum synthetic opportunity audit
+        run: |
+          set -euo pipefail
+          RULE_S8_CASES=48 RULE_S8_SEED=1592590374 timeout --signal=TERM --kill-after=10s 9m \
+            compiler/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion \
+            --sampled --opportunity-audit | tee /tmp/s21-opportunity.log
+      - name: Verify exact source denominator and all row/summary totals
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          lines=Path('/tmp/s21-opportunity.log').read_text().splitlines()
+          rows=[line.split(',') for line in lines if line.startswith('S21_ROW,')]
+          rejected=[line.split(',') for line in lines if line.startswith('S21_REJECT,')]
+          summaries=[line for line in lines if line.startswith('S21_SUMMARY ')]
+          ops=[line.split(',') for line in lines if line.startswith('S21_OP,')]
+          assert len(summaries)==2
+          assert len(rejected)+len(rows)//2==48
+          seen=set(); accum={}
+          for row in rows:
+              assert len(row)==11,row
+              _,idx,shape,hashval,stage,*fields=row
+              assert idx.isdigit() and len(hashval)==16
+              assert stage in ('raw','optimized')
+              assert (idx,stage) not in seen
+              seen.add((idx,stage))
+              values=list(map(int,fields))
+              operations,candidates,matches,representable,shared,eligible=values
+              assert 0<=eligible<=representable<=matches<=candidates<=operations
+              assert shared<=matches
+              totals=accum.setdefault(stage,[0]*6)
+              for i,n in enumerate(values):totals[i]+=n
+          for stage in ('raw','optimized'):
+              assert len([r for r in rows if r[4]==stage])==48-len(rejected)
+          labels=('operations','candidates','matches','representable','shared_inner','eligible')
+          for line in summaries:
+              m=dict(x.split('=',1) for x in line.split()[1:])
+              stage=m.pop('stage')
+              assert stage in accum
+              assert tuple(map(int,(m.pop('attempted'),m.pop('accepted'),m.pop('rejected'))))==(48,48-len(rejected),len(rejected))
+              assert m.pop('s14_rules')=='152'
+              assert [int(m[k]) for k in labels]==accum[stage]
+          for op in ops:
+              assert len(op)==4 and op[1] in accum and int(op[3])>=0
+          assert ops
+          print('S21_AUDIT_OK',accum,'rejected',len(rejected))
+          PY
+      - name: Save report and regeneration evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s19-s14-real-ssa-audit
+          if-no-files-found: warn
+          path: |
+            /tmp/s21-opportunity.log
+            /tmp/s21-unit.log
+            /tmp/s14-s21.rs
