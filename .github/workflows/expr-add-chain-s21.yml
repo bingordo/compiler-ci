@@ -1,0 +1,112 @@
+name: S21 bounded Add/Add fusion native cost check
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/expr-add-chain-s21.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  add-chain-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout exact S21 source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 29d7428c225bba8cb159a7ddebf275ac8aa9dd14
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Use public Mini-C frontend dependency in isolated CI
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("compiler/tools/mini-c-driver/Cargo.toml")
+          s=p.read_text()
+          needle="ssh://git@github.com/bingordo/mini-c.git"
+          assert s.count(needle)==2
+          p.write_text(s.replace(needle,"https://github.com/bingordo/mini-c.git"))
+          PY
+      - name: Cache Cargo compiler dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: s21-add-only-cost
+      - name: Unit-test transactional Add/Add-only fusion
+        run: |
+          set -euo pipefail
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt"]
+          EOF
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt \
+            --features experimental-generated-rules s21_add_add_ -- --nocapture \
+            2>&1 | tee /tmp/s21aa-tests.log
+          grep -F 's21_add_add_isolated_fusion_is_proven_and_bounded ... ok' /tmp/s21aa-tests.log
+          grep -F 's21_add_add_does_not_change_non_add_or_shared_producers ... ok' /tmp/s21aa-tests.log
+          grep -F 's21_add_add_failure_is_transactional ... ok' /tmp/s21aa-tests.log
+      - name: Build native Mini-C audit example with only experimental fusion
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            --features experimental-fusion-benchmark --example benchmark_generated_fusion
+      - name: Measure baseline vs Add/Add-only transformation with GCC native oracle
+        run: |
+          set -euo pipefail
+          RULE_S8_CASES=48 RULE_S8_SEED=1592590374 \
+            timeout --signal=TERM --kill-after=10s 9m \
+            compiler/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion \
+            --sampled --add-chain-eval | tee /tmp/s21aa-native.log
+      - name: Verify complete corpus, legality and ELF/native accounting
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          data=Path("/tmp/s21aa-native.log").read_text().splitlines()
+          info=[x for x in data if x.startswith("S21AA_INFO ")]
+          rows=[x.split(",") for x in data if x.startswith("S21AA_ROW,")]
+          rejects=[x.split(",") for x in data if x.startswith("S21AA_REJECT,")]
+          summary=[x for x in data if x.startswith("S21AA_SUMMARY ")]
+          assert len(info)==len(summary)==1 and 'attempted=48' in info[0]
+          seen=set();t=[0]*7;improved=regressed=unchanged=0
+          for row in rows:
+              assert len(row)==11,row
+              _,index,shape,h,*values=row
+              assert index.isdigit() and index not in seen and len(h)==16
+              seen.add(index)
+              n=list(map(int,values))
+              candidates,eligible,shared,applied,old,new,calls=n
+              assert candidates==eligible+shared
+              assert 0<=applied<=eligible<=candidates
+              assert old>0 and new>0 and calls==24
+              for i,v in enumerate(n):t[i]+=v
+              improved+=(new<old)
+              regressed+=(new>old)
+              unchanged+=(new==old)
+          assert len(rows)+len(rejects)==48
+          r=set()
+          for row in rejects:
+              assert len(row)==5,row
+              assert row[1] not in seen and row[1] not in r
+              r.add(row[1])
+          meta=dict(s.split("=",1) for s in summary[0].split()[1:])
+          exp=dict(attempted=48,accepted=len(rows),rejected=len(rejects),
+              candidates=t[0],eligible=t[1],shared=t[2],applied=t[3],
+              baseline_text_bytes=t[4],experimental_text_bytes=t[5],native_calls=t[6],
+              improved=improved,regressed=regressed,unchanged=unchanged)
+          for k,v in exp.items():assert int(meta[k])==v,(k,meta[k],v)
+          assert int(meta['native_calls'])==len(rows)*24
+          print('S21AA_COST_AUDIT_OK',exp)
+          PY
+      - name: Save audit and test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s21-add-add-native-cost
+          if-no-files-found: warn
+          path: |
+            /tmp/s21aa-native.log
+            /tmp/s21aa-tests.log
