@@ -1,0 +1,111 @@
+name: CT-06 isolated optimizer ABBA compile profiles
+on:
+  workflow_dispatch:
+    inputs:
+      samples:
+        description: ABBA rounds per checked-source case (3-12)
+        required: true
+        type: string
+        default: '5'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct06-recent-optimizers.yml'
+permissions:
+  contents: read
+concurrency:
+  group: ct06-recent-optimizers-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  compare:
+    name: Isolated ${{ matrix.label }} before/after
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: ct05f-ifconv
+            before: '96281b77257fd658fd1462b47d3a4c0ca67125fe'
+            after: '55ca95b45dfe20430ed1f957cac1cac6985adc9c'
+          - label: ct03c-mem2reg
+            before: '55ca95b45dfe20430ed1f957cac1cac6985adc9c'
+            after: 'ff6d869452d4184d559b6657781de26229f7a67b'
+          - label: ct03d-sccp
+            before: '0008ed9652d198f533c55a8f38d8cc80d3d88680'
+            after: '23fcc3410307117fdd069c3ab101349f4be2402a'
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      PAIR: ${{ matrix.label }}
+      CT06_SAMPLES: ${{ inputs.samples || '5' }}
+    steps:
+      - name: Checkout benchmark harness
+        uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Checkout exact before revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ matrix.before }}
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact after revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ matrix.after }}
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record exact source and runner provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C before rev-parse HEAD | tee results/before-sha.txt
+          git -C after rev-parse HEAD | tee results/after-sha.txt
+          printf 'pair=%s\nrounds=%s\n' "$PAIR" "$CT06_SAMPLES" > results/benchmark-parameters.txt
+          rustc --version | tee results/toolchain.txt
+          cargo --version | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\\(s\\)):' | tee -a results/toolchain.txt || true
+          python3 -m py_compile harness/tools/ct06_abba.py after/tools/source_cli_profile.py
+      - name: Configure public pinned Mini-C frontend
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before/tools/mini-c-driver -> target
+            after/tools/mini-c-driver -> target
+          key: ct06-recent-${{ matrix.label }}
+      - name: Build both release Mini-C compiler revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path before/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+          cargo build --release --manifest-path after/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+          sha256sum before/tools/mini-c-driver/target/release/compiler-mini-c after/tools/mini-c-driver/target/release/compiler-mini-c > results/compiler-binaries.sha256
+      - name: Measure checked-source ABBA and retain raw evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x /usr/bin/time
+          python3 after/tools/source_compile_corpus.py --out corpus
+          cp corpus/manifest.csv results/manifest.csv
+          python3 harness/tools/ct06_abba.py \
+            --helpers after/tools --corpus corpus \
+            --before before/tools/mini-c-driver/target/release/compiler-mini-c \
+            --after after/tools/mini-c-driver/target/release/compiler-mini-c \
+            --samples "$CT06_SAMPLES" \
+            --raw results/ct06-raw.csv --report results/ct06-report.md
+          cat results/ct06-report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload reproducible measurements
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ct06-${{ matrix.label }}-abba
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
