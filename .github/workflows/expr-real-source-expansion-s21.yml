@@ -1,0 +1,145 @@
+name: S21 pinned 22-function musl opportunity expansion
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/expr-real-source-expansion-s21.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  independent-s14:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Read exact compiler S21 revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ad20dd064826dc405092c53b8e1a97fedcd2777c
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Install Z3
+        run: sudo apt-get update -qq && sudo apt-get install -y z3
+      - name: Regenerate and independently check complete S14 rule set
+        run: |
+          set -euo pipefail
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --compose-guards --minimize-rules --commute-inferred \
+            --max-proofs 2000 --max-rules 500 --format rust --output /tmp/s14-s21.rs
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --compose-guards --minimize-rules --commute-inferred \
+            --max-proofs 2000 --max-rules 500 --format rust --check /tmp/s14-s21.rs
+          grep -q 'pub const RULE_COUNT: usize = 152;' /tmp/s14-s21.rs
+          grep -q 'pub const RULE_LIMIT_REACHED: bool = false;' /tmp/s14-s21.rs
+          rustc --edition=2021 -O --test /tmp/s14-s21.rs -o /tmp/s14-s19-tests
+          /tmp/s14-s19-tests
+      - name: Allow read-only public Mini-C frontend
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path=Path('compiler/tools/mini-c-driver/Cargo.toml')
+          data=path.read_text()
+          old='ssh://git@github.com/bingordo/mini-c.git'
+          assert data.count(old)==2
+          path.write_text(data.replace(old,'https://github.com/bingordo/mini-c.git'))
+          PY
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: s21-real-expansion
+      - name: Build actual Mini-C benchmark with fresh 152-rule matcher
+        env:
+          S14_MATCHER_FILE: /tmp/s14-s21.rs
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 12m cargo build --release \
+            --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            --features s14-ssa-audit --example benchmark_generated_fusion
+      - name: Check S14 typed-SSA bitwise and negative regressions
+        env:
+          S14_MATCHER_FILE: /tmp/s14-s21.rs
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('compiler/Cargo.toml').write_text(
+              '[workspace]\nresolver = "2"\nmembers = ["crates/ir","crates/opt"]\n')
+          PY
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt \
+            --features experimental-s14-audit s19_ -- --nocapture \
+            2>&1 | tee /tmp/s21-unit.log
+          grep -F 's19_proven_bitwise_rules_audit_real_typed_i32_ssa_without_mutation ... ok' /tmp/s21-unit.log
+          grep -F 's19_excludes_trapping_and_64_bit_operations ... ok' /tmp/s21-unit.log
+      - name: Census all 22 preselected real upstream bodies including rejections
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 9m \
+            compiler/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion \
+            --real-opportunity | tee /tmp/s21-real-expansion.log
+      - name: Revalidate the original 12 native GCC oracle functions
+        run: |
+          set -euo pipefail
+          RULE_S9_REPEATS=3 timeout --signal=TERM --kill-after=10s 9m \
+            compiler/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion \
+            --real-world | tee /tmp/s21-original-musl-oracle.log
+          grep -q 'native_calls=288' /tmp/s21-original-musl-oracle.log
+      - name: Verify expanded real-source denominator and exact row totals
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          data=Path('/tmp/s21-real-expansion.log').read_text().splitlines()
+          info=[s for s in data if s.startswith('S21R_INFO ')]
+          rows=[s.split(',') for s in data if s.startswith('S21R_ROW,')]
+          rej=[s.split(',') for s in data if s.startswith('S21R_REJECT,')]
+          summaries=[s for s in data if s.startswith('S21R_SUMMARY ')]
+          assert len(info)==1 and 'attempted=22' in info[0]
+          assert len(summaries)==2
+          assert len(rej)+len(rows)//2==22
+          names=set(); counts={}
+          for r in rows:
+              assert len(r)==10,r
+              _,name,src_hash,stage,*num=r
+              assert len(src_hash)==16 and stage in ('raw','optimized')
+              assert (name,stage) not in names
+              names.add((name,stage))
+              ns=list(map(int,num))
+              op,candidate,matched,represented,shared,eligible=ns
+              assert 0<=eligible<=represented<=matched<=candidate<=op
+              assert shared<=matched
+              d=counts.setdefault(stage,[0]*6)
+              for j,n in enumerate(ns):d[j]+=n
+          bad=set()
+          for r in rej:
+              assert len(r)==5,r
+              _,name,h,phase,reason=r
+              assert len(h)==16 and phase in ('frontend','functions','optimizer')
+              assert name not in bad and reason
+              bad.add(name)
+          good={name for name,stage in names if stage=='raw'}
+          assert good.isdisjoint(bad) and len(good)+len(bad)==22
+          assert len([r for r in rows if r[3]=='optimized'])==len(good)
+          # The original S9 corpus's 12 functions are all known parseable.
+          assert len(good)>=12
+          labels=('operations','candidates','matches','representable','shared_inner','eligible')
+          for s in summaries:
+              m=dict(q.split('=',1) for q in s.split()[1:])
+              stage=m['stage']
+              assert stage in counts
+              assert (int(m['attempted']),int(m['accepted']),int(m['rejected']))==(22,len(good),len(bad))
+              assert m['generated_rules']=='152'
+              assert [int(m[k]) for k in labels]==counts[stage]
+          print('S21R_ACCOUNTING_OK',len(good),len(bad),counts)
+          PY
+      - name: Save report and regeneration evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s21-real-source-expansion
+          if-no-files-found: warn
+          path: |
+            /tmp/s21-real-expansion.log
+            /tmp/s21-original-musl-oracle.log
+            /tmp/s21-unit.log
+            /tmp/s14-s21.rs
