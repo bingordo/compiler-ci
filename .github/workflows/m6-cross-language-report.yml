@@ -1,0 +1,156 @@
+# Manual M6.2 quality reporting; no timing-based gate or default optimization.
+name: M6 cross-language checked-source report
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact compiler SHA or branch to validate
+        required: true
+        type: string
+        default: main
+  push:
+    branches: [ci/m6-cross-language-report]
+    paths: [.github/workflows/m6-cross-language-report.yml]
+
+permissions:
+  contents: read
+concurrency:
+  group: m6-cross-language-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pin:
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || 'feature/m6-source-corpus-report' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin the exact compiler revision for both languages
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git -C compiler rev-parse HEAD)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  mini-c:
+    needs: pin
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ needs.pin.outputs.sha }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Fetch pinned Mini-C frontend over HTTPS
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: m6-cross-mini-c-v1
+      - name: Run real Mini-C source/native GCC differential tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib \
+            m6_source::m6_real_checked_mini_c_source_vs_gcc -- --nocapture \
+            2>&1 | tee results/m6-mini-c-source.log
+          test "$(grep -c '^M6_MINIC,' results/m6-mini-c-source.log)" -eq 9
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: m6-cross-mini-c
+          path: results/m6-mini-c-source.log
+          if-no-files-found: ignore
+          retention-days: 30
+
+  oberon:
+    needs: pin
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ needs.pin.outputs.sha }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Fetch pinned Oberon frontend over HTTPS
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m6-cross-oberon-v1
+      - name: Run real Oberon source/native C differential tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          cargo test --manifest-path compiler/Cargo.toml -p compiler --bin compiler \
+            m6_checked_oberon_source_vs_c_oracle -- --nocapture \
+            2>&1 | tee results/m6-oberon-source.log
+          test "$(grep -c '^M6_OBERON,' results/m6-oberon-source.log)" -eq 5
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: m6-cross-oberon
+          path: results/m6-oberon-source.log
+          if-no-files-found: ignore
+          retention-days: 30
+
+  summarize:
+    needs: [pin, mini-c, oberon]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ needs.pin.outputs.sha }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: m6-cross-*
+          path: logs
+      - name: Validate report parser
+        run: python3 -m unittest discover -s compiler/tools/tests -p test_m6_source_corpus_summary.py -v
+      - name: Produce pinned cross-language CSV JSON and Markdown
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ needs.pin.outputs.sha }}
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/m6_source_corpus_summary.py \
+            --source-sha "$SOURCE_SHA" \
+            --mini-c logs/m6-cross-mini-c/m6-mini-c-source.log \
+            --oberon logs/m6-cross-oberon/m6-oberon-source.log \
+            --expect-mini-c 9 --expect-oberon 5 \
+            --csv results/m6-source-report.csv \
+            --json results/m6-source-report.json \
+            --markdown results/m6-source-report.md
+          cat results/m6-source-report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: m6-cross-language-report
+          path: results/m6-source-report.*
+          retention-days: 30
