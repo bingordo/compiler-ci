@@ -1,0 +1,87 @@
+name: AArch64 ELF bridge on modern main
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/verify-aarch64-elf-main.yml'
+permissions:
+  contents: read
+concurrency:
+  group: aarch64-elf-main-gate
+  cancel-in-progress: true
+
+jobs:
+  x86-compat:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 290894e941090168eaf6409161c5ccd883e0e6b2
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source SHA and restrict workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "290894e941090168eaf6409161c5ccd883e0e6b2"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo 'Exact compiler SHA: 290894e941090168eaf6409161c5ccd883e0e6b2' >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: aarch64-elf-x86
+          cache-workspace-crates: 'true'
+      - name: Test shared x86 ELF and AArch64 ELF records
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib elf::tests
+          cargo test -p compiler-backend --test aarch64_elf
+          cargo test -p compiler-backend-x86 --lib
+      - name: Strict Clippy including new tests
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
+
+  arm-native:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 290894e941090168eaf6409161c5ccd883e0e6b2
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned source and prepare isolated workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "290894e941090168eaf6409161c5ccd883e0e6b2"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend"]
+          EOF
+          rm -f compiler/Cargo.lock
+          test "$(uname -m)" = aarch64
+          command -v cc
+          command -v readelf
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: aarch64-elf-arm
+          cache-workspace-crates: 'true'
+      - name: Execute native AArch64 ELF/C relocation oracle
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --test aarch64_elf -- --nocapture
+          echo 'AArch64 ET_REL, PREL32 unwind records and native CALL26 C oracle passed for 290894e941090168eaf6409161c5ccd883e0e6b2' >> "$GITHUB_STEP_SUMMARY"
