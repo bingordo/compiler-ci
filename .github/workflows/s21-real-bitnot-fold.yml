@@ -1,0 +1,134 @@
+name: S21 real-source i32 bitnot folding gate
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/s21-real-bitnot-fold.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  bitnot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out exact measured production baseline
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b880d9c14733e12657d26ae089dde0c3ca774588
+          path: old
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check out exact constant-bitnot candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: bb8747c1e7d79b7f587d442432fee57bce7fa2fb
+          path: new
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Build and test self-contained optimizer without private dependencies
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('new/Cargo.toml').write_text(chr(10).join([
+              '[workspace]','resolver = "2"',
+              'members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]','']))
+          PY
+          cargo test --manifest-path new/Cargo.toml --workspace --offline 2>&1 | tee /tmp/s21-bitnot-tests.log
+          cargo clippy --manifest-path new/Cargo.toml --workspace --all-targets --offline -- -D warnings
+          grep -F 'folds_constant_i32_bitnot_but_preserves_runtime_and_i64_complements ... ok' /tmp/s21-bitnot-tests.log
+      - name: Use exact pinned Mini-C public source revisions for the benchmarks
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          for root in ('old','new'):
+              p=Path(root)/'tools/mini-c-driver/Cargo.toml'
+              s=p.read_text()
+              private='ssh://git@github.com/bingordo/mini-c.git'
+              assert s.count(private)==2
+              p.write_text(s.replace(private,'https://github.com/bingordo/mini-c.git'))
+          PY
+      - name: Cache Mini-C build dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: new/tools/mini-c-driver -> target
+          key: s21-bitnot-real
+      - name: Build identical S9/S8 benchmark harness on both revisions
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path old/tools/mini-c-driver/Cargo.toml --features experimental-fusion-benchmark --example benchmark_generated_fusion
+          cargo build --release --manifest-path new/tools/mini-c-driver/Cargo.toml --features experimental-fusion-benchmark --example benchmark_generated_fusion
+      - name: Compare real-source GCC oracle and native code size on all 12 musl functions
+        run: |
+          set -euo pipefail
+          RULE_S9_REPEATS=3 old/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion --real-world | tee /tmp/s21-bitnot-old-real.log
+          RULE_S9_REPEATS=3 new/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion --real-world | tee /tmp/s21-bitnot-new-real.log
+      - name: Compare complete 48-case synthetic regression corpus against GCC
+        run: |
+          set -euo pipefail
+          RULE_S8_CASES=48 RULE_S8_SEED=1592590374 old/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion --sampled --add-chain-eval | tee /tmp/s21-bitnot-old-s8.log
+          RULE_S8_CASES=48 RULE_S8_SEED=1592590374 new/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion --sampled --add-chain-eval | tee /tmp/s21-bitnot-new-s8.log
+      - name: Reconcile source hashes, all native calls and actual code-size benefit
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          def real(version):
+              lines=Path(f'/tmp/s21-bitnot-{version}-real.log').read_text().splitlines()
+              rows=[r.split(',') for r in lines if r.startswith('S9_ROW,')]
+              summaries=[x for x in lines if x.startswith('S9_SUMMARY ')]
+              assert len(rows)==12 and len(summaries)==1
+              info=dict(kv.split('=',1) for kv in summaries[0].split()[1:])
+              assert all(int(info[k])==v for k,v in {
+                  'candidates':12,'supported':12,'unchanged_source':12,
+                  'unsupported':0,'native_calls':288}.items())
+              data={}
+              for r in rows:
+                  assert len(r)==17,r
+                  _,name,mode,hash_value,compiled_hash,*rest=r
+                  assert mode=='unchanged' and hash_value==compiled_hash and len(hash_value)==16
+                  assert name not in data
+                  data[name]=(hash_value,int(r[11]),int(r[12]))
+              assert sum(x[1] for x in data.values())==int(info['text_hand_bytes'])
+              return data
+          old,new=real('old'),real('new')
+          assert old.keys()==new.keys()
+          for name,a in old.items():
+              b=new[name]
+              assert b[0]==a[0],(name,a,b)
+              assert b[1]<=a[1],(name,a,b)
+          base_total=sum(x[1] for x in old.values())
+          new_total=sum(x[1] for x in new.values())
+          print('S21_BITNOT_REAL',dict(base_total=base_total,new_total=new_total,
+              changed={n:(old[n][1],new[n][1]) for n in old if old[n][1]!=new[n][1]},
+              differential_calls=576))
+          assert new['isascii'][1]<old['isascii'][1],('no isascii code-size gain',old['isascii'],new['isascii'])
+          assert new_total<base_total
+          def synthetic(version):
+              lines=Path(f'/tmp/s21-bitnot-{version}-s8.log').read_text().splitlines()
+              rows=[r.split(',') for r in lines if r.startswith('S21AA_ROW,')]
+              summaries=[r for r in lines if r.startswith('S21AA_SUMMARY ')]
+              assert len(rows)==48 and len(summaries)==1
+              info=dict(t.split('=',1) for t in summaries[0].split()[1:])
+              assert int(info['attempted'])==int(info['accepted'])==48
+              assert int(info['rejected'])==0 and int(info['native_calls'])==1152
+              d={}
+              for r in rows:
+                  assert len(r)==11 and int(r[-1])==24
+                  _,case,shape,h,*_=r
+                  assert case not in d
+                  d[case]=(shape,h,int(r[8]))
+              assert sum(v[2] for v in d.values())==int(info['baseline_text_bytes'])
+              return d
+          a,b=synthetic('old'),synthetic('new')
+          assert a==b,[(k,a.get(k),b.get(k)) for k in a if a[k]!=b.get(k)]
+          print('S21_BITNOT_SYNTHETIC_VERIFIED',len(a),'all unchanged',sum(x[2] for x in a.values()),'native_calls',2304)
+          PY
+      - name: Preserve native correctness and source-size evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s21-bitnot-real-code-size
+          if-no-files-found: warn
+          path: /tmp/s21-bitnot-*.log
