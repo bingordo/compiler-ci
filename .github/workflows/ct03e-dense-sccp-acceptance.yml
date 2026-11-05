@@ -1,0 +1,104 @@
+name: "CT-03e dense SCCP queue: core and paired ABI-safe performance"
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct03e-dense-sccp-acceptance.yml'
+permissions:
+  contents: read
+concurrency:
+  group: ct03e-dense-sccp-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  validate-and-compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Checkout exact pre-change compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '991c326c21339a81e4cd34cfa53ce4595b093b64'
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact CT-03e head
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 'c00a5ebd6520d34854da4919c09cd946c3aabf3b'
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record provenance and verify byte-identical SSA fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C before rev-parse HEAD | tee results/before-sha.txt
+          git -C after rev-parse HEAD | tee results/after-sha.txt
+          rustc --version | tee results/toolchain.txt
+          cargo --version | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\\(s\\)):' | tee -a results/toolchain.txt || true
+          python3 -m py_compile harness/tools/ct04_hotspot_compare.py
+          for checkout in before after; do
+            mkdir -p "$checkout/crates/opt/examples"
+            cp harness/tools/ct06_optimizer_hotspots.rs \
+              "$checkout/crates/opt/examples/ct06_optimizer_hotspots.rs"
+            cat > "$checkout/Cargo.toml" <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+            rm -f "$checkout/Cargo.lock"
+          done
+          cmp before/crates/opt/examples/ct06_optimizer_hotspots.rs \
+            after/crates/opt/examples/ct06_optimizer_hotspots.rs
+          sha256sum before/crates/opt/examples/ct06_optimizer_hotspots.rs \
+            after/crates/opt/examples/ct06_optimizer_hotspots.rs | tee results/fixture-sha.txt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before -> target
+            after -> target
+          key: ct03e-dense-sccp
+      - name: Rust IR/opt/x86 regression and strict production Clippy
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path after/Cargo.toml \
+            -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+          cargo clippy --manifest-path after/Cargo.toml \
+            -p compiler-ir -p compiler-opt --lib -- -D warnings
+      - name: Release-build exact pre/post optimizer binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --offline --manifest-path before/Cargo.toml \
+            -p compiler-opt --example ct06_optimizer_hotspots
+          cargo build --release --offline --manifest-path after/Cargo.toml \
+            -p compiler-opt --example ct06_optimizer_hotspots
+      - name: Same-runner SCCP forward/reverse ABBA with exact SSA signatures
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct04_hotspot_compare.py \
+            --pair ct03d \
+            --before before/target/release/examples/ct06_optimizer_hotspots \
+            --after after/target/release/examples/ct06_optimizer_hotspots \
+            --rounds 5 --raw results/raw.csv --report results/report.md
+          cat results/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Save full evidence for review
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ct03e-dense-sccp-evidence
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
