@@ -1,4 +1,4 @@
-name: S21 ADD-chain CFG regression diagnostics
+name: S21 if-conversion select-budget candidate
 on:
   push:
     branches: [main]
@@ -11,19 +11,19 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
-      - name: Checkout pinned pre-production compiler
-        uses: actions/checkout@v4
-        with:
-          repository: bingordo/compiler
-          ref: a2c24a1de2087ec177928c1bd20ae4880a1b63f4
-          path: old
-          ssh-key: ${{ secrets.CI_KEY }}
-          persist-credentials: false
-      - name: Checkout pinned merged production compiler
+      - name: Checkout merged production baseline
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
           ref: 2ed3ee8400ee426aba635d79f5a8331abdbd2e0f
+          path: old
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout select-budget candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 47fb2f63df294bde881cd57ca6c2a597c8abe78b
           path: new
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -74,6 +74,15 @@ jobs:
         with:
           workspaces: new/tools/mini-c-driver -> target
           key: s21-cfg-diag
+      - name: Test and lint affected optimizer crate
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('new/Cargo.toml').write_text('[workspace]\\nresolver = "2"\\nmembers = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]\\n')
+          PY
+          cargo test --manifest-path new/Cargo.toml -p compiler-opt --offline
+          cargo clippy --manifest-path new/Cargo.toml -p compiler-opt --all-targets --offline -- -D warnings
       - name: Build both diagnostic binaries
         run: |
           set -euo pipefail
@@ -113,12 +122,20 @@ jobs:
           assert old.keys()==new.keys()==set(range(48))
           for idx in range(48):
               assert old[idx][:2]==new[idx][:2],idx
-          for idx,old_size,new_size in ((1,53,63),(41,59,69)):
+          for idx,old_size in ((1,63),(41,69)):
               assert old[idx][2]==old_size,(idx,old[idx])
-              assert new[idx][2]==new_size,(idx,new[idx])
+              assert new[idx][2]<old_size,(idx,new[idx])
               print('S21_DIAG_VERIFIED',idx,'old_default',old[idx][2],
                   'old_post_fusion',old[idx][3],'new_default',new[idx][2],
                   'new_post_fusion',new[idx][3],'source_sha_tag',old[idx][0])
+          old_total=sum(row[2] for row in old.values())
+          new_total=sum(row[2] for row in new.values())
+          gains=[idx for idx in old if new[idx][2]<old[idx][2]]
+          regressions=[idx for idx in old if new[idx][2]>old[idx][2]]
+          print('S21_BUDGET_SUMMARY old_total',old_total,'new_total',new_total,
+                'improved_cases',gains,'regressed_cases',regressions)
+          assert not regressions,regressions
+          assert new_total < old_total,(old_total,new_total)
           print('S21_DIAG_NATIVE_VERIFIED cases=48 per_version_calls=1152')
           PY
       - name: Preserve source, SSA, disassembly and native differential evidence
