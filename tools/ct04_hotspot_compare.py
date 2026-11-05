@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ABBA comparison of exact compiler revisions on deliberately phi-heavy SSA.
+"""ABBA comparison of exact compiler revisions on verifier-valid SSA stress cases.
 
 Both binaries use the same injected Rust fixture source. Every sample is a
 fresh process, but measured nanoseconds come from the in-process optimizer/
@@ -16,6 +16,20 @@ import tempfile
 from pathlib import Path
 
 CASES = {
+    "ct03c": [
+        ("mem2reg_slots", 32, 12),
+        ("mem2reg_slots", 96, 6),
+        ("mem2reg_slots", 192, 3),
+        ("mem2reg_slots", 256, 2),
+    ],
+    "ct03d": [
+        ("sccp_reverse", 32, 12),
+        ("sccp_reverse", 96, 6),
+        ("sccp_reverse", 256, 2),
+        ("sccp_forward", 32, 12),
+        ("sccp_forward", 96, 6),
+        ("sccp_forward", 256, 2),
+    ],
     "ct04a": [
         ("pointer_reverse", 64, 8),
         ("pointer_reverse", 128, 4),
@@ -48,7 +62,7 @@ FIELDS = (
     "work_ns", "ns_per_iter", "peak_rss_kb", "signature",
 )
 RESULT = re.compile(
-    r"^CT04 case=(\w+) size=(\d+) iterations=(\d+) "
+    r"^CT0[46] case=(\w+) size=(\d+) iterations=(\d+) "
     r"ns=(\d+) signature=([0-9a-f]{16})$"
 )
 
@@ -133,12 +147,12 @@ def main():
         writer.writerows(rows)
 
     report = [
-        f"# CT-04 {args.pair} isolated worklist benchmark",
+        f"# {'CT-04' if args.pair.startswith('ct04') else 'CT-06'} {args.pair} isolated optimizer benchmark",
         "",
         "Same-runner release-built binaries, identical injected Rust SSA fixtures.",
         f"{args.rounds} interleaved ABBA rounds, two processes per variant per round.",
         "Measured ns/iteration includes fixture cloning, the *actual*",
-        "IR verifier/phi pass, and result destruction (not process startup).",
+        "IR optimizer/verifier pass, and result destruction (not process startup).",
         "Peak RSS is per-process GNU time; output signatures match.",
         "These artificial verified SSA stress cases do **not** measure",
         "end-to-end C or Oberon source-to-ELF compile latency.",
