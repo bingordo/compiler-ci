@@ -1,0 +1,108 @@
+name: CT-06 isolated SCCP and mem2reg hotspot ABBA
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct06-isolated-pass-hotspots.yml'
+      - 'tools/ct06_optimizer_hotspots.rs'
+      - 'tools/ct04_hotspot_compare.py'
+permissions:
+  contents: read
+concurrency:
+  group: ct06-pass-hotspots-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pair: ct03c
+            before_ref: '55ca95b45dfe20430ed1f957cac1cac6985adc9c'
+            after_ref: 'ff6d869452d4184d559b6657781de26229f7a67b'
+          - pair: ct03d
+            before_ref: '0008ed9652d198f533c55a8f38d8cc80d3d88680'
+            after_ref: '23fcc3410307117fdd069c3ab101349f4be2402a'
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Checkout exact before source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ matrix.before_ref }}
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact after source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ matrix.after_ref }}
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record provenance and install byte-identical replay source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C before rev-parse HEAD | tee results/before-sha.txt
+          git -C after rev-parse HEAD | tee results/after-sha.txt
+          rustc --version | tee results/toolchain.txt
+          cargo --version | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\\(s\\)):' | tee -a results/toolchain.txt || true
+          python3 -m py_compile harness/tools/ct04_hotspot_compare.py
+          for checkout in before after; do
+            mkdir -p "$checkout/crates/opt/examples"
+            cp harness/tools/ct06_optimizer_hotspots.rs \
+              "$checkout/crates/opt/examples/ct06_optimizer_hotspots.rs"
+            cat > "$checkout/Cargo.toml" <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+            rm -f "$checkout/Cargo.lock"
+          done
+          sha256sum before/crates/opt/examples/ct06_optimizer_hotspots.rs \
+            after/crates/opt/examples/ct06_optimizer_hotspots.rs | tee results/fixture-sha256.txt
+          cmp before/crates/opt/examples/ct06_optimizer_hotspots.rs \
+            after/crates/opt/examples/ct06_optimizer_hotspots.rs
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before -> target
+            after -> target
+          key: ct06-isolated-${{ matrix.pair }}
+      - name: Build two release IR optimizer benchmark binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --offline --manifest-path before/Cargo.toml \
+            -p compiler-opt --example ct06_optimizer_hotspots
+          cargo build --release --offline --manifest-path after/Cargo.toml \
+            -p compiler-opt --example ct06_optimizer_hotspots
+      - name: Run five same-runner ABBA rounds with exact output signatures
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct04_hotspot_compare.py \
+            --pair "${{ matrix.pair }}" \
+            --before before/target/release/examples/ct06_optimizer_hotspots \
+            --after after/target/release/examples/ct06_optimizer_hotspots \
+            --rounds 5 --raw results/raw.csv --report results/report.md
+          cat results/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload diagnostic measurements and provenance
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ct06-isolated-${{ matrix.pair }}
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
