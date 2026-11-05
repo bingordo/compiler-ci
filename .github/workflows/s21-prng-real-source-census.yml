@@ -1,0 +1,176 @@
+name: S21 pinned musl PRNG integer-helper census
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/s21-prng-real-source-census.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audited-prng:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact candidate compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 15032f50b9c592e452148c03930b386b90828196
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify immutable upstream Git blobs and unchanged function spans
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/expr-rule-gen/harness/prepare_s21_prng_sources.py \
+            --manifest compiler/tools/expr-rule-gen/harness/s21_prng_real_sources.json \
+            --output-dir /tmp/s21-prng | tee /tmp/s21-prng-provenance.log
+          grep -qx 'S21_PRNG_FETCH_OK selected=3 exact_functions=3' /tmp/s21-prng-provenance.log
+          test "$(grep -c '^S21_PRNG_PIN,' /tmp/s21-prng-provenance.log)" -eq 3
+      - name: Install offline Z3 prover
+        run: sudo apt-get update -qq && sudo apt-get install -y z3
+      - name: Regenerate complete 152-rule reference matcher
+        run: |
+          set -euo pipefail
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --compose-guards --minimize-rules --commute-inferred \
+            --max-proofs 2000 --max-rules 500 --format rust --output /tmp/s21-prng-rules.rs
+          grep -q 'pub const RULE_COUNT: usize = 152;' /tmp/s21-prng-rules.rs
+          grep -q 'pub const RULE_LIMIT_REACHED: bool = false;' /tmp/s21-prng-rules.rs
+      - name: Use unchanged public Mini-C revision pinned in the compiler
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('compiler/tools/mini-c-driver/Cargo.toml')
+          s=p.read_text()
+          private='ssh://git@github.com/bingordo/mini-c.git'
+          assert s.count(private)==2
+          p.write_text(s.replace(private,'https://github.com/bingordo/mini-c.git'))
+          PY
+      - name: Cache independent benchmark dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: s21-prng-provenance
+      - name: Test exact name-only extraction and build audit binary
+        env:
+          S14_MATCHER_FILE: /tmp/s21-prng-rules.rs
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            --features s14-ssa-audit --example benchmark_generated_fusion \
+            rejects_non_alias_or_bodies_modified_outside_signature -- --nocapture
+          cargo build --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            --features s14-ssa-audit --example benchmark_generated_fusion
+      - name: Count every pinned source accepted or rejected, with native GCC oracle
+        env:
+          RULE_S21_PRNG_DIR: /tmp/s21-prng
+        run: |
+          set -euo pipefail
+          compiler/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion \
+            --s21-prng-real | tee /tmp/s21-prng-results.log
+      - name: Independently reconcile full corpus, native calls, and all SSA operators
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          m=json.loads(Path('compiler/tools/expr-rule-gen/harness/s21_prng_real_sources.json').read_text())
+          specs={x['id']:x for x in m['files']}
+          assert len(specs)==3
+          lines=Path('/tmp/s21-prng-results.log').read_text().splitlines()
+          info=[x for x in lines if x.startswith('S21P_INFO ')]
+          schema=[x.split(',') for x in lines if x.startswith('S21P_OPS_SCHEMA,')]
+          accepted=[x.split(',') for x in lines if x.startswith('S21P_ROW,')]
+          rejected=[x.split(',') for x in lines if x.startswith('S21P_REJECT,')]
+          summary=[x for x in lines if x.startswith('S21P_SUMMARY ')]
+          assert len(info)==len(schema)==len(summary)==1
+          names=('const_i32','const_i64','const_bool','add','sub','mul',
+                 'div_rem','bit_and','bit_or','bit_xor','shift','cmp','select',
+                 'cast','bit_not','ctz','address','memory','call')
+          assert schema[0][4:]==list(names)
+          assert len(accepted)>=1 and len(accepted)+len(rejected)==len(specs)
+          def hash_source(s):
+              h=0xcbf29ce484222325
+              for c in s.encode():
+                  h=((h^c)*0x100000001b3)&((1<<64)-1)
+              return f'{h:016x}'
+          hashes={}
+          for id,spec in specs.items():
+              source=Path(f'/tmp/s21-prng/{id}.c').read_text()
+              signature=spec['signature']
+              renamed=signature.replace(spec['symbol'],'f',1)
+              assert source.startswith(signature) and signature.count(spec['symbol'])==1
+              assert source.replace(signature,renamed,1).replace(renamed,signature,1)==source
+              hashes[id]=hash_source(source.replace(signature,renamed,1))
+          ids=set()
+          totals=dict(attempted=len(specs),accepted=len(accepted),rejected=len(rejected),
+                      applied=0,baseline_bytes=0,trial_bytes=0,native_calls=0)
+          for r in rejected:
+              assert len(r)==5,r
+              _,id,h,stage,reason=r
+              assert id in specs and id not in ids and h==hashes[id]
+              assert stage in ('frontend','function_count') and reason
+              ids.add(id)
+          for r in accepted:
+              assert len(r)==18,r
+              _,id,h,*values=r
+              assert id in specs and id not in ids and h==hashes[id]
+              ids.add(id)
+              v=list(map(int,values))
+              assert len(v)==15
+              raw,opt,rawarith,optarith,rawpairs,optpairs,rawmatch,optmatch,rewrites,before,after,calls,rawbits,optbits,shift=v
+              assert raw>=rawarith>=rawpairs>=rawmatch>=0
+              assert opt>=optarith>=optpairs>=optmatch>=0
+              assert raw>=rawbits and opt>=optbits and opt>=shift
+              assert before>0 and after>0 and rewrites>=0
+              assert calls==(30 if specs[id]['abi']=='uint64_t' else 22)
+              for k,n in [('applied',rewrites),('baseline_bytes',before),
+                          ('trial_bytes',after),('native_calls',calls)]:
+                  totals[k]+=n
+          assert ids==set(specs)
+          pairs={}
+          for key in ('RAW','OPT'):
+              rows=[x.split(',') for x in lines if x.startswith('S21P_OPS_'+key+',')]
+              assert len(rows)==len(accepted)
+              accum=[0]*len(names)
+              identities=set()
+              for row in rows:
+                  assert len(row)==4+len(names),row
+                  _,id,h,total,*nums=row
+                  assert id in ids and id not in identities and h==hashes[id]
+                  assert id not in {r[1] for r in rejected}
+                  identities.add(id)
+                  counts=list(map(int,nums))
+                  assert all(n>=0 for n in counts) and int(total)==sum(counts)
+                  for j,c in enumerate(counts):accum[j]+=c
+                  pairs[id,key]=counts
+              total_rows=[x.split(',') for x in lines if x.startswith('S21P_TOTAL_'+key+',')]
+              assert len(total_rows)==1
+              _,who,h,total,*vals=total_rows[0]
+              assert who=='all' and h=='0000000000000000'
+              assert list(map(int,vals))==accum and sum(accum)==int(total)
+              print('S21_PRNG_OPS_RECONCILED',key,dict(zip(names,accum)))
+          for r in accepted:
+              _,id,_,*values=r
+              v=list(map(int,values))
+              raw=pairs[id,'RAW']
+              opt=pairs[id,'OPT']
+              assert v[0]==sum(raw) and v[1]==sum(opt)
+              assert v[12]==sum(raw[j] for j in (7,8,9))
+              assert v[13]==sum(opt[j] for j in (7,8,9))
+              assert v[14]==opt[10]
+          fields=dict(kv.split('=',1) for kv in summary[0].split()[1:])
+          for k,val in totals.items():
+              assert int(fields[k])==val,(k,fields[k],val)
+          print('S21_PRNG_CORPUS_VERIFIED',totals,'accepted_ids',[r[1] for r in accepted],
+                'rejected_ids',[r[1] for r in rejected])
+          PY
+      - name: Preserve sources provenance and native verification
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s21-prng-real-source-census
+          if-no-files-found: warn
+          path: |
+            /tmp/s21-prng-provenance.log
+            /tmp/s21-prng-results.log
