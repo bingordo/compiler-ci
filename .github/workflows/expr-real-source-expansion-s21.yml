@@ -15,7 +15,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 7553b93f390550d01f2b3e70b68c0272c3775549
+          ref: 8da617329d091b6bb5043de2500bfc9cd3378e18
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -151,6 +151,52 @@ jobs:
               assert m['generated_rules']=='152'
               assert [int(m[k]) for k in labels]==counts[stage]
           print('S21R_ACCOUNTING_OK',len(good),len(bad),counts)
+          PY
+      - name: Independently reconcile raw and optimized opcode histograms
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          lines=Path('/tmp/s21-real-expansion.log').read_text().splitlines()
+          prefixes=('S21R_OPS_RAW','S21R_OPS_OPT')
+          schema=[s.split(',') for s in lines if s.startswith('S21R_OPS_SCHEMA,')]
+          assert len(schema)==1
+          labels=schema[0][4:]
+          assert labels==['const_i32','const_i64','const_bool','add','sub','mul',
+              'div_rem','bit_and','bit_or','bit_xor','shift','cmp',
+              'select','cast','bit_not','ctz','address','memory','call']
+          rows=[s.split(',') for s in lines if s.startswith(prefixes[0]+',') or s.startswith(prefixes[1]+',')]
+          totals=[s.split(',') for s in lines if s.startswith('S21R_OPS_TOTAL_')]
+          audit=[s.split(',') for s in lines if s.startswith('S21R_ROW,')]
+          reject=[s.split(',') for s in lines if s.startswith('S21R_REJECT,')]
+          accepted={(r[1],r[2]) for r in audit if r[3]=='raw'}
+          assert len(accepted)+len(reject)==22
+          assert len(accepted)>=12 and len(rows)==2*len(accepted)
+          assert len(totals)==2 and len(schema[0])==4+len(labels)
+          by_stage={}
+          for row in rows:
+              assert len(row)==4+len(labels),row
+              tag,name,hash_value,total,*nums=row
+              assert len(hash_value)==16 and (name,hash_value) in accepted
+              stage=tag.removeprefix('S21R_OPS_')
+              assert stage in ('RAW','OPT')
+              key=(name,stage)
+              assert key not in by_stage,key
+              counts=list(map(int,nums))
+              assert all(n>=0 for n in counts) and sum(counts)==int(total)
+              by_stage[key]=counts
+          assert {(name,stage) for name,_ in accepted for stage in ('RAW','OPT')}==set(by_stage)
+          for summary in totals:
+              assert len(summary)==4+len(labels)
+              tag,name,h,total,*ns=summary
+              assert name=='all' and h=='0000000000000000'
+              stage=tag.removeprefix('S21R_OPS_TOTAL_')
+              assert stage in ('RAW','OPT')
+              actual=[sum(v[j] for (n,s),v in by_stage.items() if s==stage)
+                  for j in range(len(labels))]
+              assert list(map(int,ns))==actual
+              assert int(total)==sum(actual)
+              print('S21R_OPS_RECONCILED',stage,'accepted',len(accepted),'total',total,
+                  dict(zip(labels,actual)))
           PY
       - name: Save report and regeneration evidence
         if: always()
