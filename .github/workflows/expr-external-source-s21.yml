@@ -1,0 +1,112 @@
+name: S21 pinned external bit kernels opportunity probe
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/expr-external-source-s21.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  real-kernels:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout exact S21 external kernel harness
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1235d68d9f87ee8b435e0783cf6cc10c5c58d0fa
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Fetch and Git-blob verify selected upstream C functions
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/expr-rule-gen/harness/prepare_s21_external_sources.py \
+            --manifest compiler/tools/expr-rule-gen/harness/s21_external_real_sources.json \
+            --output-dir /tmp/s21-upstream | tee /tmp/s21-external-pin.log
+          grep -q '^S21_EXTERNAL_FETCH_OK selected=4 copied_function_bodies=4' /tmp/s21-external-pin.log
+          test "$(grep -c '^S21_EXTERNAL_PIN,' /tmp/s21-external-pin.log)" -eq 4
+      - name: Use public Mini-C dependency for read-only CI
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('compiler/tools/mini-c-driver/Cargo.toml')
+          s=p.read_text()
+          original='ssh://git@github.com/bingordo/mini-c.git'
+          assert s.count(original)==2
+          p.write_text(s.replace(original,'https://github.com/bingordo/mini-c.git'))
+          PY
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: s21-external-kernel-probe
+      - name: Check exact source name-only alias test
+        run: |
+          cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            --features experimental-fusion-benchmark --example benchmark_generated_fusion \
+            rename_is_only_symbol_byte_change -- --nocapture
+      - name: Build native upstream kernel benchmark
+        run: |
+          cargo build --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            --features experimental-fusion-benchmark --example benchmark_generated_fusion
+      - name: Census real function acceptance, native object size and GCC differential
+        env:
+          RULE_S21_EXTERNAL_DIR: /tmp/s21-upstream
+        run: |
+          set -euo pipefail
+          compiler/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion \
+            --s21-external-kernels | tee /tmp/s21-external-native.log
+      - name: Independently verify all four source identities and complete results
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          data=Path('/tmp/s21-external-native.log').read_text().splitlines()
+          selected=('freebsd_abs','freebsd_ffs','freebsd_fls','gcc_ffs')
+          info=[q for q in data if q.startswith('S21EXT_INFO ')]
+          rows=[q.split(',') for q in data if q.startswith('S21EXT_ROW,')]
+          rejected=[q.split(',') for q in data if q.startswith('S21EXT_REJECT,')]
+          summaries=[q for q in data if q.startswith('S21EXT_SUMMARY ')]
+          assert len(info)==1 and 'attempted=4' in info[0]
+          assert len(summaries)==1 and len(rows)+len(rejected)==4
+          identity=set(); total=dict(attempted=4,accepted=len(rows),rejected=len(rejected),
+              applied=0,improved=0,unchanged=0,regressed=0,
+              baseline_bytes=0,trial_bytes=0,native_calls=0)
+          for r in rows:
+              assert len(r)==8,r
+              _,name,hash_value,ops,applied,before,after,calls=r
+              assert name in selected and name not in identity
+              assert len(hash_value)==16
+              identity.add(name)
+              ops,applied,before,after,calls=map(int,(ops,applied,before,after,calls))
+              assert ops>=applied>=0 and min(before,after)>0 and calls==24
+              for k,v in [('applied',applied),('baseline_bytes',before),
+                          ('trial_bytes',after),('native_calls',calls)]:
+                  total[k]+=v
+              total['improved']+=(after<before)
+              total['unchanged']+=(after==before)
+              total['regressed']+=(after>before)
+          for r in rejected:
+              assert len(r)==5,r
+              _,name,hash_value,stage,reason=r
+              assert name in selected and name not in identity
+              assert len(hash_value)==16 and stage in ('frontend','function_count') and reason
+              identity.add(name)
+          assert identity==set(selected)
+          assert len(rows)>=1,'all external functions were rejected'
+          meta=dict(x.split('=',1) for x in summaries[0].split()[1:])
+          for key,value in total.items():
+              assert int(meta[key])==value,(key,meta[key],value)
+          assert total['native_calls']==len(rows)*24
+          print('S21_EXTERNAL_VERIFIED',total)
+          PY
+      - name: Upload provenance and native logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s21-real-external-kernels
+          if-no-files-found: warn
+          path: |
+            /tmp/s21-external-pin.log
+            /tmp/s21-external-native.log
