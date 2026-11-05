@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       source_ref:
-        description: "Compiler commit/branch to test (default: main)"
+        description: "Compiler commit/branch to test (default: T5 stage proof PR)"
         required: false
         type: string
   push:
@@ -26,7 +26,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ inputs.source_ref || 'main' }}
+          ref: ${{ inputs.source_ref || 'c1c9482ba113f64db6b99cb78a4a7f8d4651392b' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -94,6 +94,30 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/t5-typeid-smt-proof.log"
           grep -E 'test result: ok\. 1 passed; 0 failed;' "$RUNNER_TEMP/t5-typeid-smt-proof.log"
           grep -E 'T5_TYPED_CHAIN_SMT fixtures=5 orders=3 proofs=15 changed=[1-9][0-9]* negative=2 status=PROVEN' "$RUNNER_TEMP/t5-typeid-smt-proof.log"
+      - name: Verify every intermediate typed stage stays within exact-word proof scope
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 3m \
+            cargo test -p compiler-opt --test alive_lite \
+              t5_typed_every_intermediate_stage_stays_in_exact_word_scope \
+              -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/t5-stage-scope.log"
+          grep -F 'test alive_lite_typed_pipeline::t5_typed_every_intermediate_stage_stays_in_exact_word_scope ... ok' "$RUNNER_TEMP/t5-stage-scope.log"
+      - name: Prove all changed intermediate typed stages with Z3
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 4m \
+            cargo test -p compiler-opt --test alive_lite \
+              t5_typed_stage_by_stage_smt_proves_each_changed_transition \
+              -- --ignored --nocapture --test-threads=1 \
+            2>&1 | tee "$RUNNER_TEMP/t5-stage-proof.log"
+          grep -F 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/t5-stage-proof.log"
+          grep -E 'T5_TYPED_STAGE_SMT fixtures=5 orders=3 stages=90 changed_proven=[1-9][0-9]* changed_passes=[2-9] status=PROVEN' "$RUNNER_TEMP/t5-stage-proof.log"
+          echo 'Selected typed-stage SMT proofs PASSED (changed transitions only)' >> "$GITHUB_STEP_SUMMARY"
       - name: Check both test suites with strict Clippy
         shell: bash
         working-directory: compiler
@@ -110,5 +134,7 @@ jobs:
             ${{ runner.temp }}/t5-typed-pipeline.log
             ${{ runner.temp }}/t5-typeid-smt-scope.log
             ${{ runner.temp }}/t5-typeid-smt-proof.log
+            ${{ runner.temp }}/t5-stage-scope.log
+            ${{ runner.temp }}/t5-stage-proof.log
           if-no-files-found: ignore
           retention-days: 7
