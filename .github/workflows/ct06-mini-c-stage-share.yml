@@ -1,0 +1,87 @@
+name: CT-06 checked Mini-C optimizer stage attribution
+on:
+  workflow_dispatch:
+    inputs:
+      compiler_ref:
+        description: Exact compiler SHA or branch to profile
+        required: true
+        type: string
+        default: main
+      repetitions:
+        description: Samples per checked source (3-21)
+        required: true
+        type: string
+        default: '11'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct06-mini-c-stage-share.yml'
+      - 'tools/ct06_stage_shares.py'
+permissions:
+  contents: read
+concurrency:
+  group: ct06-mini-c-stage-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      OPT_PROFILE_REPETITIONS: ${{ inputs.repetitions || '11' }}
+    steps:
+      - name: Checkout benchmark harness
+        uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Checkout compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.compiler_ref || 'main' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Source and runner provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C compiler rev-parse HEAD | tee results/compiler-sha.txt
+          rustc --version | tee results/toolchain.txt
+          cargo --version | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\\(s\\)):' | tee -a results/toolchain.txt || true
+          printf 'repetitions=%s\n' "$OPT_PROFILE_REPETITIONS" > results/parameters.txt
+          python3 -m py_compile harness/tools/ct06_stage_shares.py
+      - name: Configure pinned public Mini-C frontend
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: ct06-mini-c-stage
+      - name: Run the existing checked Mini-C optimizer-stage profiling test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release \
+            --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --lib \
+            full_optimizer_stage_profile_mini_c \
+            -- --ignored --nocapture 2>&1 | tee results/mini-c-stages.log
+      - name: Summarize SCCP and mem2reg stage costs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct06_stage_shares.py \
+            --log results/mini-c-stages.log \
+            --report results/stage-shares.md --csv results/stage-shares.csv
+          cat results/stage-shares.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Archive source-level evidence
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ct06-mini-c-stage-shares
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
