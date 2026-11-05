@@ -1,0 +1,56 @@
+name: AArch64 local C function ELF bindings
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/verify-aarch64-local-functions.yml'
+permissions:
+  contents: read
+concurrency:
+  group: aarch64-local-function-source
+  cancel-in-progress: true
+jobs:
+  native:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 22
+    steps:
+      - name: Configure read-only SSH for pinned frontends
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub SSH host
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b58fca40d285f78da71a77a9ad5349d37ad91727
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler source and native host
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 'b58fca40d285f78da71a77a9ad5349d37ad91727'
+          test "$(uname -m)" = aarch64
+          command -v readelf
+          command -v nm
+          command -v cc
+          echo 'Compiler source b58fca40d285f78da71a77a9ad5349d37ad91727' >> "$GITHUB_STEP_SUMMARY"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: aarch64-local-c-functions
+          cache-workspace-crates: 'true'
+      - name: Native AArch64 ABI, ELF and CFI regression suite
+        working-directory: compiler
+        run: cargo test -p compiler-backend-aarch64 --all-targets -- --test-threads=1
+      - name: Build actual pinned-frontends unified compiler
+        working-directory: compiler
+        run: RUSTFLAGS="-D warnings" cargo build -p compiler --bin compiler
+      - name: Execute public and private checked-source C oracles
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          COMPILER_DRIVER="$PWD/target/debug/compiler" bash tests/aarch64_driver_integration.sh
+          echo 'Private recursive C static function retained STB_LOCAL and passed independent C oracle' >> "$GITHUB_STEP_SUMMARY"
