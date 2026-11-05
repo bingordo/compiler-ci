@@ -97,6 +97,38 @@ jobs:
           RULE_S8_CASES=48 RULE_S8_SEED=1592590374 \
             timeout --signal=TERM --kill-after=10s 10m new/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion \
             --sampled --add-chain-eval | tee /tmp/s21-after.log
+      - name: Native GCC differential for 12 unchanged pinned musl bodies on both compilers
+        run: |
+          set -euo pipefail
+          RULE_S9_REPEATS=3 old/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion --real-world | tee /tmp/s21-musl-before.log
+          RULE_S9_REPEATS=3 new/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion --real-world | tee /tmp/s21-musl-after.log
+          python3 - <<'PY'
+          from pathlib import Path
+          def read(label):
+              lines=Path('/tmp/s21-musl-'+label+'.log').read_text().splitlines()
+              rows=[s.split(',') for s in lines if s.startswith('S9_ROW,')]
+              assert len(rows)==12,(label,len(rows))
+              m={}
+              for row in rows:
+                  assert len(row)==17,row
+                  _,name,mode,sourcehash,compiledhash,blocks,ssa_hand,ssa_fused,arith_hand,arith_fused,applied,text_hand,text_fused,*timing=row
+                  assert name not in m and mode=='unchanged' and sourcehash==compiledhash
+                  m[name]=(sourcehash,int(text_hand),int(text_fused))
+              summaries=[s for s in lines if s.startswith('S9_SUMMARY ')]
+              assert len(summaries)==1
+              info=dict(t.split('=',1) for t in summaries[0].split()[1:])
+              assert all(int(info[k])==v for k,v in {'candidates':12,'supported':12,'unchanged_source':12,'unsupported':0,'native_calls':288}.items())
+              assert sum(row[1] for row in m.values())==int(info['text_hand_bytes'])
+              return m
+          old,new=read('before'),read('after')
+          assert old.keys()==new.keys()
+          for name,(sourcehash,base,_) in old.items():
+              assert new[name][0]==sourcehash
+              assert new[name][1]<=base,(name,base,new[name][1])
+          print('S21_MUSL_VERIFIED',len(new),'before_bytes',sum(v[1] for v in old.values()),
+              'after_bytes',sum(v[1] for v in new.values()),
+              'native_calls',576)
+          PY
       - name: Reconcile exact source and native size regressions
         run: |
           python3 - <<'PY'
