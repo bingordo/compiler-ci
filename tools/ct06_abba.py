@@ -38,6 +38,10 @@ def main():
     ap.add_argument("--after", required=True, type=Path)
     ap.add_argument("--samples", default=5, type=int,
                     help="ABBA rounds; each variant runs twice per round")
+    ap.add_argument("--extended-24-128", action="store_true",
+                    help="use exact generated 24/48/96/128 Mini-C corpus")
+    ap.add_argument("--require-identical-elf", action="store_true",
+                    help="fail if an A/B case emitted different ELF hashes")
     ap.add_argument("--raw", required=True, type=Path)
     ap.add_argument("--report", required=True, type=Path)
     args = ap.parse_args()
@@ -48,7 +52,11 @@ def main():
     from source_cli_profile import one_compile, read_manifest
 
     corpus = args.corpus.resolve()
-    entries = read_manifest(corpus / "manifest.csv", corpus, "mini_c")
+    if args.extended_24_128:
+        from ct06_large_corpus import read_manifest as read_large_manifest
+        entries = read_large_manifest(corpus / "manifest.csv", corpus, args.helpers)
+    else:
+        entries = read_manifest(corpus / "manifest.csv", corpus, "mini_c")
     binaries = {"before": args.before.resolve(), "after": args.after.resolve()}
     for name, binary in binaries.items():
         if not binary.is_file():
@@ -128,6 +136,8 @@ def main():
         after_rss = rounded_median([r["peak_rss_kb"] for r in after]) / 1024
         same = before[0]["object_sha256"] == after[0]["object_sha256"]
         exact_elf_parity += int(same)
+        if args.require_identical_elf and not same:
+            raise AssertionError(f"unexpected A/B ELF mismatch: {case}/{scale}")
         report.append(
             f"| {case} | {scale} | {baseline:.3f} | {revised:.3f} | "
             f"{baseline / revised:.2f}x | {before_mad:.3f} | {after_mad:.3f} | {before_rss:.1f} | "
@@ -142,6 +152,17 @@ def main():
             before48, after48 = medians[(case, 48)]
             before24, after24 = medians[(case, 24)]
             report.append(f"| {case} | {before48 / before24:.2f}x | {after48 / after24:.2f}x |")
+    if args.extended_24_128:
+        report.extend(["", "### Larger-source scaling ratios", "",
+            "| Case | Before 96/48 | After 96/48 | Before 128/96 | After 128/96 |",
+            "|---|---:|---:|---:|---:|"])
+        for case in ("branch_chain", "array_loop", "call_graph"):
+            values = [medians.get((case, scale)) for scale in (48, 96, 128)]
+            if any(v is None for v in values):
+                raise ValueError(f"missing larger-source medians: {case}")
+            (b48, a48), (b96, a96), (b128, a128) = values
+            report.append(f"| {case} | {b96/b48:.2f}x | {a96/a48:.2f}x | "
+                          f"{b128/b96:.2f}x | {a128/a96:.2f}x |")
     report.extend([
         "", "Full source SHA, toolchain/CPU information, raw subprocess CPU/RSS,",
         "source hash and emitted ELF sizes/hashes are retained alongside this report.",
