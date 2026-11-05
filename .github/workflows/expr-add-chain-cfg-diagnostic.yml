@@ -1,0 +1,130 @@
+name: S21 ADD-chain CFG regression diagnostics
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/expr-add-chain-cfg-diagnostic.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout pinned pre-production compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a2c24a1de2087ec177928c1bd20ae4880a1b63f4
+          path: old
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout pinned merged production compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2ed3ee8400ee426aba635d79f5a8331abdbd2e0f
+          path: new
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Instrument only benchmark harness and expose public frontend
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          for root in ('old', 'new'):
+              manifest = Path(root)/'tools/mini-c-driver/Cargo.toml'
+              s = manifest.read_text()
+              private = 'ssh://git@github.com/bingordo/mini-c.git'
+              assert s.count(private) == 2, (root, s.count(private))
+              manifest.write_text(s.replace(private, 'https://github.com/bingordo/mini-c.git'))
+
+              main = Path(root)/'tools/mini-c-driver/examples/benchmark_generated_fusion.rs'
+              s = main.read_text()
+              needle = '    std::fs::remove_dir_all(&tmp).map_err(|e|e.to_string())?;'
+              assert s.count(needle) == 1, root
+              diag = '''
+    // Read-only diagnostic on two pinned S8 cases. All native checks ran first.
+    if name == "s21aa_001" || name == "s21aa_041" {
+        for (variant,path) in [("default",&obj_baseline),("post_fusion",&obj_fused)] {
+            let mut dis = Command::new("objdump");
+            dis.arg("-dr").arg(path);
+            println!("S21_DIAG_DISASM_BEGIN case={name} version={} variant={variant}", env!("CARGO_PKG_VERSION"));
+            println!("{}", command(dis,"objdump -dr")?);
+            println!("S21_DIAG_DISASM_END case={name} variant={variant}");
+        }
+    }
+'''
+              main.write_text(s.replace(needle, diag+needle))
+
+              sampled = Path(root)/'tools/mini-c-driver/examples/benchmark_generated_fusion/sampled.rs'
+              s = sampled.read_text()
+              needle = '        let (old_size,new_size,calls)=native_check('
+              assert s.count(needle) == 1, root
+              diag = '''
+        if index == 1 || index == 41 {
+            println!("S21_DIAG_SOURCE case={index} source={source}");
+            println!("S21_DIAG_DEFAULT_SSA case={index} {:#?}",base[0]);
+            println!("S21_DIAG_POST_FUSION_SSA case={index} {:#?}",experimental[0]);
+        }
+'''
+              sampled.write_text(s.replace(needle, diag+needle))
+          PY
+      - name: Cache checked Mini-C crates
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: new/tools/mini-c-driver -> target
+          key: s21-cfg-diag
+      - name: Build both diagnostic binaries
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path old/tools/mini-c-driver/Cargo.toml --features experimental-fusion-benchmark --example benchmark_generated_fusion
+          cargo build --release --manifest-path new/tools/mini-c-driver/Cargo.toml --features experimental-fusion-benchmark --example benchmark_generated_fusion
+      - name: Native differential, SSA and x86 disassembly for pinned cases
+        run: |
+          set -euo pipefail
+          RULE_S8_CASES=48 RULE_S8_SEED=1592590374 \
+            timeout --signal=TERM --kill-after=10s 10m old/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion \
+            --sampled --add-chain-eval | tee /tmp/s21-before.log
+          RULE_S8_CASES=48 RULE_S8_SEED=1592590374 \
+            timeout --signal=TERM --kill-after=10s 10m new/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion \
+            --sampled --add-chain-eval | tee /tmp/s21-after.log
+      - name: Reconcile exact source and native size regressions
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          def read(name):
+              data=Path(f'/tmp/s21-{name}.log').read_text()
+              lines=data.splitlines()
+              rows=[r.split(',') for r in lines if r.startswith('S21AA_ROW,')]
+              assert len(rows)==48,(name,len(rows))
+              for idx in ('1','41'):
+                  assert f'S21_DIAG_SOURCE case={idx} ' in data
+                  assert f'S21_DIAG_DEFAULT_SSA case={idx} ' in data
+                  assert f'S21_DIAG_POST_FUSION_SSA case={idx} ' in data
+                  assert f'S21_DIAG_DISASM_BEGIN case=s21aa_{int(idx):03}' in data
+              out={}
+              for r in rows:
+                  assert len(r)==11 and int(r[-1])==24,r
+                  _,idx,shape,h,cand,elig,shared,applied,normal,extra,calls=r
+                  out[int(idx)]=(h,shape,int(normal),int(extra),int(applied))
+              assert sum(int(r[-1]) for r in rows)==1152
+              return out
+          old,new=read('before'),read('after')
+          assert old.keys()==new.keys()==set(range(48))
+          for idx in range(48):
+              assert old[idx][:2]==new[idx][:2],idx
+          for idx,old_size,new_size in ((1,53,63),(41,59,69)):
+              assert old[idx][2]==old_size,(idx,old[idx])
+              assert new[idx][2]==new_size,(idx,new[idx])
+              print('S21_DIAG_VERIFIED',idx,'old_default',old[idx][2],
+                  'old_post_fusion',old[idx][3],'new_default',new[idx][2],
+                  'new_post_fusion',new[idx][3],'source_sha_tag',old[idx][0])
+          print('S21_DIAG_NATIVE_VERIFIED cases=48 per_version_calls=1152')
+          PY
+      - name: Preserve source, SSA, disassembly and native differential evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s21-add-chain-cfg-regression-evidence
+          if-no-files-found: warn
+          path: /tmp/s21-*.log
