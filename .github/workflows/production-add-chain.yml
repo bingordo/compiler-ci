@@ -1,0 +1,171 @@
+name: Production Add/Add algebra gate
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/production-add-chain.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  production-add:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout exact old compiler baseline
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a2c24a1de2087ec177928c1bd20ae4880a1b63f4
+          path: baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact production candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 710707a3f6d694686eb8639dcca52e5ab9a914c1
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Test and lint production core including typed SSA
+        run: |
+          set -euo pipefail
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          EOF
+          cargo test --manifest-path compiler/Cargo.toml --workspace --offline \
+            2>&1 | tee /tmp/algebra-prod-core-tests.log
+          cargo clippy --manifest-path compiler/Cargo.toml --workspace --all-targets --offline -- -D warnings \
+            2>&1 | tee /tmp/algebra-prod-clippy.log
+      - name: Use public Mini-C frontend for read-only external CI
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          for root in ('baseline','compiler'):
+              p=Path(root)/'tools/mini-c-driver/Cargo.toml'
+              s=p.read_text()
+              old='ssh://git@github.com/bingordo/mini-c.git'
+              assert s.count(old)==2
+              p.write_text(s.replace(old,'https://github.com/bingordo/mini-c.git'))
+          PY
+      - name: Cache Mini-C dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: algebra-production-add
+      - name: Build old and production experimental benchmark binaries
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path baseline/tools/mini-c-driver/Cargo.toml \
+            --features experimental-fusion-benchmark --example benchmark_generated_fusion
+          cargo build --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            --features experimental-fusion-benchmark --example benchmark_generated_fusion
+      - name: Differential 48-case native GCC before and after production
+        run: |
+          set -euo pipefail
+          RULE_S8_CASES=48 RULE_S8_SEED=1592590374 \
+            timeout --signal=TERM --kill-after=10s 10m \
+            baseline/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion \
+            --sampled --add-chain-eval | tee /tmp/algebra-prod-before.log
+          RULE_S8_CASES=48 RULE_S8_SEED=1592590374 \
+            timeout --signal=TERM --kill-after=10s 10m \
+            compiler/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion \
+            --sampled --add-chain-eval | tee /tmp/algebra-prod-after.log
+      - name: Execute unchanged pinned musl native reference regressions
+        run: |
+          set -euo pipefail
+          RULE_S9_REPEATS=3 \
+            compiler/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion \
+            --real-world | tee /tmp/algebra-prod-musl.log
+          grep -q 'native_calls=288' /tmp/algebra-prod-musl.log
+      - name: Record default source to ELF compilation timing before and after
+        run: |
+          set -euo pipefail
+          rustc --version --verbose > /tmp/algebra-prod-env.log
+          grep -m1 'model name' /proc/cpuinfo >> /tmp/algebra-prod-env.log
+          RULE_S21_CT_REPEATS=3 RULE_S21_CT_BATCH=3 RULE_S21_CT_PASS_BATCH=32 \
+            baseline/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion \
+            --add-chain-timing | tee /tmp/algebra-prod-before-timing.log
+          RULE_S21_CT_REPEATS=3 RULE_S21_CT_BATCH=3 RULE_S21_CT_PASS_BATCH=32 \
+            compiler/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion \
+            --add-chain-timing | tee /tmp/algebra-prod-after-timing.log
+      - name: Independently reconcile both versions and measurable machine code gain
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          def read(label):
+              lines=Path('/tmp/algebra-prod-'+label+'.log').read_text().splitlines()
+              rows=[q.split(',') for q in lines if q.startswith('S21AA_ROW,')]
+              summaries=[q for q in lines if q.startswith('S21AA_SUMMARY ')]
+              assert len(rows)==48 and len(summaries)==1
+              d={}
+              totals=[0,0,0,0]
+              for r in rows:
+                  assert len(r)==11,r
+                  _,case,shape,h,candidates,eligible,shared,applied,normal,extra,calls=r
+                  assert case not in d and len(h)==16 and int(calls)==24
+                  assert int(candidates)>=int(eligible)>=int(applied)>=0
+                  d[case]=dict(shape=shape,hash=h,normal=int(normal),
+                      extra=int(extra),applied=int(applied))
+                  for j,n in enumerate((int(normal),int(extra),int(applied),int(calls))):
+                      totals[j]+=n
+              s=dict(token.split('=',1) for token in summaries[0].split()[1:])
+              assert int(s['attempted'])==int(s['accepted'])==48
+              assert int(s['rejected'])==0
+              for key,value in [('baseline_text_bytes',totals[0]),
+                                ('experimental_text_bytes',totals[1]),
+                                ('applied',totals[2]),('native_calls',totals[3])]:
+                  assert int(s[key])==value
+              assert totals[3]==1152
+              return d,totals
+          old,ot=read('before')
+          new,nt=read('after')
+          assert old.keys()==new.keys()
+          improved=worse=same=0
+          for case,a in old.items():
+              b=new[case]
+              assert (a['hash'],a['shape'])==(b['hash'],b['shape'])
+              improved+=(b['normal']<a['normal'])
+              worse+=(b['normal']>a['normal'])
+              same+=(b['normal']==a['normal'])
+          print('PRODUCTION_ADD_CODE_SIZE',dict(
+              old_baseline_bytes=ot[0],old_experimental_bytes=ot[1],
+              new_production_bytes=nt[0],new_experimental_bytes=nt[1],
+              old_experimental_applied=ot[2],new_experimental_applied=nt[2],
+              improved=improved,worse=worse,same=same,native_calls=ot[3]+nt[3]))
+          assert nt[0]<ot[0], 'no measurable gain in production native code'
+          assert improved>0
+          def timing(label):
+              lines=Path('/tmp/algebra-prod-'+label+'-timing.log').read_text().splitlines()
+              summaries=[q for q in lines if q.startswith('S21CT_SUMMARY ')]
+              assert len(summaries)==2
+              m={}
+              for row in summaries:
+                  s=dict(token.split('=',1) for token in row.split()[1:])
+                  group=s.pop('group')
+                  assert group in ('synthetic','real')
+                  n=48 if group=='synthetic' else 12
+                  assert int(s['attempted'])==int(s['accepted'])==n
+                  assert int(s['rejected'])==0 and int(s['native_calls'])==n*24
+                  m[group]=s
+              return m
+          before,after=timing('before'),timing('after')
+          for group in ('synthetic','real'):
+              o=int(before[group]['sum_baseline_full_medians_ns'])
+              n=int(after[group]['sum_baseline_full_medians_ns'])
+              print('PRODUCTION_ADD_COMPILE',group,
+                    'before_sum_medians_ns='+str(o),
+                    'after_sum_medians_ns='+str(n),
+                    'ratio='+str(round(n/o,4)))
+          print('PRODUCTION_ADD_VERIFIED')
+          PY
+      - name: Save all correctness, size and compilation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: algebra-production-add-comparison
+          if-no-files-found: warn
+          path: |
+            /tmp/algebra-prod-*.log
