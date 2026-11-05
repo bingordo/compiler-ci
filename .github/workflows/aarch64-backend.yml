@@ -70,7 +70,7 @@ jobs:
     needs: detect-change
     if: needs.detect-change.outputs.should_test == 'true'
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Configure SSH for compiler checkout
         uses: webfactory/ssh-agent@v0.9.0
@@ -86,6 +86,13 @@ jobs:
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
+      - name: Checkout pinned public Mini-C frontend
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: 421e0b93b0b78409987e37cf9c43f8e58ed92cb3
+          path: mini-c
+          persist-credentials: false
       - name: Report exact compiler revision under test
         env:
           COMPILER_SHA: ${{ needs.detect-change.outputs.source_sha }}
@@ -96,11 +103,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p aarch64-workspace/crates
+          mkdir -p aarch64-workspace/crates aarch64-workspace/tools
           cp -a compiler/crates/ir compiler/crates/opt compiler/crates/backend \
             compiler/crates/backend-x86 compiler/crates/backend-aarch64 \
             compiler/crates/driver aarch64-workspace/crates/
           cp -a compiler/examples compiler/tests aarch64-workspace/
+          cp -a compiler/tools/mini-c-driver aarch64-workspace/tools/
           cat > aarch64-workspace/Cargo.toml <<'EOF'
           [workspace]
           resolver = "2"
@@ -142,6 +150,18 @@ jobs:
           set -euo pipefail
           bash tests/aarch64_frontend_integration.sh
           echo 'Source frontend + shared SSA/optimization + native AArch64 ELF integration passed: Flow 19,551-case oracle, Math 20,402-result implicit ELF target, 16 argument calls, recursion, arrays and unsupported output diagnostics.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Test checked Mini-C AArch64 emission without x86-native unit oracles
+        working-directory: aarch64-workspace
+        shell: bash
+        env:
+          MINI_C_LOCAL_REPO: ${{ github.workspace }}/mini-c
+          CARGO_TARGET_DIR: ${{ github.workspace }}/aarch64-workspace/target
+        run: |
+          set -euo pipefail
+          bash tools/mini-c-driver/cargo-local.sh test -p compiler-mini-c --lib aarch64_ -- --test-threads=1
+          bash tools/mini-c-driver/cargo-local.sh build -p compiler-mini-c --bin compiler-mini-c
+          MINI_C_COMPILER="$CARGO_TARGET_DIR/debug/compiler-mini-c" bash tests/aarch64_mini_c_integration.sh
+          echo 'Checked Mini-C C source -> shared SSA/opt -> AArch64 ELF -> C oracle passed (AAPCS64, recursion, loops, pointers, byte loads, signed division/remainder); unsupported output modes rejected.' >> "$GITHUB_STEP_SUMMARY"
       - name: Record successful verification
         run: |
           mkdir -p .aarch64-verified
