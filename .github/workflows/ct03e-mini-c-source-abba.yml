@@ -1,0 +1,84 @@
+name: CT-03e dense SCCP real Mini-C source-to-ELF ABBA
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct03e-mini-c-source-abba.yml'
+permissions:
+  contents: read
+concurrency:
+  group: ct03e-mini-c-source-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '991c326c21339a81e4cd34cfa53ce4595b093b64'
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 'c00a5ebd6520d34854da4919c09cd946c3aabf3b'
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Provenance and checked-source harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C before rev-parse HEAD | tee results/before-sha.txt
+          git -C after rev-parse HEAD | tee results/after-sha.txt
+          rustc --version | tee results/toolchain.txt
+          cargo --version | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\\(s\\)):' | tee -a results/toolchain.txt || true
+          python3 -m py_compile harness/tools/ct06_abba.py after/tools/source_cli_profile.py
+      - name: Allow public pinned Mini-C frontend dependency
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before/tools/mini-c-driver -> target
+            after/tools/mini-c-driver -> target
+          key: ct03e-source-abba
+      - name: Build exact parent and new SCCP release compilers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path before/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+          cargo build --release --manifest-path after/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+      - name: Real Mini-C source-to-ELF ABBA and exact object parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x /usr/bin/time
+          python3 after/tools/source_compile_corpus.py --out corpus
+          cp corpus/manifest.csv results/manifest.csv
+          python3 harness/tools/ct06_abba.py \
+            --helpers after/tools --corpus corpus \
+            --before before/tools/mini-c-driver/target/release/compiler-mini-c \
+            --after after/tools/mini-c-driver/target/release/compiler-mini-c \
+            --samples 5 \
+            --raw results/raw.csv --report results/report.md
+          cat results/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Save source and compiler provenance
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ct03e-mini-c-abba
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
