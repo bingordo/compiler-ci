@@ -1,0 +1,116 @@
+name: "CT-06 extended Mini-C ABBA 24/48/96/128: dense SCCP"
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct06-large-source-abba.yml'
+      - 'tools/ct06_large_corpus.py'
+      - 'tools/ct06_abba.py'
+permissions:
+  contents: read
+concurrency:
+  group: ct06-extended-mini-c-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  compare:
+    name: Independent hosted-runner session ${{ matrix.session }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        session: [a, b]
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout benchmark harness
+        uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Checkout exact pre-CT03e compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '991c326c21339a81e4cd34cfa53ce4595b093b64'
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact dense SCCP compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 'c00a5ebd6520d34854da4919c09cd946c3aabf3b'
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Exact revision, toolchain and CPU evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C before rev-parse HEAD | tee results/before-sha.txt
+          git -C after rev-parse HEAD | tee results/after-sha.txt
+          printf 'session=%s\nABBA_rounds=5\nscales=24,48,96,128\n' \
+            "${{ matrix.session }}" | tee results/parameters.txt
+          rustc --version | tee results/toolchain.txt
+          cargo --version | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\\(s\\)):' | tee -a results/toolchain.txt || true
+          python3 -m py_compile harness/tools/ct06_abba.py \
+            harness/tools/ct06_large_corpus.py after/tools/source_compile_corpus.py \
+            after/tools/source_cli_profile.py
+      - name: Configure HTTPS for pinned public Mini-C
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before/tools/mini-c-driver -> target
+            after/tools/mini-c-driver -> target
+          key: ct06-extended-mini-c-sccp-${{ matrix.session }}
+      - name: Build exact parent and dense-queue release compiler binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path before/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --bin compiler-mini-c
+          cargo build --release --manifest-path after/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --bin compiler-mini-c
+          sha256sum before/tools/mini-c-driver/target/release/compiler-mini-c \
+            after/tools/mini-c-driver/target/release/compiler-mini-c \
+            > results/compiler-binaries.sha256
+      - name: Generate and verify 24/48/96/128 real Mini-C cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct06_large_corpus.py \
+            --helpers after/tools --out corpus
+          cp corpus/manifest.csv results/source-manifest.csv
+          python3 - <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, 'harness/tools')
+          from ct06_large_corpus import read_manifest
+          assert len(read_manifest(Path('corpus/manifest.csv'),
+                                   Path('corpus'), Path('after/tools'))) == 12
+          PY
+      - name: Same-runner checked-source ABBA with strict ELF parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x /usr/bin/time
+          python3 harness/tools/ct06_abba.py \
+            --helpers after/tools --corpus corpus \
+            --before before/tools/mini-c-driver/target/release/compiler-mini-c \
+            --after after/tools/mini-c-driver/target/release/compiler-mini-c \
+            --extended-24-128 --require-identical-elf \
+            --samples 5 --raw results/ct06-raw.csv --report results/ct06-report.md
+          cat results/ct06-report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Archive samples, hashes, source manifest and provenance
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ct06-large-mini-c-${{ matrix.session }}
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
