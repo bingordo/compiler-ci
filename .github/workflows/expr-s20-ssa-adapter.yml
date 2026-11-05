@@ -1,0 +1,111 @@
+name: S20 verified SSA audit adapter cost
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/expr-s20-ssa-adapter.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  ssa-adapter:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact compiler SSA audit revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e210d1b7beaeef142e987afdaa31f8f2f81582a5
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Install Z3 to regenerate real S14 matcher
+        run: sudo apt-get update -qq && sudo apt-get install -y z3
+      - name: Reproduce full S14 152-rule basis
+        run: |
+          set -euo pipefail
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --compose-guards --minimize-rules --commute-inferred \
+            --max-proofs 2000 --max-rules 500 --format rust --output /tmp/s20-ssa-matcher.rs
+          grep -q 'pub const RULE_COUNT: usize = 152;' /tmp/s20-ssa-matcher.rs
+          grep -q 'pub const RULE_LIMIT_REACHED: bool = false;' /tmp/s20-ssa-matcher.rs
+      - name: Allow read-only public Mini-C source
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path=Path("compiler/tools/mini-c-driver/Cargo.toml")
+          s=path.read_text()
+          original="ssh://git@github.com/bingordo/mini-c.git"
+          assert s.count(original)==2
+          path.write_text(s.replace(original,"https://github.com/bingordo/mini-c.git"))
+          PY
+      - name: Cache Mini-C benchmark dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: s20-ssa-audit
+      - name: Compile experimental SSA audit with fresh rule file
+        env:
+          S14_MATCHER_FILE: /tmp/s20-ssa-matcher.rs
+        run: |
+          cargo build --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            --features s14-ssa-audit --example benchmark_generated_fusion
+      - name: Time verified SSA scan independently from standalone verifier
+        run: |
+          set -euo pipefail
+          rustc --version > /tmp/s20-ssa-system.log
+          uname -a >> /tmp/s20-ssa-system.log
+          grep -m1 "model name" /proc/cpuinfo >> /tmp/s20-ssa-system.log
+          RULE_S20_SSA_REPEATS=5 RULE_S20_SSA_CALLS=500 \
+          compiler/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion \
+            --s20-ssa-adapter | tee /tmp/s20-ssa-audit.log
+      - name: Independently validate source denominators and timing rows
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          d=Path("/tmp/s20-ssa-audit.log").read_text().splitlines()
+          rows=[x.split(',') for x in d if x.startswith("S20_SSA_ROW,")]
+          rejected=[x.split(',') for x in d if x.startswith("S20_SSA_REJECT,")]
+          summaries=[x for x in d if x.startswith("S20_SSA_SUMMARY ")]
+          assert len([x for x in d if x.startswith("S20_SSA_INFO ")])==1
+          assert len(summaries)==2
+          assert len(rows)+len(rejected)==60
+          def fields(line):
+              return dict(x.split('=',1) for x in line.split()[1:])
+          for group,n in (('synthetic',48),('real',12)):
+              good=[x for x in rows if x[1]==group]
+              bad=[x for x in rejected if x[1]==group]
+              assert len(good)+len(bad)==n
+              assert len({x[2] for x in good+bad})==n
+              aggregate=dict(attempted=n,accepted=len(good),rejected=len(bad),
+                  instructions=0,candidates=0,matches=0,
+                  sum_verify_median_ns=0,sum_audit_median_ns=0)
+              for row in good:
+                  assert len(row)==9,row
+                  _,g,name,h,*values=row
+                  assert len(h)==16 and name
+                  inst,candidates,matches,verify_ns,audit_ns=map(int,values)
+                  assert inst>=0 and 0<=matches<=candidates and verify_ns>0 and audit_ns>0
+                  for k,v in zip(('instructions','candidates','matches',
+                                  'sum_verify_median_ns','sum_audit_median_ns'),values):
+                      aggregate[k]+=int(v)
+              for row in bad:
+                  assert len(row)==6,row
+                  assert len(row[3])==16 and row[4] in ('frontend','function_count')
+              summary=next(x for x in summaries if 'group='+group+' ' in x)
+              meta=fields(summary)
+              for k,value in aggregate.items():
+                  assert int(meta[k])==value,(group,k,meta.get(k),value)
+              assert len(good)==n
+              print("S20_SSA_ACCOUNTING_OK",group,aggregate)
+          PY
+      - name: Save adapter measurements and CPU environment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s20-ssa-adapter-cost
+          if-no-files-found: warn
+          path: |
+            /tmp/s20-ssa-audit.log
+            /tmp/s20-ssa-system.log
+            /tmp/s20-ssa-matcher.rs
