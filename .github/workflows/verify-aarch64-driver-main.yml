@@ -1,0 +1,55 @@
+name: AArch64 unified driver source-to-ELF
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/verify-aarch64-driver-main.yml'
+permissions:
+  contents: read
+concurrency:
+  group: aarch64-unified-driver
+  cancel-in-progress: true
+
+jobs:
+  arm-source:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - name: Configure read-only SSH for pinned frontends
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub SSH host for pinned source dependencies
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: bf0ab052828744afd6cb58ab14de85a4a8395fa3
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler source SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = bf0ab052828744afd6cb58ab14de85a4a8395fa3
+          test "$(uname -m)" = aarch64
+          command -v cc
+          command -v readelf
+          echo 'AArch64 source integration at compiler SHA bf0ab052828744afd6cb58ab14de85a4a8395fa3' >> "$GITHUB_STEP_SUMMARY"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: aarch64-unified-driver
+          cache-workspace-crates: 'true'
+      - name: Compile real Oberon/Mini-C unified compiler binary
+        working-directory: compiler
+        run: RUSTFLAGS="-D warnings" cargo build -p compiler --bin compiler
+      - name: Execute checked source-to-AArch64 ELF linked C oracles
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          COMPILER_DRIVER="$PWD/target/debug/compiler" bash tests/aarch64_driver_integration.sh
+          echo 'Native ARM64 unified driver source C oracles + x86 default and unsupported-mode checks passed.' >> "$GITHUB_STEP_SUMMARY"
