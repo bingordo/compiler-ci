@@ -1,0 +1,78 @@
+name: Verify internal-function relocation roots (focused)
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Compiler commit or branch to verify"
+        required: false
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/verify-dead-function-relocation.yml'
+permissions:
+  contents: read
+concurrency:
+  group: dead-function-relocation-${{ inputs.source_ref || 'default' }}
+  cancel-in-progress: true
+jobs:
+  reachability:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout source revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || 'a3d5554d7b667f00ecbfd1023eeeb796b312f511' }}
+          ssh-key: ${{ secrets.CI_KEY }}
+          path: compiler
+          persist-credentials: false
+      - name: Record exact source and require regression fixture
+        run: |
+          set -euo pipefail
+          git -C compiler rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
+          test -s compiler/crates/backend-x86/tests/dead_function_relocation_native.rs
+      - name: Restrict workspace to Rust compiler core
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: prune-relocation-v1
+      - name: Test module roots and fail-closed behavior
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib dead_functions::tests -- --nocapture 2>&1 |
+            tee "$RUNNER_TEMP/dead-functions-unit.log"
+          grep -F 'test dead_functions::tests::private_relocation_root_keeps_transitive_callees_but_prunes_dead_scc ... ok' "$RUNNER_TEMP/dead-functions-unit.log"
+          grep -F 'test dead_functions::tests::code_address_use_in_public_function_preserves_private_symbol ... ok' "$RUNNER_TEMP/dead-functions-unit.log"
+          grep -F 'test dead_functions::tests::malformed_relocation_is_rejected_without_module_mutation ... ok' "$RUNNER_TEMP/dead-functions-unit.log"
+      - name: Verify private relocation through GAS and direct ELF
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test dead_function_relocation_native -- --nocapture 2>&1 |
+            tee "$RUNNER_TEMP/dead-function-native.log"
+          grep -F 'test relocated_private_function_survives_pruning_in_gas_and_direct_elf ... ok' "$RUNNER_TEMP/dead-function-native.log"
+          cargo test -p compiler-backend-x86 --test m4_global_pointer_relocations_native -- --nocapture
+      - name: Enforce strict Clippy including all tests
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend-x86 --all-targets -- -D warnings
+      - name: Preserve failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dead-function-relocation-failure
+          path: |
+            ${{ runner.temp }}/dead-functions-unit.log
+            ${{ runner.temp }}/dead-function-native.log
+          if-no-files-found: ignore
+          retention-days: 7
