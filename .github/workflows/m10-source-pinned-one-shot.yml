@@ -1,0 +1,134 @@
+name: M10 source-pinned original Csmith diagnostic corpus
+
+# One bounded, branch-scoped source-build investigation. Do not promote this
+# heavyweight experiment to main/push or call reference-only results a pass.
+on:
+  push:
+    branches: [ci/m10-source-corpus-20261105]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: m10-source-corpus-20261105
+  cancel-in-progress: false
+
+jobs:
+  original-corpus:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout exact compiler source snapshot
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c4053c6334ff835991c171fde58752f3d6861c35
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record immutable compiler and frontend provenance
+        id: pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="$(git -C compiler rev-parse HEAD)"
+          test "$src" = c4053c6334ff835991c171fde58752f3d6861c35
+          frontend="$(python3 - <<'PY'
+          from pathlib import Path
+          import sys
+          sys.path.insert(0,'compiler/tools')
+          from csmith_probe import pinned_frontend_revision
+          print(pinned_frontend_revision(Path('compiler/tools/mini-c-driver/Cargo.toml').read_text()))
+          PY
+          )"
+          echo "source_sha=$src" >> "$GITHUB_OUTPUT"
+          echo "frontend_sha=$frontend" >> "$GITHUB_OUTPUT"
+          echo "Csmith exact source build: $src; pinned frontend: $frontend" >> "$GITHUB_STEP_SUMMARY"
+      - name: Use public Mini-C source transport for the identical pinned revision
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path=Path('compiler/tools/mini-c-driver/Cargo.toml')
+          original=path.read_text()
+          old='ssh://git@github.com/bingordo/mini-c.git'
+          assert original.count(old)==2
+          path.write_text(original.replace(old,'https://github.com/bingordo/mini-c.git'))
+          PY
+      - name: Reuse source compiler cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: m10-csmith-source-20261105
+          cache-workspace-crates: 'true'
+      - name: Build current compiler-mini-c once, not from stale binary publisher
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 12m cargo build \
+            --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --bin compiler-mini-c \
+            2>&1 | tee "$RUNNER_TEMP/m10-build.log"
+          test -x compiler/tools/mini-c-driver/target/debug/compiler-mini-c
+      - name: Install Csmith 2.3.0 and independent references
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y --no-install-recommends csmith libcsmith-dev gcc clang
+          version="$(dpkg-query -W csmith | awk '{print $2}')"
+          [[ "$version" == 2.3.0-* ]]
+          header="$(dpkg -L libcsmith-dev | grep '/csmith.h$' | head -n1)"
+          test -s "$header"
+          echo "CSMITH_INCLUDE=$(dirname "$header")" >> "$GITHUB_ENV"
+      - name: Generate immutable original eight Csmith TUs
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 2m python3 \
+            compiler/tools/csmith_probe.py --generate \
+            --csmith csmith --seed-base 1 --seed-count 8 \
+            --profile restricted-observable \
+            --cases-dir "$RUNNER_TEMP/m10-cases" \
+            2>&1 | tee "$RUNNER_TEMP/m10-generate.log"
+      - name: Run eight independent reference and native source comparisons
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 8m python3 \
+            compiler/tools/csmith_probe.py --probe \
+            --cases-dir "$RUNNER_TEMP/m10-cases" \
+            --artifacts-dir "$RUNNER_TEMP/m10-results" \
+            --include-dir "$CSMITH_INCLUDE" \
+            --preprocess-c \
+            --driver "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" \
+            --compiler-sha "${{ steps.pins.outputs.source_sha }}" \
+            --frontend-sha "${{ steps.pins.outputs.frontend_sha }}" \
+            --compile-timeout 15 --run-timeout 3 \
+            --max-wall-seconds 360 --minimum-native 0 \
+            2>&1 | tee "$RUNNER_TEMP/m10-probe.log"
+          python3 - "$RUNNER_TEMP/m10-results/summary.json" <<'PY'
+          import json,sys,os
+          d=json.load(open(sys.argv[1]))
+          print("M10_ORIGINAL",json.dumps({
+              k:d[k] for k in ('compiler_sha','frontend_sha','total_seeds','reference_agreed',
+                               'native_accepted','passed','counts','frontend_blockers','status')
+          },sort_keys=True))
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as out:
+              out.write(f"Original Csmith: {d['total_seeds']} seeds, {d['reference_agreed']} independent agreeing references; {d['native_accepted']} native accepted; {d['passed']} passed. Status: {d['status']}.\n")
+              if d['native_accepted']==0:
+                  out.write("**COVERAGE ONLY — no native Csmith correctness evidence.**\n")
+          PY
+      - name: Preserve original sources, hashes, exact first-error locations and reproducers
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m10-source-pinned-real-csmith-8
+          path: |
+            ${{ runner.temp }}/m10-cases/
+            ${{ runner.temp }}/m10-results/
+            ${{ runner.temp }}/m10-build.log
+            ${{ runner.temp }}/m10-generate.log
+            ${{ runner.temp }}/m10-probe.log
+          if-no-files-found: ignore
+          retention-days: 14
