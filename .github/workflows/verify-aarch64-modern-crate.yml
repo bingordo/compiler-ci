@@ -1,0 +1,79 @@
+name: AArch64 modern IR backend admission
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/verify-aarch64-modern-crate.yml'
+permissions:
+  contents: read
+concurrency:
+  group: aarch64-modern-crate
+  cancel-in-progress: true
+jobs:
+  compile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: dfb6fa47df056101cf8b2d4cee2b9c1a76b8b692
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin source and exclude private frontends
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = dfb6fa47df056101cf8b2d4cee2b9c1a76b8b692
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: modern-a64-crate
+          cache-workspace-crates: 'true'
+      - name: Modern IR and AArch64 compile / all-target tests
+        working-directory: compiler
+        run: |
+          cargo check -p compiler-backend-aarch64 --all-targets
+          cargo test -p compiler-backend-aarch64 --lib
+
+  native:
+    needs: compile
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: dfb6fa47df056101cf8b2d4cee2b9c1a76b8b692
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify native ARM host and pinned compiler source
+        run: |
+          test "$(uname -m)" = aarch64
+          test "$(git -C compiler rev-parse HEAD)" = dfb6fa47df056101cf8b2d4cee2b9c1a76b8b692
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          command -v cc
+          command -v objcopy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: modern-a64-native
+          cache-workspace-crates: 'true'
+      - name: Targeted AArch64 native ELF, unwind and C ABI tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-aarch64 --all-targets -- --test-threads=1
+          echo 'Modern IR AArch64 backend native C/ELF tests passed for dfb6fa47df056101cf8b2d4cee2b9c1a76b8b692' >> "$GITHUB_STEP_SUMMARY"
