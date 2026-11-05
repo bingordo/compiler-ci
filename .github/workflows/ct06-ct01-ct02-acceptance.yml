@@ -1,0 +1,117 @@
+name: "CT-06 CT-01/CT-02 exact-merge Mini-C ABBA acceptance"
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct06-ct01-ct02-acceptance.yml'
+permissions:
+  contents: read
+concurrency:
+  group: ct06-ct01-ct02-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  compare:
+    name: ${{ matrix.change }} independent session ${{ matrix.session }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {change: ct01a, session: a, before: '676af572015c88f4c39e9351ffff188bdaf7ff92', after: '37bbaa4f7ee8f01a9d3d99412463c1d68b886692'}
+          - {change: ct01a, session: b, before: '676af572015c88f4c39e9351ffff188bdaf7ff92', after: '37bbaa4f7ee8f01a9d3d99412463c1d68b886692'}
+          - {change: ct01b, session: a, before: 'a07944c9198505f18d1a701b37252f4665adc1db', after: 'dc7c4ad785eb2cb7e86b7d8b4d5a6754376ae07b'}
+          - {change: ct01b, session: b, before: 'a07944c9198505f18d1a701b37252f4665adc1db', after: 'dc7c4ad785eb2cb7e86b7d8b4d5a6754376ae07b'}
+          - {change: ct02, session: a, before: '3eb6dd5428588b1ea51d900a44d6b5545c2ff6cc', after: '7c93192fc5619fb09d863e62ef9e0ad8c411b8bc'}
+          - {change: ct02, session: b, before: '3eb6dd5428588b1ea51d900a44d6b5545c2ff6cc', after: '7c93192fc5619fb09d863e62ef9e0ad8c411b8bc'}
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout benchmark harness
+        uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Checkout exact pre-merge compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ matrix.before }}
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact squash merge compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ matrix.after }}
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Capture immutable source revision and runner provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C before rev-parse HEAD | tee results/before-sha.txt
+          git -C after rev-parse HEAD | tee results/after-sha.txt
+          printf 'change=%s\nsession=%s\nrounds=5\nsizes=24,48,96,128\n' \
+            '${{ matrix.change }}' '${{ matrix.session }}' > results/parameters.txt
+          rustc --version | tee results/toolchain.txt
+          cargo --version | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\\(s\\)):' | tee -a results/toolchain.txt || true
+          python3 -m py_compile harness/tools/ct06_abba.py \
+            harness/tools/ct06_large_corpus.py after/tools/source_compile_corpus.py
+      - name: Configure public pinned Mini-C frontend over HTTPS
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before/tools/mini-c-driver -> target
+            after/tools/mini-c-driver -> target
+          key: ct06-${{ matrix.change }}-${{ matrix.session }}
+      - name: Build exact before and after release Mini-C drivers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path before/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+          cargo build --release --manifest-path after/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+          sha256sum before/tools/mini-c-driver/target/release/compiler-mini-c \
+            after/tools/mini-c-driver/target/release/compiler-mini-c \
+            > results/compiler-binaries.sha256
+      - name: Generate checked 24/48/96/128 C source corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct06_large_corpus.py \
+            --helpers after/tools --out corpus
+          cp corpus/manifest.csv results/source-manifest.csv
+          python3 - <<'PY'
+          from pathlib import Path
+          import sys
+          sys.path.insert(0, "harness/tools")
+          from ct06_large_corpus import read_manifest
+          assert len(read_manifest(Path("corpus/manifest.csv"),
+                                   Path("corpus"), Path("after/tools"))) == 12
+          PY
+      - name: Same-runner 5-round ABBA compilation with strict ELF parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x /usr/bin/time
+          python3 harness/tools/ct06_abba.py \
+            --helpers after/tools --corpus corpus \
+            --before before/tools/mini-c-driver/target/release/compiler-mini-c \
+            --after after/tools/mini-c-driver/target/release/compiler-mini-c \
+            --extended-24-128 --require-identical-elf \
+            --samples 5 --raw results/raw.csv --report results/report.md
+          cat results/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload raw ABBA samples, output hashes and toolchain
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ct06-${{ matrix.change }}-${{ matrix.session }}
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
