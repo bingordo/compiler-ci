@@ -1,0 +1,107 @@
+name: "CT-06 regalloc simplify ordering: core and checked-source ABBA"
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct06-regalloc-simplify-acceptance.yml'
+permissions:
+  contents: read
+concurrency:
+  group: ct06-regalloc-simplify-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout benchmark harness
+        uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Checkout exact before compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 'e941e83a97028dbf9fd92c3e120ba21bee18e298'
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact new regalloc candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '81cac90a84dca9e1c272bd79890b77ecc9f6da67'
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact revisions, fixture and environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C before rev-parse HEAD | tee results/before-sha.txt
+          git -C after rev-parse HEAD | tee results/after-sha.txt
+          git -C after diff --name-only HEAD
+          rustc --version | tee results/toolchain.txt
+          cargo --version | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\\(s\\)):' | tee -a results/toolchain.txt || true
+          python3 -m py_compile harness/tools/ct06_abba.py harness/tools/ct06_large_corpus.py
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - name: Core IR/backend correctness and strict Clippy
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp after/Cargo.toml results/original-workspace.toml
+          cat > after/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f after/Cargo.lock
+          cargo test --manifest-path after/Cargo.toml \
+            -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+          cargo clippy --manifest-path after/Cargo.toml \
+            -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 \
+            --all-targets -- -D warnings
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before/tools/mini-c-driver -> target
+            after/tools/mini-c-driver -> target
+          key: ct06-regalloc-ordered-candidates
+      - name: Build exact before/after release Mini-C compilers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path before/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --bin compiler-mini-c
+          cargo build --release --manifest-path after/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --bin compiler-mini-c
+          sha256sum before/tools/mini-c-driver/target/release/compiler-mini-c \
+            after/tools/mini-c-driver/target/release/compiler-mini-c > results/compiler-binaries.sha256
+      - name: Same-runner 24/48/96/128 checked-source ABBA and ELF parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct06_large_corpus.py \
+            --helpers after/tools --out corpus
+          cp corpus/manifest.csv results/source-manifest.csv
+          python3 harness/tools/ct06_abba.py \
+            --helpers after/tools --corpus corpus \
+            --before before/tools/mini-c-driver/target/release/compiler-mini-c \
+            --after after/tools/mini-c-driver/target/release/compiler-mini-c \
+            --extended-24-128 --require-identical-elf --samples 5 \
+            --raw results/ct06-raw.csv --report results/report.md
+          cat results/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Archive validation and timing provenance
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ct06-regalloc-simplify-acceptance
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
