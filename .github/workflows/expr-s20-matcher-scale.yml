@@ -1,0 +1,119 @@
+name: S20 compiled matcher guard scaling 152 to 5000
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/expr-s20-matcher-scale.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  scale:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout exact S20 benchmark revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7692731993e0191430ed380b6a69bf2e43e3192b
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Install independent Z3 proof tool
+        run: sudo apt-get update -qq && sudo apt-get install -y z3 binutils
+      - name: Regenerate full 152-rule Z3-proven S14 dispatcher
+        run: |
+          set -euo pipefail
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --compose-guards --minimize-rules --commute-inferred \
+            --max-proofs 2000 --max-rules 500 --format rust --output /tmp/s20-proven-152.rs
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --compose-guards --minimize-rules --commute-inferred \
+            --max-proofs 2000 --max-rules 500 --format rust --check /tmp/s20-proven-152.rs
+          grep -q 'pub const RULE_COUNT: usize = 152;' /tmp/s20-proven-152.rs
+          grep -q 'pub const RULE_LIMIT_REACHED: bool = false;' /tmp/s20-proven-152.rs
+          rustc --edition=2021 -O --test /tmp/s20-proven-152.rs -o /tmp/s20-rule-tests
+          /tmp/s20-rule-tests
+      - name: Measure compiled dispatcher guard throughput, code size, and rustc time
+        run: |
+          set -euo pipefail
+          python3 -m py_compile compiler/tools/expr-rule-gen/harness/s20_matcher_scale.py
+          rustc --version --verbose > /tmp/s20-system.txt
+          uname -a >> /tmp/s20-system.txt
+          grep -m1 "model name" /proc/cpuinfo >> /tmp/s20-system.txt
+          python3 compiler/tools/expr-rule-gen/harness/s20_matcher_scale.py \
+            --matcher /tmp/s20-proven-152.rs \
+            --runner compiler/tools/expr-rule-gen/harness/s20_scale_runner.rs \
+            --output /tmp/s20-scale \
+            --calls 30000 --repeats 7 | tee /tmp/s20-scale.log
+      - name: Independently verify seven variants and all workloads
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          lines=Path("/tmp/s20-scale.log").read_text().splitlines()
+          info=[x for x in lines if x.startswith("S20_INFO ")]
+          builds=[x for x in lines if x.startswith("S20_BUILD ")]
+          verifies=[x for x in lines if x.startswith("S20_VERIFY ")]
+          benches=[x for x in lines if x.startswith("S20_BENCH ")]
+          done=[x for x in lines if x.startswith("S20_VALIDATION_OK ")]
+          assert len(info)==len(done)==1
+          assert "canonical_rules=152" in info[0]
+          assert "nonbaseline_entries_are_synthetic=true" in info[0]
+          variants={(152,"base")}
+          for count in (500,1000,5000):
+              variants.add((count,"spread"))
+              variants.add((count,"skew"))
+          def fields(row):
+              return dict(part.split("=",1) for part in row.split()[1:])
+          assert len(builds)==len(verifies)==len(variants)==7
+          assert len(benches)==7*7
+          known=set()
+          for line in builds:
+              d=fields(line)
+              key=(int(d["count"]),d["layout"])
+              assert key in variants and key not in known
+              known.add(key)
+              assert int(d["real_rules"])==152
+              assert int(d["synthetic_entries"])==key[0]-152
+              assert min(int(d[k]) for k in ("source_bytes","text_bytes","binary_bytes","rustc_ms"))>0
+          assert known==variants
+          h=set()
+          for line in verifies:
+              d=fields(line)
+              key=(int(d["count"]),d["layout"])
+              assert key in variants
+              assert int(d["tested"])>17000
+              assert len(d["result_hash"])==16
+              h.add(d["result_hash"])
+          assert len(h)==1
+          names={"hit_early","hit_middle","hit_late","miss_mixed","miss_skew","mixed_pairs","shape_reject"}
+          groups={}
+          for line in benches:
+              d=fields(line)
+              key=(int(d["count"]),d["layout"])
+              assert key in variants
+              groups.setdefault(key,set()).add(d["workload"])
+              assert d["workload"] in names
+              assert int(d["calls"])==30000 and int(d["repeats"])==7
+              assert int(d["samples"])>0
+              assert 0<=int(d["hits"])<=30000
+              assert int(d["median_ns"])>=0 and int(d["p95_ns"])>=int(d["median_ns"])
+              if d["workload"].startswith("hit_"):
+                  assert int(d["rule_index"])>=0 and int(d["branch_rules"])>=1
+                  assert int(d["hits"])==30000
+              elif d["workload"].startswith("miss_") or d["workload"]=="shape_reject":
+                  assert int(d["hits"])==0
+          assert len(groups)==7 and all(s==names for s in groups.values())
+          print("S20_SCALING_ACCOUNTING_OK",sorted(variants),next(iter(h)))
+          PY
+      - name: Retain exact benchmark results, generator source and environment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s20-matcher-scale-results
+          if-no-files-found: warn
+          path: |
+            /tmp/s20-scale.log
+            /tmp/s20-system.txt
+            /tmp/s20-proven-152.rs
+            /tmp/s20-scale/matcher_*.rs
