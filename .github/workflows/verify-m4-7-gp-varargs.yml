@@ -1,0 +1,87 @@
+name: M4.7 checked GP variadic native ABI (compiler-ci)
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-m4-7-gp-varargs.yml'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact compiler SHA/branch
+        required: true
+        default: main
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: m47-gp-abi-${{ github.event.inputs.source_ref || github.head_ref || 'default' }}
+  cancel-in-progress: true
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 24
+    steps:
+      - name: Checkout pinned compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || '2265e3e70e5a279e3a732826504bf270fb11893d' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact source SHA
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          echo "M4.7 compiler SHA: $actual" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${{ github.event_name }}" == 'pull_request' ]]; then
+            test "$actual" = '2265e3e70e5a279e3a732826504bf270fb11893d'
+          fi
+          test -s crates/backend-x86/tests/m4_7_gp_variadic_native.rs
+      - name: Self-contained backend workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m47-gp-varargs
+          cache-workspace-crates: 'true'
+      - name: Strict checked variadic external signatures
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test sysv_gp_variadics -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/m47-ir.log"
+          grep -F 'test sysv_gp_marker_requires_explicit_variadic_signature_and_checked_prefix ... ok' "$RUNNER_TEMP/m47-ir.log"
+      - name: Real glibc printf and stack varargs via ELF and GAS
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test m4_7_gp_variadic_native -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/m47-native.log"
+          grep -F 'test real_glibc_printf_and_stack_gp_varargs_match_in_elf_and_gas ... ok' "$RUNNER_TEMP/m47-native.log"
+      - name: Existing IR/backend/x86 native regression tests
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-backend -p compiler-backend-x86
+      - name: Strict all-targets Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
+      - name: Save logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m47-variadic-abi-failure
+          path: |
+            ${{ runner.temp }}/m47-ir.log
+            ${{ runner.temp }}/m47-native.log
+          if-no-files-found: ignore
+          retention-days: 7
