@@ -1,0 +1,90 @@
+name: PR 432 compare-select native ABBA
+on:
+  push:
+    branches: [ci/relational-cmovcc-abba-pr432-20261106]
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Checkout pre-relational baseline
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a189988d0de7526c3fff9da060b05637740810f4
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout relational CMOVcc candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 8a65de98dee4c6cdd12aba9e41540fca5dcb50b4
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record source hashes and runner CPU
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          test "$(git -C before rev-parse HEAD)" = "a189988d0de7526c3fff9da060b05637740810f4"
+          test "$(git -C after rev-parse HEAD)" = "8a65de98dee4c6cdd12aba9e41540fca5dcb50b4"
+          git -C before rev-parse HEAD | tee results/before-sha.txt
+          git -C after rev-parse HEAD | tee results/after-sha.txt
+          rustc --version | tee results/toolchain.txt
+          cc --version | head -1 | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\\(s\\)):' | tee -a results/toolchain.txt || true
+          python3 -m py_compile harness/tools/ct05d_select_budget_compare.py after/tools/source_cli_profile.py
+      - name: Configure pinned public Mini-C dependency
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before/tools/mini-c-driver -> target
+            after/tools/mini-c-driver -> target
+          key: pr432-cmovcc-abba
+      - name: Build both release Mini-C compilers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path before/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+          cargo build --release --manifest-path after/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+      - name: Source-level native ABBA with independent GCC oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Reuse the repository's existing source-level checked-native
+          # measurement harness. Its printed "cap8" headers are historical:
+          # here before/after mean pinned main vs relational CMOVcc PR 432.
+          python3 harness/tools/ct05d_select_budget_compare.py \
+            --helpers after/tools \
+            --before before/tools/mini-c-driver/target/release/compiler-mini-c \
+            --after after/tools/mini-c-driver/target/release/compiler-mini-c \
+            --rounds 3 --results results/cases
+          cat results/cases/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve exact object disassemblies
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results/disassembly
+          for obj in results/cases/*/*.o; do
+            name="$(basename "$(dirname "$obj")")-$(basename "$obj" .o)"
+            objdump -drwC -M intel "$obj" > "results/disassembly/$name.txt"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr432-relational-cmovcc-abba
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
