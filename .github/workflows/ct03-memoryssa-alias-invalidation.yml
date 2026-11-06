@@ -1,0 +1,90 @@
+name: "CT-03 MemorySSA predecessor and alias invalidation acceptance"
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct03-memoryssa-alias-invalidation.yml'
+permissions:
+  contents: read
+concurrency:
+  group: ct03-memoryssa-alias-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  regression-and-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 'e8676196f25f8d25570c9dbf447eaa1e83a61989'
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record reproducible source and toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C compiler rev-parse HEAD | tee results/compiler-sha.txt
+          rustc --version | tee results/toolchain.txt
+          cargo --version | tee -a results/toolchain.txt
+          cc --version | head -1 | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\\(s\\)):' | tee -a results/toolchain.txt || true
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ct03-memoryssa-alias-lifetime
+      - name: Default IR/optimizer/backend/x86 complete regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/Cargo.toml \
+            -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 \
+            2>&1 | tee results/core.log
+      - name: Confirm growing join and changed-CFG predecessor graphs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt \
+            ct03_many_predecessors_parallel_edges_and_mutation_reanalysis -- --nocapture \
+            2>&1 | tee results/memory-phis.log
+      - name: Direct ELF and GAS oracle against independent C
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt \
+            --test ct03_memoryssa_invalidation_native -- --nocapture \
+            2>&1 | tee results/native.log
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt \
+            --test memory_native -- --nocapture \
+            2>&1 | tee results/existing-memory-native.log
+      - name: Strict Clippy, default and opt-in verifier count modes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --manifest-path compiler/Cargo.toml \
+            -p compiler-ir -p compiler-opt --all-targets -- -D warnings \
+            2>&1 | tee results/clippy-default.log
+          cargo clippy --manifest-path compiler/Cargo.toml \
+            -p compiler-ir -p compiler-opt --features compiler-opt/verify-counts \
+            --all-targets -- -D warnings \
+            2>&1 | tee results/clippy-verify-counts.log
+      - name: Archive raw logs, compiler commit and CPU
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ct03-memoryssa-alias-invalidation
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
