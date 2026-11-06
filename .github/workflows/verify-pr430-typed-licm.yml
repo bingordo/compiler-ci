@@ -1,0 +1,42 @@
+name: Verify PR430 TypeId LICM and preheaders
+on:
+  push:
+    branches: [ci/pr430-typeid-licm]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 36d581e0b6447d26195ecd2e9ac6015d8d77ce96
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact compiler source revision
+        run: test "$(git -C compiler rev-parse HEAD)" = "36d581e0b6447d26195ecd2e9ac6015d8d77ce96"
+      - name: Restrict compiler self-contained core and native workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-licm-pr430
+          cache-workspace-crates: 'true'
+      - name: Focused TypeId LICM and preheaders native replay
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typed_licm_native --test typed_core_pipeline --test typed_pre_native --test licm_native --test licm_preheaders --test ir_replay_cli -- --nocapture
+      - name: Full self-contained IR optimizer backend and x86 regressions
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+      - name: Strict optimizer Clippy all targets
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt --all-targets -- -D warnings
