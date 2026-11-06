@@ -1,0 +1,123 @@
+name: Experimental bounded shared comparison rematerialization
+on:
+  push:
+    branches: [ci/exp-shared-compare-remat-20261106]
+permissions:
+  contents: read
+jobs:
+  correctness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: aa833b23cef4da237f1f253b525d38049179966a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned candidate
+        run: test "$(git -C compiler rev-parse HEAD)" = "aa833b23cef4da237f1f253b525d38049179966a"
+      - name: Use independent core workspace
+        shell: bash
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: shared-cmp-remat-core
+      - name: Cross-block native GCC oracle, GAS and direct ELF
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --test shared_compare_select_native -- --nocapture
+      - name: Full independent core and backend suites
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+      - name: Strict Clippy for modified target and optimizer
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-backend-x86 --all-targets -- -D warnings
+          cargo clippy -p compiler-ir -p compiler-opt --all-targets -- -D warnings
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Exact baseline compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7a43637b6237590fc4a776b236e9ead6b42d3cc4
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Exact experimental candidate compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: aa833b23cef4da237f1f253b525d38049179966a
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record immutable revisions, CPU, and host compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          test "$(git -C before rev-parse HEAD)" = "7a43637b6237590fc4a776b236e9ead6b42d3cc4"
+          test "$(git -C after rev-parse HEAD)" = "aa833b23cef4da237f1f253b525d38049179966a"
+          git -C before rev-parse HEAD | tee results/before-sha.txt
+          git -C after rev-parse HEAD | tee results/after-sha.txt
+          rustc --version | tee results/toolchain.txt
+          cc --version | head -1 | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\\(s\\)):' | tee -a results/toolchain.txt || true
+          python3 -m py_compile harness/tools/ct05d_select_budget_compare.py after/tools/source_cli_profile.py
+      - name: Configure Mini-C syntax/sema over HTTPS
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before/tools/mini-c-driver -> target
+            after/tools/mini-c-driver -> target
+          key: shared-cmp-remat-release
+      - name: Build both optimized compilers on the same runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path before/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+          cargo build --release --manifest-path after/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+      - name: Independent native C oracle and compile/runtime ABBA
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct05d_select_budget_compare.py \
+            --helpers after/tools \
+            --before before/tools/mini-c-driver/target/release/compiler-mini-c \
+            --after after/tools/mini-c-driver/target/release/compiler-mini-c \
+            --rounds 3 --results results/cases
+          cat results/cases/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain full object disassemblies
+        if: success()
+        shell: bash
+        run: |
+          mkdir -p results/disassembly
+          for obj in results/cases/*/*.o; do
+            name="$(basename "$(dirname "$obj")")-$(basename "$obj" .o)"
+            objdump -drwC -M intel "$obj" > "results/disassembly/$name.txt"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bounded-shared-compare-remat-abba
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
