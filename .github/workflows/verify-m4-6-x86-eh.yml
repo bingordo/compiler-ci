@@ -1,0 +1,96 @@
+name: M4.6 x86 ELF unwind (compiler-ci)
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-m4-6-x86-eh.yml']
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        required: true
+        description: 'Exact compiler SHA or branch'
+        default: main
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: m46-x86-eh-${{ github.event.inputs.source_ref || github.head_ref || 'default' }}
+  cancel-in-progress: true
+jobs:
+  core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || '238e1dce0788db2980d92cfd0324a500ad08ef24' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin and report tested source
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          if [[ "${{ github.event_name }}" == 'pull_request' ]]; then
+            test "$sha" = '238e1dce0788db2980d92cfd0324a500ad08ef24'
+          fi
+          echo "Compiler tested source $sha" >> "$GITHUB_STEP_SUMMARY"
+          test -s crates/backend/tests/x86_elf_unwind.rs
+      - name: Self-contained workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m46-elf
+          cache-workspace-crates: 'true'
+      - name: New shared ELF unwind contract
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --test x86_elf_unwind -- --nocapture 2>&1 | tee "$RUNNER_TEMP/m46.log"
+          grep -F 'test x86_eh_frame_uses_section_pc32_fixups_and_valid_section_links ... ok' "$RUNNER_TEMP/m46.log"
+          grep -F 'test x86_invalid_fde_sites_and_duplicate_locations_fail_closed ... ok' "$RUNNER_TEMP/m46.log"
+      - name: Native x86 physical CFI and libgcc backtrace
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test m4_6_unwind_native -- --nocapture             2>&1 | tee "$RUNNER_TEMP/m46-native.log"
+          grep -F 'test machine_cfi_survives_link_and_real_native_unwind ... ok' "$RUNNER_TEMP/m46-native.log"
+      - name: Source-to-machine x86 direct ELF native unwinding
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test m4_6_source_unwind_native -- --nocapture             2>&1 | tee "$RUNNER_TEMP/m46-source.log"
+          grep -F 'test real_machine_ssa_calls_have_runtime_cfi_in_frameless_framed_and_pic_elf ... ok' "$RUNNER_TEMP/m46-source.log"
+      - name: Native PIC shared library unwind via dlopen
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test m4_6_unwind_shared_native -- --nocapture             2>&1 | tee "$RUNNER_TEMP/m46-shared.log"
+          grep -F 'test pic_shared_library_can_unwind_through_generated_x86_elf ... ok' "$RUNNER_TEMP/m46-shared.log"
+      - name: Native x86 and AArch64 shared-writer regressions
+        working-directory: compiler
+        run: cargo test -p compiler-backend -p compiler-backend-x86 -- --nocapture
+      - name: Strict Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
+      - name: Save failure log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m46-elf-failure
+          path: ${{ runner.temp }}/m46.log
+          if-no-files-found: ignore
+          retention-days: 7
