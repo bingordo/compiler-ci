@@ -1,0 +1,43 @@
+name: Verify inliner PR 396 at exact SHA
+on:
+  push:
+    branches:
+      - ci/inliner-pr396-e2744e2-20261106
+permissions:
+  contents: read
+jobs:
+  inliner:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e2744e2aaee4065a878db0b8a9091e75383e96c8
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Ensure immutable PR revision
+        run: test "$(git -C compiler rev-parse HEAD)" = "e2744e2aaee4065a878db0b8a9091e75383e96c8"
+      - name: Isolate self-contained core workspace
+        shell: bash
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: pr396-inliner-core
+      - name: Targeted modern-scalar inlining native oracle
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test inline_modern_scalar_native -- --nocapture
+      - name: Full self-contained core and x86 native suites
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+      - name: Strict Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
