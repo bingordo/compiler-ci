@@ -1,0 +1,85 @@
+name: "CT-03 typed pointer-phi alias epoch and native correctness"
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct03-typed-alias-epoch.yml'
+permissions:
+  contents: read
+concurrency:
+  group: ct03-typed-alias-epoch-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 'd30b7be17e9396babd32480035afa0f175e3021c'
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Exact compiler revision, rustc and native C oracle provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C compiler rev-parse HEAD | tee results/compiler-sha.txt
+          rustc --version | tee results/toolchain.txt
+          cargo --version | tee -a results/toolchain.txt
+          cc --version | head -1 | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\\(s\\)):' | tee -a results/toolchain.txt || true
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ct03-typed-alias-epoch-native
+      - name: Full default IR optimizer backend x86 tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/Cargo.toml \
+            -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 \
+            2>&1 | tee results/core.log
+      - name: Separate typed epoch, malformed module rollback, and C-native oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt \
+            --test ct03_typed_alias_epoch_native -- --nocapture \
+            2>&1 | tee results/epoch-native.log
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt \
+            --test typed_global_memory -- --nocapture \
+            2>&1 | tee results/typed-global.log
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt \
+            --test typed_dse -- --nocapture \
+            2>&1 | tee results/typed-dse.log
+      - name: Strict production and opt-in Clippy including new test target
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --manifest-path compiler/Cargo.toml \
+            -p compiler-ir -p compiler-opt --all-targets -- -D warnings \
+            2>&1 | tee results/clippy-default.log
+          cargo clippy --manifest-path compiler/Cargo.toml \
+            -p compiler-ir -p compiler-opt \
+            --features compiler-opt/verify-counts --all-targets -- -D warnings \
+            2>&1 | tee results/clippy-verify-counts.log
+      - name: Archive precise validation logs and toolchain
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ct03-typed-alias-epoch
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
