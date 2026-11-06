@@ -1,0 +1,42 @@
+name: Verify PR409 TypeId phi CFG core migration
+on:
+  push:
+    branches: [ci/pr409-typeid-phi-cfg]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 31470e34b554f199e9928b51d7951672889ac3e3
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check pinned compiler SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "31470e34b554f199e9928b51d7951672889ac3e3"
+      - name: Isolate the self-contained core/native workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-phi-cfg-pr409
+          cache-workspace-crates: 'true'
+      - name: Focused TypeId phi CFG core and replay native oracle
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typed_phi_cfg --test typed_core_pipeline --test typed_sccp --test ir_replay_cli -- --nocapture
+      - name: Full self-contained four crate IR optimizer and native regression
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+      - name: Strict optimizer Clippy all targets
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt --all-targets -- -D warnings
