@@ -1,0 +1,96 @@
+name: "CT-03 multi-edit PRE analysis-lifetime GAS and ELF oracles"
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct03-multi-edit-invalidation.yml'
+permissions:
+  contents: read
+concurrency:
+  group: ct03-multi-invalidation-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '52067c30bb28e011aaf529faf46f623a21dc91d0'
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Source/toolchain/CPU provenance and isolated local workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C compiler rev-parse HEAD | tee results/sha.txt
+          rustc --version | tee results/toolchain.txt
+          cargo --version | tee -a results/toolchain.txt
+          cc --version | head -1 | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\\(s\\)):' | tee -a results/toolchain.txt || true
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ct03-multiedit-native
+      - name: Entire IR/optimizer/x86 regression suite, default compiler semantics
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/Cargo.toml \
+            -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 \
+            2>&1 | tee results/core.log
+      - name: Run targeted two-edit PRE in original and reordered storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/Cargo.toml \
+            -p compiler-opt --features verify-counts \
+            --lib successive_ -- --nocapture \
+            2>&1 | tee results/reanalysis.log
+          cargo test --manifest-path compiler/Cargo.toml \
+            -p compiler-opt --features verify-counts \
+            --lib malformed_successor_or_dominance -- --nocapture \
+            2>&1 | tee results/rejection.log
+          grep 'CT03_MULTI_EDIT_VERIFY_COUNT' results/reanalysis.log | tee results/call-counts.txt
+          test "$(grep -c CT03_MULTI_EDIT_VERIFY_COUNT results/call-counts.txt)" -eq 2
+      - name: Native direct ELF and GAS independent wrapping-C oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt \
+            --test ct03_multi_edit_native -- --nocapture \
+            2>&1 | tee results/native.log
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt \
+            --test pre_licm_semantic_matrix -- --nocapture \
+            2>&1 | tee results/pre-licm.log
+      - name: Strict default and opt-in Clippy including new test targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --manifest-path compiler/Cargo.toml \
+            -p compiler-ir -p compiler-opt --all-targets -- -D warnings \
+            2>&1 | tee results/clippy-default.log
+          cargo clippy --manifest-path compiler/Cargo.toml \
+            -p compiler-ir -p compiler-opt \
+            --features compiler-opt/verify-counts --all-targets -- -D warnings \
+            2>&1 | tee results/clippy-optin.log
+      - name: Persist count/native/error logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ct03-multi-edit-invalidation
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
