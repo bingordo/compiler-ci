@@ -1,0 +1,93 @@
+# Exact-source M4.5 x86 ELF object-writer contract and native ABI regression.
+# PR validation uses an immutable compiler commit. Manual dispatch can select
+# another source ref; the workflow records the resolved SHA in the summary.
+name: M4.5 x86 ELF contract (compiler-ci)
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-m4-5-x86-elf.yml'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Compiler source commit SHA/branch/tag to verify
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: m4-5-x86-elf-${{ github.event.inputs.source_ref || github.head_ref || 'manual' }}
+  cancel-in-progress: true
+
+jobs:
+  x86-elf:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout tested compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || '238e0442116bc056cc813e473a4a33d22a283472' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record and pin PR source revision
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          expected='${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || '238e0442116bc056cc813e473a4a33d22a283472' }}'
+          if [[ "${{ github.event_name }}" == 'pull_request' ]]; then
+            test "$actual" = "$expected"
+          fi
+          printf 'M4.5 source SHA: %s\n' "$actual" | tee -a "$GITHUB_STEP_SUMMARY"
+          test -s crates/backend/tests/x86_elf_contract.rs
+      - name: Use self-contained compiler crates
+        working-directory: compiler
+        shell: bash
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x86-elf-m45
+          cache-workspace-crates: 'true'
+      - name: Structural contract and explicit negative cases
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --test x86_elf_contract -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/m45-elf-contract.log"
+          grep -F 'test malformed_symbols_and_relocations_fail_before_emitting_objects ... ok' "$RUNNER_TEMP/m45-elf-contract.log"
+          grep -F 'test mixed_functions_globals_and_constructors_have_valid_section_links_and_placements ... ok' "$RUNNER_TEMP/m45-elf-contract.log"
+      - name: Full core and native x86 object regression
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 -- --nocapture
+      - name: Strict Clippy (including contract test)
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
+      - name: Record success
+        shell: bash
+        run: printf 'M4.5 structural, native object and strict Clippy checks passed for SHA %s\n' "$(git -C compiler rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain failing contract details
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m4-5-elf-contract-failure
+          path: ${{ runner.temp }}/m45-elf-contract.log
+          if-no-files-found: ignore
+          retention-days: 7
