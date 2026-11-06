@@ -1,0 +1,53 @@
+name: S21 Mini-C native ctz PR validation
+on:
+  push:
+    branches: [test/mini-c-s21-ctz-20261106]
+    paths: ['.github/workflows/test-mini-c-s21-ctz.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  mini-c-ctz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 400e6bcc026c6e990f78d8825dd06aefd300e63b
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact candidate revision
+        run: test "$(git -C compiler rev-parse HEAD)" = 400e6bcc026c6e990f78d8825dd06aefd300e63b
+      - name: Resolve pinned public Mini-C via HTTPS
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: s21-mini-c-ctz-native-v1
+      - name: Compile and test checked native CTZ and register path
+        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib s21_ -- --nocapture
+      - name: Check native adapter Clippy
+        run: cargo clippy --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --all-targets -- -D warnings
+      - name: Build and run GCC differential native executable suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path compiler/tools/mini-c-driver/Cargo.toml --bin compiler-mini-c
+          mkdir -p results
+          python3 compiler/tools/mini-c-driver/tests/differential.py \
+            --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" \
+            --seed-count 2 --steps 80 --timeout 15 \
+            --artifacts "$PWD/results/failures" 2>&1 | tee results/s21-differential.log
+      - name: Preserve exact-revision test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mini-c-s21-ctz-native-validation
+          path: results/
+          if-no-files-found: ignore
+          retention-days: 14
