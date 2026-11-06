@@ -15,7 +15,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 2b2552111e9bf2536cce5ac4fea2e9111c3f5f19
+          ref: d7f244317ddf301d04f69b99aaf3307095af038d
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -69,6 +69,14 @@ jobs:
           set -euo pipefail
           compiler/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion \
             --s21-prng-real | tee /tmp/s21-prng-results.log
+      - name: Restore genuine system stdint.h through GCC -E -P, preserving original helpers
+        env:
+          RULE_S21_PRNG_DIR: /tmp/s21-prng
+          RULE_S21_PRNG_HEADER_CONTEXT: system-stdint
+        run: |
+          set -euo pipefail
+          compiler/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion \
+            --s21-prng-real | tee /tmp/s21-prng-header-results.log
       - name: Independently reconcile full corpus, native calls, and all SSA operators
         run: |
           python3 - <<'PY'
@@ -165,6 +173,62 @@ jobs:
           print('S21_PRNG_CORPUS_VERIFIED',totals,'accepted_ids',[r[1] for r in accepted],
                 'rejected_ids',[r[1] for r in rejected])
           PY
+      - name: Independently account header-context source identities and GCC native outcomes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          specs={x['id']:x for x in json.loads(Path(
+              'compiler/tools/expr-rule-gen/harness/s21_prng_real_sources.json').read_text())['files']}
+          old=Path('/tmp/s21-prng-results.log').read_text().splitlines()
+          data=Path('/tmp/s21-prng-header-results.log').read_text().splitlines()
+          info=[s for s in data if s.startswith('S21P_INFO ')]
+          assert len(info)==1 and 'context=system_stdint' in info[0]
+          rows=[s.split(',') for s in data if s.startswith('S21P_ROW,')]
+          rejected=[s.split(',') for s in data if s.startswith('S21P_REJECT,')]
+          cpp=[s.split(',') for s in data if s.startswith('S21P_CPP,')]
+          totals=[s.split(',') for s in data if s.startswith('S21P_TOTAL_')]
+          summary=[s for s in data if s.startswith('S21P_SUMMARY ')]
+          assert len(rows)>=1 and len(rows)+len(rejected)==len(specs)
+          assert len(cpp)==2 and {c[1] for c in cpp}=={'musl_lcg31','musl_lcg64'}
+          for c in cpp:
+              assert len(c)==5 and len(c[2])==16 and int(c[3])>0 and c[4]=='system_stdint'
+          old_hashes={r[1]:r[2] for s in old if s.startswith(('S21P_ROW,','S21P_REJECT,')) for r in [s.split(',')]}
+          assert set(old_hashes)==set(specs)
+          identities=set(); applied=0; bytes_old=bytes_new=calls=0
+          for r in rows:
+              assert len(r)==18,r
+              _,id,h,*v=r
+              assert id in specs and id not in identities and h==old_hashes[id]
+              identities.add(id)
+              n=list(map(int,v)); applied+=n[8];bytes_old+=n[9];bytes_new+=n[10];calls+=n[11]
+              assert n[11]==(30 if specs[id]['abi']=='uint64_t' else 22)
+              assert n[9]>0 and n[10]>0
+          for r in rejected:
+              assert len(r)==5,r
+              _,id,h,stage,reason=r
+              assert id in specs and id not in identities and h==old_hashes[id]
+              assert stage in ('frontend','function_count') and reason
+              identities.add(id)
+          assert identities==set(specs) and len(summary)==1
+          fields=dict(kv.split('=',1) for kv in summary[0].split()[1:])
+          expected=dict(attempted=3,accepted=len(rows),rejected=len(rejected),applied=applied,
+                        baseline_bytes=bytes_old,trial_bytes=bytes_new,native_calls=calls)
+          assert all(int(fields[k])==v for k,v in expected.items()),(fields,expected)
+          assert {x.split(',')[0] for x in totals}=={'S21P_TOTAL_RAW','S21P_TOTAL_OPT'}
+          assert len(totals)==2
+          for stage in ('RAW','OPT'):
+              rr=[s.split(',') for s in data if s.startswith(f'S21P_OPS_{stage},')]
+              assert len(rr)==len(rows)
+              for r in rr:
+                  assert len(r)==23 and r[1] in identities and r[2]==old_hashes[r[1]]
+                  assert int(r[3])==sum(map(int,r[4:]))
+              t=next(t for t in totals if t[0]==f'S21P_TOTAL_{stage}')
+              assert list(map(int,t[4:]))==[sum(int(r[j]) for r in rr) for j in range(4,23)]
+          print('S21_PRNG_STDINT_CONTEXT_VERIFIED',expected,
+                'accepted_ids',sorted(r[1] for r in rows),
+                'rejected_ids',sorted(r[1] for r in rejected))
+          PY
       - name: Preserve sources provenance and native verification
         if: always()
         uses: actions/upload-artifact@v4
@@ -174,3 +238,4 @@ jobs:
           path: |
             /tmp/s21-prng-provenance.log
             /tmp/s21-prng-results.log
+            /tmp/s21-prng-header-results.log
