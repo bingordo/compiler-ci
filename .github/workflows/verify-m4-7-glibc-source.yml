@@ -1,0 +1,169 @@
+name: M4.7 real glibc Mini-C source native (compiler-ci)
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-m4-7-glibc-source.yml'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact compiler commit SHA or ref to verify
+        required: true
+        default: main
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: m47-source-${{ github.event.inputs.source_ref || github.head_ref || 'default' }}
+  cancel-in-progress: true
+jobs:
+  mini-c-p4:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Check out exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || '05d27ba8f1d0be2d53eb641c6e514c66c61150a5' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert tested compiler revision and real fixtures
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          printf 'M4.7 glibc source checked at compiler SHA %s\n' "$sha" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            test "$sha" = "05d27ba8f1d0be2d53eb641c6e514c66c61150a5"
+          fi
+          test -s tools/mini-c-driver/tests/s12_p4_native.py
+          test -s tools/mini-c-driver/tests/fixtures/s12_printf_stdio.c
+      - name: Use public pinned Mini-C dependency, not frontend secrets
+        run: |
+          set -euo pipefail
+          # The requested pinned Mini-C Git revision is public. Keep compiler
+          # private checkout on CI_KEY but fetch this dependency over HTTPS.
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git ls-remote https://github.com/bingordo/mini-c.git HEAD > /dev/null
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: m47-source-mini-c
+          cache-workspace-crates: 'true'
+      - name: Checked frontend literal pool, alias and varargs negatives
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib m47_checked_source -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/m47-source-unit.log"
+      - name: Exact unmodified glibc stdio C source through native ELF and GAS
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+          python3 tools/mini-c-driver/tests/s12_p4_native.py \
+            --compiler tools/mini-c-driver/target/debug/compiler-mini-c \
+            --artifacts "$RUNNER_TEMP/m47-source-repro" \
+            2>&1 | tee "$RUNNER_TEMP/m47-source-native.log"
+          grep -F 'PASS s12_printf_stdio.c' "$RUNNER_TEMP/m47-source-native.log"
+          grep -F 'PASS s12_printf_stack.c' "$RUNNER_TEMP/m47-source-native.log"
+          grep -F 'PASS unsupported FP variadic argument fails' "$RUNNER_TEMP/m47-source-native.log"
+      - name: Full checked Mini-C native unit regression
+        working-directory: compiler
+        run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib
+      - name: Strict all-targets checked Mini-C Clippy
+        working-directory: compiler
+        run: cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --all-targets -- -D warnings
+      - name: Unified compiler CLI unchanged glibc C across all six x86 modes
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test mini_c_cli             cli_unmodified_glibc_stdin_printf_and_stack_varargs_match_gcc -- --nocapture             2>&1 | tee "$RUNNER_TEMP/m47-main-cli.log"
+          grep -F 'test cli_unmodified_glibc_stdin_printf_and_stack_varargs_match_gcc ... ok'             "$RUNNER_TEMP/m47-main-cli.log"
+      - name: Unified C frontend CLI regression and strict Clippy
+        working-directory: compiler
+        run: |
+          cargo test -p compiler --test mini_c_cli
+          cargo clippy -p compiler --all-targets -- -D warnings
+      - name: Retain on-failure original sources and native traces
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m47-real-glibc-mini-c-repro
+          path: |
+            ${{ runner.temp }}/m47-source-unit.log
+            ${{ runner.temp }}/m47-source-native.log
+            ${{ runner.temp }}/m47-main-cli.log
+            ${{ runner.temp }}/m47-source-repro/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  cranelift-reference:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 23
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact native compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '05d27ba8f1d0be2d53eb641c6e514c66c61150a5'
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exactly pinned Mini-C Cranelift reference
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: '34fd4d83c74fc82620a3fc9a75607a7ebf9e0a66'
+          path: mini-c-reference
+          persist-credentials: false
+      - name: Record both exact compiler revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "05d27ba8f1d0be2d53eb641c6e514c66c61150a5"
+          test "$(git -C mini-c-reference rev-parse HEAD)" = "34fd4d83c74fc82620a3fc9a75607a7ebf9e0a66"
+          echo 'Native compiler: 05d27ba8f1d0be2d53eb641c6e514c66c61150a5' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Cranelift frontend: 34fd4d83c74fc82620a3fc9a75607a7ebf9e0a66' >> "$GITHUB_STEP_SUMMARY"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mini-c-reference -> target
+          key: m47-glibc-cranelift
+          cache-workspace-crates: 'true'
+      - name: Compile independent Cranelift and pinned native frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path mini-c-reference/Cargo.toml -p mini-c-cranelift --bin mini-c-cranelift
+          cargo build --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+      - name: Compare exact original C fixture against Cranelift, ELF, GAS and GCC
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/mini-c-driver/tests/s12_p4_native.py \
+            --compiler compiler/tools/mini-c-driver/target/debug/compiler-mini-c \
+            --cranelift mini-c-reference/target/debug/mini-c-cranelift \
+            --artifacts "$RUNNER_TEMP/m47-cranelift-repro" \
+            2>&1 | tee "$RUNNER_TEMP/m47-cranelift.log"
+          grep -F 'Mini-C Cranelift' "$RUNNER_TEMP/m47-cranelift.log"
+          grep -F 'PASS s12_printf_stack.c' "$RUNNER_TEMP/m47-cranelift.log"
+      - name: Save independent reference artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m47-cranelift-reference-failures
+          path: |
+            ${{ runner.temp }}/m47-cranelift-repro/
+            ${{ runner.temp }}/m47-cranelift.log
+          if-no-files-found: ignore
+          retention-days: 7
