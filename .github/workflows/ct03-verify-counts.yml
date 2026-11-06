@@ -1,0 +1,89 @@
+name: "CT-03 checked verifier boundary and call count acceptance"
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct03-verify-counts.yml'
+permissions:
+  contents: read
+concurrency:
+  group: ct03-verify-counts-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  verify-counts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler audit commit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '22536dbf32b7b4de7dcbb90e3f2dd86ec0b42960'
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Capture source and rustc provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C compiler rev-parse HEAD | tee results/compiler-sha.txt
+          rustc --version | tee results/toolchain.txt
+          cargo --version | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\\(s\\)):' | tee -a results/toolchain.txt || true
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ct03-verified-boundary-counts
+      - name: Core IR/optimizer/backend/x86 regression without instrumentation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/Cargo.toml \
+            -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 \
+            2>&1 | tee results/core.log
+      - name: Run measured 8/24/48/96 scope and full-pipeline verifications
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/Cargo.toml \
+            -p compiler-opt --features verify-counts \
+            ct03_verify_counts -- --nocapture 2>&1 | tee results/verify-counts.log
+          grep 'CT03_VERIFY_COUNT' results/verify-counts.log \
+            > results/counts-only.log
+          test "$(grep -c 'CT03_VERIFY_COUNT' results/counts-only.log)" -ge 24
+          cat results/counts-only.log >> "$GITHUB_STEP_SUMMARY"
+      - name: Count verifier calls across actual PRE and LICM mutations
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/Cargo.toml \
+            -p compiler-opt --features verify-counts \
+            mutating_ -- --nocapture 2>&1 | tee results/mutating-handoffs.log
+          grep 'CT03_VERIFY_COUNT' results/mutating-handoffs.log \
+            >> "$GITHUB_STEP_SUMMARY"
+      - name: Strict feature-enabled lint checks, including tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --manifest-path compiler/Cargo.toml \
+            -p compiler-ir -p compiler-opt \
+            --features compiler-opt/verify-counts --all-targets -- -D warnings \
+            2>&1 | tee results/clippy.log
+      - name: Preserve diagnostic counts and checked source version
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ct03-verifier-calls
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
