@@ -1,0 +1,73 @@
+name: Validate inliner source ablation PR408
+on:
+  push:
+    branches: [ci/inliner-source-ablation-pr408-20261106]
+permissions:
+  contents: read
+jobs:
+  source-ablation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b59cd12586a3f300348ead5875f2da7781f2ff9e
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler revision
+        run: test "$(git -C compiler rev-parse HEAD)" = "b59cd12586a3f300348ead5875f2da7781f2ff9e"
+      - name: Resolve pinned source frontends
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: inliner-source-ablation-pr408
+      - name: Run checked-source ablation regression tests for both languages
+        working-directory: compiler
+        run: cargo test -p compiler --bin compiler no_inline -- --nocapture
+      - name: Optimizer library regression
+        working-directory: compiler
+        run: cargo test -p compiler-opt --lib
+      - name: Strict Clippy on touched optimizer and unified driver
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-opt --lib -- -D warnings
+          cargo clippy -p compiler --bin compiler -- -D warnings
+      - name: Build release unified native compiler
+        working-directory: compiler
+        run: cargo build -p compiler --bin compiler --release
+      - name: Generate checked Oberon and Mini-C source corpus
+        working-directory: compiler
+        run: python3 tools/source_compile_corpus.py --out "$RUNNER_TEMP/source-corpus"
+      - name: Run paired inliner A/B source-to-ELF ablation
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          python3 tools/inliner_ablation.py \
+            --corpus "$RUNNER_TEMP/source-corpus" \
+            --compiler target/release/compiler \
+            --samples 3 --output results/inliner-ablation.csv \
+            | tee results/inliner-ablation-summary.csv
+          python3 - <<'PY'
+          import csv
+          with open('results/inliner-ablation.csv') as f:
+              rows = list(csv.DictReader(f))
+          assert len(rows) == 18 * 2 * 3, len(rows)
+          assert {r['language'] for r in rows} == {'oberon','mini_c'}
+          assert {r['mode'] for r in rows} == {'enabled','disabled'}
+          assert all(int(r['text_bytes']) > 0 for r in rows)
+          PY
+          cat results/inliner-ablation-summary.csv >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: inliner-pr408-source-ablation
+          path: compiler/results/inliner-ablation*
+          if-no-files-found: ignore
+          retention-days: 14
