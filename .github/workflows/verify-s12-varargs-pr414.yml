@@ -1,0 +1,51 @@
+name: Validate compiler x86 GP varargs PR #414
+on:
+  push:
+    branches: [test/s12-varargs-abi-414-20261106]
+  pull_request:
+    paths:
+      - '.github/workflows/verify-s12-varargs-pr414.yml'
+permissions:
+  contents: read
+jobs:
+  s12-gp-varargs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout exact compiler PR source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 475d4b0b4d7391ba0a97927cce46d09452725286
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify immutable source and test presence
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "475d4b0b4d7391ba0a97927cce46d09452725286"
+          grep -q "gp_variadic_eight_mixed_width_args_execute_against_c_va_arg" crates/backend-x86/src/call.rs
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text('''[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          ''')
+          PY
+      - name: Build and execute targeted GP-only SysV varargs ABI tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib call::tests::gp_variadic -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/s12-gp-abi-tests.log"
+          grep -F 'test call::tests::gp_variadic_eight_mixed_width_args_execute_against_c_va_arg ... ok' "$RUNNER_TEMP/s12-gp-abi-tests.log"
+          grep -F 'test call::tests::gp_variadic_call_sets_al_after_argument_moves_and_before_call ... ok' "$RUNNER_TEMP/s12-gp-abi-tests.log"
+          grep -F 'test call::tests::gp_variadic_void_call_has_no_return_move ... ok' "$RUNNER_TEMP/s12-gp-abi-tests.log"
+      - name: Preserve any failures
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s12-varargs-pr414-failure
+          path: ${{ runner.temp }}/s12-gp-abi-tests.log
+          if-no-files-found: ignore
