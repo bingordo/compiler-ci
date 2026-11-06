@@ -1,0 +1,113 @@
+name: Diagnose large-scale Mini-C compare-select eligibility
+on:
+  push:
+    branches: [ci/diagnose-large-compare-select-20261106]
+permissions:
+  contents: read
+jobs:
+  diagnosis:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7a43637b6237590fc4a776b236e9ead6b42d3cc4
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler source and configure Mini-C frontend
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "7a43637b6237590fc4a776b236e9ead6b42d3cc4"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: diag-large-compare-select
+      - name: Create read-only end-to-end SSA diagnostic test
+        shell: bash
+        run: |
+          mkdir -p compiler/tools/mini-c-driver/tests
+          cat > compiler/tools/mini-c-driver/tests/ifconv_scale_diagnostics.rs <<'EOF'
+          use compiler_ir::{Op, Terminator};
+          use compiler_backend_x86::machine::{self, Inst, End};
+          use compiler_opt::{self, profile::Profile, if_conversion};
+          use compiler_mini_c::lower_source_linked_for_fusion_benchmark;
+
+          fn source(branches: usize, loops: usize) -> String {
+              let mut s = String::from(
+                  "int kernel(int x) {\n  int total=0;\n  int tick=0;\n");
+              if loops > 1 { s.push_str(&format!("while(tick<{loops}) {{\n")); }
+              for k in 0..branches {
+                  let threshold = (k % 13) as i32 - 6;
+                  let left = k % 5 + 1;
+                  let right = k % 7 + 2;
+                  s.push_str(&format!(
+                      "if (x>{threshold}) {{ total=total+{left}; }} else {{ total=total+{right}; }}\n"));
+              }
+              if loops > 1 { s.push_str("tick=tick+1;\n}\n"); }
+              s.push_str("return total+tick;\n}\n");
+              s
+          }
+          #[test]
+          fn report_compiler_scale() {
+              for (n, loops) in [
+                  (8, 1), (24, 1), (48, 1), (72, 1), (96, 1), (120, 1),
+                  (144, 1), (24, 4),
+              ] {
+                  let (mut fs, _) = lower_source_linked_for_fusion_benchmark(&source(n,loops)).unwrap();
+                  let f = &fs[0];
+                  let pre_branches = f.blocks.iter().filter(|b| matches!(b.end, Terminator::Branch { .. })).count();
+                  let pre_regions = if_conversion::discover(f).unwrap();
+                  let pre_candidates = if_conversion::scalar_select_candidates(f).unwrap();
+                  let mut profile = Profile::default();
+                  compiler_opt::optimize_module_profiled(&mut fs, &mut profile).unwrap();
+                  let f = &fs[0];
+                  let blocks = f.blocks.len();
+                  let branches = f.blocks.iter().filter(|b| matches!(b.end, Terminator::Branch { .. })).count();
+                  let cmp = f.blocks.iter().flat_map(|b| &b.instructions).filter(|i|
+                      matches!(i.op, Op::Cmp(..) | Op::IntCmp { .. })).count();
+                  let selects = f.blocks.iter().flat_map(|b| &b.instructions)
+                      .filter(|i| matches!(i.op, Op::Select(..))).count();
+                  let mut one_use_cmp_select = 0;
+                  let mut two_use_cmp_select = 0;
+                  for b in &f.blocks {
+                      for i in &b.instructions {
+                          if let Op::Select(cond, _, _) = i.op {
+                              let parent = b.instructions.iter().find(|j| j.id == cond);
+                              if parent.is_some_and(|j| matches!(j.op, Op::Cmp(..) | Op::IntCmp { .. })) {
+                                  let uses = f.blocks.iter().flat_map(|x| &x.instructions)
+                                      .flat_map(|j| j.op.uses()).filter(|v| *v == cond).count();
+                                  if uses == 1 { one_use_cmp_select += 1; }
+                                  else { two_use_cmp_select += 1; }
+                              }
+                          }
+                      }
+                  }
+                  let selected = machine::select(f).unwrap();
+                  let fused = selected.blocks.iter().flat_map(|b| &b.insts)
+                      .filter(|i| matches!(i, Inst::CompareSelect32 { .. })).count();
+                  let materialized = selected.blocks.iter().flat_map(|b| &b.insts)
+                      .filter(|i| matches!(i, Inst::ScalarCmp { .. } | Inst::CompareSet32 { .. })).count();
+                  let selected_branches = selected.blocks.iter().filter(|b| matches!(b.end,
+                      End::Branch { .. } | End::CompareBranch { .. })).count();
+                  println!(
+                      "SCALE n={n} loops={loops} raw_blocks={} raw_branches={pre_branches} raw_regions={} raw_candidates={} opt_blocks={blocks} opt_branches={branches} ir_compares={cmp} ir_selects={selects} local_one_use={one_use_cmp_select} shared_or_multi={two_use_cmp_select} machine_fused={fused} machine_materialized={materialized} machine_branches={selected_branches} ifconv_regions={} ifconv_epochs={} ifconv_batches={}",
+                      fs[0].blocks.len() /* replaced by actual raw_blocks below */,
+                      pre_regions.len(), pre_candidates.len(),
+                      profile.count("ifconv.scalar.converted_regions"),
+                      profile.count("ifconv.scalar.discovery_epochs"),
+                      profile.count("ifconv.scalar.batches"),
+                  );
+              }
+          }
+          EOF
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("compiler/tools/mini-c-driver/tests/ifconv_scale_diagnostics.rs")
+          s=p.read_text().replace('let pre_branches = f.blocks.iter()', 'let raw_blocks = f.blocks.len();\n                  let pre_branches = f.blocks.iter()').replace('fs[0].blocks.len() /* replaced by actual raw_blocks below */','raw_blocks')
+          p.write_text(s)
+          PY
+      - name: Run scale diagnostics with actual checked Mini-C frontend
+        working-directory: compiler/tools/mini-c-driver
+        run: cargo test --features experimental-fusion-benchmark --test ifconv_scale_diagnostics -- --nocapture
