@@ -1,0 +1,63 @@
+name: X7 shared executable generated DAG matcher
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/x7-shared-generated-dag-matcher.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-generated-path:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out exact generic generator integration candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 54f2de0d6da320dcf6efc1c0d4b58a4262fb5c10
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Cache build results
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-g1-common-match-v1
+      - name: All backend x86 tests, including source-proven ADD and CTZ native GAS and ELF
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-backend-x86 -- --nocapture | tee /tmp/x7-g1-native.log
+          ! grep -Eq 'test result: FAILED|panicked at' /tmp/x7-g1-native.log
+      - name: Compilation and lints for backend x86
+        run: |
+          set -euo pipefail
+          cargo clippy --manifest-path compiler/Cargo.toml -p compiler-backend-x86 \
+            --all-targets -- -D warnings
+      - name: Assert production source includes one shared matcher for both proven rule families
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('compiler/crates/backend-x86/src')
+          common=(p/'dag_match.rs').read_text()
+          add=(p/'dag_add_match.rs').read_text()
+          ctz=(p/'dag_ctz_match.rs').read_text()
+          lib=(p/'lib.rs').read_text()
+          assert 'mod dag_match;' in lib
+          assert 'pub(crate) fn match_node<' in common
+          for name,s in [('ADD32/ADD64',add),('CTZ32',ctz)]:
+              assert 'use crate::dag_match::{match_node, State};' in s
+              assert 'impl crate::dag_match::PatternNode for DagNode' in s
+              assert 'fn match_node(' not in s,(name,'duplicate matcher')
+          assert 'GENERATED_ADD64_DAG_RULES' in add
+          assert 'GENERATED_ADD_DAG_RULES' in add
+          assert 'GENERATED_DAG_RULES' in ctz
+          print('X7_G1_SHARED_MATCHER=PASS existing_generated_rule_families=ADD32,ADD64,CTZ32')
+          PY
+      - name: Archive native regression output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-shared-dag-native
+          path: /tmp/x7-g1-native.log
+          if-no-files-found: warn
