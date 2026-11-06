@@ -1,0 +1,77 @@
+name: Compare cross-block compare-select rematerialization fanouts 4 vs 12
+on:
+  push:
+    branches: [ci/exp-shared-remat-cap12-abba-20261106]
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Checkout fanout 4
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: aa833b23cef4da237f1f253b525d38049179966a
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout experimental fanout 12
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 77b663d931cc5842d9413c89b479f75db0a82f0e
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler SHAs and source profiling tool
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          test "$(git -C before rev-parse HEAD)" = "aa833b23cef4da237f1f253b525d38049179966a"
+          test "$(git -C after rev-parse HEAD)" = "77b663d931cc5842d9413c89b479f75db0a82f0e"
+          git -C before rev-parse HEAD | tee results/before-sha.txt
+          git -C after rev-parse HEAD | tee results/after-sha.txt
+          rustc --version | tee results/toolchain.txt
+          cc --version | head -1 | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\\(s\\)):' | tee -a results/toolchain.txt || true
+          python3 -m py_compile harness/tools/ct05d_select_budget_compare.py after/tools/source_cli_profile.py
+      - name: Configure public Mini-C frontend
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before/tools/mini-c-driver -> target
+            after/tools/mini-c-driver -> target
+          key: cmp-remat-cap4-cap12
+      - name: Build exact release compilers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path before/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+          cargo build --release --manifest-path after/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+      - name: Same runner native correctness and ABBA measurements
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct05d_select_budget_compare.py \
+            --helpers after/tools \
+            --before before/tools/mini-c-driver/target/release/compiler-mini-c \
+            --after after/tools/mini-c-driver/target/release/compiler-mini-c \
+            --rounds 3 --results results/cases
+          cat results/cases/report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: remat-cap4-vs-cap12
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
