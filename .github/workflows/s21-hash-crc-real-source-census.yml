@@ -1,0 +1,192 @@
+name: S21 original musl MD5 SHA zlib CRC helper audit
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/s21-hash-crc-real-source-census.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  exact-hash-crc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: daf68ae3f418f11622a8d10aec86b615cbbc9463
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout original CRC header and sources at immutable upstream revision
+        uses: actions/checkout@v4
+        with:
+          repository: madler/zlib
+          ref: 99623ef7097352da7993ba614161fd6a311e046e
+          path: zlib
+          persist-credentials: false
+      - name: Verify all original Git blobs and extract exact helper function spans
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/expr-rule-gen/harness/prepare_s21_hash_crc_sources.py \
+            --manifest compiler/tools/expr-rule-gen/harness/s21_hash_crc_real_sources.json \
+            --output-dir /tmp/s21-hash | tee /tmp/s21-hash-provenance.log
+          grep -qx 'S21H_FETCH_OK selected=4 exact_functions=4' /tmp/s21-hash-provenance.log
+          test "$(grep -c '^S21H_PIN,' /tmp/s21-hash-provenance.log)" -eq 4
+          # Extra cross-check that a real upstream checkout, not benchmark-local
+          # headers, supplies zlib's types and macros.
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,json
+          m=json.loads(Path('compiler/tools/expr-rule-gen/harness/s21_hash_crc_real_sources.json').read_text())
+          z=next(x for x in m['files'] if x['id']=='zlib_crc_multmodp')
+          data=Path('zlib/crc32.c').read_bytes()
+          calc=hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
+          assert calc==z['blob_sha'],(calc,z['blob_sha'])
+          assert Path('zlib/zutil.h').exists() and Path('zlib/zlib.h').exists()
+          print('S21H_ZLIB_CHECKOUT_EXACT',calc)
+          PY
+      - name: Install offline Z3 prover
+        run: sudo apt-get update -qq && sudo apt-get install -y z3
+      - name: Regenerate and pin complete 152-rule experimental matcher
+        run: |
+          set -euo pipefail
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --compose-guards --minimize-rules --commute-inferred \
+            --max-proofs 2000 --max-rules 500 --format rust --output /tmp/s21-hash-rules.rs
+          grep -q 'pub const RULE_COUNT: usize = 152;' /tmp/s21-hash-rules.rs
+          grep -q 'pub const RULE_LIMIT_REACHED: bool = false;' /tmp/s21-hash-rules.rs
+      - name: Use exact pinned public Mini-C source without private git SSH
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('compiler/tools/mini-c-driver/Cargo.toml')
+          s=p.read_text()
+          old='ssh://git@github.com/bingordo/mini-c.git'
+          assert s.count(old)==2
+          p.write_text(s.replace(old,'https://github.com/bingordo/mini-c.git'))
+          PY
+      - name: Cache Rust compilation
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: s21-hash-original-source
+      - name: Test function-name-only aliasing and compile experimental audit
+        env:
+          S14_MATCHER_FILE: /tmp/s21-hash-rules.rs
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            --features s14-ssa-audit --example benchmark_generated_fusion \
+            aliases_only_original_hash_symbol -- --nocapture
+          cargo build --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            --features s14-ssa-audit --example benchmark_generated_fusion
+      - name: Audit four original hash and CRC functions, native GCC oracle
+        env:
+          RULE_S21_HASH_DIR: /tmp/s21-hash
+          RULE_S21_ZLIB_DIR: ${{ github.workspace }}/zlib
+        run: |
+          set -euo pipefail
+          compiler/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion \
+            --s21-hash-real | tee /tmp/s21-hash-results.log
+      - name: Independently reconcile original source denominator and all typed SSA operators
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          m=json.loads(Path('compiler/tools/expr-rule-gen/harness/s21_hash_crc_real_sources.json').read_text())
+          specs={x['id']:x for x in m['files']}
+          assert len(specs)==4
+          lines=Path('/tmp/s21-hash-results.log').read_text().splitlines()
+          schema=[s.split(',') for s in lines if s.startswith('S21H_OPS_SCHEMA,')]
+          info=[s for s in lines if s.startswith('S21H_INFO ')]
+          rows=[s.split(',') for s in lines if s.startswith('S21H_ROW,')]
+          rejected=[s.split(',') for s in lines if s.startswith('S21H_REJECT,')]
+          cpp=[s.split(',') for s in lines if s.startswith('S21H_CPP,')]
+          summary=[s for s in lines if s.startswith('S21H_SUMMARY ')]
+          assert len(schema)==len(info)==len(summary)==1
+          assert 'selected=4' in info[0] and 'real_headers=true' in info[0]
+          names=('const_i32','const_i64','const_bool','add','sub','mul',
+                 'div_rem','bit_and','bit_or','bit_xor','shift','cmp','select',
+                 'cast','bit_not','ctz','address','memory','call')
+          assert schema[0][4:]==list(names)
+          assert len(rows)+len(rejected)==4 and len(rows)>=2
+          hashes={}
+          for id,spec in specs.items():
+              original=Path('/tmp/s21-hash',id+'.c').read_text()
+              sig=spec['signature'];sym=spec['symbol']
+              assert original.startswith(sig) and sig.count(sym)==1
+              alias=sig.replace(sym,'f',1)
+              assert original.replace(sig,alias,1).replace(alias,sig,1)==original
+              h=0xcbf29ce484222325
+              for b in original.replace(sig,alias,1).encode():
+                  h=((h^b)*0x100000001b3)&((1<<64)-1)
+              hashes[id]=f'{h:016x}'
+          ids=set()
+          totals=dict(attempted=4,accepted=len(rows),rejected=len(rejected),applied=0,
+                      baseline_bytes=0,trial_bytes=0,native_calls=0)
+          row_values={}
+          for r in rows:
+              assert len(r)==15,r
+              _,id,h,*v=r
+              assert id in specs and id not in ids and h==hashes[id]
+              ids.add(id)
+              a=list(map(int,v));assert len(a)==12
+              raw,opt,rawarith,optarith,rawpairs,optpairs,applied,before,after,calls,bit,shift=a
+              assert raw>=rawarith>=rawpairs>=0 and opt>=optarith>=optpairs>=0
+              assert opt>=bit and opt>=shift and before>0 and after>0
+              assert calls==({'rot32':120,'rot64':168,'crc64':108}[specs[id]['kind']])
+              row_values[id]=a
+              for k,val in [('applied',applied),('baseline_bytes',before),
+                            ('trial_bytes',after),('native_calls',calls)]:
+                  totals[k]+=val
+          for r in rejected:
+              assert len(r)==5,r
+              _,id,h,stage,reason=r
+              assert id in specs and id not in ids and h==hashes[id]
+              assert stage in ('frontend','preprocessor','function_count') and reason
+              ids.add(id)
+          assert ids==set(specs)
+          assert {r[1] for r in cpp}.issubset(ids)
+          for r in cpp:
+              assert len(r)==5 and r[1] in specs and len(r[2])==16 and int(r[3])>0
+          hist={}
+          for which in ('RAW','OPT'):
+              rr=[s.split(',') for s in lines if s.startswith(f'S21H_OPS_{which},')]
+              tt=[s.split(',') for s in lines if s.startswith(f'S21H_TOTAL_{which},')]
+              assert len(rr)==len(rows) and len(tt)==1
+              assert all(len(r)==23 for r in rr)
+              got=set()
+              accum=[0]*len(names)
+              for r in rr:
+                  _,id,h,total,*fields=r
+                  assert id in row_values and id not in got and h==hashes[id]
+                  got.add(id)
+                  nums=list(map(int,fields))
+                  assert int(total)==sum(nums) and all(x>=0 for x in nums)
+                  for i,v in enumerate(nums):accum[i]+=v
+                  hist[id,which]=nums
+              assert got==set(row_values)
+              _,who,h,total,*fields=tt[0]
+              assert who=='all' and h=='0000000000000000'
+              assert list(map(int,fields))==accum and int(total)==sum(accum)
+              print('S21H_FULL_OPS_RECONCILED',which,dict(zip(names,accum)))
+          for id,v in row_values.items():
+              assert v[0]==sum(hist[id,'RAW']) and v[1]==sum(hist[id,'OPT'])
+              assert v[10]==sum(hist[id,'OPT'][j] for j in (7,8,9))
+              assert v[11]==hist[id,'OPT'][10]
+          fields=dict(x.split('=',1) for x in summary[0].split()[1:])
+          assert all(int(fields[k])==v for k,v in totals.items()),(fields,totals)
+          print('S21H_CORPUS_VERIFIED',totals,'accepted',list(row_values),
+                'rejected',[r[1] for r in rejected])
+          PY
+      - name: Archive original-source audit logs and source provenance
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s21-original-hash-crc-source-census
+          if-no-files-found: warn
+          path: |
+            /tmp/s21-hash-provenance.log
+            /tmp/s21-hash-results.log
