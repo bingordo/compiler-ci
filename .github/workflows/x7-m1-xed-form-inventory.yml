@@ -1,0 +1,97 @@
+name: X7 M1 pinned Intel XED normalized variant inventory
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/x7-m1-xed-form-inventory.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  xed-variant-corpus:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact compiler M1 importer commit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9b65dfd0c37349e59b3fed2931271a28ae865720
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Test fail-closed XED identity, duplicates and deterministic regeneration
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s compiler/tests -p test_import_xed_forms.py -v
+          python3 -m unittest discover -s compiler/tests -p test_x86_uops_import.py -v
+      - name: Obtain exact Intel XED/mbuild revisions
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/intelxed/xed.git /tmp/xed
+          git -C /tmp/xed checkout 0bcb6237345c5066726dcc08b3d87928df3b5b26
+          git clone --filter=blob:none https://github.com/intelxed/mbuild.git /tmp/mbuild
+          git -C /tmp/mbuild checkout 1b437e409221a2b5703b4d8896baa20d43e4ba1a
+          test "$(git -C /tmp/xed rev-parse HEAD)" = 0bcb6237345c5066726dcc08b3d87928df3b5b26
+          test "$(git -C /tmp/mbuild rev-parse HEAD)" = 1b437e409221a2b5703b4d8896baa20d43e4ba1a
+      - name: Build XED's actual upstream generated dgen database
+        run: |
+          set -euo pipefail
+          cd /tmp/xed
+          ./mfile.py --no-encoder
+          for file in all-state.txt all-cpuid.txt all-dec-instructions.txt all-chip-models.txt all-widths.txt all-extra-widths.txt all-element-types.txt all-map-descriptions.txt; do
+            test -s "obj/dgen/$file"
+          done
+      - name: Export real Intel XED JSON (not a hand-authored machine description)
+        run: |
+          set -euo pipefail
+          python3 /tmp/xed/pysrc/xed_to_db.py --xed-dgen /tmp/xed/obj/dgen \
+            --out /tmp/x7-m1-xed-upstream.json --compact
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          db=json.loads(Path('/tmp/x7-m1-xed-upstream.json').read_text())
+          assert isinstance(db.get('Instructions'),list) and len(db['Instructions'])>1000
+          print('X7_M1_UPSTREAM_XED_RECORDS',len(db['Instructions']))
+          PY
+      - name: Normalize all real XED variants and report independent unsupported coverage
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/import_xed_forms.py \
+            --xed-json /tmp/x7-m1-xed-upstream.json \
+            --xed-revision 0bcb6237345c5066726dcc08b3d87928df3b5b26 \
+            --legacy-forms compiler/data/x86_encoding_forms.json \
+            --output /tmp/x7-m1-xed-normalized.json \
+            --report /tmp/x7-m1-xed-report.json
+          python3 compiler/tools/import_xed_forms.py \
+            --xed-json /tmp/x7-m1-xed-upstream.json \
+            --xed-revision 0bcb6237345c5066726dcc08b3d87928df3b5b26 \
+            --legacy-forms compiler/data/x86_encoding_forms.json \
+            --output /tmp/x7-m1-xed-normalized.json \
+            --report /tmp/x7-m1-xed-report.json --check
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          raw=Path('/tmp/x7-m1-xed-upstream.json').read_bytes()
+          inv=json.loads(Path('/tmp/x7-m1-xed-normalized.json').read_text())
+          rep=json.loads(Path('/tmp/x7-m1-xed-report.json').read_text())
+          s=rep['summary']
+          assert s['xed_records']==len(inv['forms']) and s['xed_records']>1000
+          assert s['unique_canonical_variants']<=s['xed_records']
+          assert s['legacy_forms']==55 and len(rep['legacy_opcode_probes'])==55
+          assert s['legacy_fully_reconciled']==0
+          assert inv['source']['xed_export_sha256']==hashlib.sha256(raw).hexdigest()
+          assert all(x['admission']=='inventory_only' for x in inv['forms'])
+          for k in ('selected_generated','encoded_generated','native_verified_generated','measured_uops_variants'):
+              assert s[k]==0
+          print('X7_M1_REAL_SOURCE_VERIFIED',s)
+          print('X7_M1_OPCODE_PROBES',rep['legacy_opcode_probes'][:12])
+          PY
+      - name: Archive pinned upstream form inventory and coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-m1-xed-pinned-variant-inventory
+          if-no-files-found: warn
+          path: |
+            /tmp/x7-m1-xed-normalized.json
+            /tmp/x7-m1-xed-report.json
