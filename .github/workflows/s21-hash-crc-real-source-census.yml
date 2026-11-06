@@ -15,7 +15,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ac5fbee8333990009607d549689556571b5f4838
+          ref: 3a522a03b4eeccb7fec8a07b57016e0ee3c329b5
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -148,6 +148,13 @@ jobs:
               assert stage in ('frontend','preprocessor','function_count') and reason
               ids.add(id)
           assert ids==set(specs)
+          machine=[s.split(',') for s in lines if s.startswith('S21H_X86,')]
+          assert len(machine)==len(rows)
+          assert {r[1] for r in machine}==set(row_values)
+          assert all(len(r)==4 and r[2] in ('baseline_rotate=true','baseline_rotate=false')
+                     and r[3] in ('trial_rotate=true','trial_rotate=false')
+                     for r in machine)
+          print('S21H_X86_RECONCILED',machine)
           assert {r[1] for r in cpp}.issubset(ids)
           for r in cpp:
               assert len(r)==5 and r[1] in specs and len(r[2])==16 and int(r[3])>0
@@ -181,6 +188,44 @@ jobs:
           print('S21H_CORPUS_VERIFIED',totals,'accepted',list(row_values),
                 'rejected',[r[1] for r in rejected])
           PY
+      - name: Compare GCC -O2 rotate code generated from unchanged original musl hash functions
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee /tmp/s21-gcc-rotate-reference.log
+          import json,re,subprocess,tempfile
+          from pathlib import Path
+          manifest=json.loads(Path('compiler/tools/expr-rule-gen/harness/s21_hash_crc_real_sources.json').read_text())
+          rows=[x for x in manifest['files'] if x['kind'].startswith('rot')]
+          assert len(rows)==3
+          with tempfile.TemporaryDirectory(prefix='s21-gcc-orig-rotate-') as td:
+              td=Path(td)
+              for x in rows:
+                  id=x['id']
+                  orig=Path('/tmp/s21-hash',id+'.c').read_text()
+                  typ='uint64_t' if x['kind']=='rot64' else 'uint32_t'
+                  assert orig.startswith(x['signature'])
+                  decl=f'{typ} s21_gcc_wrapper({typ} n, int k) {{ return {x["symbol"]}(n,k); }}\n'
+                  c=td.joinpath(id+'.c')
+                  o=td.joinpath(id+'.o')
+                  c.write_text('#include <stdint.h>\n'+orig+'\n'+decl)
+                  subprocess.run(['cc','-O2','-std=c11','-fwrapv','-fno-strict-aliasing',
+                                  '-c',str(c),'-o',str(o)],check=True)
+                  syms=subprocess.check_output(['readelf','-Ws',str(o)],text=True)
+                  functions=[line.split() for line in syms.splitlines()
+                             if line.split() and line.split()[-1]=='s21_gcc_wrapper']
+                  assert len(functions)==1,syms
+                  size=int(functions[0][2])
+                  asm=subprocess.check_output(['objdump','-d','-M','intel',str(o)],text=True)
+                  section=asm.split('<s21_gcc_wrapper>:',1)
+                  assert len(section)==2,asm
+                  body=section[1].split('\n\n',1)[0]
+                  operations=re.findall(r'\s(?:rol|ror|rorx)\s',body)
+                  assert size>0 and operations,(id,size,body)
+                  print('S21H_GCC_REF',id,'native_bytes',size,
+                        'rotate_instructions',len(operations),
+                        'reference=original_source_plus_separate_wrapper')
+          PY
+          test "$(grep -c '^S21H_GCC_REF ' /tmp/s21-gcc-rotate-reference.log)" -eq 3
       - name: Archive original-source audit logs and source provenance
         if: always()
         uses: actions/upload-artifact@v4
@@ -190,3 +235,4 @@ jobs:
           path: |
             /tmp/s21-hash-provenance.log
             /tmp/s21-hash-results.log
+            /tmp/s21-gcc-rotate-reference.log
