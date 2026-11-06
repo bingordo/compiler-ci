@@ -1,0 +1,42 @@
+name: Verify PR423 TypeId bounded edge-sensitive PRE
+on:
+  push:
+    branches: [ci/pr423-typeid-pre]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: dddca6066fb1696157fb3094b3302e3516b25945
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert immutable compiler source revision
+        run: test "$(git -C compiler rev-parse HEAD)" = "dddca6066fb1696157fb3094b3302e3516b25945"
+      - name: Isolate self-contained compiler core/native workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-edge-pre-pr423
+          cache-workspace-crates: 'true'
+      - name: Focused TypeId PRE replay and native C oracle
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typed_pre_native --test typed_core_pipeline --test typed_phi_cfg --test typed_phi_dead_linear --test ir_replay_cli -- --nocapture
+      - name: Full isolated four-crate compiler core/native regressions
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+      - name: Strict compiler optimizer Clippy all targets
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt --all-targets -- -D warnings
