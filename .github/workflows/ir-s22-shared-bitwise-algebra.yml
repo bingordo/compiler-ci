@@ -1,0 +1,81 @@
+name: IR S22 shared typed bitwise simplification and SMT
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/ir-s22-shared-bitwise-algebra.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  bitwise-algebra:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 86460ceb1f917dbcb2dc63bc492dc0eb5e5c36b6
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source revision and isolate the pure IR/opt workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 86460ceb1f917dbcb2dc63bc492dc0eb5e5c36b6
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Install offline Z3 bitvector prover
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends z3
+      - name: Prove every 32-bit and 64-bit identity independently
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/prove_ir_bitwise_identities.py | tee /tmp/ir-s22-bitwise-smt.log
+          grep -qx 'IR_BITWISE_SMT_PROVEN widths=32,64 rules=26 negative_controls=2' /tmp/ir-s22-bitwise-smt.log
+      - name: Cache Rust build results
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: s22-ir-bitwise-proof
+      - name: Unit test shared legacy/typed algebra identities and effects
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt --lib algebra::tests -- --nocapture
+      - name: Test TypeId versus legacy IR, replay and failure atomicity
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt --test typed_algebra -- --nocapture
+      - name: Test full typed-core optimizer and existing native differential
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt --test typed_core_pipeline -- --nocapture
+      - name: Strict Clippy for library and changed TypeId regression paths
+        run: |
+          set -euo pipefail
+          cargo clippy --manifest-path compiler/Cargo.toml -p compiler-opt --lib --test typed_algebra --test typed_core_pipeline -- -D warnings
+      - name: Check new bitwise rules stay in shared IR optimizer rather than x86 backend
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("compiler/crates/opt/src/algebra.rs").read_text()
+          a=Path("compiler/crates/opt/src/typed_algebra.rs").read_text()
+          assert "fn simplify_bitwise(" in p
+          assert "Op::IntBin {kind,bits,lhs,rhs}" in p
+          assert "simplify_typed_body" in a
+          assert "Constant64(i64)" in p
+          print("IR_S22_SHARED_PASS=PASS widths=32,64 engines=legacy,TypeId")
+          PY
+      - name: Archive Z3 proof log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ir-s22-bitwise-proof-and-tests
+          if-no-files-found: warn
+          path: /tmp/ir-s22-bitwise-smt.log
