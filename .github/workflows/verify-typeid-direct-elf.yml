@@ -1,0 +1,52 @@
+name: Direct native TypeId scalar GAS and ELF execution (compiler-ci)
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-typeid-direct-elf.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ed5990aeb17c633f68fbac7b1d1ec697c9484f3e
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact source pin
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "ed5990aeb17c633f68fbac7b1d1ec697c9484f3e"
+      - name: Isolate core compiler workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-native-direct-elf
+      - name: Execute independent C11 GAS/direct ELF oracle
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --test native_typeid_direct -- --nocapture
+      - name: Full IR optimizer and backend regressions
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+      - name: AArch64 backend build compatibility
+        working-directory: compiler
+        run: cargo check -p compiler-backend-aarch64 --all-targets
+      - name: Strict core all-target Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
+      - name: Strict AArch64 production-library Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
