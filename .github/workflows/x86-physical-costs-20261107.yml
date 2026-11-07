@@ -1,0 +1,53 @@
+name: x86 physical measured cost and spill telemetry
+on:
+  push:
+    branches: [ci/x86-physical-costs-20261107]
+permissions:
+  contents: read
+jobs:
+  profiles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ad278cbca78e1176686f37d469c4ee8d6ef315a3
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Regenerate two exact CMP-direction physical form CPU profiles
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "ad278cbca78e1176686f37d469c4ee8d6ef315a3"
+          python3 tools/regen_x86_forms.py --check
+          curl --fail --show-error -L --retry 2 --max-time 180 \
+            https://uops.info/instructions.xml -o /tmp/instructions.xml
+          echo "e5e702caaf04c4fc1f75192a9bbe4d8554b3e174f7933a14d124cc33ca677ab3  /tmp/instructions.xml" | sha256sum -c
+          mkdir -p /tmp/profiles
+          for arch in SKL ZEN4; do
+            python3 tools/import_uops_info.py /tmp/instructions.xml \
+              --architecture "$arch" --mapping data/x86_uops_variant_mapping.json \
+              --output "/tmp/profiles/${arch}.json"
+            python3 tools/validate_x86_costs.py "/tmp/profiles/${arch}.json"
+            python3 - "$arch" <<'PY'
+          import json,sys
+          from pathlib import Path
+          arch=sys.argv[1]
+          p=json.loads(Path('/tmp/profiles',arch+'.json').read_text())
+          print('BEGIN_PROFILE',arch)
+          print(json.dumps(p,indent=2,sort_keys=True))
+          print('END_PROFILE',arch)
+          print('COVERAGE',arch,len(p['forms']))
+          assert len(p['forms'])==38
+          for bits in (32,64):
+              assert 'CMP_R_R_3B_'+str(bits) in p['forms']
+          PY
+          done
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: x86-skl-zen4-physical-cmp-direction-profiles
+          path: /tmp/profiles/
+          retention-days: 30
