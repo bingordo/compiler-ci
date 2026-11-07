@@ -15,12 +15,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 50e10f949d97886c60a55b3c470a18d41d84444c
+          ref: f7120b96d8da990b220d762ec2c0bbc2b342146f
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - name: Verify immutable compiler SHA
-        run: test "$(git -C compiler rev-parse HEAD)" = "50e10f949d97886c60a55b3c470a18d41d84444c"
+        run: test "$(git -C compiler rev-parse HEAD)" = "f7120b96d8da990b220d762ec2c0bbc2b342146f"
       - name: Resolve pinned checked frontends
         run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
       - uses: Swatinem/rust-cache@v2
@@ -32,6 +32,7 @@ jobs:
         run: |
           python3 -m unittest discover -s tools/tests -p test_inliner_runtime_ablation.py -v
           python3 -m unittest discover -s tools/tests -p test_x86_machine_sequences.py -v
+          python3 -m unittest discover -s tools/tests -p test_inliner_machine_sequence_compare.py -v
       - name: Verify cost admission and previous native inliner tests
         working-directory: compiler
         run: |
@@ -163,6 +164,33 @@ jobs:
           cat results/inliner-source-cost-summary.csv >> "$GITHUB_STEP_SUMMARY"
           cat results/inliner-native-x86-summary.csv >> "$GITHUB_STEP_SUMMARY"
           cat results/inliner-source-x86-summary.csv >> "$GITHUB_STEP_SUMMARY"
+      - name: Compare full decoded machine-code sequences and six-argument optimization
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/inliner_machine_sequence_compare.py \
+            --legacy results/inliner-native-runtime-sequences.jsonl \
+            --cost results/inliner-native-cost-sequences.jsonl \
+            --x86 results/inliner-native-x86-sequences.jsonl \
+            --output results/inliner-machine-byte-comparison.csv \
+            | tee results/inliner-machine-byte-summary.csv
+          python3 - <<'PY'
+          import csv
+          with open('results/inliner-machine-byte-comparison.csv') as f:
+              rows=list(csv.DictReader(f))
+          assert len(rows)==54,len(rows)
+          assert {r['policy'] for r in rows}=={'legacy','cost','x86'}
+          for language in ('oberon','mini_c'):
+              for scale in (4,12):
+                  x=next(r for r in rows if r['policy']=='x86' and r['language']==language
+                         and r['case']=='hot_args' and int(r['scale'])==scale)
+                  assert int(x['baseline_kernel_calls'])==scale,x
+                  assert int(x['inline_kernel_calls'])==0,x
+                  assert int(x['delta_text_bytes'])<0,x
+                  assert int(x['delta_kernel_call_bytes'])==-5*scale,x
+          PY
+          cat results/inliner-machine-byte-summary.csv >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
