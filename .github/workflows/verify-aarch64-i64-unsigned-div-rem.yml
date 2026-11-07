@@ -1,0 +1,49 @@
+name: AArch64 M7 I64 unsigned div/rem native gate
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/verify-aarch64-i64-unsigned-div-rem.yml'
+permissions:
+  contents: read
+concurrency:
+  group: aarch64-m7-i64-unsigned-div-rem
+  cancel-in-progress: true
+jobs:
+  native:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 14e7d896d51cc1c0e5241f7fc274c0b68ad47def
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin and isolate self-contained backend workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 14e7d896d51cc1c0e5241f7fc274c0b68ad47def
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m7-i64-udiv-rem-v1
+      - name: Check AArch64 crate with warnings denied
+        working-directory: compiler
+        run: |
+          RUSTFLAGS="-D warnings" cargo check -p compiler-backend-aarch64 --all-targets
+          cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
+      - name: Verify native backend tests and independent C oracle
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend-aarch64 -- --test-threads=1
+          echo 'PASS native AArch64 U64 DivU/RemU differential, wide spills, 4 SIGTRAP cases, and legacy backend tests' >> "$GITHUB_STEP_SUMMARY"
