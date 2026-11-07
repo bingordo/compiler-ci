@@ -1,0 +1,52 @@
+name: IR native generic integer v2 (compiler-ci)
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-ir-generic-int-v2.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-ir:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a7f7fc81c28fff798c8a979512ffe31ce4d5f287
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert immutable compiler source SHA
+        working-directory: compiler
+        run: |
+          test "$(git rev-parse HEAD)" = "a7f7fc81c28fff798c8a979512ffe31ce4d5f287"
+          echo "Compiler PR 493 revision: a7f7fc81c28fff798c8a979512ffe31ce4d5f287" >> "$GITHUB_STEP_SUMMARY"
+      - name: Create isolated compiler core workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-generic-int-v2
+          cache-workspace-crates: 'true'
+      - name: Focused TypeId v2 roundtrip and v1 rejection
+        working-directory: compiler
+        run: cargo test -p compiler-ir --test typed_integer_v2 -- --nocapture
+      - name: Existing typed opcode and verifier parity
+        working-directory: compiler
+        run: cargo test -p compiler-ir --test typed_opcode_types --test typed_verifier_parity --test typed_verifier_generated
+      - name: Full IR optimizer and backend core regression
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+      - name: Strict full-core Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
