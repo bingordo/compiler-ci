@@ -1,0 +1,118 @@
+name: "CT-03 phi transaction: checked core and exact-parent isolated ABBA"
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct03-phi-atomic.yml'
+permissions:
+  contents: read
+concurrency:
+  group: ct03-phi-atomic-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  verify-and-profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '4ad9dec1ad9bbddd980acfed9dc9406bcbbe6287'
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '9395967d73a04da1f6f1bbe4061758fecc3926e8'
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record checked source SHA, runner and exact shared benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C before rev-parse HEAD | tee results/before-sha.txt
+          git -C after rev-parse HEAD | tee results/after-sha.txt
+          rustc --version | tee results/toolchain.txt
+          cargo --version | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\\(s\\)):' | tee -a results/toolchain.txt || true
+          python3 -m py_compile harness/tools/ct04_hotspot_compare.py
+          for checkout in before after; do
+            mkdir -p "$checkout/crates/opt/examples"
+            cp harness/tools/ct04_hotspot_bench.rs \
+              "$checkout/crates/opt/examples/ct04_hotspot_bench.rs"
+            cat > "$checkout/Cargo.toml" <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+            rm -f "$checkout/Cargo.lock"
+          done
+          cmp before/crates/opt/examples/ct04_hotspot_bench.rs \
+            after/crates/opt/examples/ct04_hotspot_bench.rs
+          sha256sum before/crates/opt/examples/ct04_hotspot_bench.rs \
+            after/crates/opt/examples/ct04_hotspot_bench.rs | tee results/fixture-sha.txt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before -> target
+            after -> target
+          key: ct03-phi-atomic
+      - name: Full production IR/optimizer/backend/x86 suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path after/Cargo.toml \
+            -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 \
+            2>&1 | tee results/core.log
+      - name: Targeted fault injection and strict Clippy in both modes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path after/Cargo.toml -p compiler-opt \
+            --lib rejected_postcheck_after_real_phi_and_edge_compaction_is_atomic \
+            -- --nocapture 2>&1 | tee results/rollback.log
+          cargo test --manifest-path after/Cargo.toml -p compiler-opt \
+            --lib malformed_phi_input_is_rejected_without_mutation \
+            -- --nocapture 2>&1 | tee results/bad-input.log
+          cargo clippy --manifest-path after/Cargo.toml \
+            -p compiler-ir -p compiler-opt --all-targets -- -D warnings \
+            2>&1 | tee results/clippy-default.log
+          cargo clippy --manifest-path after/Cargo.toml \
+            -p compiler-ir -p compiler-opt \
+            --features compiler-opt/verify-counts --all-targets -- -D warnings \
+            2>&1 | tee results/clippy-optin.log
+      - name: Release build exact parent/candidate phi benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path before/Cargo.toml \
+            -p compiler-opt --example ct04_hotspot_bench
+          cargo build --release --manifest-path after/Cargo.toml \
+            -p compiler-opt --example ct04_hotspot_bench
+      - name: Same runner 5-round phi reverse/wide ABBA with output parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct04_hotspot_compare.py \
+            --pair ct04b \
+            --before before/target/release/examples/ct04_hotspot_bench \
+            --after after/target/release/examples/ct04_hotspot_bench \
+            --rounds 5 --raw results/raw.csv --report results/report.md
+          cat results/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve complete raw timing, output and regression evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ct03-phi-atomic
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
