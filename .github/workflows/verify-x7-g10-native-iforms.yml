@@ -1,0 +1,48 @@
+name: X7.G10 native Intel memory form differential oracle
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-x7-g10-native-iforms.yml']
+permissions:
+  contents: read
+jobs:
+  native-iforms:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Checkout exact X7.G10 fixture source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 24e8214847a9a167f7c2b429cd34ceb9af7b831c
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Validate offline native-form metadata and mutation regressions
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          python3 -m unittest discover -s tools -p 'test_x86_g10_native_iforms.py' -v
+          python3 -m py_compile tools/x86_g10_native_iforms.py
+      - name: Fetch exact pinned Intel source-form XML
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/x7-g10-intel /tmp/x7-g10-output
+          rev=35eface1b7ee003a1cda95005ec5fd83de658a64
+          for instruction in MOV ADD XOR; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 45 \
+              "https://raw.githubusercontent.com/intel/SDM/${rev}/data/instruction/${instruction}.xml" \
+              --output "/tmp/x7-g10-intel/${instruction}.xml"
+          done
+          python3 tools/x86_g10_native_iforms.py --xml-dir /tmp/x7-g10-intel --out-dir /tmp/x7-g10-output
+      - name: Execute actual GAS and literal x86-64 machine bytes against C oracle
+        run: |
+          set -euo pipefail
+          cc --version | head -n 1
+          cc -std=c11 -O2 -Wall -Wextra -Werror -fno-strict-aliasing \
+            tools/tests/x86_g10_native_iforms.c /tmp/x7-g10-output/native_forms.S \
+            -o /tmp/x7-g10-output/native_oracle
+          /tmp/x7-g10-output/native_oracle
+          # These instructions are direct machine bytes, not the
+          # compiler's still-unverified direct ELF instruction forms.
+          objdump -d /tmp/x7-g10-output/native_oracle | grep -m 1 '<x7g10_mov_read_bytes>:'
