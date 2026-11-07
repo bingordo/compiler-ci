@@ -30,6 +30,17 @@ CASES = {
         ("sccp_forward", 96, 6),
         ("sccp_forward", 256, 2),
     ],
+    "ct03licm": [
+        ("licm_preheader", 24, 12),
+        ("licm_preheader", 96, 6),
+        ("licm_preheader", 256, 3),
+        ("licm_hoist", 24, 12),
+        ("licm_hoist", 96, 6),
+        ("licm_hoist", 256, 3),
+        ("licm_pipeline", 24, 12),
+        ("licm_pipeline", 96, 6),
+        ("licm_pipeline", 256, 3),
+    ],
     "ct03scalar": [
         ("sccp_forward", 32, 12),
         ("sccp_forward", 96, 6),
