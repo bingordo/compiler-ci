@@ -1,0 +1,65 @@
+name: X86 uops.info exact variant identity audit
+on:
+  push:
+    branches: [ci/x86-uops-variant-audit-20261106]
+permissions:
+  contents: read
+jobs:
+  upstream:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Download current upstream uops.info XML and pin checksum
+        run: |
+          set -euo pipefail
+          curl --fail --show-error --location --retry 2 --connect-timeout 15 --max-time 160 \
+            https://uops.info/instructions.xml -o instructions.xml
+          sha256sum instructions.xml
+          ls -lh instructions.xml
+      - name: Inspect exact comparison and select-related encodings and architecture measurements
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from collections import defaultdict
+          import json, re, xml.etree.ElementTree as ET
+          opcodes={'39','3B','81','83','0F94','0F95','0F9F','0F9C','0F9E',
+            '0F9D','0FB6','0F44','0F45','0F4F','0F4C','0F47','0F42'}
+          variants=defaultdict(list)
+          arch_names=defaultdict(set)
+          total=0
+          for _, elem in ET.iterparse('instructions.xml',events=('end',)):
+            if elem.tag!='instruction': continue
+            total+=1
+            attrs=elem.attrib.copy()
+            opcode=''.join(attrs.get('opcode','').split()).upper()
+            if opcode not in opcodes: elem.clear(); continue
+            iform=attrs.get('iform','')
+            if not iform.startswith(('CMP_', 'SET', 'MOVZX_', 'CMOV')):
+              elem.clear(); continue
+            records=[(a.get('name'),m.attrib)
+              for a in elem.iter('architecture') for m in a.findall('measurement')]
+            for arch,_ in records: arch_names[opcode].add(arch)
+            variants[(opcode,iform)].append({
+              'attr':attrs,
+              'operands':[c.attrib for c in elem.findall('operand')],
+              'architectures':[(arch,v) for arch,v in records
+                if arch in ('SKL','HSW','ICL','ADL-P','ZEN4')][:5],
+            })
+            elem.clear()
+          print('TOTAL_INSTRUCTIONS',total)
+          for opcode in sorted(opcodes):
+            groups=[(iform,rows) for (op,iform),rows in variants.items() if op==opcode]
+            print('OPCODE',opcode,'IFORM_COUNT',len(groups),'VARIANTS',sum(len(r) for _,r in groups),
+                  'ARCH_NAMES',','.join(sorted(arch_names[opcode]))[:180])
+            for iform,rows in sorted(groups,key=lambda p:p[0])[:8]:
+              print('GROUP',opcode,iform,'N',len(rows))
+              chosen=[]
+              seen=set()
+              for record in rows:
+                a=record['attr']; key=(a.get('eosz'),a.get('rm'),a.get('agen'),a.get('opcode'))
+                if key not in seen:
+                  chosen.append(record);seen.add(key)
+                if len(chosen)==3:break
+              for record in chosen:
+                print('VARIANT',json.dumps(record,separators=(',',':'),sort_keys=True)[:2600])
+          PY
