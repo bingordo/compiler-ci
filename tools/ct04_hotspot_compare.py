@@ -30,6 +30,14 @@ CASES = {
         ("sccp_forward", 96, 6),
         ("sccp_forward", 256, 2),
     ],
+    "ct03scalar": [
+        ("sccp_forward", 32, 12),
+        ("sccp_forward", 96, 6),
+        ("sccp_forward", 256, 2),
+        ("sccp_reverse", 32, 12),
+        ("sccp_reverse", 96, 6),
+        ("sccp_reverse", 256, 2),
+    ],
     "ct03typed": [
         ("typed_sccp_fold", 32, 12),
         ("typed_sccp_fold", 96, 6),
