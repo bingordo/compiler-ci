@@ -30,6 +30,12 @@ CASES = {
         ("sccp_forward", 96, 6),
         ("sccp_forward", 256, 2),
     ],
+    "ct03induction": [
+        ("induction_products", 1, 12),
+        ("induction_products", 4, 8),
+        ("induction_products", 8, 4),
+        ("induction_products", 16, 2),
+    ],
     "ct03licm": [
         ("licm_preheader", 24, 12),
         ("licm_preheader", 96, 6),
