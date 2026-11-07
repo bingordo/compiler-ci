@@ -15,13 +15,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: c76db4bd6f4480e44f3d8bb21a7d6c7e962e73b5
+          ref: 591841febd0d7de12604b144b213e4453b7bbfcb
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - name: Assert exact source pin
         working-directory: compiler
-        run: test "$(git rev-parse HEAD)" = "c76db4bd6f4480e44f3d8bb21a7d6c7e962e73b5"
+        run: test "$(git rev-parse HEAD)" = "591841febd0d7de12604b144b213e4453b7bbfcb"
       - name: Isolate core compiler workspace
         working-directory: compiler
         run: |
@@ -38,6 +38,33 @@ jobs:
       - name: Execute independent C11 GAS/direct ELF oracle
         working-directory: compiler
         run: cargo test -p compiler-backend-x86 --test native_typeid_direct -- --nocapture
+      - name: Standalone TypeId CLI both GAS and ELF with C caller
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture=crates/backend-x86/tests/fixtures/native_add8_v2.ir
+          cargo run -p compiler-backend-x86 --bin typeid-x86 -- elf "$fixture" "$RUNNER_TEMP/native.o"
+          cargo run -p compiler-backend-x86 --bin typeid-x86 -- gas "$fixture" "$RUNNER_TEMP/native.s"
+          test "$(head -c 4 "$RUNNER_TEMP/native.o" | od -An -tx1 | tr -d ' \n')" = "7f454c46"
+          cat > "$RUNNER_TEMP/native_oracle.c" <<'EOF'
+          #include <stdint.h>
+          extern uint8_t add8(uint8_t, uint8_t);
+          int main(void) {
+              for (unsigned a=0;a<256;a++) for (unsigned b=0;b<256;b++)
+                  if (add8((uint8_t)a,(uint8_t)b)!=(uint8_t)(a+b)) return 1;
+              return 0;
+          }
+          EOF
+          for suffix in o s; do
+            cc -std=c11 -O2 -Wall -Wextra -Werror "$RUNNER_TEMP/native_oracle.c" "$RUNNER_TEMP/native.$suffix" -o "$RUNNER_TEMP/native_caller"
+            "$RUNNER_TEMP/native_caller"
+          done
+          if cargo run -p compiler-backend-x86 --bin typeid-x86 -- elf crates/ir/tests/fixtures/native_int_casts_v2.ir "$RUNNER_TEMP/unsupported.o" > "$RUNNER_TEMP/reject.out" 2> "$RUNNER_TEMP/reject.err"; then
+            echo "i128 unexpectedly lowered" >&2
+            exit 1
+          fi
+          grep -F "i128 needs multiprecision legalization" "$RUNNER_TEMP/reject.err"
       - name: Full IR optimizer and backend regressions
         working-directory: compiler
         run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
