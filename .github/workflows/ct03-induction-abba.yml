@@ -1,0 +1,95 @@
+name: "CT-03 final induction rollback cost: exact-parent ABBA"
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct03-induction-abba.yml'
+      - 'tools/ct03_induction_hotspot.rs'
+permissions:
+  contents: read
+concurrency:
+  group: ct03-induction-abba-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '424fba0dd17716aca0ea28bdfd24d1efd599928d'
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '3948cd664df8c4a4c1a234939642c722979d2b9b'
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Exact source and toolchain provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C before rev-parse HEAD | tee results/before-sha.txt
+          git -C after rev-parse HEAD | tee results/after-sha.txt
+          rustc --version | tee results/toolchain.txt
+          cargo --version | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\\(s\\)):' | tee -a results/toolchain.txt || true
+          python3 -m py_compile harness/tools/ct04_hotspot_compare.py
+          for checkout in before after; do
+            mkdir -p "$checkout/crates/opt/examples"
+            cp harness/tools/ct03_induction_hotspot.rs \
+              "$checkout/crates/opt/examples/ct03_induction_hotspot.rs"
+            cat > "$checkout/Cargo.toml" <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+            rm -f "$checkout/Cargo.lock"
+          done
+          cmp before/crates/opt/examples/ct03_induction_hotspot.rs \
+            after/crates/opt/examples/ct03_induction_hotspot.rs
+          sha256sum before/crates/opt/examples/ct03_induction_hotspot.rs \
+            after/crates/opt/examples/ct03_induction_hotspot.rs | tee results/fixture-sha.txt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before -> target
+            after -> target
+          key: ct03-induction-atomic-abba
+      - name: Build both release optimizer benchmark binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path before/Cargo.toml \
+            -p compiler-opt --example ct03_induction_hotspot
+          cargo build --release --manifest-path after/Cargo.toml \
+            -p compiler-opt --example ct03_induction_hotspot
+      - name: Four actually-mutating counted-loop cases in five ABBA rounds
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct04_hotspot_compare.py \
+            --pair ct03induction \
+            --before before/target/release/examples/ct03_induction_hotspot \
+            --after after/target/release/examples/ct03_induction_hotspot \
+            --rounds 5 --raw results/raw.csv --report results/report.md
+          cat results/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain complete timing, hashes, RSS and provenance
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ct03-induction-exact-parent-abba
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
