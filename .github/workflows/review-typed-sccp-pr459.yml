@@ -1,0 +1,47 @@
+name: One-off TypeId SCCP PR459 post-CT03 validation
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/review-typed-sccp-pr459.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 0a616e205e90926c035d1c58f349ba5449b34536
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify immutable compiler source
+        run: test "$(git -C compiler rev-parse HEAD)" = "0a616e205e90926c035d1c58f349ba5449b34536"
+      - name: Self-contained core workspace
+        shell: bash
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: review-typed-sccp-pr459
+      - name: SCCP legacy differential, loop-PHI, and no-op tests
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typed_sccp -- --nocapture
+      - name: CT03 post-compaction rollback injection
+        working-directory: compiler
+        run: cargo test -p compiler-opt --lib typed_sccp::tests::postcheck_failure_rolls_back_after_real_cfg_compaction -- --exact --nocapture
+      - name: Complete IR and optimizer regression tests
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt
+      - name: Strict Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt --all-targets -- -D warnings
