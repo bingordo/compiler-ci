@@ -1,0 +1,80 @@
+name: M4.7 P6b typed scalar FP IR and exact-bit verifier (compiler-ci)
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-m4-7-fp-ir.yml'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact compiler SHA/ref
+        required: true
+        default: main
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: m47-p6b-fp-ir-${{ github.event.inputs.source_ref || github.head_ref || 'default' }}
+  cancel-in-progress: true
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 26
+    steps:
+      - name: Checkout pinned scalar FP IR compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || '5a9cb1d78f7ef682841dd2c59aa58bae7ced4980' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact source revision
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          echo "P6b IEEE F32/F64 SSA source SHA $actual" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${{ github.event_name }}" == 'pull_request' ]]; then test "$actual" = '5a9cb1d78f7ef682841dd2c59aa58bae7ced4980'; fi
+          test -s crates/ir/tests/scalar_fp_ssa.rs
+      - name: Isolate native core workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m47-p6b-fp-ir
+          cache-workspace-crates: 'true'
+      - name: IEEE bit-exact scalar FP verifier and native IR roundtrip
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test scalar_fp_ssa -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/p6b-fp-ir.log"
+          cargo test -p compiler-ir
+      - name: Optimizer unit and selected semantic regressions
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test alias_phis --test mem2reg_native --test sccp_sparse_native --test inline_native
+      - name: X86 fail-closed typed FP selector and existing backend unit regressions
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --lib
+      - name: Strict FP IR, optimizer and x86 all-target Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
+      - name: Save verification failures
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p6b-fp-ir-failures
+          path: ${{ runner.temp }}/p6b-fp-ir.log
+          if-no-files-found: ignore
+          retention-days: 7
