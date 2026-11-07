@@ -1,53 +1,127 @@
-name: x86 physical measured cost and spill telemetry
+name: x86 exact physical stream cost and spill telemetry
 on:
   push:
     branches: [ci/x86-physical-costs-20261107]
 permissions:
   contents: read
 jobs:
-  profiles:
+  verified-profiles:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ad278cbca78e1176686f37d469c4ee8d6ef315a3
+          ref: 37f875a78c7e62e3c22d0e1955b03fc3dbe97eb8
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Regenerate two exact CMP-direction physical form CPU profiles
+      - name: Python importer tests, source maps, generated Rust freshness
         working-directory: compiler
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "ad278cbca78e1176686f37d469c4ee8d6ef315a3"
+          test "$(git rev-parse HEAD)" = "37f875a78c7e62e3c22d0e1955b03fc3dbe97eb8"
           python3 tools/regen_x86_forms.py --check
-          curl --fail --show-error -L --retry 2 --max-time 180 \
-            https://uops.info/instructions.xml -o /tmp/instructions.xml
-          echo "e5e702caaf04c4fc1f75192a9bbe4d8554b3e174f7933a14d124cc33ca677ab3  /tmp/instructions.xml" | sha256sum -c
-          mkdir -p /tmp/profiles
+          python3 tools/regen_x86_physical_costs.py --check
+          PYTHONPATH=tools python3 -m unittest discover -s tools -p test_import_uops_info.py -v
+          python3 tools/validate_x86_costs.py data/x86_costs_generic.json data/x86_costs_skl.json data/x86_costs_zen4.json
+      - name: Independently reproduce 38 exact XED forms on both CPUs
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 2 --max-time 180 https://uops.info/instructions.xml -o /tmp/instructions.xml
+          echo "e5e702caaf04c4fc1f75192a9bbe4d8554b3e174f7933a14d124cc33ca677ab3  /tmp/instructions.xml" | sha256sum -c -
           for arch in SKL ZEN4; do
-            python3 tools/import_uops_info.py /tmp/instructions.xml \
-              --architecture "$arch" --mapping data/x86_uops_variant_mapping.json \
-              --output "/tmp/profiles/${arch}.json"
-            python3 tools/validate_x86_costs.py "/tmp/profiles/${arch}.json"
+            python3 tools/import_uops_info.py /tmp/instructions.xml --architecture "$arch" \
+              --mapping data/x86_uops_variant_mapping.json --output "/tmp/${arch}.json"
             python3 - "$arch" <<'PY'
           import json,sys
           from pathlib import Path
           arch=sys.argv[1]
-          p=json.loads(Path('/tmp/profiles',arch+'.json').read_text())
-          print('BEGIN_PROFILE',arch)
-          print(json.dumps(p,indent=2,sort_keys=True))
-          print('END_PROFILE',arch)
-          print('COVERAGE',arch,len(p['forms']))
-          assert len(p['forms'])==38
-          for bits in (32,64):
-              assert 'CMP_R_R_3B_'+str(bits) in p['forms']
+          actual=json.loads(Path("/tmp",arch+".json").read_text())
+          committed=json.loads(Path("data/x86_costs_"+arch.lower()+".json").read_text())
+          assert actual==committed, "reviewed XML source profile drift: "+arch
+          assert len(actual["forms"])==38
+          print("PASS exact vendor XML",arch,len(actual["forms"]))
           PY
           done
+  native-backend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 37f875a78c7e62e3c22d0e1955b03fc3dbe97eb8
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: x86 backend-only Cargo workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Full x86 native/ELF/backend tests and Clippy warnings
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86
+          cargo clippy -p compiler-backend-x86 --all-targets -- -D warnings
+      - name: Show rustfmt changes for newly authored physical telemetry
+        working-directory: compiler
+        run: |
+          rustfmt --edition 2021 crates/backend-x86/src/physical_costs.rs
+          git diff --numstat -- crates/backend-x86/src/physical_costs.rs
+          python3 - <<'PY'
+          from pathlib import Path
+          print('BEGIN_FORMATTED_PHYSICAL_COSTS')
+          print(Path('crates/backend-x86/src/physical_costs.rs').read_text(),end='')
+          print('END_FORMATTED_PHYSICAL_COSTS')
+          PY
+  actual-physical-traffic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 37f875a78c7e62e3c22d0e1955b03fc3dbe97eb8
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Run checked Mini-C emitter through two CPU profiles and verify static spill sites
+        run: |
+          set -euo pipefail
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          mkdir -p results
+          cargo run --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --example shared_select_physical_costs \
+            | tee results/physical_costs_spill_sites.csv
+          python3 - <<'PY'
+          import csv
+          from pathlib import Path
+          rows=list(csv.DictReader(Path('results/physical_costs_spill_sites.csv').open()))
+          assert len(rows)==28,len(rows)
+          assert {r['cpu'] for r in rows}=={'SKL','ZEN4'}
+          assert {int(r['budget']) for r in rows}=={8,15}
+          assert {r['case'] for r in rows}=={
+              'branches_8','branches_24','branches_48','branches_72',
+              'branches_96','branches_144','loop_24'}
+          for r in rows:
+              assert int(r['physical_instructions']) == int(r['measured_sites'])+int(r['unpriced_sites'])
+              assert int(r['physical_instructions']) > 0
+              assert int(r['unpriced_sites']) > 0
+              assert int(r['spill_words']) >= int(r['spill_homes'])
+          assert any(int(r['static_spill_reads'])>0 for r in rows)
+          assert any(int(r['static_spill_writes'])>0 for r in rows)
+          print('PASS actual emitted-stream static spill and cost audit: 28 rows')
+          PY
       - uses: actions/upload-artifact@v4
         if: success()
         with:
-          name: x86-skl-zen4-physical-cmp-direction-profiles
-          path: /tmp/profiles/
+          name: x86-physical-costs-spill-sites
+          path: results/physical_costs_spill_sites.csv
           retention-days: 30
