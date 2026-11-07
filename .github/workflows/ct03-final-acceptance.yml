@@ -1,0 +1,113 @@
+name: "CT-03 final: public verification and analysis-lifetime acceptance"
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct03-final-acceptance.yml'
+permissions:
+  contents: read
+concurrency:
+  group: ct03-final-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  closeout:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '3948cd664df8c4a4c1a234939642c722979d2b9b'
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Reproducible compiler and native toolchain provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C compiler rev-parse HEAD | tee results/compiler-sha.txt
+          rustc --version | tee results/toolchain.txt
+          cargo --version | tee -a results/toolchain.txt
+          cc --version | head -1 | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\\(s\\)):' | tee -a results/toolchain.txt || true
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ct03-final-boundary
+      - name: Uninstrumented IR, optimizer, backend and x86 full regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/Cargo.toml \
+            -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 \
+            2>&1 | tee results/full-core.log
+      - name: Final public module and scalar boundary acceptance
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt \
+            --test ct03_closeout -- --nocapture \
+            2>&1 | tee results/final-boundary.log
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt \
+            --lib induction::ct03_atomicity_tests -- --nocapture \
+            2>&1 | tee results/induction-rollback.log
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt \
+            --test induction_native -- --nocapture \
+            2>&1 | tee results/induction-native.log
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt \
+            --test pre_licm_semantic_matrix -- --nocapture \
+            2>&1 | tee results/loops-native.log
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt \
+            --test ct03_multi_edit_native -- --nocapture \
+            2>&1 | tee results/pre-native.log
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt \
+            --test ct03_memoryssa_invalidation_native -- --nocapture \
+            2>&1 | tee results/memory-native.log
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt \
+            --test ct03_typed_alias_epoch_native -- --nocapture \
+            2>&1 | tee results/typed-native.log
+      - name: Diagnostic verifier call accounting without default instrumentation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/Cargo.toml \
+            -p compiler-opt --features verify-counts \
+            --lib ct03_verify_counts -- --nocapture \
+            2>&1 | tee results/verified-handoffs.log
+          cargo test --manifest-path compiler/Cargo.toml \
+            -p compiler-opt --features verify-counts \
+            --lib mutating_licm_verified_handoff -- --nocapture \
+            2>&1 | tee results/mutating-licm-counts.log
+          cargo test --manifest-path compiler/Cargo.toml \
+            -p compiler-opt --features verify-counts \
+            --lib successive_pre_edits -- --nocapture \
+            2>&1 | tee results/multi-edit-counts.log
+      - name: Strict Clippy for default and opt-in feature paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --manifest-path compiler/Cargo.toml \
+            -p compiler-ir -p compiler-opt --all-targets -- -D warnings \
+            2>&1 | tee results/clippy-default.log
+          cargo clippy --manifest-path compiler/Cargo.toml \
+            -p compiler-ir -p compiler-opt --features compiler-opt/verify-counts \
+            --all-targets -- -D warnings \
+            2>&1 | tee results/clippy-counts.log
+      - name: Retain full test, C native, counts and provenance
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ct03-final-acceptance
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
