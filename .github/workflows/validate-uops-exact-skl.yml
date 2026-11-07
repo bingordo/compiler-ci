@@ -1,0 +1,76 @@
+name: Reproducible x86 uops.info exact form cost import
+on:
+  push:
+    branches: [ci/x86-uops-skl-exact-profiles-20261106]
+permissions:
+  contents: read
+jobs:
+  verify-mappings:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: eb44dde44e74fa9cb65c628c7c225958c1f05a19
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler revision, Rust forms and importer negative tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "eb44dde44e74fa9cb65c628c7c225958c1f05a19"
+          python3 tools/regen_x86_forms.py --check
+          PYTHONPATH=tools python3 -m unittest discover -s tools -p test_import_uops_info.py -v
+          python3 tools/validate_x86_costs.py data/x86_costs_generic.json
+      - name: Fetch March 2026 uops.info upstream XML at verified checksum
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 2 --connect-timeout 15 --max-time 180 \
+            https://uops.info/instructions.xml -o /tmp/instructions.xml
+          echo "e5e702caaf04c4fc1f75192a9bbe4d8554b3e174f7933a14d124cc33ca677ab3  /tmp/instructions.xml" | sha256sum --check -
+      - name: Regenerate exact Skylake cost profile without CPU substitution
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/import_uops_info.py /tmp/instructions.xml \
+            --architecture SKL \
+            --mapping data/x86_uops_variant_mapping.json \
+            --output /tmp/x86_costs_skl.json
+          python3 tools/validate_x86_costs.py /tmp/x86_costs_skl.json
+          echo 'BEGIN SKL_PROFILE'
+          cat /tmp/x86_costs_skl.json
+          echo 'END SKL_PROFILE'
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: exact-uops-info-skl-verified
+          path: /tmp/x86_costs_skl.json
+          retention-days: 30
+  rust-core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: eb44dde44e74fa9cb65c628c7c225958c1f05a19
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Isolate compiler IR/backend workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Test generated form descriptors and backend
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86
+          cargo clippy -p compiler-backend-x86 --all-targets -- -D warnings
