@@ -1,0 +1,49 @@
+name: AArch64 M7 modern I32 scalar native gate
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/verify-aarch64-modern-i32.yml'
+permissions:
+  contents: read
+concurrency:
+  group: aarch64-m7-modern-i32
+  cancel-in-progress: true
+jobs:
+  native:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5c91080d832041077811f723e82d5749baf22f0c
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin and isolate self-contained backend workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 5c91080d832041077811f723e82d5749baf22f0c
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m7-modern-i32-v1
+      - name: Check AArch64 crate with warnings denied
+        working-directory: compiler
+        run: |
+          RUSTFLAGS="-D warnings" cargo check -p compiler-backend-aarch64 --all-targets
+          cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
+      - name: Verify native backend tests and independent C oracle
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend-aarch64 -- --test-threads=1
+          echo 'PASS native AArch64 full modern I32 binary/comparison/NOT, trap and spill oracles, plus prior backend tests' >> "$GITHUB_STEP_SUMMARY"
