@@ -1,0 +1,144 @@
+name: Direct EDG to compiler SSA native ELF (pilot)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/edg-direct-ssa-pilot.yml
+  pull_request:
+    paths:
+      - .github/workflows/edg-direct-ssa-pilot.yml
+  schedule:
+    - cron: '37 7 * * *'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        type: string
+        description: Exact compiler commit or branch
+        default: main
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: edg-native-ssa-${{ github.event.pull_request.number || inputs.source_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  direct-edg:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8
+    defaults:
+      run:
+        shell: edg-container-exec "bash -eo pipefail {0}"
+    env:
+      EDG_SOURCE_SHA: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+      EDG_RELEASE_TAG: edgcpfe-ci-799603e0b5ab
+      EDG_RELEASE_SHA256: fa769825e70766fbefe017806816b2338acd03daa93bb5562369c293972ce64c
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUST_TOOLCHAIN_VERSION: 1.99.1
+    steps:
+      - name: Checkout private compiler pilot with scoped CI key
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || 'main' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+
+      - name: Check out exact EDG headers and configuration
+        uses: actions/checkout@v7
+        with:
+          repository: bingundu/edgcpp
+          ref: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+          path: edgcpp
+          persist-credentials: false
+
+      - name: Record compiler and EDG source revision
+        run: |
+          test "$(git -C edgcpp rev-parse HEAD)" = "$EDG_SOURCE_SHA"
+          git -C compiler rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Configure matching EDG native metadata only
+        env:
+          EDG_BASE: ${{ github.workspace }}/edgcpp/bases/docker/dev-env/gcc
+        working-directory: edgcpp
+        run: |
+          cmake --preset linux-gcc-release \
+            -DEDG_BUILD_LIB=OFF \
+            -DEDG_BUILD_CALLABLE_LIBRARY=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          cmake --build build/gcc-release --target error-info --parallel 2
+
+      - name: Restore exact EDG prebuilt native archive
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          url="https://github.com/bingundu/edgcpp/releases/download/$EDG_RELEASE_TAG/edgcpfe-ci-x86_64-callable-release-linux-x86_64.tar.gz"
+          mkdir -p build/gcc-release/lib build/prebuilt-edg
+          curl --fail --location --silent --show-error --retry 4 --retry-delay 2 \
+            "$url" --output build/prebuilt-edg/archive.tar.gz
+          printf '%s  %s\n' "$EDG_RELEASE_SHA256" build/prebuilt-edg/archive.tar.gz | sha256sum --check --status
+          tar -xzf build/prebuilt-edg/archive.tar.gz -C build/prebuilt-edg
+          grep -Fx "commit=$EDG_SOURCE_SHA" build/prebuilt-edg/BUILD-INFO.txt
+          grep -Fx 'platform=linux-x86_64' build/prebuilt-edg/BUILD-INFO.txt
+          test -s build/prebuilt-edg/lib/libedgcpfe.a
+          cp build/prebuilt-edg/lib/libedgcpfe.a build/gcc-release/lib/libedgcpfe.a
+
+      - name: Install pinned Rust toolchain
+        run: |
+          if ! command -v cargo >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN_VERSION"
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install "$RUST_TOOLCHAIN_VERSION" --profile minimal
+          rustup default "$RUST_TOOLCHAIN_VERSION"
+
+      - name: Build direct EDG to compiler-ir and x86 backend adapter
+        working-directory: compiler
+        env:
+          EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+          EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+          EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+          EDGCPP_EDG_REVISION: ${{ env.EDG_SOURCE_SHA }}
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test --manifest-path tools/edg-driver/Cargo.toml
+          cargo build --manifest-path tools/edg-driver/Cargo.toml
+
+      - name: Native direct compiler IR x86 ELF versus GCC differential
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cp tools/edg-driver/tests/fixtures/edg_native_ir*.c ../edgcpp/build/gcc-release/
+          (
+            cd ../edgcpp/build/gcc-release
+            source environment.sh
+            binary="../../../compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+            if ! "$binary" native_edg.o --c11 edg_native_ir_pilot.c >native_edg.log 2>&1; then
+              cat native_edg.log
+              exit 1
+            fi
+            test "$(od -An -tx1 -N4 native_edg.o | tr -d ' \n')" = 7f454c46
+            nm -g --defined-only native_edg.o | grep -q edg_native_sum
+            nm -g --defined-only native_edg.o | grep -q edg_native_u64
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_native_ir_pilot.c edg_native_ir_pilot_driver.c -o gcc_edg_native_ir
+            gcc -std=c11 -O2 -Wall -Wextra -Werror native_edg.o edg_native_ir_pilot_driver.c -o compiler_edg_native_ir
+            ./gcc_edg_native_ir
+            ./compiler_edg_native_ir
+            for source in edg_native_ir_bad_local.c edg_native_ir_bad_implicit.c edg_native_ir_bad_div.c edg_native_ir_bad_ternary.c edg_native_ir_bad_global.c edg_native_ir_bad_fp.c; do
+              rm -f bad_native_edg.o bad_native_edg.log
+              if "$binary" bad_native_edg.o --c11 "$source" >bad_native_edg.log 2>&1; then
+                echo "Unsupported EDG/compiler-ir source unexpectedly compiled: $source"
+                exit 1
+              fi
+              grep -E 'compiler-ir|native pilot|unsupported|EDG|C operation|C expression|C return|source' bad_native_edg.log
+              test ! -e bad_native_edg.o
+            done
+          )
