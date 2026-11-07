@@ -1,0 +1,96 @@
+name: M10 original Csmith seeds on current Mini-C frontend
+on:
+  push:
+    branches: [test/m10-csmith-current-source-20261106]
+    paths: ['.github/workflows/test-m10-current-csmith.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source-pinned-eight-seeds:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      COMPILER_SHA: d48890156701b075265c298de4933f7dd836e526
+      FRONTEND_SHA: 34fd4d83c74fc82620a3fc9a75607a7ebf9e0a66
+    steps:
+      - name: Checkout exact compiler and checked Mini-C integration
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d48890156701b075265c298de4933f7dd836e526
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm exact compiler and Mini-C revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          python3 - <<'PY'
+          from pathlib import Path
+          import os,re
+          s=Path("compiler/tools/mini-c-driver/Cargo.toml").read_text()
+          versions=re.findall(r'mini-c-(?:syntax|sema)\s*=\s*\{[^\n]*rev\s*=\s*"([0-9a-f]{40})"',s)
+          assert versions == [os.environ["FRONTEND_SHA"]]*2,versions
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          python3 -m unittest discover -s compiler/tools -p test_csmith_probe.py
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: m10-source-csmith-nov6
+      - name: Build exact native Mini-C driver, not stale prebuilt
+        run: cargo build --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml --bin compiler-mini-c
+      - name: Install original Csmith 2.3, GCC and Clang
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y --no-install-recommends csmith libcsmith-dev gcc clang
+          version="$(dpkg-query -W csmith | awk '{print $2}')"
+          [[ "$version" == 2.3.0-* ]]
+          header="$(dpkg -L libcsmith-dev | grep '/csmith.h$' | head -n1)"
+          test -s "$header"
+          echo "CSMITH_INCLUDE=$(dirname "$header")" >> "$GITHUB_ENV"
+      - name: Generate eight original restricted-observable Csmith sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          python3 compiler/tools/csmith_probe.py --generate \
+            --cases-dir "$RUNNER_TEMP/csmith-cases" \
+            --csmith csmith --seed-base 1 --seed-count 8 \
+            --profile restricted-observable | tee results/generate.log
+      - name: Compare GCC/Clang first, then original source preprocessed for Mini-C
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/csmith_probe.py --probe \
+            --cases-dir "$RUNNER_TEMP/csmith-cases" \
+            --artifacts-dir "$RUNNER_TEMP/csmith-results" \
+            --include-dir "$CSMITH_INCLUDE" --preprocess-c \
+            --max-wall-seconds 360 \
+            --driver "$PWD/compiler/tools/mini-c-driver/target/release/compiler-mini-c" \
+            --compiler-sha "$COMPILER_SHA" --frontend-sha "$FRONTEND_SHA" \
+            --minimum-native 0 | tee results/probe.log
+          cp "$RUNNER_TEMP/csmith-results/summary.json" results/summary.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('results/summary.json'))
+          print('M10_CURRENT_CSMITH_SUMMARY',json.dumps(d,sort_keys=True))
+          assert d['total_seeds']==8, d
+          PY
+      - name: Save complete original and hashed preprocessed sources and failure evidence
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: m10-current-source-csmith-eight-seeds
+          path: |
+            results/
+            ${{ runner.temp }}/csmith-cases/
+            ${{ runner.temp }}/csmith-results/
+          if-no-files-found: ignore
+          retention-days: 14
