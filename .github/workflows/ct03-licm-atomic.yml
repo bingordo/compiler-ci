@@ -1,0 +1,94 @@
+name: "CT-03 legacy LICM atomic preheaders and hoist"
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct03-licm-atomic.yml'
+permissions:
+  contents: read
+concurrency:
+  group: ct03-licm-atomic-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 'd16c9d6ae0b68ef79114f1d1d4a4011d42be3078'
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Exact compiler revision, rustc, C-native oracle provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C compiler rev-parse HEAD | tee results/compiler-sha.txt
+          rustc --version | tee results/toolchain.txt
+          cargo --version | tee -a results/toolchain.txt
+          cc --version | head -1 | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\\(s\\)):' | tee -a results/toolchain.txt || true
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ct03-licm-atomic
+      - name: Core IR optimizer generic backend and x86 suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/Cargo.toml \
+            -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 \
+            2>&1 | tee results/core.log
+      - name: Both post-edit fault injections and verified handoff counts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt \
+            --lib ct03_atomicity_tests -- --nocapture \
+            2>&1 | tee results/rollback.log
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt \
+            --features verify-counts --lib mutating_licm_verified_handoff \
+            -- --nocapture 2>&1 | tee results/counts.log
+          grep 'CT03_VERIFY_COUNT boundary=preheader_licm_mutating' \
+            results/counts.log | tee results/handoff-counts.txt
+      - name: Confirm standalone and native semantic regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt \
+            --test licm_preheaders -- --nocapture \
+            2>&1 | tee results/native.log
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt \
+            --test pre_licm_semantic_matrix -- --nocapture \
+            2>&1 | tee results/semantic-matrix.log
+      - name: Strict default and opt-in verifier-count Clippy
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --manifest-path compiler/Cargo.toml \
+            -p compiler-ir -p compiler-opt --all-targets -- -D warnings \
+            2>&1 | tee results/clippy-default.log
+          cargo clippy --manifest-path compiler/Cargo.toml \
+            -p compiler-ir -p compiler-opt \
+            --features compiler-opt/verify-counts --all-targets -- -D warnings \
+            2>&1 | tee results/clippy-counts.log
+      - name: Archive raw regression, source and compiler provenance
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ct03-licm-atomic
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
