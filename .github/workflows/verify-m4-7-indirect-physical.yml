@@ -1,0 +1,77 @@
+name: M4.7 indirect SysV x86 physical call (compiler-ci)
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-m4-7-indirect-physical.yml'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Compiler source SHA/ref
+        required: true
+        default: main
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: m47-indirect-${{ github.event.inputs.source_ref || github.head_ref || 'default' }}
+  cancel-in-progress: true
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 22
+    steps:
+      - name: Checkout pinned compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || '68aa0b234696bac6c7cbff19d6ce06c1e89b779f' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact source SHA
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          echo "M4.7 indirect compiler source SHA $sha" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${{ github.event_name }}" == 'pull_request' ]]; then
+            test "$sha" = '68aa0b234696bac6c7cbff19d6ce06c1e89b779f'
+          fi
+          test -s crates/backend-x86/tests/m4_7_indirect_physical_native.rs
+      - name: Self-contained backend workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m47-indirect-physical
+          cache-workspace-crates: 'true'
+      - name: Native indirect callback ABI ELF and GAS
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test m4_7_indirect_physical_native -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/m47-indirect.log"
+          grep -F 'test native_elf_and_gas_call_c_supplied_function_pointers ... ok' "$RUNNER_TEMP/m47-indirect.log"
+      - name: Existing IR/backend x86 native regressions
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-backend -p compiler-backend-x86
+      - name: Strict all-targets backend Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
+      - name: Failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m47-indirect-physical
+          path: ${{ runner.temp }}/m47-indirect.log
+          if-no-files-found: ignore
+          retention-days: 7
