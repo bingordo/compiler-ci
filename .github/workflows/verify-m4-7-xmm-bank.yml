@@ -1,0 +1,75 @@
+name: M4.7 P6b XMM generic allocator bank and clobbers
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-m4-7-xmm-bank.yml'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact compiler SHA
+        required: true
+        default: main
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: p6b-xmm-bank-${{ github.event.inputs.source_ref || github.head_ref || 'default' }}
+  cancel-in-progress: true
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || '960a356828dfa286057fc52b5ce2b1e290fc9b35' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Validate pinned source and test fixture
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          source="$(git rev-parse HEAD)"
+          echo "M4.7 XMM physical bank SHA $source" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${{ github.event_name }}" == 'pull_request' ]]; then test "$source" = '960a356828dfa286057fc52b5ce2b1e290fc9b35'; fi
+          test -s crates/backend-x86/tests/m4_7_xmm_bank.rs
+      - name: Isolate standalone Rust core backend
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m47-p6b-xmm-bank
+          cache-workspace-crates: 'true'
+      - name: XMM aliasing, clobbers and actual generic allocation regressions
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test m4_7_xmm_bank -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/m47-xmm-bank.log"
+          grep -F 'test generic_allocator_spills_fp_values_live_through_calls_not_gp_values ... ok' "$RUNNER_TEMP/m47-xmm-bank.log"
+      - name: All IR, allocator and native x86 regressions
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-backend -p compiler-backend-x86
+      - name: Strict backend all-target Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
+      - name: Preserve failure details
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m47-p6b-xmm-bank
+          path: ${{ runner.temp }}/m47-xmm-bank.log
+          if-no-files-found: ignore
+          retention-days: 7
