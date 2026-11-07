@@ -15,7 +15,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ee8d0e9d3d010bb72817efb1854d44014d006252
+          ref: 80a6be8cacef68a824454ad0fdf1e4ba06cc587b
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -88,6 +88,50 @@ jobs:
           set -euo pipefail
           compiler/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion \
             --s21-crypt-real | tee /tmp/s21-crypt-results.log
+      - name: Independently audit unchanged numeric bodies in standalone builtin-long C context
+        env:
+          RULE_S21_CRYPT_DIR: /tmp/s21-crypt
+          RULE_S21_CRYPT_ZLIB_DIR: ${{ github.workspace }}/zlib
+          RULE_S21_CRYPT_NUMERIC_CONTEXT: standalone-builtin
+        run: |
+          set -euo pipefail
+          compiler/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion \
+            --s21-crypt-real | tee /tmp/s21-crypt-standalone-results.log
+      - name: Reconcile standalone numeric results separately from original-header cohort
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/expr-rule-gen/harness/check_s21_opportunities.py \
+            --cohort crypt --log /tmp/s21-crypt-standalone-results.log
+          python3 - <<'PY'
+          from pathlib import Path
+          a=Path('/tmp/s21-crypt-results.log').read_text().splitlines()
+          b=Path('/tmp/s21-crypt-standalone-results.log').read_text().splitlines()
+          info=[s for s in b if s.startswith('S21C_INFO ')]
+          assert len(info)==1 and 'numeric_context=standalone-builtin' in info[0]
+          def cohort(lines):
+              rows={x.split(',')[1]:x.split(',') for x in lines if x.startswith('S21C_ROW,')}
+              rejects={x.split(',')[1]:x.split(',') for x in lines if x.startswith('S21C_REJECT,')}
+              assert set(rows).isdisjoint(rejects)
+              assert len(rows)+len(rejects)==6
+              summary=[x for x in lines if x.startswith('S21C_SUMMARY ')]
+              assert len(summary)==1
+              fields=dict(x.split('=',1) for x in summary[0].split()[1:])
+              assert int(fields['attempted'])==6
+              assert int(fields['accepted'])==len(rows)
+              assert int(fields['rejected'])==len(rejects)
+              return rows,rejects
+          old,old_reject=cohort(a)
+          new,new_reject=cohort(b)
+          assert 'musl_stdlib_labs' in old_reject
+          assert 'musl_stdlib_llabs' in old_reject
+          # No source-body edits: accepted row hashes must correspond to the
+          # same original function alias in both preprocessing contexts.
+          for id in set(old)&set(new):assert old[id][2]==new[id][2]
+          assert 'musl_des_ascii_to_bin' in new
+          print('S21C_CONTEXT_COMPARE','header_accepted',sorted(old),
+                'standalone_accepted',sorted(new),
+                'still_rejected',sorted(new_reject))
+          PY
       - name: Independently reconcile all 19 typed SSA op classes and every attempted helper
         run: |
           set -euo pipefail
@@ -166,3 +210,4 @@ jobs:
           path: |
             /tmp/s21-crypt-source.log
             /tmp/s21-crypt-results.log
+            /tmp/s21-crypt-standalone-results.log
