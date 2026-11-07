@@ -96,7 +96,11 @@ jobs:
           driver="$PWD/compiler/tools/mini-c-driver/target/release/compiler-mini-c"
           for mode in strict omit; do
             extra=()
-            if [ "$mode" = omit ]; then extra+=(--omit-unreferenced-static-bodies); fi
+            minimum=0
+            if [ "$mode" = omit ]; then
+              extra+=(--omit-unreferenced-static-bodies)
+              minimum=31
+            fi
             python3 compiler/tools/csmith_probe.py --probe \
               --cases-dir "$RUNNER_TEMP/csmith-cases" \
               --artifacts-dir "$RUNNER_TEMP/csmith-results-$mode" \
@@ -104,7 +108,7 @@ jobs:
               --max-wall-seconds 360 --run-timeout 10 \
               --driver "$driver" \
               --compiler-sha "$COMPILER_SHA" --frontend-sha "$FRONTEND_SHA" \
-              --minimum-native 0 "${extra[@]}" | tee "results/$mode.log"
+              --minimum-native "$minimum" "${extra[@]}" | tee "results/$mode.log"
             cp "$RUNNER_TEMP/csmith-results-$mode/summary.json" "results/$mode.json"
           done
           python3 - <<'PY'
@@ -114,12 +118,24 @@ jobs:
           strict=json.loads(Path("results/strict.json").read_text())
           omit=json.loads(Path("results/omit.json").read_text())
           assert strict["total_seeds"] == omit["total_seeds"] == 32
-          assert strict["reference_agreed"] == omit["reference_agreed"] == 32
+          assert strict["reference_agreed"] == omit["reference_agreed"] == 31
+          assert strict["counts"]["reference-timeout"] == omit["counts"]["reference-timeout"] == 1
+          assert strict["counts"]["unsupported-front-end"] == 31
+          assert omit["native_accepted"] == omit["passed"] == 31
+          assert omit["counts"]["unsupported-front-end"] == 0
+          assert strict["minimum_native"] == 0 and omit["minimum_native"] == 31
+          for d in (strict,omit):
+              assert all(d["counts"][error] == 0 for error in [
+                  "wrong-code","compiler-crash","compiler-timeout","compiler-link-error",
+                  "native-crash","native-timeout","harness-error","budget-exhausted"
+              ])
           assert strict["distinct_reference_output_hashes"] == omit["distinct_reference_output_hashes"]
           assert 30 <= strict["distinct_reference_output_hashes"] <= 32
           assert not strict["omit_unreferenced_static_bodies"]
           assert omit["omit_unreferenced_static_bodies"]
           for seed in range(1,33):
+              if seed == 30:  # Unresolved GCC/Clang reference timeout; retained in the denominator.
+                  continue
               p=f"case-{seed}/candidate.i"
               a=(root/"csmith-results-strict"/p).read_bytes()
               b=(root/"csmith-results-omit"/p).read_bytes()
