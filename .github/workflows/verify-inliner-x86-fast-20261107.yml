@@ -1,0 +1,227 @@
+name: Verify cheap x86 inline growth vs exact and legacy
+on:
+  push:
+    branches: [ci/inliner-x86-fast-20261107]
+permissions:
+  contents: read
+jobs:
+  native-ablation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2059a4b8a47d7dc2d8e79254754ea723e8775064
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify immutable compiler SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "2059a4b8a47d7dc2d8e79254754ea723e8775064"
+      - name: Resolve pinned checked frontends
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: inliner-x86-fast-v1
+      - name: Check Python harness parsing and source construction
+        working-directory: compiler
+        run: |
+          python3 -m unittest discover -s tools/tests -p test_inliner_runtime_ablation.py -v
+          python3 -m unittest discover -s tools/tests -p test_x86_machine_sequences.py -v
+          python3 -m unittest discover -s tools/tests -p test_inliner_machine_sequence_compare.py -v
+      - name: Verify cost admission and previous native inliner tests
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test inline_cost_policy -- --nocapture
+          cargo test -p compiler-backend-x86 --test inliner_target_cost
+          cargo test -p compiler-backend-x86 --lib inliner_cost::tests
+          cargo test -p compiler-backend-x86 --lib inliner_cost::tests
+          cargo test -p compiler-opt --test inline_native
+          cargo test -p compiler-opt --test inline_practical_native
+          cargo test -p compiler --bin compiler no_inline
+      - name: Strict Clippy on touched optimizer and source driver
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-opt --lib -- -D warnings
+          cargo clippy -p compiler-backend-x86 --lib -- -D warnings
+          cargo clippy -p compiler --bin compiler -- -D warnings
+      - name: Build release unified native compiler
+        working-directory: compiler
+        run: cargo build -p compiler --bin compiler --release
+      - name: Generate deterministic checked-source corpus
+        working-directory: compiler
+        run: python3 tools/source_compile_corpus.py --out "$RUNNER_TEMP/inliner-source"
+      - name: Run independent-C-oracle native runtime experiment
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          python3 tools/inliner_runtime_ablation.py \
+            --compiler target/release/compiler \
+            --corpus "$RUNNER_TEMP/inliner-source" \
+            --samples 3 --iterations 1000000 \
+            --output results/inliner-native-runtime.csv \
+            --sequences results/inliner-native-runtime-sequences.jsonl \
+            | tee results/inliner-native-summary.csv
+          python3 - <<'PY'
+          import csv
+          with open('results/inliner-native-runtime.csv') as f:
+              rows=list(csv.DictReader(f))
+          assert len(rows) == 18*2*3, len(rows)
+          assert {r['language'] for r in rows} == {'oberon','mini_c'}
+          assert {r['case'] for r in rows} == {'call_graph','hot_leaf','hot_args'}
+          assert {r['mode'] for r in rows} == {'enabled','disabled'}
+          assert all(int(r['text_bytes'])>0 and int(r['ns'])>0 for r in rows)
+          for lang in ('oberon','mini_c'):
+              for size in (1,4,12):
+                  a=[r for r in rows if r['language']==lang and r['case']=='hot_leaf'
+                     and int(r['scale'])==size]
+                  assert len(a) == 6
+                  inline=next(r for r in a if r['mode']=='enabled')
+                  baseline=next(r for r in a if r['mode']=='disabled')
+                  assert int(inline['kernel_calls'])<int(baseline['kernel_calls']), a
+                  assert len({r['checksum'] for r in a})==1
+          PY
+          cat results/inliner-native-summary.csv >> "$GITHUB_STEP_SUMMARY"
+      - name: Measure experimental cost policy against identical disabled baseline
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/inliner_runtime_ablation.py \
+            --compiler target/release/compiler \
+            --corpus "$RUNNER_TEMP/inliner-source" \
+            --samples 3 --iterations 1000000 --policy cost \
+            --output results/inliner-native-cost.csv \
+            --sequences results/inliner-native-cost-sequences.jsonl \
+            | tee results/inliner-native-cost-summary.csv
+          python3 tools/inliner_ablation.py \
+            --compiler target/release/compiler \
+            --corpus "$RUNNER_TEMP/inliner-source" \
+            --samples 3 --policy legacy \
+            --output results/inliner-source-legacy.csv \
+            | tee results/inliner-source-legacy-summary.csv
+          python3 tools/inliner_ablation.py \
+            --compiler target/release/compiler \
+            --corpus "$RUNNER_TEMP/inliner-source" \
+            --samples 3 --policy cost \
+            --output results/inliner-source-cost.csv \
+            | tee results/inliner-source-cost-summary.csv
+          python3 tools/inliner_runtime_ablation.py \
+            --compiler target/release/compiler \
+            --corpus "$RUNNER_TEMP/inliner-source" \
+            --samples 3 --iterations 1000000 --policy x86 \
+            --output results/inliner-native-x86.csv \
+            --sequences results/inliner-native-x86-sequences.jsonl \
+            | tee results/inliner-native-x86-summary.csv
+          python3 tools/inliner_ablation.py \
+            --compiler target/release/compiler \
+            --corpus "$RUNNER_TEMP/inliner-source" \
+            --samples 3 --policy x86 \
+            --output results/inliner-source-x86.csv \
+            | tee results/inliner-source-x86-summary.csv
+          python3 tools/inliner_runtime_ablation.py \
+            --compiler target/release/compiler \
+            --corpus "$RUNNER_TEMP/inliner-source" \
+            --samples 3 --iterations 1000000 --policy x86-fast \
+            --output results/inliner-native-x86-fast.csv \
+            --sequences results/inliner-native-x86-fast-sequences.jsonl \
+            | tee results/inliner-native-x86-fast-summary.csv
+          python3 tools/inliner_ablation.py \
+            --compiler target/release/compiler \
+            --corpus "$RUNNER_TEMP/inliner-source" \
+            --samples 3 --policy x86-fast \
+            --output results/inliner-source-x86-fast.csv \
+            | tee results/inliner-source-x86-fast-summary.csv
+          python3 - <<'PY'
+          import csv
+          from pathlib import Path
+          p=Path('results')
+          def read(name):
+              with (p/name).open() as f: return list(csv.DictReader(f))
+          a=read('inliner-native-runtime.csv')
+          b=read('inliner-native-cost.csv')
+          c=read('inliner-native-x86.csv')
+          d=read('inliner-native-x86-fast.csv')
+          assert len(a)==len(b)==len(c)==len(d)==108
+          key=lambda r:(r['language'],r['case'],r['scale'],r['mode'],r['sample'])
+          baseline={key(r):r['object_sha256'] for r in a if r['mode']=='disabled'}
+          assert baseline=={key(r):r['object_sha256'] for r in b if r['mode']=='disabled'}
+          assert baseline=={key(r):r['object_sha256'] for r in c if r['mode']=='disabled'}
+          assert baseline=={key(r):r['object_sha256'] for r in d if r['mode']=='disabled'}
+          for mode in ('legacy','cost','x86','x86-fast'):
+              rows=read('inliner-source-'+mode+'.csv')
+              assert len(rows)==18*2*3, len(rows)
+          for row in b:
+              assert int(row['ns'])>0 and int(row['text_bytes'])>0
+          for name in ('runtime','cost','x86','x86-fast'):
+              with (p/('inliner-native-'+name+'-sequences.jsonl')).open() as f:
+                  records=[__import__('json').loads(line) for line in f]
+              assert len(records)==36, len(records)
+              for item in records:
+                  assert item['functions'] and item['object_sha256']
+              rows=read('inliner-native-'+name+'.csv')
+              assert len(rows)==108
+              for row in rows:
+                  assert int(row['kernel_instruction_bytes'])>0
+                  assert int(row['module_instruction_bytes'])<=int(row['text_bytes'])
+                  assert int(row['kernel_call_bytes'])>=int(row['kernel_calls'])*2
+                  assert int(row['kernel_instruction_count'])>0
+                  assert len(row['kernel_sequence_sha256'])==64
+          for row in b:
+              assert int(row['ns'])>0 and int(row['text_bytes'])>0
+          PY
+          cat results/inliner-native-cost-summary.csv >> "$GITHUB_STEP_SUMMARY"
+          cat results/inliner-source-cost-summary.csv >> "$GITHUB_STEP_SUMMARY"
+          cat results/inliner-native-x86-summary.csv >> "$GITHUB_STEP_SUMMARY"
+          cat results/inliner-source-x86-summary.csv >> "$GITHUB_STEP_SUMMARY"
+          cat results/inliner-native-x86-fast-summary.csv >> "$GITHUB_STEP_SUMMARY"
+          cat results/inliner-source-x86-fast-summary.csv >> "$GITHUB_STEP_SUMMARY"
+      - name: Compare full decoded machine-code sequences and six-argument optimization
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/inliner_machine_sequence_compare.py \
+            --legacy results/inliner-native-runtime-sequences.jsonl \
+            --cost results/inliner-native-cost-sequences.jsonl \
+            --x86 results/inliner-native-x86-sequences.jsonl \
+            --fast results/inliner-native-x86-fast-sequences.jsonl \
+            --output results/inliner-machine-byte-comparison.csv \
+            | tee results/inliner-machine-byte-summary.csv
+          python3 - <<'PY'
+          import csv
+          with open('results/inliner-machine-byte-comparison.csv') as f:
+              rows=list(csv.DictReader(f))
+          assert len(rows)==72,len(rows)
+          assert {r['policy'] for r in rows}=={'legacy','cost','x86','x86-fast'}
+          for language in ('oberon','mini_c'):
+              for scale in (4,12):
+                  x=next(r for r in rows if r['policy']=='x86' and r['language']==language
+                         and r['case']=='hot_args' and int(r['scale'])==scale)
+                  assert int(x['baseline_kernel_calls'])==scale,x
+                  assert int(x['inline_kernel_calls'])==0,x
+                  assert int(x['delta_text_bytes'])<0,x
+                  assert int(x['delta_kernel_call_bytes'])==-5*scale,x
+                  fast=next(r for r in rows if r['policy']=='x86-fast'
+                            and r['language']==language and r['case']=='hot_args'
+                            and int(r['scale'])==scale)
+                  # Correctness is separately gated by the independent C
+                  # oracle for every mode. Compare fast decisions with exact
+                  # native-size admission, without assuming identical bytes.
+                  assert int(fast['baseline_kernel_calls'])==scale,fast
+                  assert int(fast['inline_kernel_calls']) <= scale,fast
+          PY
+          cat results/inliner-machine-byte-summary.csv >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: inliner-x86-fast-four-policy-ablation
+          path: compiler/results/inliner-*
+          if-no-files-found: ignore
+          retention-days: 14
