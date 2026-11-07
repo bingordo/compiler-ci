@@ -1,0 +1,141 @@
+name: S21 pinned FreeBSD numeric and codec SSA census
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/s21-freebsd-numeric-codec-ssa.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  pinned-freebsd-ssa:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact compiler audit candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 94aefc951060db7a21b5b3d263cf7e3fd8994a10
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify immutable complete FreeBSD source blobs and copy original function spans
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/expr-rule-gen/harness/prepare_s21_freebsd_codec_sources.py \
+            --manifest compiler/tools/expr-rule-gen/harness/s21_freebsd_codec_real_sources.json \
+            --output-dir /tmp/s21-freebsd-sources | tee /tmp/s21-freebsd-pin.log
+          grep -qx 'S21F_FETCH_OK selected=3 exact_functions=3' /tmp/s21-freebsd-pin.log
+          test "$(grep -c '^S21F_PIN,' /tmp/s21-freebsd-pin.log)" -eq 3
+      - name: Install offline Z3 prover
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends z3
+      - name: Regenerate original experimental 152-rule matcher, no new rules
+        run: |
+          set -euo pipefail
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --compose-guards --minimize-rules --commute-inferred \
+            --max-proofs 2000 --max-rules 500 --format rust --output /tmp/s21-fbsd-rules.rs
+          grep -q 'pub const RULE_COUNT: usize = 152;' /tmp/s21-fbsd-rules.rs
+          grep -q 'pub const RULE_LIMIT_REACHED: bool = false;' /tmp/s21-fbsd-rules.rs
+      - name: Convert public Mini-C frontend Git transport to anonymous HTTPS on CI only
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('compiler/tools/mini-c-driver/Cargo.toml')
+          s=p.read_text()
+          old='ssh://git@github.com/bingordo/mini-c.git'
+          assert s.count(old)==2
+          p.write_text(s.replace(old,'https://github.com/bingordo/mini-c.git'))
+          PY
+      - name: Cache Rust benchmark compilation
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: s21-freebsd-ssa-v1
+      - name: Compile original-source audit and test exact function alias
+        env:
+          S14_MATCHER_FILE: /tmp/s21-fbsd-rules.rs
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            --features s14-ssa-audit --example benchmark_generated_fusion \
+            s21_freebsd::tests -- --nocapture
+          cargo build --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            --features s14-ssa-audit --example benchmark_generated_fusion
+      - name: Run full fixed source/SSA/native denominator
+        env:
+          RULE_S21_FREEBSD_DIR: /tmp/s21-freebsd-sources
+        run: |
+          set -euo pipefail
+          compiler/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion \
+            --s21-freebsd-real | tee /tmp/s21-freebsd-ssa.log
+      - name: Independently reconcile every accepted original SSA source hash and histogram
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/expr-rule-gen/harness/check_s21_opportunities.py \
+            --cohort freebsd --log /tmp/s21-freebsd-ssa.log
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          m=json.loads(Path('compiler/tools/expr-rule-gen/harness/s21_freebsd_codec_real_sources.json').read_text())
+          ids={x['id'] for x in m['files']}
+          assert len(ids)==3
+          lines=Path('/tmp/s21-freebsd-ssa.log').read_text().splitlines()
+          rows={r.split(',')[1]:r.split(',') for r in lines if r.startswith('S21F_ROW,')}
+          rejected={r.split(',')[1]:r.split(',') for r in lines if r.startswith('S21F_REJECT,')}
+          native_rejected={r.split(',')[1]:r.split(',') for r in lines if r.startswith('S21F_NATIVE_REJECT,')}
+          assert set(rows).isdisjoint(rejected)
+          assert set(rows)|set(rejected)==ids
+          assert len(rows)>=1, 'no actual real source accepted as typed SSA'
+          assert set(native_rejected)<=set(rows)
+          n_native=0; bytes_old=0; bytes_new=0
+          for id,r in rows.items():
+              assert len(r)==10,r
+              _,name,hash64,raw,optimized,passed,old,new,calls,kind=r
+              assert name==id and len(hash64)==16
+              assert int(raw)>=int(optimized)>0
+              assert int(passed) in (0,1)
+              assert kind in ('ascii64_decode','ascii64_encode','prng_pointer_state')
+              assert int(old)==int(new)
+              assert (id in native_rejected)==(int(passed)==0)
+              if int(passed):
+                  assert int(calls)>0 and int(old)>0
+                  n_native+=1
+              else:
+                  assert int(calls)==int(old)==int(new)==0
+              bytes_old+=int(old);bytes_new+=int(new)
+          assert n_native>=1,'no original-source native differential was verified'
+          schema=[x.split(',') for x in lines if x.startswith('S21F_OPS_SCHEMA,')]
+          assert len(schema)==1 and len(schema[0])==23
+          for stage in ('RAW','OPT'):
+              found={x.split(',')[1]:x.split(',') for x in lines
+                     if x.startswith('S21F_OPS_'+stage+',')}
+              assert set(found)==set(rows)
+              agg=[0]*19
+              for id,r in found.items():
+                  assert len(r)==23 and r[2]==rows[id][2]
+                  counts=list(map(int,r[4:]))
+                  assert sum(counts)==int(r[3])
+                  agg=[a+b for a,b in zip(agg,counts)]
+              total=[x.split(',') for x in lines if x.startswith('S21F_TOTAL_'+stage+',')]
+              assert len(total)==1 and len(total[0])==23
+              assert list(map(int,total[0][4:]))==agg
+          summary=[x for x in lines if x.startswith('S21F_SUMMARY ')]
+          assert len(summary)==1
+          fields=dict(x.split('=',1) for x in summary[0].split()[1:])
+          expected={'attempted':3,'accepted':len(rows),'rejected':len(rejected),
+                    'native_verified':n_native,'native_rejected':len(native_rejected),
+                    'native_checks':sum(int(r[8]) for r in rows.values()),
+                    'baseline_bytes':bytes_old,'trial_bytes':bytes_new}
+          assert all(int(fields[k])==v for k,v in expected.items()),(fields,expected)
+          print('S21F_CORPUS_VERIFIED',expected,'ssa',sorted(rows),'frontend_rejects',sorted(rejected),'native_rejects',sorted(native_rejected))
+          PY
+      - name: Archive exact-source and native outcome accounting
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s21-freebsd-codec-source-ssa-native
+          if-no-files-found: warn
+          path: |
+            /tmp/s21-freebsd-pin.log
+            /tmp/s21-freebsd-ssa.log
