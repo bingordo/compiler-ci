@@ -1,0 +1,75 @@
+name: M4.7 P6b native allocated F32/F64 machine SSA (compiler-ci)
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-m4-7-float-machine.yml'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact compiler SHA
+        required: true
+        default: main
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: p6b-float-machine-${{ github.event.inputs.source_ref || github.head_ref || 'default' }}
+  cancel-in-progress: true
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 26
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || '848b9ffa647093d76d329236a3c4bbbec3cfd801' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned native FP machine acceptance
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          source="$(git rev-parse HEAD)"
+          echo "M4.7 P6b F32/F64 machine SHA $source" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${{ github.event_name }}" == 'pull_request' ]]; then test "$source" = '848b9ffa647093d76d329236a3c4bbbec3cfd801'; fi
+          test -s crates/backend-x86/tests/unit/float_machine_native.rs
+      - name: Minimal native backend Rust workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m47-p6b-float-machine
+          cache-workspace-crates: 'true'
+      - name: Native allocated FP machine SSA and independent C oracle
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib float_machine_native_tests -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/m47-float-machine.log"
+          grep -F 'test float_machine_native_tests::native_allocated_scalar_fp_ssa_elf_gas_frameless_and_rbp ... ok' "$RUNNER_TEMP/m47-float-machine.log"
+      - name: Complete IR backend and x86 native test suites
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-backend -p compiler-backend-x86
+      - name: Strict all-target backend Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
+      - name: Preserve native failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m47-float-machine
+          path: ${{ runner.temp }}/m47-float-machine.log
+          if-no-files-found: ignore
+          retention-days: 7
