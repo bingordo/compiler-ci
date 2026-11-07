@@ -1,0 +1,96 @@
+name: "CT-03 LICM transaction: exact-parent loop-heavy isolated ABBA"
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct03-licm-isolated-abba.yml'
+      - 'tools/ct03_licm_hotspot.rs'
+      - 'tools/ct04_hotspot_compare.py'
+permissions:
+  contents: read
+concurrency:
+  group: ct03-licm-isolated-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '6736f138e20420f2164ba3a68147f72a150b2b6a'
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '58f628efcf821f91f233054e74382221fba7935c'
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Source and rustc provenance; same immutable SSA fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C before rev-parse HEAD | tee results/before-sha.txt
+          git -C after rev-parse HEAD | tee results/after-sha.txt
+          rustc --version | tee results/toolchain.txt
+          cargo --version | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\\(s\\)):' | tee -a results/toolchain.txt || true
+          python3 -m py_compile harness/tools/ct04_hotspot_compare.py
+          for checkout in before after; do
+            mkdir -p "$checkout/crates/opt/examples"
+            cp harness/tools/ct03_licm_hotspot.rs \
+              "$checkout/crates/opt/examples/ct03_licm_hotspot.rs"
+            cat > "$checkout/Cargo.toml" <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+            rm -f "$checkout/Cargo.lock"
+          done
+          cmp before/crates/opt/examples/ct03_licm_hotspot.rs \
+            after/crates/opt/examples/ct03_licm_hotspot.rs
+          sha256sum before/crates/opt/examples/ct03_licm_hotspot.rs \
+            after/crates/opt/examples/ct03_licm_hotspot.rs | tee results/fixture-sha.txt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before -> target
+            after -> target
+          key: ct03-licm-isolated
+      - name: Release build exact baseline and candidate LICM benches
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path before/Cargo.toml \
+            -p compiler-opt --example ct03_licm_hotspot
+          cargo build --release --manifest-path after/Cargo.toml \
+            -p compiler-opt --example ct03_licm_hotspot
+      - name: Five ABBA rounds with full output statistics parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct04_hotspot_compare.py \
+            --pair ct03licm \
+            --before before/target/release/examples/ct03_licm_hotspot \
+            --after after/target/release/examples/ct03_licm_hotspot \
+            --rounds 5 --raw results/raw.csv --report results/report.md
+          cat results/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve raw timing, memory and source provenance
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ct03-licm-loop-heavy-abba
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
