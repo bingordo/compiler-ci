@@ -1,0 +1,55 @@
+name: Native TypeId generic regalloc and executable oracles (compiler-ci)
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-typeid-regalloc.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  typeid-regalloc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout immutable compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: dec5707fa724acc50e641f46a9b118c0a5288ede
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact compiler commit
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "dec5707fa724acc50e641f46a9b118c0a5288ede"
+      - name: Isolate compiler backend workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-generic-ra
+      - name: Native TypeId C11 GAS/ELF oracle including pressure, spills, phi swaps
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --test native_typeid_direct -- --nocapture
+      - name: Generic RA projection and alias reservations
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 native_regalloc -- --nocapture
+      - name: Full IR optimizer backend and x86 tests
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+      - name: AArch64 compatible compilation
+        working-directory: compiler
+        run: cargo check -p compiler-backend-aarch64 --all-targets
+      - name: Strict all-target core Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
+      - name: Strict AArch64 library Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
