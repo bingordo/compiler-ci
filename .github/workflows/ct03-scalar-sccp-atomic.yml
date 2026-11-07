@@ -1,0 +1,116 @@
+name: "CT-03 scalar SCCP: atomic postcheck and exact-parent ABBA"
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct03-scalar-sccp-atomic.yml'
+      - 'tools/ct04_hotspot_compare.py'
+permissions:
+  contents: read
+concurrency:
+  group: ct03-scalar-sccp-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '6dbbe8b86b9467ced0fa3b7e6c5bc650c0f040f4'
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '18cc80fa1120b2197fcaa442e22a880db2eaf5e6'
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin both exact refs, one immutable SSA source and Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C before rev-parse HEAD | tee results/before-sha.txt
+          git -C after rev-parse HEAD | tee results/after-sha.txt
+          rustc --version | tee results/toolchain.txt
+          cargo --version | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\\(s\\)):' | tee -a results/toolchain.txt || true
+          python3 -m py_compile harness/tools/ct04_hotspot_compare.py
+          for checkout in before after; do
+            mkdir -p "$checkout/crates/opt/examples"
+            cp harness/tools/ct06_optimizer_hotspots.rs \
+              "$checkout/crates/opt/examples/ct06_optimizer_hotspots.rs"
+            cat > "$checkout/Cargo.toml" <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+            rm -f "$checkout/Cargo.lock"
+          done
+          cmp before/crates/opt/examples/ct06_optimizer_hotspots.rs \
+            after/crates/opt/examples/ct06_optimizer_hotspots.rs
+          sha256sum before/crates/opt/examples/ct06_optimizer_hotspots.rs \
+            after/crates/opt/examples/ct06_optimizer_hotspots.rs | tee results/fixture-sha.txt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before -> target
+            after -> target
+          key: ct03-scalar-sccp-atomic
+      - name: Full uninstrumented core IR optimizer backend and x86 tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path after/Cargo.toml \
+            -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 \
+            2>&1 | tee results/core.log
+      - name: Targeted scalar rollback, SCCP semantics and diagnostic build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path after/Cargo.toml -p compiler-opt \
+            --lib atomicity_tests -- --nocapture \
+            2>&1 | tee results/rollback.log
+          cargo clippy --manifest-path after/Cargo.toml \
+            -p compiler-ir -p compiler-opt --all-targets -- -D warnings \
+            2>&1 | tee results/clippy-default.log
+          cargo clippy --manifest-path after/Cargo.toml \
+            -p compiler-ir -p compiler-opt \
+            --features compiler-opt/verify-counts --all-targets -- -D warnings \
+            2>&1 | tee results/clippy-optin.log
+      - name: Compile exact parent and candidate release optimizer benchmarks
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path before/Cargo.toml \
+            -p compiler-opt --example ct06_optimizer_hotspots
+          cargo build --release --manifest-path after/Cargo.toml \
+            -p compiler-opt --example ct06_optimizer_hotspots
+      - name: SCCP forward/reverse 5-round ABBA with strict output signatures
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct04_hotspot_compare.py \
+            --pair ct03scalar \
+            --before before/target/release/examples/ct06_optimizer_hotspots \
+            --after after/target/release/examples/ct06_optimizer_hotspots \
+            --rounds 5 --raw results/raw.csv --report results/report.md
+          cat results/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain full test, raw timing and exact revision evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ct03-scalar-sccp-atomic
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
