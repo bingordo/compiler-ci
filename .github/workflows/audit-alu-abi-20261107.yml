@@ -1,72 +1,52 @@
-name: audited ALU and ABI CPU form identities
+name: verify exact x86 ALU and ABI measured source variants
 on:
   push:
     branches: [ci/x86-alu-abi-audit-20261107]
 permissions:
   contents: read
 jobs:
-  audit:
+  profiles:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - name: Read exact pinned uops.info XML
-        shell: bash
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f6b457c69b536b78a4bde689c9c909020f80515f
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Review regenerated exact x86 form catalog
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "f6b457c69b536b78a4bde689c9c909020f80515f"
+          python3 tools/regen_x86_forms.py --check
+      - name: Import CPU-specific 127 distinct full-XED identities from source checksum
+        working-directory: compiler
         run: |
           set -euo pipefail
           curl -fsSL --retry 2 --connect-timeout 15 --max-time 180 https://uops.info/instructions.xml -o /tmp/instructions.xml
           echo 'e5e702caaf04c4fc1f75192a9bbe4d8554b3e174f7933a14d124cc33ca677ab3  /tmp/instructions.xml' | sha256sum -c -
-      - name: Audit exact 32/64 ALU and special ABI instruction identities
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          import json, xml.etree.ElementTree as ET
-          # Actual physical encoder families: explicit opcode, width, direction,
-          # access mode, and special immediates, not generic mnemonics.
-          wanted_ops = {'03','2B','23','0B','33','0FAF','0FBC','01','29',
-                        '31','F7','D3','C1','81','83','50','58','C3',
-                        'E8','FF','99','0F0B','F3AB'}
-          roots=('ADD_','SUB_','AND_','OR_','XOR_','IMUL_','BSF_','SHL_',
-                 'SHR_','SAR_','NEG_','NOT_','IDIV_','DIV_',
-                 'PUSH_','POP_','RET_','CALL_','CQO_','CDQ_','UD2_','STOS_')
-          hits=[]
-          for _,el in ET.iterparse('/tmp/instructions.xml',events=('end',)):
-              if el.tag!='instruction': continue
-              a=el.attrib
-              opcode=''.join(a.get('opcode','').split()).upper()
-              if opcode not in wanted_ops or not a.get('iform','').startswith(roots):
-                  el.clear();continue
-              ops=[o.attrib for o in el.findall('operand') if o.get('suppressed')!='1']
-              types=tuple(o.get('type') for o in ops)
-              widths=tuple(o.get('width') for o in ops)
-              if opcode in ('03','2B','23','0B','33','0FAF','0FBC','01','29','31'):
-                  if types not in (('reg','reg'),('reg','mem'),('mem','reg')) or widths not in (('32','32'),('64','64')):
-                      el.clear();continue
-              elif opcode in ('F7','D3','C1'):
-                  if types not in (('reg',),('reg','imm'),('mem',),('mem','imm')) or widths[0] not in ('32','64'):
-                      el.clear();continue
-              elif opcode in ('81','83'):
-                  if types not in (('reg','imm'),('mem','imm')) or widths[0] not in ('32','64'):
-                      el.clear();continue
-              elif opcode in ('50','58'):
-                  if types!=('reg',) or widths!=('64',):
-                      el.clear();continue
-              elif opcode=='FF':
-                  if types not in (('reg',),('mem',)):
-                      el.clear();continue
-              elif opcode=='E8':
-                  if not a.get('iform','').startswith('CALL_'):el.clear();continue
-              identity={k:a.get(k) for k in ('iform','agen','bcast','eosz','high8','immzero','mask','nf','opcode','rep','rm','sae','zeroing')}
-              arch={}
-              for cpu in el.findall('architecture'):
-                  if cpu.get('name') in ('SKL','ZEN4'):
-                      measurements=[m.attrib for m in cpu.findall('measurement')]
-                      if len(measurements)==1:
-                          arch[cpu.get('name')]={k:measurements[0].get(k) for k in ('uops','TP_unrolled','TP_loop')}
-              if arch.get('SKL') and arch.get('ZEN4'):
-                  hits.append(dict(opcode=opcode,iform=a.get('iform'),types=types,
-                      widths=widths,identity=identity,arch=arch,label=a.get('string')))
-              el.clear()
-          for h in sorted(hits,key=lambda x:(x['opcode'],x['iform'],str(x['widths']),str(x['identity']))):
-              print('ALU_AUDIT',json.dumps(h,sort_keys=True,separators=(',',':')))
-          print('ALU_AUDIT_COUNT',len(hits))
+          for arch in SKL ZEN4; do
+            python3 tools/import_uops_info.py /tmp/instructions.xml --architecture "$arch" \
+              --mapping data/x86_uops_variant_mapping.json --output "/tmp/${arch}.json"
+            python3 tools/validate_x86_costs.py "/tmp/${arch}.json"
+            python3 - "$arch" <<'PY'
+          import json,sys
+          from pathlib import Path
+          arch=sys.argv[1]
+          p=json.loads(Path('/tmp',arch+'.json').read_text())
+          print('ALU_PROFILE_COVERAGE',arch,len(p['forms']))
+          print('ALU_BEGIN_PROFILE',arch)
+          print(json.dumps(p,sort_keys=True,indent=2))
+          print('ALU_END_PROFILE',arch)
+          assert len(p['forms'])==127, (arch,len(p['forms']))
           PY
+          done
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: x86-alu-abi-skl-zen4-profiles
+          path: /tmp/{SKL,ZEN4}.json
+          retention-days: 30
