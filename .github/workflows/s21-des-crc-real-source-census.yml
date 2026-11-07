@@ -1,0 +1,166 @@
+name: S21 original musl DES and zlib CRC real-source SSA census
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/s21-des-crc-real-source-census.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  des-crc-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: eb7b42ba246fa367b4bce3199ff79b717b0b16e3
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout original zlib source and true include context
+        uses: actions/checkout@v4
+        with:
+          repository: madler/zlib
+          ref: 99623ef7097352da7993ba614161fd6a311e046e
+          path: zlib
+          persist-credentials: false
+      - name: Pin full upstream DES and CRC source Git blobs and exact original function spans
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/expr-rule-gen/harness/prepare_s21_crypt_crc_sources.py \
+            --manifest compiler/tools/expr-rule-gen/harness/s21_crypt_crc_real_sources.json \
+            --output-dir /tmp/s21-crypt | tee /tmp/s21-crypt-source.log
+          grep -qx 'S21C_FETCH_OK selected=4 exact_functions=4' /tmp/s21-crypt-source.log
+          test "$(grep -c '^S21C_PIN,' /tmp/s21-crypt-source.log)" -eq 4
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          m=json.loads(Path('compiler/tools/expr-rule-gen/harness/s21_crypt_crc_real_sources.json').read_text())
+          z=next(x for x in m['files'] if x['id']=='zlib_crc_byte_swap')
+          src=Path('zlib/crc32.c').read_bytes()
+          sha=hashlib.sha1(b'blob '+str(len(src)).encode()+b'\0'+src).hexdigest()
+          assert sha==z['blob_sha']
+          assert Path('zlib/zutil.h').exists()
+          print('S21C_PINNED_ZLIB_CONTEXT',sha)
+          PY
+      - name: Install offline Z3 prover
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends z3
+      - name: Regenerate existing full 152-rule experimental matcher without source edits
+        run: |
+          set -euo pipefail
+          cargo run --release --manifest-path compiler/tools/expr-rule-gen/Cargo.toml -- \
+            --infer-guards --compose-guards --minimize-rules --commute-inferred \
+            --max-proofs 2000 --max-rules 500 --format rust --output /tmp/s21-crypt-rules.rs
+          grep -q 'pub const RULE_COUNT: usize = 152;' /tmp/s21-crypt-rules.rs
+          grep -q 'pub const RULE_LIMIT_REACHED: bool = false;' /tmp/s21-crypt-rules.rs
+      - name: Use unchanged pinned public Mini-C frontend without runner SSH credentials
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('compiler/tools/mini-c-driver/Cargo.toml')
+          s=p.read_text()
+          old='ssh://git@github.com/bingordo/mini-c.git'
+          assert s.count(old)==2
+          p.write_text(s.replace(old,'https://github.com/bingordo/mini-c.git'))
+          PY
+      - name: Cache compiled SSA benchmark
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: s21-des-crc-original
+      - name: Test original-only signature alias and compile benchmark
+        env:
+          S14_MATCHER_FILE: /tmp/s21-crypt-rules.rs
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            --features s14-ssa-audit --example benchmark_generated_fusion \
+            s21_crypt::tests -- --nocapture
+          cargo build --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            --features s14-ssa-audit --example benchmark_generated_fusion
+      - name: Run fixed source denominator, real headers, SSA optimizer and native GCC oracles
+        env:
+          RULE_S21_CRYPT_DIR: /tmp/s21-crypt
+          RULE_S21_CRYPT_ZLIB_DIR: ${{ github.workspace }}/zlib
+        run: |
+          set -euo pipefail
+          compiler/tools/mini-c-driver/target/release/examples/benchmark_generated_fusion \
+            --s21-crypt-real | tee /tmp/s21-crypt-results.log
+      - name: Independently reconcile all 19 typed SSA op classes and every attempted helper
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/expr-rule-gen/harness/check_s21_opportunities.py \
+            --cohort crypt --log /tmp/s21-crypt-results.log
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          m=json.loads(Path('compiler/tools/expr-rule-gen/harness/s21_crypt_crc_real_sources.json').read_text())
+          records={i['id']:i for i in m['files']}
+          assert len(records)==4
+          lines=Path('/tmp/s21-crypt-results.log').read_text().splitlines()
+          prefix=[x for x in lines if x.startswith('S21C_INFO ')]
+          summary=[x for x in lines if x.startswith('S21C_SUMMARY ')]
+          schema=[x.split(',') for x in lines if x.startswith('S21C_OPS_SCHEMA,')]
+          assert len(prefix)==len(summary)==len(schema)==1
+          assert len(schema[0])==23
+          rows=[x.split(',') for x in lines if x.startswith('S21C_ROW,')]
+          rejects=[x.split(',') for x in lines if x.startswith('S21C_REJECT,')]
+          assert len(rows)+len(rejects)==4
+          assert len(rows)>=1,'all source functions rejected by frontend'
+          chosen=set()
+          totals=dict(attempted=4,accepted=0,rejected=0,
+                      baseline_bytes=0,trial_bytes=0,native_calls=0)
+          for r in rows:
+              assert len(r)==9,r
+              _,id,hash64,raw,optimized,old,new,native,abi=r
+              assert id in records and id not in chosen
+              assert records[id]['abi']==abi and len(hash64)==16
+              assert int(raw)>0 and int(optimized)>0
+              assert int(native)>0 and int(old)>0 and int(new)>0
+              assert int(old)==int(new)
+              chosen.add(id)
+              totals['accepted']+=1
+              totals['baseline_bytes']+=int(old)
+              totals['trial_bytes']+=int(new)
+              totals['native_calls']+=int(native)
+          for r in rejects:
+              assert len(r)==5,r
+              _,id,hash64,stage,reason=r
+              assert id in records and id not in chosen
+              assert len(hash64)==16 and stage in ('preprocessor','frontend','function_count')
+              assert reason
+              chosen.add(id)
+              totals['rejected']+=1
+          assert chosen==set(records)
+          for stage in ('RAW','OPT'):
+              rows=[x.split(',') for x in lines if x.startswith('S21C_OPS_'+stage+',')]
+              total=[x.split(',') for x in lines if x.startswith('S21C_TOTAL_'+stage+',')]
+              assert len(rows)==totals['accepted'] and len(total)==1
+              assert len(total[0])==23
+              aggregate=[0]*19
+              seen=set()
+              for r in rows:
+                  assert len(r)==23,r
+                  _,id,source_hash,count,*hist=r
+                  assert id in records and id not in seen
+                  seen.add(id)
+                  nums=list(map(int,hist))
+                  assert sum(nums)==int(count) and all(n>=0 for n in nums)
+                  aggregate=[a+b for a,b in zip(aggregate,nums)]
+              assert list(map(int,total[0][4:]))==aggregate
+              assert int(total[0][3])==sum(aggregate)
+          fields=dict(s.split('=',1) for s in summary[0].split()[1:])
+          assert all(int(fields[k])==v for k,v in totals.items()),(fields,totals)
+          print('S21C_FULL_CORPUS_VERIFIED',totals,'accepted',sorted(chosen))
+          PY
+      - name: Archive original-source provenance, SSA census and native comparison
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s21-des-crc-original-sources
+          if-no-files-found: warn
+          path: |
+            /tmp/s21-crypt-source.log
+            /tmp/s21-crypt-results.log
