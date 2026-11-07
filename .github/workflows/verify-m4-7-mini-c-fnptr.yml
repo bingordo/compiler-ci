@@ -1,0 +1,82 @@
+name: M4.7 Mini-C checked function pointers (compiler-ci)
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-m4-7-mini-c-fnptr.yml'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact compiler SHA to test
+        required: true
+        default: main
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: m47-mini-c-fnptr-${{ github.event.inputs.source_ref || github.head_ref || 'default' }}
+  cancel-in-progress: true
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 26
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || '5ce67896b059a1e48612c4b4f91e7a151c7b58ea' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin and identify source
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          echo "M4.7 Mini-C function pointers compiler SHA $actual" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${{ github.event_name }}" == 'pull_request' ]]; then
+            test "$actual" = '5ce67896b059a1e48612c4b4f91e7a151c7b58ea'
+          fi
+          test -s tools/mini-c-driver/tests/fixtures/s13_indirect_callbacks.c
+      - name: Use public pinned checked Mini-C frontend over HTTPS
+        run: |
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: m47-mini-c-fnptr
+          cache-workspace-crates: 'true'
+      - name: Checked source signature, storage and fail-closed negatives
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib m47_p5c -- --nocapture             2>&1 | tee "$RUNNER_TEMP/m47-p5c-unit.log"
+      - name: Original C source native ELF/GAS versus independent GCC oracle
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+          python3 tools/mini-c-driver/tests/s13_p5c_native.py             --compiler tools/mini-c-driver/target/debug/compiler-mini-c             --artifacts "$RUNNER_TEMP/m47-p5c-repro"             2>&1 | tee "$RUNNER_TEMP/m47-p5c-native.log"
+          grep -F "PASS P5c function pointer callbacks" "$RUNNER_TEMP/m47-p5c-native.log"
+      - name: Full checked Mini-C unit regression
+        working-directory: compiler
+        run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib
+      - name: Strict all-target Mini-C Clippy
+        working-directory: compiler
+        run: cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --all-targets -- -D warnings
+      - name: Preserve failure source and native artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m47-mini-c-fnptr-failures
+          path: |
+            ${{ runner.temp }}/m47-p5c-repro/
+            ${{ runner.temp }}/m47-p5c-unit.log
+            ${{ runner.temp }}/m47-p5c-native.log
+          if-no-files-found: ignore
+          retention-days: 7
