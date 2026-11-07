@@ -1,0 +1,84 @@
+name: x86 all condition measured-cost provenance
+on:
+  push:
+    branches: [ci/x86-uops-all-predicates-skl-zen4-20261106]
+permissions:
+  contents: read
+jobs:
+  profiles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: aae8032f4112b8ddf259de9e7939133815933ee5
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Exact source revision, generated forms, import and validator negatives
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "aae8032f4112b8ddf259de9e7939133815933ee5"
+          python3 tools/regen_x86_forms.py --check
+          PYTHONPATH=tools python3 -m unittest discover -s tools -p test_import_uops_info.py -v
+          python3 tools/validate_x86_costs.py data/x86_costs_generic.json data/x86_costs_skl.json
+      - name: Download SHA-pinned vendor XML
+        run: |
+          set -euo pipefail
+          curl --fail --show-error --location --retry 2 --connect-timeout 15 --max-time 180 \
+            https://uops.info/instructions.xml -o /tmp/instructions.xml
+          echo "e5e702caaf04c4fc1f75192a9bbe4d8554b3e174f7933a14d124cc33ca677ab3  /tmp/instructions.xml" | sha256sum --check -
+      - name: Deterministically import two precise CPU profiles
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/x86-profiles
+          for cpu in SKL ZEN4; do
+            python3 tools/import_uops_info.py /tmp/instructions.xml \
+              --architecture "$cpu" --mapping data/x86_uops_variant_mapping.json \
+              --output "/tmp/x86-profiles/${cpu}.json"
+            python3 tools/validate_x86_costs.py "/tmp/x86-profiles/${cpu}.json"
+            python3 - "$cpu" <<'PY'
+          import json,sys
+          from pathlib import Path
+          cpu=sys.argv[1]
+          profile=json.loads(Path('/tmp/x86-profiles',cpu+'.json').read_text())
+          print('COVERAGE',cpu,len(profile['forms']))
+          print('BEGIN_PROFILE',cpu)
+          print(json.dumps(profile,sort_keys=True,indent=2))
+          print('END_PROFILE',cpu)
+          PY
+          done
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: sklm-zen4-reviewed-uops-profiles
+          path: /tmp/x86-profiles/
+          retention-days: 30
+  backend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: aae8032f4112b8ddf259de9e7939133815933ee5
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Local backend-only workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: x86 direct ELF, GAS and unit tests plus strict lint
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86
+          cargo clippy -p compiler-backend-x86 --all-targets -- -D warnings
