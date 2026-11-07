@@ -15,52 +15,16 @@ jobs:
           curl --fail --show-error --location --retry 2 --connect-timeout 15 --max-time 160 \
             https://uops.info/instructions.xml -o instructions.xml
           sha256sum instructions.xml
-      - name: Audit all x86 flag predicates and selected 32/64-bit forms
-        shell: bash
+      - name: Verify high8 register byte variant semantics
         run: |
           python3 - <<'PY'
-          import json,xml.etree.ElementTree as ET
-          # All 10 conditions produced by x86 machine::CompareSelect32.
-          suffix={"E":"44","NE":"45","L":"4C","LE":"4E","G":"4F","GE":"4D",
-                  "B":"42","BE":"46","A":"47","AE":"43"}
-          # uops XED uses condition names for aliases, not the GNU spelling.
-          wanted={"CMP_GPRv_GPRv_39","CMP_GPRv_IMMb"}
-          cmov=set("0F"+v for v in suffix.values())
-          setcc=set("0F"+x for x in ("94","95","9C","9E","9F","9D","92","96","97","93"))
-          identities=[]
-          for _,el in ET.iterparse("instructions.xml",events=("end",)):
-              if el.tag!="instruction":continue
-              a=el.attrib
-              opcode="".join(a.get("opcode","").split()).upper()
-              if opcode not in cmov|setcc|{"39","83"}:
-                  el.clear();continue
-              op=[x.attrib for x in el.findall("operand") if x.get("suppressed")!="1"]
-              types=tuple(x.get("type") for x in op)
-              widths=tuple(x.get("width") for x in op)
-              if opcode in cmov:
-                  if a.get("eosz")!="2" or types not in (("reg","reg"),("reg","mem")) or widths!=("32","32"):
-                      el.clear();continue
-              elif opcode in setcc:
-                  if types!=("reg",) or widths!=("8",):
-                      el.clear();continue
-              elif opcode=="39":
-                  if a.get("iform")!="CMP_GPRv_GPRv_39" or types!=("reg","reg") or widths not in (("32","32"),("64","64")):
-                      el.clear();continue
-              else:
-                  if a.get("iform")!="CMP_GPRv_IMMb" or types!=("reg","imm") or a.get("immzero")!="1" or a.get("eosz") not in ("2","3"):
-                      el.clear();continue
-              arch={}
-              for aa in el.iter("architecture"):
-                  if aa.get("name") in ("SKL","ZEN4"):
-                      ms=[m.attrib for m in aa.findall("measurement")]
-                      if len(ms)==1:
-                          arch[aa.get("name")]={k:ms[0].get(k) for k in ("TP_unrolled","TP_loop","uops","ports") if k in ms[0]}
-              identity={k:a.get(k) for k in
-                ("iform","agen","bcast","eosz","high8","immzero","mask","nf","opcode","rep","rm","sae","zeroing")}
-              identities.append((opcode,types,widths,identity,arch))
-              el.clear()
-          print("AUDIT_VARIANTS",len(identities))
-          for opcode,types,widths,identity,arch in sorted(identities,key=lambda t:(t[0],t[1],t[2])):
-              print("AUDIT",json.dumps({"opcode":opcode,"types":types,"widths":widths,
-               "identity":identity,"arch":arch},sort_keys=True,separators=(",",":")))
+          import xml.etree.ElementTree as ET
+          for _,e in ET.iterparse('instructions.xml',events=('end',)):
+            if e.tag!='instruction':continue
+            if e.get('iform') in ('SETL_GPR8','SETNBE_GPR8','SETZ_GPR8','MOVZX_GPRv_GPR8'):
+              print('BYTE_VARIANT',{'iform':e.get('iform'),'high8':e.get('high8'),
+                'string':e.get('string'),'url':e.get('url'),
+                'eosz':e.get('eosz'),'op':e.get('opcode'),
+                'operands':[o.attrib for o in e.findall('operand') if o.get('suppressed')!='1']})
+            e.clear()
           PY
