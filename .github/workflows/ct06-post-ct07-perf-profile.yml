@@ -1,0 +1,119 @@
+name: CT-06 post-CT-07 Mini-C CPU call graphs
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct06-post-ct07-perf-profile.yml'
+permissions:
+  contents: read
+concurrency:
+  group: ct06-post-ct07-perf-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  sample:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      RUSTFLAGS: '-C debuginfo=1 -C force-frame-pointers=yes'
+    steps:
+      - name: Checkout current benchmark harness
+        uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Checkout pinned post-CT-07 compiler revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '5ac2a7c0c2b727f93c55ab99a998380fa3d2b4d4'
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify Linux perf and capture exact compiler/runner provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C compiler rev-parse HEAD | tee results/compiler-sha.txt
+          test "$(cat results/compiler-sha.txt)" = '5ac2a7c0c2b727f93c55ab99a998380fa3d2b4d4'
+          printf 'baseline=post-CT-07 main\nprofile=cpu-clock:u\n' | tee results/profile-scope.txt
+          git -C harness rev-parse HEAD | tee results/harness-sha.txt
+          rustc --version | tee results/toolchain.txt
+          cargo --version | tee -a results/toolchain.txt
+          uname -a | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\\(s\\)):' | tee -a results/toolchain.txt || true
+          perf --version | tee -a results/toolchain.txt
+          echo "Original paranoid=$(cat /proc/sys/kernel/perf_event_paranoid)" | tee -a results/toolchain.txt
+          # Only on the ephemeral CI runner, never modify a user's host.
+          sudo sysctl -w kernel.perf_event_paranoid=1
+          perf stat -e task-clock -- /bin/true 2>&1 | tee results/perf-probe.txt
+          python3 -m py_compile harness/tools/ct06_large_corpus.py \
+            compiler/tools/perf_repeat_compile.py compiler/tools/source_compile_corpus.py
+      - name: Configure pinned Mini-C frontend dependency over HTTPS
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: ct06-post-ct07-perf-fp
+      - name: Build release Mini-C compiler with debug symbols and frame pointers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --bin compiler-mini-c
+          file compiler/tools/mini-c-driver/target/release/compiler-mini-c | tee results/binary.txt
+          sha256sum compiler/tools/mini-c-driver/target/release/compiler-mini-c \
+            > results/compiler-binary.sha256
+      - name: Generate real checked C sources and verify extended manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct06_large_corpus.py \
+            --helpers compiler/tools --out corpus
+          cp corpus/manifest.csv results/source-manifest.csv
+      - name: Record array-loop scaling and ordinary control call stacks
+        shell: bash
+        run: |
+          set -euo pipefail
+          COMPILER="$PWD/compiler/tools/mini-c-driver/target/release/compiler-mini-c"
+          for spec in "array_loop 48 120" "array_loop 96 120" \
+                      "array_loop 128 120" "branch_chain 128 140" \
+                      "call_graph 128 140"; do
+            read -r kind size count <<< "$spec"
+            case_id="${kind}_${size}"
+            source="$PWD/corpus/mini_c/${case_id}.c"
+            echo "::group::Perf ${case_id} (${count} fresh compiler processes)"
+            perf record --quiet -e cpu-clock:u -F 499 \
+              -g --call-graph fp \
+              -o "results/${case_id}.perf.data" -- \
+              python3 compiler/tools/perf_repeat_compile.py \
+                --compiler "$COMPILER" --source "$source" \
+                --count "$count" > "results/${case_id}.json"
+            perf report -i "results/${case_id}.perf.data" \
+              --stdio --no-children --sort comm,dso,symbol \
+              --percent-limit 0.25 > "results/${case_id}.leaf.txt"
+            perf report -i "results/${case_id}.perf.data" \
+              --stdio --children --sort comm,dso,symbol \
+              --percent-limit 0.5 > "results/${case_id}.stacks.txt"
+            perf stat -e task-clock,context-switches,page-faults \
+              -o "results/${case_id}.stat.txt" -- \
+              python3 compiler/tools/perf_repeat_compile.py \
+                --compiler "$COMPILER" --source "$source" \
+                --count 25 > "results/${case_id}.stat.json"
+            cat "results/${case_id}.json"
+            echo "Top leaf symbols:"
+            grep -E '^[[:space:]]*[0-9]+[.][0-9]+%.*compiler-mini-c' \
+              "results/${case_id}.leaf.txt" | head -n 20 || true
+            echo "::endgroup::"
+          done
+      - name: Save raw perf recordings, stacks, counters, hashes and source manifest
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ct06-post-ct07-perf-48-96-128
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
+          compression-level: 3
