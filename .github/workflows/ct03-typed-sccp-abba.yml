@@ -1,0 +1,96 @@
+name: "CT-03 typed SCCP atomic clone: exact-commit isolated ABBA"
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct03-typed-sccp-abba.yml'
+      - 'tools/ct03_typed_sccp_hotspot.rs'
+      - 'tools/ct04_hotspot_compare.py'
+permissions:
+  contents: read
+concurrency:
+  group: ct03-typed-sccp-abba-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 'd61bff343649803a55d0f4176b4b46f5441c5ba6'
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 'b1cb51e4eb678f510a0c79de8bb6a2a37531437a'
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify immutable provenance and identical typed SSA fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C before rev-parse HEAD | tee results/before-sha.txt
+          git -C after rev-parse HEAD | tee results/after-sha.txt
+          rustc --version | tee results/toolchain.txt
+          cargo --version | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\\(s\\)):' | tee -a results/toolchain.txt || true
+          python3 -m py_compile harness/tools/ct04_hotspot_compare.py
+          for checkout in before after; do
+            mkdir -p "$checkout/crates/opt/examples"
+            cp harness/tools/ct03_typed_sccp_hotspot.rs \
+              "$checkout/crates/opt/examples/ct03_typed_sccp_hotspot.rs"
+            cat > "$checkout/Cargo.toml" <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+            rm -f "$checkout/Cargo.lock"
+          done
+          cmp before/crates/opt/examples/ct03_typed_sccp_hotspot.rs \
+            after/crates/opt/examples/ct03_typed_sccp_hotspot.rs
+          sha256sum before/crates/opt/examples/ct03_typed_sccp_hotspot.rs \
+            after/crates/opt/examples/ct03_typed_sccp_hotspot.rs | tee results/fixture-sha.txt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before -> target
+            after -> target
+          key: ct03-typed-sccp-abba
+      - name: Build exact before and after release optimizer examples
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path before/Cargo.toml \
+            -p compiler-opt --example ct03_typed_sccp_hotspot
+          cargo build --release --manifest-path after/Cargo.toml \
+            -p compiler-opt --example ct03_typed_sccp_hotspot
+      - name: Compare TypeId SCCP on folded, no-op and multifunc SSA
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct04_hotspot_compare.py \
+            --pair ct03typed \
+            --before before/target/release/examples/ct03_typed_sccp_hotspot \
+            --after after/target/release/examples/ct03_typed_sccp_hotspot \
+            --rounds 5 --raw results/raw.csv --report results/report.md
+          cat results/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Archive exact raw parity/timings and CPU provenance
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ct03-typed-sccp-abba
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
