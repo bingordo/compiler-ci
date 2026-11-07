@@ -1,0 +1,81 @@
+name: M4.7 verified indirect SSA SysV x86 (compiler-ci)
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-m4-7-indirect-ssa.yml'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact compiler commit SHA or ref
+        required: true
+        default: main
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: m47-indirect-ssa-${{ github.event.inputs.source_ref || github.head_ref || 'default' }}
+  cancel-in-progress: true
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 23
+    steps:
+      - name: Checkout pinned compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || '393cf5615eeaa98f9a0ebbe01261fa74809ae248' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact compiler SHA
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          echo "M4.7 indirect SSA SHA $actual" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${{ github.event_name }}" == 'pull_request' ]]; then
+            test "$actual" = '393cf5615eeaa98f9a0ebbe01261fa74809ae248'
+          fi
+          test -s crates/backend-x86/tests/m4_7_indirect_ssa_native.rs
+      - name: Create self-contained core native workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m47-indirect-ssa
+          cache-workspace-crates: 'true'
+      - name: Native allocated SSA indirect calls ELF and GAS
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test m4_7_indirect_ssa_native -- --nocapture 2>&1 | tee "$RUNNER_TEMP/m47-ssa.log"
+          grep -F 'test indirect_ssa_calls_real_c_callbacks_elf_and_gas_all_frame_modes ... ok' "$RUNNER_TEMP/m47-ssa.log"
+      - name: Full IR and x86 backend native regression
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-backend -p compiler-backend-x86
+      - name: Targeted optimizer alias and call-semantics regressions
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test alias_phis --test mem2reg_native --test sccp_sparse_native --test inline_native
+      - name: Strict all-target Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
+      - name: Save failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m47-ssa-failures
+          path: ${{ runner.temp }}/m47-ssa.log
+          if-no-files-found: ignore
+          retention-days: 7
