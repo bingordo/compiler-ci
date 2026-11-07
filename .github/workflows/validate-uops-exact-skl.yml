@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: eb44dde44e74fa9cb65c628c7c225958c1f05a19
+          ref: 6ba5ca502e3a539a7908207726714f43b4221a19
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -20,7 +20,7 @@ jobs:
         working-directory: compiler
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "eb44dde44e74fa9cb65c628c7c225958c1f05a19"
+          test "$(git rev-parse HEAD)" = "6ba5ca502e3a539a7908207726714f43b4221a19"
           python3 tools/regen_x86_forms.py --check
           PYTHONPATH=tools python3 -m unittest discover -s tools -p test_import_uops_info.py -v
           python3 tools/validate_x86_costs.py data/x86_costs_generic.json
@@ -39,7 +39,16 @@ jobs:
             --architecture SKL \
             --mapping data/x86_uops_variant_mapping.json \
             --output /tmp/x86_costs_skl.json
-          python3 tools/validate_x86_costs.py /tmp/x86_costs_skl.json
+          python3 tools/validate_x86_costs.py /tmp/x86_costs_skl.json data/x86_costs_skl.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          generated=json.loads(Path('/tmp/x86_costs_skl.json').read_text())
+          committed=json.loads(Path('data/x86_costs_skl.json').read_text())
+          assert generated==committed, 'pinned measured SKL profile is stale or changed'
+          assert len(committed['forms'])==9
+          print('PASS pinned 9-form SKL measured profile reproduces exact upstream variants')
+          PY
           echo 'BEGIN SKL_PROFILE'
           cat /tmp/x86_costs_skl.json
           echo 'END SKL_PROFILE'
@@ -56,7 +65,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: eb44dde44e74fa9cb65c628c7c225958c1f05a19
+          ref: 6ba5ca502e3a539a7908207726714f43b4221a19
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -74,3 +83,45 @@ jobs:
           set -euo pipefail
           cargo test -p compiler-backend-x86
           cargo clippy -p compiler-backend-x86 --all-targets -- -D warnings
+
+  allocation-spill-profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 6ba5ca502e3a539a7908207726714f43b4221a19
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned compiler and configure Mini-C dependencies
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "6ba5ca502e3a539a7908207726714f43b4221a19"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - name: Build and run checked-source actual regalloc profile
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          cargo run --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --example shared_select_allocation_metrics \
+            | tee results/shared_select_allocated_homes.csv
+          python3 - <<'PY'
+          import csv
+          from pathlib import Path
+          rows=list(csv.DictReader(Path('results/shared_select_allocated_homes.csv').open()))
+          assert len(rows)==32, len(rows)
+          assert {int(row['budget']) for row in rows}=={2,8,14,15}
+          assert len({row['case'] for row in rows})==8
+          for row in rows:
+              assert int(row['spill_frame_words'])>=int(row['stack_homed_values'])
+          assert any(int(row['stack_homed_values'])>0 for row in rows if int(row['budget'])==2)
+          print('PASS: 8 checked-source cases, 4 actual regalloc budgets, nonzero constrained spills')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: native-x86-allocator-spill-homes
+          path: results/shared_select_allocated_homes.csv
+          retention-days: 30
