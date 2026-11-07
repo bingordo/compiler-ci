@@ -1,0 +1,106 @@
+name: "CT-03 scalar SCCP: independent full Mini-C source-to-ELF ABBA"
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct03-scalar-sccp-source-abba.yml'
+permissions:
+  contents: read
+concurrency:
+  group: ct03-scalar-source-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout benchmark harness
+        uses: actions/checkout@v4
+        with:
+          path: harness
+      - name: Checkout exact pre-merge compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 6dbbe8b86b9467ced0fa3b7e6c5bc650c0f040f4
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact squash merge compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 18cc80fa1120b2197fcaa442e22a880db2eaf5e6
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Capture immutable source revision and runner provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C before rev-parse HEAD | tee results/before-sha.txt
+          git -C after rev-parse HEAD | tee results/after-sha.txt
+          printf 'change=%s\nsession=%s\nrounds=5\nsizes=24,48,96,128\n' \
+            'ct03scalar' 'a' > results/parameters.txt
+          rustc --version | tee results/toolchain.txt
+          cargo --version | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\\(s\\)):' | tee -a results/toolchain.txt || true
+          python3 -m py_compile harness/tools/ct06_abba.py \
+            harness/tools/ct06_large_corpus.py after/tools/source_compile_corpus.py
+      - name: Configure public pinned Mini-C frontend over HTTPS
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before/tools/mini-c-driver -> target
+            after/tools/mini-c-driver -> target
+          key: ct03-scalar-sccp-source-a
+      - name: Build exact before and after release Mini-C drivers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path before/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+          cargo build --release --manifest-path after/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+          sha256sum before/tools/mini-c-driver/target/release/compiler-mini-c \
+            after/tools/mini-c-driver/target/release/compiler-mini-c \
+            > results/compiler-binaries.sha256
+      - name: Generate checked 24/48/96/128 C source corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct06_large_corpus.py \
+            --helpers after/tools --out corpus
+          cp corpus/manifest.csv results/source-manifest.csv
+          python3 - <<'PY'
+          from pathlib import Path
+          import sys
+          sys.path.insert(0, "harness/tools")
+          from ct06_large_corpus import read_manifest
+          assert len(read_manifest(Path("corpus/manifest.csv"),
+                                   Path("corpus"), Path("after/tools"))) == 12
+          PY
+      - name: Same-runner 5-round ABBA compilation with strict ELF parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x /usr/bin/time
+          python3 harness/tools/ct06_abba.py \
+            --helpers after/tools --corpus corpus \
+            --before before/tools/mini-c-driver/target/release/compiler-mini-c \
+            --after after/tools/mini-c-driver/target/release/compiler-mini-c \
+            --extended-24-128 --require-identical-elf \
+            --samples 5 --raw results/raw.csv --report results/report.md
+          cat results/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload raw ABBA samples, output hashes and toolchain
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ct03-scalar-sccp-source-a
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
