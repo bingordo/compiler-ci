@@ -1,0 +1,55 @@
+name: TypeId indirect GP ABI parity (compiler-ci)
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-typeid-indirect-gp.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  typed-indirect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact compiler PR #473 source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ce1be2a0dd9b783550a6804892edfc37e85750a4
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source pin
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "ce1be2a0dd9b783550a6804892edfc37e85750a4"
+          echo "Compiler PR #473 source: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Isolate compiler core native workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-indirect-gp-473
+          cache-workspace-crates: 'true'
+      - name: TypeId opcode and module ABI acceptance and rejection tests
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-ir --test typed_opcode_types -- --nocapture
+          cargo test -p compiler-ir --test typed_module_abi -- --nocapture
+      - name: Existing indirect SSA native C callback ELF/GAS all frame modes
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --test m4_7_indirect_ssa_native -- --nocapture
+      - name: Full IR optimizer and backend regressions
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+      - name: Strict core all-target Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
