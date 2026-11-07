@@ -1,0 +1,78 @@
+name: M4.7 P6 scalar SSE in shared x86 ELF and GAS stream
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-m4-7-sse-stream.yml'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Compiler SHA/ref
+        required: true
+        default: main
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: m47-p6-sse-${{ github.event.inputs.source_ref || github.head_ref || 'default' }}
+  cancel-in-progress: true
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || 'ab4fa1bc2ab0cd1e874285ad88f4f94131943708' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify immutable source SHA
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          echo "M4.7 P6 physical scalar SSE compiler SHA: $actual" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${{ github.event_name }}" == 'pull_request' ]]; then
+            test "$actual" = 'ab4fa1bc2ab0cd1e874285ad88f4f94131943708'
+          fi
+          test -s crates/backend-x86/tests/m4_7_scalar_sse_stream_native.rs
+      - name: Use independent core workspace
+        working-directory: compiler
+        shell: bash
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m47-sse-native
+          cache-workspace-crates: 'true'
+      - name: Exact SSE stream native ELF/GAS independent C ABI acceptance
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test m4_7_scalar_sse_stream_native -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/m47-p6-native.log"
+          grep -F 'test native_elf_and_gas_share_scalar_sse_and_real_c_sysv_calls ... ok' "$RUNNER_TEMP/m47-p6-native.log"
+      - name: All IR and native x86 backend regression tests
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-backend -p compiler-backend-x86
+      - name: Strict all-target Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
+      - name: Preserve native probe failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m47-p6-sse-stream
+          path: ${{ runner.temp }}/m47-p6-native.log
+          if-no-files-found: ignore
+          retention-days: 7
