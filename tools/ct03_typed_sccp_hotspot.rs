@@ -93,7 +93,11 @@ fn main() {
     let result = compiler_opt::typed_sccp::propagate_typed(&mut expected).unwrap();
     expected.validate().unwrap();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    format!("{expected:?}|{result:?}").hash(&mut hasher);
+    // Debug formatting of linkage/type hash maps can depend on per-process
+    // randomized hash iteration order. Compare the *canonical* typed SSA
+    // serialization instead; retain exact pass statistics in the signature.
+    let canonical = compiler_ir::typed_ssa_text::write_typed_ssa(&expected).unwrap();
+    format!("{canonical}|{result:?}").hash(&mut hasher);
     let signature = hasher.finish();
 
     let start = Instant::now();
