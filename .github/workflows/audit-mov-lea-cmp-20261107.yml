@@ -1,0 +1,56 @@
+name: audit exact MOV LEA CMP physical variant identities
+on:
+  push:
+    branches: [ci/x86-mov-lea-form-audit-20261107]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Fetch pinned uops.info instruction XML
+        run: |
+          set -euo pipefail
+          curl -fL --retry 2 --max-time 180 https://uops.info/instructions.xml -o /tmp/instructions.xml
+          echo 'e5e702caaf04c4fc1f75192a9bbe4d8554b3e174f7933a14d124cc33ca677ab3  /tmp/instructions.xml' | sha256sum -c -
+      - name: Inspect exact physical register/memory MOV LEA and compare forms
+        run: |
+          python3 - <<'PY'
+          import json,xml.etree.ElementTree as ET
+          matches=[]
+          for _, el in ET.iterparse('/tmp/instructions.xml', events=('end',)):
+              if el.tag!='instruction':continue
+              a=el.attrib
+              op=''.join(a.get('opcode','').split()).upper()
+              if op not in {'89','8B','8D','B8','3B','39','83','81'}:
+                  el.clear();continue
+              iform=a.get('iform','')
+              if not iform.startswith(('MOV_','LEA_','CMP_')):
+                  el.clear();continue
+              operands=[o.attrib for o in el.findall('operand') if o.get('suppressed')!='1']
+              types=tuple(o.get('type') for o in operands)
+              widths=tuple(o.get('width') for o in operands)
+              if op in ('89','8B') and (types not in (('reg','reg'),('reg','mem'),('mem','reg')) or widths not in (('32','32'),('64','64'))):
+                  el.clear();continue
+              if op=='8D' and (types!=('reg','agen') or widths[0] not in ('32','64')):
+                  el.clear();continue
+              if op=='B8' and (types!=('reg','imm') or widths[0] not in ('32','64')):
+                  el.clear();continue
+              if op in ('3B','39') and (types not in (('reg','mem'),('mem','reg')) or widths not in (('32','32'),('64','64'))):
+                  el.clear();continue
+              if op in ('83','81') and (types not in (('reg','imm'),('mem','imm')) or widths[0] not in ('32','64')):
+                  el.clear();continue
+              identity={k:a.get(k) for k in ('iform','agen','bcast','eosz','high8','immzero','mask','nf','opcode','rep','rm','sae','zeroing')}
+              arch={}
+              for cpu in el.findall('architecture'):
+                  if cpu.get('name') in ('SKL','ZEN4'):
+                      ms=[m.attrib for m in cpu.findall('measurement')]
+                      if len(ms)==1:
+                          arch[cpu.get('name')]={x:ms[0].get(x) for x in ('uops','TP_loop','TP_unrolled')}
+              matches.append(dict(opcode=op,iform=iform,types=types,widths=widths,identity=identity,arch=arch,string=a.get('string')))
+              el.clear()
+          for m in sorted(matches,key=lambda v:(v['opcode'],v['iform'],str(v['types']),str(v['widths']),str(v['identity']))):
+              print('AUDIT',json.dumps(m,sort_keys=True,separators=(',',':')))
+          print('TOTAL_CANDIDATES',len(matches))
+          PY
