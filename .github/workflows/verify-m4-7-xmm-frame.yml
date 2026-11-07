@@ -1,0 +1,75 @@
+name: M4.7 P6b symbolic XMM frame spill native acceptance
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-m4-7-xmm-frame.yml'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Compiler source SHA
+        required: true
+        default: main
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: m47-xmm-frame-${{ github.event.inputs.source_ref || github.head_ref || 'default' }}
+  cancel-in-progress: true
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || 'ad08eae28b694e35cccde87651ad2f6150d62c15' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source revision and acceptance
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          source="$(git rev-parse HEAD)"
+          echo "M4.7 scalar XMM frame source $source" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${{ github.event_name }}" == 'pull_request' ]]; then test "$source" = 'ad08eae28b694e35cccde87651ad2f6150d62c15'; fi
+          test -s crates/backend-x86/tests/m4_7_xmm_frame_native.rs
+      - name: Isolate existing native compiler core
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m47-p6b-xmm-frame
+          cache-workspace-crates: 'true'
+      - name: Symbolic SSE frame ELF/GAS native C oracle
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test m4_7_xmm_frame_native -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/m47-xmm-frame.log"
+          grep -F 'test real_c_float_and_double_bits_survive_xmm_spills_in_direct_elf_and_gas ... ok' "$RUNNER_TEMP/m47-xmm-frame.log"
+      - name: Full native IR, backend and x86 regressions
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-backend -p compiler-backend-x86
+      - name: Strict all-target core compiler Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
+      - name: Preserve failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m47-xmm-frame
+          path: ${{ runner.temp }}/m47-xmm-frame.log
+          if-no-files-found: ignore
+          retention-days: 7
