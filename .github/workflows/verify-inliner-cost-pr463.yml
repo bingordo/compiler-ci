@@ -1,0 +1,132 @@
+name: Verify opt-in inliner profitability PR463
+on:
+  push:
+    branches: [ci/inliner-cost-pr463-20261106]
+permissions:
+  contents: read
+jobs:
+  native-ablation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 160e6b25a8fa0ec5dee813573c816a0cc2dfb50f
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify immutable compiler SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "160e6b25a8fa0ec5dee813573c816a0cc2dfb50f"
+      - name: Resolve pinned checked frontends
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: inliner-cost-policy-pr463
+      - name: Check Python harness parsing and source construction
+        working-directory: compiler
+        run: python3 -m unittest discover -s tools/tests -p test_inliner_runtime_ablation.py -v
+      - name: Verify cost admission and previous native inliner tests
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test inline_cost_policy -- --nocapture
+          cargo test -p compiler-opt --test inline_native
+          cargo test -p compiler-opt --test inline_practical_native
+          cargo test -p compiler --bin compiler no_inline
+      - name: Strict Clippy on touched optimizer and source driver
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-opt --lib -- -D warnings
+          cargo clippy -p compiler --bin compiler -- -D warnings
+      - name: Build release unified native compiler
+        working-directory: compiler
+        run: cargo build -p compiler --bin compiler --release
+      - name: Generate deterministic checked-source corpus
+        working-directory: compiler
+        run: python3 tools/source_compile_corpus.py --out "$RUNNER_TEMP/inliner-source"
+      - name: Run independent-C-oracle native runtime experiment
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          python3 tools/inliner_runtime_ablation.py \
+            --compiler target/release/compiler \
+            --corpus "$RUNNER_TEMP/inliner-source" \
+            --samples 3 --iterations 1000000 \
+            --output results/inliner-native-runtime.csv \
+            | tee results/inliner-native-summary.csv
+          python3 - <<'PY'
+          import csv
+          with open('results/inliner-native-runtime.csv') as f:
+              rows=list(csv.DictReader(f))
+          assert len(rows) == 12*2*3, len(rows)
+          assert {r['language'] for r in rows} == {'oberon','mini_c'}
+          assert {r['case'] for r in rows} == {'call_graph','hot_leaf'}
+          assert {r['mode'] for r in rows} == {'enabled','disabled'}
+          assert all(int(r['text_bytes'])>0 and int(r['ns'])>0 for r in rows)
+          for lang in ('oberon','mini_c'):
+              for size in (1,4,12):
+                  a=[r for r in rows if r['language']==lang and r['case']=='hot_leaf'
+                     and int(r['scale'])==size]
+                  assert len(a) == 6
+                  inline=next(r for r in a if r['mode']=='enabled')
+                  baseline=next(r for r in a if r['mode']=='disabled')
+                  assert int(inline['kernel_calls'])<int(baseline['kernel_calls']), a
+                  assert len({r['checksum'] for r in a})==1
+          PY
+          cat results/inliner-native-summary.csv >> "$GITHUB_STEP_SUMMARY"
+      - name: Measure experimental cost policy against identical disabled baseline
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/inliner_runtime_ablation.py \
+            --compiler target/release/compiler \
+            --corpus "$RUNNER_TEMP/inliner-source" \
+            --samples 3 --iterations 1000000 --policy cost \
+            --output results/inliner-native-cost.csv \
+            | tee results/inliner-native-cost-summary.csv
+          python3 tools/inliner_ablation.py \
+            --compiler target/release/compiler \
+            --corpus "$RUNNER_TEMP/inliner-source" \
+            --samples 3 --policy legacy \
+            --output results/inliner-source-legacy.csv \
+            | tee results/inliner-source-legacy-summary.csv
+          python3 tools/inliner_ablation.py \
+            --compiler target/release/compiler \
+            --corpus "$RUNNER_TEMP/inliner-source" \
+            --samples 3 --policy cost \
+            --output results/inliner-source-cost.csv \
+            | tee results/inliner-source-cost-summary.csv
+          python3 - <<'PY'
+          import csv
+          from pathlib import Path
+          p=Path('results')
+          def read(name):
+              with (p/name).open() as f: return list(csv.DictReader(f))
+          a=read('inliner-native-runtime.csv')
+          b=read('inliner-native-cost.csv')
+          assert len(a)==len(b)==72
+          key=lambda r:(r['language'],r['case'],r['scale'],r['mode'],r['sample'])
+          baseline={key(r):r['object_sha256'] for r in a if r['mode']=='disabled'}
+          assert baseline=={key(r):r['object_sha256'] for r in b if r['mode']=='disabled'}
+          for mode in ('legacy','cost'):
+              rows=read('inliner-source-'+mode+'.csv')
+              assert len(rows)==18*2*3, len(rows)
+          for row in b:
+              assert int(row['ns'])>0 and int(row['text_bytes'])>0
+          PY
+          cat results/inliner-native-cost-summary.csv >> "$GITHUB_STEP_SUMMARY"
+          cat results/inliner-source-cost-summary.csv >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: inliner-pr463-cost-policy
+          path: compiler/results/inliner-*
+          if-no-files-found: ignore
+          retention-days: 14
