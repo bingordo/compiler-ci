@@ -1,0 +1,55 @@
+name: M4.7 P6b IEEE F32/F64 scalar IR and ABI gate
+on:
+  pull_request:
+    paths:
+      - .github/workflows/verify-m4-7-p6b-fp-ir.yml
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Compiler source SHA
+        required: true
+        default: main
+        type: string
+permissions:
+  contents: read
+jobs:
+  ir:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || '5a9cb1d78f7ef682841dd2c59aa58bae7ced4980' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source SHA
+        working-directory: compiler
+        run: |
+          git rev-parse HEAD
+          if [ "${{ github.event_name }}" = pull_request ]; then
+            test "$(git rev-parse HEAD)" = '5a9cb1d78f7ef682841dd2c59aa58bae7ced4980'
+          fi
+      - name: Use independently compilable core workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m47-p6b-fp-ir
+      - name: FP SSA verifier native tests
+        working-directory: compiler
+        run: cargo test -p compiler-ir --test scalar_fp_ssa -- --nocapture
+      - name: Core IR, optimizer and x86 backend regression
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-backend -p compiler-backend-x86
+      - name: Strict IR and backend all-target Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
