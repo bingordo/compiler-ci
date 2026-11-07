@@ -1,0 +1,85 @@
+name: "CT-03 typed SCCP atomic post-verification correctness"
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct03-typed-sccp-atomic.yml'
+permissions:
+  contents: read
+concurrency:
+  group: ct03-typed-sccp-atomic-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 'b1cb51e4eb678f510a0c79de8bb6a2a37531437a'
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Capture provenance and construct isolated workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C compiler rev-parse HEAD | tee results/source-commit.txt
+          rustc --version | tee results/toolchain.txt
+          cargo --version | tee -a results/toolchain.txt
+          cc --version | head -1 | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\\(s\\)):' | tee -a results/toolchain.txt || true
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ct03-typed-sccp-atomic
+      - name: Full IR opt generic-backend x86 regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/Cargo.toml \
+            -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 \
+            2>&1 | tee results/core.log
+      - name: Targeted failed-postcheck rollback and TypeId SCCP parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt \
+            --lib postcheck_failure_rolls_back_after_real_cfg_compaction \
+            -- --nocapture 2>&1 | tee results/rollback.log
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt \
+            --test typed_sccp -- --nocapture 2>&1 | tee results/typed-sccp.log
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt \
+            --test typed_native_parity -- --nocapture \
+            2>&1 | tee results/typed-native.log
+      - name: Strict Clippy in default and diagnostic modes, including unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --manifest-path compiler/Cargo.toml \
+            -p compiler-ir -p compiler-opt --all-targets -- -D warnings \
+            2>&1 | tee results/clippy.log
+          cargo clippy --manifest-path compiler/Cargo.toml \
+            -p compiler-ir -p compiler-opt \
+            --features compiler-opt/verify-counts --all-targets -- -D warnings \
+            2>&1 | tee results/clippy-verify-counts.log
+      - name: Archive exact source and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ct03-typed-sccp-atomic-evidence
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
