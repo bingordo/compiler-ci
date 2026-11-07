@@ -1,0 +1,51 @@
+name: Validate M4.7 indirect GP-only varargs PR470
+on:
+  push:
+    branches: [test/m47-indirect-gp-varargs-470-20261106]
+  pull_request:
+    paths:
+      - '.github/workflows/verify-m47-indirect-gp-varargs.yml'
+permissions:
+  contents: read
+jobs:
+  indirect-gp-varargs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Checkout immutable compiler PR470 source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 370099f8da56bcace9b2b2138c3ef8f993cbfdd3
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source SHA and isolate credential-independent core workspace
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "370099f8da56bcace9b2b2138c3ef8f993cbfdd3"
+          grep -q "indirect_gp_variadic_eight_mixed_width_args_match_gcc_va_arg" crates/backend-x86/src/call.rs
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text('''[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          ''')
+          PY
+      - name: Compile and run targeted indirect GP-only varargs tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib call::tests::indirect_gp_variadic -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/m47-indirect-gp-varargs.log"
+          grep -F 'test call::tests::indirect_gp_variadic_call_sets_al_and_retains_target_slot ... ok' "$RUNNER_TEMP/m47-indirect-gp-varargs.log"
+          grep -F 'test call::tests::indirect_gp_variadic_invalid_target_and_overlap_fail_atomically ... ok' "$RUNNER_TEMP/m47-indirect-gp-varargs.log"
+          grep -F 'test call::tests::indirect_gp_variadic_eight_mixed_width_args_match_gcc_va_arg ... ok' "$RUNNER_TEMP/m47-indirect-gp-varargs.log"
+      - name: Preserve build/runtime failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m47-indirect-gp-varargs-failure
+          path: ${{ runner.temp }}/m47-indirect-gp-varargs.log
+          if-no-files-found: ignore
