@@ -1,0 +1,81 @@
+name: TypeId CFG cached caller facts and ABBA verification
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/verify-typeid-inline-cached-facts-20261108.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inliner:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 8cc380d0926dc50e703d7c16bacd3b711eefedf4
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b8184070ac7abc0a41be70d0f0c36ead257272dc
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned SHA
+        shell: bash
+        run: |
+          test "$(git -C after rev-parse HEAD)" = "8cc380d0926dc50e703d7c16bacd3b711eefedf4"
+          test "$(git -C before rev-parse HEAD)" = "b8184070ac7abc0a41be70d0f0c36ead257272dc"
+      - name: Restrict workspace to optimizer core
+        shell: bash
+        run: |
+          for dir in before after; do
+            cat > "$dir/Cargo.toml" <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+            rm -f "$dir/Cargo.lock"
+          done
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: after -> target
+          key: typeid-inliner-cached-facts
+      - name: Run exact native and verifier regressions
+        working-directory: after
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_core_inline_integration -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_memory_native -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_cfg_native -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_wide_void_native -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_leaf_native -- --nocapture
+          cargo test -p compiler-opt --test inline_memory_native -- --nocapture
+          cargo test -p compiler-opt --test inline_native -- --nocapture
+          cargo test -p compiler-opt --lib typed_inline::tests -- --nocapture
+          cargo test -p compiler-opt --features verify-counts --test typed_core_inline_integration bounded_trial_cost_is_one_caller_not_full_module_per_inline -- --nocapture
+          cargo clippy -p compiler-opt --all-targets -- -D warnings
+      - name: Run release 48-site before-after-after-before comparison
+        shell: bash
+        run: |
+          set -euo pipefail
+          for iteration in 1 2 3 4; do
+            case "$iteration" in 1|4) dir=before ;; *) dir=after ;; esac
+            (
+              cd "$dir"
+              cargo test --release -p compiler-opt --test typed_core_inline_integration dense_caller_48_call_sites_preserve_abi_and_exact_replay -- --nocapture
+              cargo test --release -p compiler-opt --test typed_core_inline_integration dense_caller_48_call_release_profile -- --nocapture
+            ) 2>&1 | tee "$RUNNER_TEMP/typeid-cached-$iteration-$dir.log"
+          done
+          grep -H 'TYPEID_INLINER_DENSE_48 median_us=' "$RUNNER_TEMP"/typeid-cached-*.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: typeid-cached-facts
+          path: ${{ runner.temp }}/typeid-cached-*.log
+          if-no-files-found: ignore
