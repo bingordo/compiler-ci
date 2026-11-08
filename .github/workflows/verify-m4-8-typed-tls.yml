@@ -1,0 +1,110 @@
+name: M4.8 typed SSA TLS provenance (compiler-ci)
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-m4-8-typed-tls.yml']
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact compiler SHA to verify
+        required: true
+        default: 88e1a288586efc93f9e3c5b14f8491e960cc9bed
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: m48-typed-tls-${{ github.event.inputs.source_ref || github.head_ref || 'default' }}
+  cancel-in-progress: true
+
+jobs:
+  x86-symbols:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact private compiler revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || '88e1a288586efc93f9e3c5b14f8491e960cc9bed' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and required tests
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            test "$actual" = '88e1a288586efc93f9e3c5b14f8491e960cc9bed'
+          fi
+          echo "M4.8 exact compiler source SHA: $actual" >> "$GITHUB_STEP_SUMMARY"
+          test -s crates/backend/tests/x86_elf_symbol_attributes.rs
+          test -s crates/backend/tests/x86_elf_symbol_link_native.rs
+      - name: Use self-contained core workspace
+        working-directory: compiler
+        shell: bash
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m48-elf-checked
+          cache-workspace-crates: 'true'
+      - name: Check ELF metadata and negative symbol attributes
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --test x86_elf_symbol_attributes -- --nocapture 2>&1 | tee "$RUNNER_TEMP/m48-symbols.log"
+          grep -F 'test weak_definitions_undefined_references_and_hidden_visibility ... ok' "$RUNNER_TEMP/m48-symbols.log"
+          grep -F 'test old_api_is_unchanged_and_invalid_attributes_fail_closed ... ok' "$RUNNER_TEMP/m48-symbols.log"
+      - name: Native C linker and DSO symbol resolution
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --test x86_elf_symbol_link_native -- --nocapture 2>&1 | tee "$RUNNER_TEMP/m48-native.log"
+          grep -F 'test weak_overrides_unresolved_weak_and_hidden_dso_exports_link_natively ... ok' "$RUNNER_TEMP/m48-native.log"
+      - name: Dedicated IR TLS provenance verifier and SSA transforms
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-ir
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test cse_native --test inline_native --test phi_native --test mem2reg_native --test sccp_sparse_native --test typed_native_parity
+      - name: Checked SSA to native ELF and independent C-link oracle
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --test m4_8_checked_symbol_attributes_native -- --nocapture
+      - name: Native ELF TLS PIE and PIC pthread/GAS comparison
+        working-directory: compiler
+        run: cargo test -p compiler-backend --test x86_elf_tls_native -- --nocapture
+      - name: Source-checked SSA TLS pointer addresses through ELF and GAS
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --test m4_8_ssa_tls_native -- --nocapture
+      - name: Existing ELF and x86 backend regressions
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend --test x86_elf_contract
+          cargo test -p compiler-backend
+          # Current x7_g10_reviewed_physical_forms_native target imports a
+          # feature-gated module; enable its contract for full backend tests.
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation
+      - name: Strict Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-backend -p compiler-backend-x86 --features x7-native-form-validation --all-targets -- -D warnings
+      - name: Preserve failing test output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m48-typed-tls-failure
+          path: |
+            ${{ runner.temp }}/m48-symbols.log
+            ${{ runner.temp }}/m48-native.log
+          if-no-files-found: ignore
+          retention-days: 7
