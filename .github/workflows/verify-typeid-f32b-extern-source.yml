@@ -1,0 +1,72 @@
+name: F3.2b checked Mini-C TypeId external C source calls
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-typeid-f32b-extern-source.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  f32b:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c795eb84c3f787b041feada91010431b0b57501d
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source SHA
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "c795eb84c3f787b041feada91010431b0b57501d"
+      - name: Resolve pinned public frontend dependencies
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: f32b-source-typeid
+      - name: F3.2 source external native GAS and ELF C11 runtime oracles
+        working-directory: compiler
+        run: cargo test -p compiler --bin compiler typeid_native_source -- --nocapture
+      - name: Actual CLI source-to-native checked external links
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          mkdir -p target/f32b-extern
+          cat > target/f32b-extern/source.c <<'EOF'
+          extern int external_add(int a,int b);
+          int use_external_native(int x) { return external_add(x,17); }
+          EOF
+          cat > target/f32b-extern/oracle.c <<'EOF'
+          int external_add(int a,int b){return 3*a+b;}
+          extern int use_external_native(int);
+          int main(void){for(int i=-40;i<40;i++)if(use_external_native(i)!=3*i+17)return 1;return 0;}
+          EOF
+          cargo run --quiet -p compiler --bin compiler -- target/f32b-extern/source.c --language mini-c --ir typeid --emit obj -o target/f32b-extern/native.o
+          cc -std=c11 -O2 -Wall -Wextra -Werror target/f32b-extern/oracle.c target/f32b-extern/native.o -o target/f32b-extern/oracle
+          target/f32b-extern/oracle
+          cargo run --quiet -p compiler --bin compiler -- target/f32b-extern/source.c --language mini-c --ir typeid --emit asm -o target/f32b-extern/native.s
+          cc -std=c11 -O2 -Wall -Wextra -Werror target/f32b-extern/oracle.c target/f32b-extern/native.s -o target/f32b-extern/oracle
+          target/f32b-extern/oracle
+      - name: F3.2 IR checked external declaration regressions
+        working-directory: compiler
+        run: cargo test -p compiler-ir --test native_source_bridge -- --nocapture
+      - name: AArch64 TypeId shared API compatibility
+        working-directory: compiler
+        run: cargo check -p compiler-backend-aarch64 --all-targets
+      - name: Strict compiler, native IR and x86 lint
+        working-directory: compiler
+        run: cargo clippy -p compiler -p compiler-ir -p compiler-backend-x86 --all-targets -- -D warnings
+      - name: Strict AArch64 production lint
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
+      - name: Full IR, optimizer and backend regression
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
