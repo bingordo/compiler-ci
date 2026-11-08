@@ -1,0 +1,45 @@
+name: X7.G10 reviewed physical form bridge GAS and direct ELF
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-x7-g10-physical-bridge.yml']
+permissions:
+  contents: read
+jobs:
+  native-reviewed-physical:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Checkout exact X7.G10 physical form source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 4b6fae80672cee20204c756a69de67769673693a
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin and audit actual Intel SDM source contracts
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          mkdir -p /tmp/x7-g10-intel
+          revision=35eface1b7ee003a1cda95005ec5fd83de658a64
+          for instruction in MOV ADD XOR; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 45 \
+              "https://raw.githubusercontent.com/intel/SDM/${revision}/data/instruction/${instruction}.xml" \
+              --output "/tmp/x7-g10-intel/${instruction}.xml"
+          done
+          python3 tools/x86_g10_regen_physical_forms.py --xml-dir /tmp/x7-g10-intel --check
+          python3 -m py_compile tools/x86_g10_regen_physical_forms.py
+      - name: Run real compiler reviewed-form GAS and direct ELF native C oracle
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          """)
+          PY
+          cargo test -p compiler-backend-x86 --lib x7_native_form_bridge --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --test x7_g10_reviewed_physical_forms_native --offline -- --nocapture
