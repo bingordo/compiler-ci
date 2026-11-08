@@ -1,0 +1,85 @@
+name: S23.5 sign-bit XOR and bitwise NOT order isomorphisms
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/s23-5-sign-order.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-integer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out exact compiler PR revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: fe7f19dd27a682f019ffd3bb2c088c7445ac9b59
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin source and isolate self-contained crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = fe7f19dd27a682f019ffd3bb2c088c7445ac9b59
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: s22-native-integer-generated
+      - name: Generate and verify all five native integer widths
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test generated_native_integer_algebra -- --nocapture
+      - name: Generate and verify signed-unsigned comparisons and cast chains
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test generated_native_cmp_cast -- --nocapture
+      - name: Verify generated nested bit masks and SSA-use controls
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test generated_native_masks -- --nocapture
+      - name: Verify generated shift-affine and rotate recognition matrix
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test generated_native_shift_affine -- --nocapture
+      - name: Generated GCC LLVM Boolean DAG SSA across five widths
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test generated_native_boolean_dag -- --nocapture
+      - name: Generated exact-width complemented SSA DAGs and GCC XOR guards
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test generated_native_complement_dag -- --nocapture
+      - name: Generated equality cancellation De Morgan comparison SSA across five widths
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test generated_native_compare_dag -- --nocapture
+      - name: Validate NOT order inversion XOR signbit signedness all widths
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test generated_native_sign_order -- --nocapture
+      - name: Verify preexisting i32 and i64 typed algebra
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typed_algebra
+      - name: Verify neighboring algebra and native integer semantics
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --lib algebra::tests
+          cargo test -p compiler-ir --lib native_int_semantics::tests
+      - name: Exhaustive i8 comparison range guards
+        working-directory: compiler
+        run: cargo test -p compiler-opt --lib native_integer_algebra::tests -- --nocapture
+      - name: S23 actual x86 GAS ELF text and executable C11 differential
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --test native_s23_profitability -- --nocapture
+      - name: S23 release-profile native profitability comparison
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --release --test native_s23_profitability -- --nocapture
+      - name: Strict optimizer Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt --all-targets -- -D warnings
+      - name: Strict direct TypeId CLI and native cost test Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-x86 --bin typeid-x86 --test native_s23_profitability -- -D warnings
