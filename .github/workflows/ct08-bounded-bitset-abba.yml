@@ -1,0 +1,136 @@
+name: CT-08 bounded bitset interference correctness and source ABBA
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct08-bounded-bitset-abba.yml'
+permissions:
+  contents: read
+concurrency:
+  group: ct08-bounded-bitset-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 'cff92433ef3b7ad19077856a379d03d49eecace5'
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record pinned source and toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C compiler rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
+          rustc --version | tee -a "$GITHUB_STEP_SUMMARY"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ct08-bounded-bitset-core
+      - name: IR, optimizer, generic backend and x86 tests
+        working-directory: compiler
+        run: |
+          # The optimizer CLI has a separate end-to-end gate; this small
+          # workspace checks optimizer library contracts and the complete
+          # IR/backend/x86 integration suites.
+          cargo test -p compiler-ir -p compiler-backend -p compiler-backend-x86 --lib --features compiler-backend-x86/x7-native-form-validation
+          cargo test -p compiler-opt --lib
+      - name: Strict Clippy including generic and x86 backend
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --lib -- -D warnings
+  source-abba:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        session: [a, b]
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 'c620162b24f2d4ca89bb1b912437e001b15783a8'
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 'cff92433ef3b7ad19077856a379d03d49eecace5'
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pinned refs, runner provenance and verified benchmark helpers
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          printf 'independent_session=%s\\n' "${{ matrix.session }}" > results/session.txt
+          git -C before rev-parse HEAD | tee results/before-sha.txt
+          git -C after rev-parse HEAD | tee results/after-sha.txt
+          rustc --version | tee results/toolchain.txt
+          cargo --version | tee -a results/toolchain.txt
+          lscpu | grep -E '^(Model name|CPU\\(s\\)):' | tee -a results/toolchain.txt || true
+          python3 -m py_compile harness/tools/ct06_abba.py \
+            harness/tools/ct06_large_corpus.py after/tools/source_compile_corpus.py \
+            after/tools/source_cli_profile.py
+      - name: Configure pinned Mini-C frontend over HTTPS
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before/tools/mini-c-driver -> target
+            after/tools/mini-c-driver -> target
+          key: ct08-bounded-bitset-mini-c-${{ matrix.session }}
+      - name: Build both release Mini-C compiler revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path before/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --bin compiler-mini-c
+          cargo build --release --manifest-path after/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --bin compiler-mini-c
+          sha256sum before/tools/mini-c-driver/target/release/compiler-mini-c \
+            after/tools/mini-c-driver/target/release/compiler-mini-c \
+            > results/compiler-binaries.sha256
+      - name: Generate exact 24/48/96/128 checked sources and run ABBA
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x /usr/bin/time
+          python3 harness/tools/ct06_large_corpus.py \
+            --helpers after/tools --out corpus
+          cp corpus/manifest.csv results/source-manifest.csv
+          python3 harness/tools/ct06_abba.py \
+            --helpers after/tools --corpus corpus \
+            --before before/tools/mini-c-driver/target/release/compiler-mini-c \
+            --after after/tools/mini-c-driver/target/release/compiler-mini-c \
+            --extended-24-128 --require-identical-elf \
+            --samples 5 --raw results/raw.csv --report results/report.md
+          cat results/report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ct08-bitset-source-abba-${{ matrix.session }}
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
