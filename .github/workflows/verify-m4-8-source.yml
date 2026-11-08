@@ -1,0 +1,57 @@
+name: M4.8 checked Mini-C source ELF and TLS (compiler-ci)
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-m4-8-source.yml']
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Exact compiler candidate commit SHA"
+        required: true
+        type: string
+        default: 23fa5210e20cb36166da1612ecdd7a9c129b731f
+permissions:
+  contents: read
+concurrency:
+  group: m48-source-${{ github.event.inputs.source_ref || github.head_ref || 'default' }}
+  cancel-in-progress: true
+jobs:
+  mini-c-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || '23fa5210e20cb36166da1612ecdd7a9c129b731f' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Exact source audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git -C compiler rev-parse HEAD)"
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            test "$actual" = '23fa5210e20cb36166da1612ecdd7a9c129b731f'
+          fi
+          echo "Checked M4.8 Mini-C source SHA: $actual" >> "$GITHUB_STEP_SUMMARY"
+          test -s compiler/tools/mini-c-driver/src/m48_source.rs
+          test -s compiler/tools/mini-c-driver/tests/m4_8_source_native.rs
+      - name: Use public pinned Mini-C dependency
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: m48-mini-c-source-v1
+      - name: Mini-C checked source lexical annotations and semantic tests
+        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib m48_source -- --nocapture
+      - name: Native checked Mini-C source ELF and GAS PIE DSO pthread tests
+        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test m4_8_source_native -- --nocapture
+      - name: Existing Mini-C checked source + module regression
+        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib
+      - name: Mini-C strict Clippy
+        run: cargo clippy --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --all-targets -- -D warnings
