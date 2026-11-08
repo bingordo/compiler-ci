@@ -1,0 +1,146 @@
+name: M10 typed null Ptr64 native original Csmith pointer differential
+on:
+  push:
+    branches: [test/m10-native-nullptr-source-20261108]
+    paths: ['.github/workflows/test-m10-nullptr-csmith.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source-pinned-nullptr-seeds:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      COMPILER_SHA: c99bcda4abbdd8e54a526bfcf111d23d8d4214b1
+      FRONTEND_SHA: 6dce48890d302d639f143134ee57698c1556bf8c
+    steps:
+      - name: Checkout exact compiler and checked Mini-C integration
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c99bcda4abbdd8e54a526bfcf111d23d8d4214b1
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm exact compiler and Mini-C revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          python3 - <<'PY'
+          from pathlib import Path
+          import os,re
+          s=Path("compiler/tools/mini-c-driver/Cargo.toml").read_text()
+          versions=re.findall(r'mini-c-(?:syntax|sema)\s*=\s*\{[^\n]*rev\s*=\s*"([0-9a-f]{40})"',s)
+          assert versions == [os.environ["FRONTEND_SHA"]]*2,versions
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          python3 -m unittest discover -s compiler/tools -p test_csmith_probe.py
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: m10-native-nullptr-nov8
+      - name: Test native FP failure boundary and strict Clippy
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib m10_ -- --nocapture
+          cargo clippy --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --all-targets -- -D warnings
+      - name: Build exact native Mini-C driver, not stale prebuilt
+        run: cargo build --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml --bin compiler-mini-c
+      - name: Test native IR verifier and typed pointer source regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-ir m10_typed_null_pointer -- --nocapture
+          cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib m10_checked_null_casts -- --nocapture
+      - name: Native zero pointer casts execute the same as GCC and Clang
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          cat > "$RUNNER_TEMP/nullptr.c" <<'C'
+          int main(void) {
+              int *p=(int*)0, **q=(int**)0;
+              void *v=(void*)0;
+              if (p!=v || q!=(void*)0 || p!=(int*)0) return 1;
+              int x=17;
+              v=(void*)&x;
+              p=(int*)v;
+              if (*p != 17) return 2;
+              return 0;
+          }
+          C
+          driver="$PWD/compiler/tools/mini-c-driver/target/release/compiler-mini-c"
+          "$driver" "$RUNNER_TEMP/nullptr.c" -o "$RUNNER_TEMP/nullptr.o" --emit obj
+          cc "$RUNNER_TEMP/nullptr.o" -o "$RUNNER_TEMP/native-nullptr"
+          "$driver" "$RUNNER_TEMP/nullptr.c" -o "$RUNNER_TEMP/nullptr.s" --emit asm
+          cc "$RUNNER_TEMP/nullptr.s" -o "$RUNNER_TEMP/native-nullptr-asm"
+          gcc -O2 "$RUNNER_TEMP/nullptr.c" -o "$RUNNER_TEMP/gcc-nullptr"
+          clang -O2 "$RUNNER_TEMP/nullptr.c" -o "$RUNNER_TEMP/clang-nullptr"
+          for app in native-nullptr native-nullptr-asm gcc-nullptr clang-nullptr; do
+            "$RUNNER_TEMP/$app" || { echo "Native/reference failure: $app"; exit 1; }
+          done
+          sha256sum "$RUNNER_TEMP/nullptr.o" "$RUNNER_TEMP/nullptr.s" > results/nullptr-objects-sha256.txt
+      - name: Install original Csmith 2.3, GCC and Clang
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y --no-install-recommends csmith libcsmith-dev gcc clang
+          version="$(dpkg-query -W csmith | awk '{print $2}')"
+          [[ "$version" == 2.3.0-* ]]
+          header="$(dpkg -L libcsmith-dev | grep '/csmith.h$' | head -n1)"
+          test -s "$header"
+          echo "CSMITH_INCLUDE=$(dirname "$header")" >> "$GITHUB_ENV"
+      - name: Run eight original Csmith pointer seeds under opt-in unused-static policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/csmith_probe.py --generate \
+            --cases-dir "$RUNNER_TEMP/csmith-pointers" \
+            --csmith csmith --seed-base 1 --seed-count 8 \
+            --profile restricted-pointers | tee results/generate.log
+          driver="$PWD/compiler/tools/mini-c-driver/target/release/compiler-mini-c"
+          python3 compiler/tools/csmith_probe.py --probe \
+            --cases-dir "$RUNNER_TEMP/csmith-pointers" \
+            --artifacts-dir "$RUNNER_TEMP/csmith-results-pointers" \
+            --include-dir "$CSMITH_INCLUDE" --preprocess-c \
+            --max-wall-seconds 300 --run-timeout 10 \
+            --driver "$driver" \
+            --compiler-sha "$COMPILER_SHA" --frontend-sha "$FRONTEND_SHA" \
+            --minimum-native 0 --omit-unreferenced-static-bodies \
+            | tee results/probe.log || echo "Native compiler failed a seed; triage below"
+          cp "$RUNNER_TEMP/csmith-results-pointers/summary.json" results/summary.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          d=json.loads(Path("results/summary.json").read_text())
+          assert d["total_seeds"] == d["manifest_total_seeds"] == 8, d
+          assert d["generator_profile"] == "restricted-pointers", d
+          assert d["reference_agreed"] == 8, d
+          assert d["omit_unreferenced_static_bodies"] is True, d
+          assert d["counts"]["budget-exhausted"] == 0, d
+          print("M10_NULLPTR_CSMITH_SUMMARY",json.dumps(d,sort_keys=True),flush=True)
+          for line in Path(__import__('os').environ["RUNNER_TEMP"]).joinpath("csmith-results-pointers/results.jsonl").read_text().splitlines():
+              r=json.loads(line)
+              if r["classification"]!="passed":
+                  print("M10_NULLPTR_FIRST_FAILURE","seed",r["seed"],"classification",r["classification"],
+                    "diagnostic",r.get("frontend_diagnostic"),
+                    "stderr",(r.get("compiler") or {}).get("stderr_preview"),
+                    "location",r.get("frontend_location"),flush=True)
+          assert d["counts"]["wrong-code"] == d["counts"]["native-crash"] == 0, d
+          PY
+      - name: Save complete original and hashed preprocessed sources and failure evidence
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: m10-nullptr-pointers-original-seeds
+          path: |
+            results/
+            ${{ runner.temp }}/csmith-pointers/
+            ${{ runner.temp }}/csmith-results-pointers/
+          if-no-files-found: ignore
+          retention-days: 14
