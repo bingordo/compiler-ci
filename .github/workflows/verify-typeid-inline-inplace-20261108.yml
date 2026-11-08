@@ -1,0 +1,94 @@
+name: TypeId CFG inliner trial rollback and dense-call A/B
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/verify-typeid-inline-inplace-20261108.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inliner:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9e1c6b9afd341823e5bff1f8db4ced91208cd2e0
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 499e80bc44c1be0538fae72329de676b08e4e445
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Validate exact source revisions
+        shell: bash
+        run: |
+          test "$(git -C after rev-parse HEAD)" = "9e1c6b9afd341823e5bff1f8db4ced91208cd2e0"
+          test "$(git -C before rev-parse HEAD)" = "499e80bc44c1be0538fae72329de676b08e4e445"
+      - name: Restrict both workspaces to public optimizer core
+        shell: bash
+        run: |
+          for dir in before after; do
+            cat > "$dir/Cargo.toml" <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+            rm -f "$dir/Cargo.lock"
+          done
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: after -> target
+          key: typeid-cfg-inplace
+      - name: Exact transactional unit and native regression suites
+        working-directory: after
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib typed_inline::tests -- --nocapture
+          cargo test -p compiler-opt --test typed_core_inline_integration -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_cfg_native -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_memory_native -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_wide_void_native -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_leaf_native -- --nocapture
+          cargo test -p compiler-opt --features verify-counts --test typed_core_inline_integration bounded_trial_cost_is_one_caller_not_full_module_per_inline -- --nocapture
+          cargo clippy -p compiler-opt --all-targets -- -D warnings
+      - name: Add identical dense caller benchmark to pinned baseline
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = "crates/opt/tests/typed_core_inline_integration.rs"
+          before = Path("before") / path
+          after = Path("after") / path
+          old, new = before.read_text(), after.read_text()
+          marker = "#[test]\nfn bounded_inliner_release_profile_reports_padded_module_time()"
+          start = new.index("/// Source-shaped large caller")
+          end = new.index(marker, start)
+          assert marker in old and "dense_wide_caller" not in old
+          before.write_text(old.replace(marker, new[start:end] + marker))
+          PY
+      - name: Same-runner 48-site release A/B, independent correctness
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dir in before after; do
+            (
+              cd "$dir"
+              cargo test -p compiler-opt --test typed_core_inline_integration --release dense_caller_48_call_sites_preserve_abi_and_exact_replay -- --nocapture
+              cargo test -p compiler-opt --test typed_core_inline_integration --release dense_caller_48_call_release_profile -- --nocapture
+            ) 2>&1 | tee "$RUNNER_TEMP/typeid-inline-$dir.log"
+          done
+          echo "Pinned release A/B medians (same runner, separate compilations)"
+          grep -H 'TYPEID_INLINER_DENSE_48 median_us=' "$RUNNER_TEMP"/typeid-inline-*.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: typeid-inline-inplace-logs
+          path: ${{ runner.temp }}/typeid-inline-*.log
+          if-no-files-found: ignore
