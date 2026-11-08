@@ -1,0 +1,61 @@
+name: Direct TypeId checked indexing and fixed indirect GP ABI
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-typeid-indexed-indirect.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  typeid-indexed-indirect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout immutable compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 539a14c1cf6e5c91a6ad8e467ff888fb90830a83
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source commit
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "539a14c1cf6e5c91a6ad8e467ff888fb90830a83"
+      - name: Isolate compiler backend workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-indexed-indirect
+      - name: Native indexed/indirect C11 GAS and ELF oracle and rejection checks
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --test native_typeid_indexed_indirect -- --nocapture
+      - name: Existing native memory and global direct C call executable C11 oracle
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --test native_typeid_memory_calls -- --nocapture
+      - name: Existing native scalar/phi/spill ABI executable C11 oracle
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --test native_typeid_direct -- --nocapture
+      - name: Generic allocator aliases, liveness, spills
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 native_regalloc -- --nocapture
+      - name: Full IR optimizer backend and x86 regression suites
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+      - name: AArch64 shared backend compatibility
+        working-directory: compiler
+        run: cargo check -p compiler-backend-aarch64 --all-targets
+      - name: Strict all-target core Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
+      - name: Strict AArch64 library Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
