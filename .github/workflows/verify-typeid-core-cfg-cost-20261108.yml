@@ -1,0 +1,62 @@
+name: Verify TypeId default CostAware CFG core pipeline and compilation A/B
+on:
+  push:
+    branches: [ci/typeid-core-cfg-cost-20261108]
+permissions:
+  contents: read
+jobs:
+  typed-cfg-inline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5787729a753c9cafbc05d551b3b368b11c9e9374
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "5787729a753c9cafbc05d551b3b368b11c9e9374"
+      - name: Resolve pinned frontend Git dependencies
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-core-cfg-cost-v1
+      - name: Composed CostAware typed-core native differential and previous inliner modes
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typed_core_inline_integration -- --nocapture
+          cargo test -p compiler-opt --test typed_core_pipeline -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_wide_void_native -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_cfg_native -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_memory_native -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_leaf_native -- --nocapture
+      - name: Original SSA CFG/array inliner and target callback
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test inline_native
+          cargo test -p compiler-opt --test inline_practical_native
+          cargo test -p compiler-opt --test inline_memory_native
+          cargo test -p compiler-opt --test inline_cost_policy
+          cargo test -p compiler-backend-x86 --test inliner_target_cost
+      - name: Native TypeId integration and replay tools
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typed_native_parity
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test typed_core_inline_integration -- --nocapture
+          cargo test -p compiler-opt --bin ir-opt
+      - name: Strict Clippy on optimizer and TypeId modules
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-ir --lib -- -D warnings
+          cargo clippy -p compiler-opt --lib -- -D warnings
+          cargo clippy -p compiler-opt --bin ir-opt -- -D warnings
+      - name: CI summary
+        run: |
+          echo "CostAware CFG in typed-core default, baseline/disabled comparison, native x86 C oracle and compilations, strict Clippy, previous TypeId regressions passed." >> "$GITHUB_STEP_SUMMARY"
