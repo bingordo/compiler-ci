@@ -1,4 +1,4 @@
-name: X7.G10.N5a typed source candidate refinement
+name: X7.G10.N5 source operand candidate refinement
 on:
   workflow_dispatch:
   push:
@@ -15,16 +15,17 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: a7200cac643b348fa946fc37913e6ce035dd6c05
+          ref: 0a7667ed295dc116d5608d38036dba4f21ff5678
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - name: Fail-closed source and unit tests
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = a7200cac643b348fa946fc37913e6ce035dd6c05
-          python3 -m py_compile tools/x86_g10_catalog_census.py tools/x86_g10_candidate_refinement.py
+          test "$(git rev-parse HEAD)" = 0a7667ed295dc116d5608d38036dba4f21ff5678
+          python3 -m py_compile tools/x86_g10_catalog_census.py tools/x86_g10_candidate_refinement.py tools/x86_g10_source_operand_shapes.py
           python3 -m unittest discover -s tools -p 'test_x86_g10_catalog_census.py' -v
           python3 -m unittest discover -s tools -p 'test_x86_g10_candidate_refinement.py' -v
+          python3 -m unittest discover -s tools -p 'test_x86_g10_source_operand_shapes.py' -v
       - name: Fetch complete revision-pinned Intel XML
         run: |
           set -euo pipefail
@@ -60,11 +61,16 @@ jobs:
           python3 tools/x86_g10_candidate_refinement.py \
             --census /tmp/g10-n5/census.json \
             --output /tmp/g10-n5/refined.json
+          python3 tools/x86_g10_source_operand_shapes.py \
+            --census /tmp/g10-n5/census.json --xml-dir /tmp/intel-xml \
+            --output /tmp/g10-n5/source-shapes.json
           python3 - <<'PY'
           import json
           from pathlib import Path
           census=json.loads(Path('/tmp/g10-n5/census.json').read_text())
           refined=json.loads(Path('/tmp/g10-n5/refined.json').read_text())
+          source=json.loads(Path('/tmp/g10-n5/source-shapes.json').read_text())
+          assert source['source_corpus_sha256']==census['source_corpus_sha256']
           assert census['source_corpus_sha256']==refined['source_corpus_sha256']
           assert len(census['rows'])==181==len(refined['rows'])
           assert refined['summary']['rows_with_typed_alternatives']==7
@@ -76,7 +82,16 @@ jobs:
           assert all(not c['production_selection_eligible'] for row in refined['rows']
                      for alt in row['typed_alternatives']
                      for c in alt['source_candidates'])
+          assert source['summary']['typed_local_records']==7
+          assert source['summary']['untyped_local_records']==174
+          assert source['summary']['local_rows_with_modrm_discrepancy']==16
+          assert source['generated_rules_enabled']==0
+          assert source['production_selection_eligible'] is False
+          assert all(not row['selection_eligible'] for row in source['rows'])
+          assert all(not d['selection_eligible'] for row in source['rows'] for d in row['draft_source_forms'])
+          assert all(not alt['selection_eligible'] for row in source['rows'] for draft in row['draft_source_forms'] for alt in draft['typed_alternative_checks'])
           print('N5A_REFINEMENT',refined['summary'])
+          print('N5B_SOURCE_OPERANDS',source['summary'])
           PY
       - name: Attach source and typed alternative reports
         uses: actions/upload-artifact@v4
@@ -85,4 +100,5 @@ jobs:
           path: |
             /tmp/g10-n5/census.json
             /tmp/g10-n5/refined.json
+            /tmp/g10-n5/source-shapes.json
           retention-days: 7
