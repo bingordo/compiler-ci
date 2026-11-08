@@ -1,0 +1,66 @@
+name: Verify bounded incremental TypeId inliner caller verification
+on:
+  push:
+    branches: [ci/typeid-inliner-one-caller-20261108]
+permissions:
+  contents: read
+jobs:
+  typed-cfg-inline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 3c21625fe1b4afcb6dccaebf97ab3fcb0520bd77
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "3c21625fe1b4afcb6dccaebf97ab3fcb0520bd77"
+      - name: Resolve pinned frontend Git dependencies
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-inline-one-caller-v1
+      - name: TypeId CFG memory/array differential and prior scalar-leaf inliner
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typed_core_inline_integration -- --nocapture
+          cargo test -p compiler-opt --features verify-counts --test typed_core_inline_integration bounded_trial_cost_is_one_caller_not_full_module_per_inline -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_wide_void_native -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_cfg_native -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_memory_native -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_leaf_native -- --nocapture
+      - name: Original SSA CFG/array inliner and target callback
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test inline_native
+          cargo test -p compiler-opt --test inline_practical_native
+          cargo test -p compiler-opt --test inline_memory_native
+          cargo test -p compiler-opt --test inline_cost_policy
+          cargo test -p compiler-backend-x86 --test inliner_target_cost
+      - name: Native TypeId integration and replay tools
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typed_native_parity
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --bin ir-opt
+      - name: Strict Clippy on optimizer and TypeId modules
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-ir --lib -- -D warnings
+          cargo clippy -p compiler-opt --lib -- -D warnings
+          cargo clippy -p compiler-opt --bin ir-opt -- -D warnings
+      - name: Release optimizer timing and native A/B
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --release --test typed_core_inline_integration bounded_inliner_release_profile_reports_padded_module_time -- --nocapture
+          cargo test -p compiler-opt --release --test typed_core_inline_integration composed_typed_core_native_oracle_and_compile_time_ablation -- --nocapture
+      - name: CI summary
+        run: |
+          echo "TypeId single-caller exact verifier, counts and padded-module compile-time/native correctness, previous inliner suites and strict Clippy passed." >> "$GITHUB_STEP_SUMMARY"
