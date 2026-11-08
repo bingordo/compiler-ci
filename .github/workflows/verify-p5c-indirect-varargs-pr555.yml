@@ -1,0 +1,87 @@
+name: Test compiler P5c source-checked indirect GP varargs
+on:
+  push:
+    branches: [test/p5c-checked-indirect-varargs-555-20261108]
+  pull_request:
+    paths: ['.github/workflows/verify-p5c-indirect-varargs-pr555.yml']
+permissions:
+  contents: read
+jobs:
+  core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out immutable compiler PR
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 85097f418b55afbb6a76073cd76d85af5ca30414
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Validate exact revision and use core-only Cargo workspace
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "85097f418b55afbb6a76073cd76d85af5ca30414"
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          """)
+          PY
+      - name: Verify IR, optimizer, and x86 native source linking
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --all-targets 2>&1 | tee "$RUNNER_TEMP/p5c-ir.log"
+          cargo test -p compiler-opt --lib 2>&1 | tee "$RUNNER_TEMP/p5c-opt.log"
+          cargo test -p compiler-backend-x86 --test m4_7_indirect_ssa_native -- --nocapture 2>&1 | tee "$RUNNER_TEMP/p5c-native.log"
+          grep -F 'test indirect_ssa_calls_real_c_callbacks_elf_and_gas_all_frame_modes ... ok' "$RUNNER_TEMP/p5c-native.log"
+          cargo clippy -p compiler-backend-x86 -p compiler-ir --all-targets -- -D warnings
+      - name: Keep failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p5c-core-logs
+          path: ${{ runner.temp }}/p5c-*.log
+          if-no-files-found: ignore
+  frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Check out immutable compiler PR
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 85097f418b55afbb6a76073cd76d85af5ca30414
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify revision and allow public Mini-C Git dependency
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "85097f418b55afbb6a76073cd76d85af5ca30414"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: p5c-indirect-source
+      - name: Test full checked Mini-C source adapter and native ELF/GAS
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib m47_p5c -- --nocapture 2>&1 | tee "$RUNNER_TEMP/p5c-source.log"
+          grep -F 'test tests::m47_p5c_checked_gp_indirect_varargs_reach_native_ssa_and_elf ... ok' "$RUNNER_TEMP/p5c-source.log"
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib
+          cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --all-targets -- -D warnings
+      - name: Keep failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p5c-source-logs
+          path: ${{ runner.temp }}/p5c-*.log
+          if-no-files-found: ignore
