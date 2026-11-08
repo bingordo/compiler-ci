@@ -1,0 +1,61 @@
+name: F2.2 native TypeId v3 declarations, globals and relocation replay
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-typeid-f22-module-declarations.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  typeid-f22:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout immutable compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9e42d4dc57b2f37af8db4152e1522e7f388fa434
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source pin
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "9e42d4dc57b2f37af8db4152e1522e7f388fa434"
+      - name: Isolate the core compiler workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-f22-declarations
+      - name: F2.2 native v3 declarations and relocation negative cases
+        working-directory: compiler
+        run: cargo test -p compiler-ir --test native_module_declarations_v3 -- --nocapture
+      - name: F2.1 canonical TypeId signature type/layout metadata replay
+        working-directory: compiler
+        run: cargo test -p compiler-ir --test native_type_records_v3 -- --nocapture
+      - name: Full compiler IR legacy and native interchange regression
+        working-directory: compiler
+        run: cargo test -p compiler-ir
+      - name: F1 typed indirect callback GAS and ELF compatibility
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --test native_typeid_function_signatures -- --nocapture
+      - name: AArch64 shared IR and ABI compatibility
+        working-directory: compiler
+        run: cargo check -p compiler-backend-aarch64 --all-targets
+      - name: Strict IR all-target Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir --all-targets -- -D warnings
+      - name: Strict AArch64 production library Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
+      - name: Full compiler optimizer and x86 backend regression
+        working-directory: compiler
+        run: cargo test -p compiler-opt -p compiler-backend -p compiler-backend-x86
