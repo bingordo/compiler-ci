@@ -1,0 +1,88 @@
+name: X7.G10.N5a typed source candidate refinement
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-x7-g10-n5-refinement.yml']
+permissions:
+  contents: read
+jobs:
+  typed-source-refinement:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Checkout exact compiler N5a implementation
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 4d6e6e6dfa31b47bc2dda8b41b3ce478b1793b3c
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Fail-closed source and unit tests
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 4d6e6e6dfa31b47bc2dda8b41b3ce478b1793b3c
+          python3 -m py_compile tools/x86_g10_catalog_census.py tools/x86_g10_candidate_refinement.py
+          python3 -m unittest discover -s tools -p 'test_x86_g10_catalog_census.py' -v
+          python3 -m unittest discover -s tools -p 'test_x86_g10_candidate_refinement.py' -v
+      - name: Fetch complete revision-pinned Intel XML
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/intel-xml /tmp/g10-n5
+          rev=35eface1b7ee003a1cda95005ec5fd83de658a64
+          curl --fail --silent --show-error --location --retry 2 --max-time 180 \
+            "https://codeload.github.com/intel/SDM/tar.gz/${rev}" \
+            --output /tmp/g10-n5/intel.tar.gz
+          python3 - <<'PY'
+          from pathlib import Path
+          import re,tarfile
+          target=Path('/tmp/intel-xml')
+          n=0
+          with tarfile.open('/tmp/g10-n5/intel.tar.gz', 'r:gz') as tar:
+              for member in tar:
+                  if not (member.isfile() and re.fullmatch(
+                          r'[^/]+/data/instruction/[^/]+\.xml',member.name)):
+                      continue
+                  assert 0 < member.size < 4*1024*1024
+                  data=tar.extractfile(member).read()
+                  assert len(data)==member.size
+                  (target/member.name.rsplit('/',1)[-1]).write_bytes(data)
+                  n+=1
+                  assert n<=900
+          assert 700<=n<=900, n
+          print('PINNED_SOURCE_FILES',n)
+          PY
+      - name: Produce N4 census and strictly ineligible N5a alternative report
+        run: |
+          set -euo pipefail
+          python3 tools/x86_g10_catalog_census.py \
+            --xml-dir /tmp/intel-xml --output /tmp/g10-n5/census.json
+          python3 tools/x86_g10_candidate_refinement.py \
+            --census /tmp/g10-n5/census.json \
+            --output /tmp/g10-n5/refined.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          census=json.loads(Path('/tmp/g10-n5/census.json').read_text())
+          refined=json.loads(Path('/tmp/g10-n5/refined.json').read_text())
+          assert census['source_corpus_sha256']==refined['source_corpus_sha256']
+          assert len(census['rows'])==181==len(refined['rows'])
+          assert refined['summary']['rows_with_typed_alternatives']==7
+          assert refined['generated_rules_enabled']==0
+          assert refined['production_selection_eligible'] is False
+          assert all(not row['production_selection_eligible'] for row in refined['rows'])
+          assert all(not alt['selection_eligible'] for row in refined['rows']
+                     for alt in row['typed_alternatives'])
+          assert all(not c['production_selection_eligible'] for row in refined['rows']
+                     for alt in row['typed_alternatives']
+                     for c in alt['source_candidates'])
+          print('N5A_REFINEMENT',refined['summary'])
+          PY
+      - name: Attach source and typed alternative reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-g10-n5a-source-shape-report
+          path: |
+            /tmp/g10-n5/census.json
+            /tmp/g10-n5/refined.json
+          retention-days: 7
