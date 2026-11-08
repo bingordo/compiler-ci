@@ -1,0 +1,80 @@
+name: X7.G10 complete Intel source-form candidate census
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-x7-g10-form-census.yml']
+permissions:
+  contents: read
+jobs:
+  catalog-census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Checkout pinned compiler catalog candidate scanner
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: fddf525d7a863a22e638371fd64881fc56bdcf90
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Unit regressions for full catalog and exact links
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          python3 -m py_compile tools/x86_g10_catalog_census.py
+          python3 -m unittest discover -s tools -p 'test_x86_g10_catalog_census.py' -v
+      - name: Retrieve complete commit-pinned Intel instruction XML corpus
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/x7-g10-full-xml /tmp/x7-g10-census
+          rev=35eface1b7ee003a1cda95005ec5fd83de658a64
+          curl --fail --silent --show-error --location --retry 2 --max-time 180 \
+            "https://codeload.github.com/intel/SDM/tar.gz/${rev}" \
+            --output /tmp/x7-g10-census/intel-sdm.tar.gz
+          python3 - <<'PY'
+          from pathlib import Path
+          import re,tarfile
+          archive=Path('/tmp/x7-g10-census/intel-sdm.tar.gz')
+          target=Path('/tmp/x7-g10-full-xml')
+          total=0
+          with tarfile.open(archive,'r:gz') as tar:
+              for member in tar:
+                  if not (member.isfile() and
+                          re.fullmatch(r'[^/]+/data/instruction/[^/]+\.xml',member.name)):
+                      continue
+                  assert 0 < member.size < 4 * 1024 * 1024, member.name
+                  data=tar.extractfile(member).read()
+                  assert len(data)==member.size
+                  (target/member.name.rsplit('/',1)[-1]).write_bytes(data)
+                  total+=1
+                  assert total <= 900
+          assert 700 <= total <= 900, total
+          print('PINNED_INTEL_XML_FILES',total)
+          PY
+      - name: Generate catalog candidate, ambiguity and blocker evidence
+        run: |
+          set -euo pipefail
+          python3 tools/x86_g10_catalog_census.py \
+            --xml-dir /tmp/x7-g10-full-xml \
+            --output /tmp/x7-g10-census/full-iform-candidate-census.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          j=json.loads(Path('/tmp/x7-g10-census/full-iform-candidate-census.json').read_text())
+          s=j['summary']
+          assert j['generated_rules_enabled']==0
+          assert j['production_selection_eligible'] is False
+          assert s['local_encoding_records'] >= 180
+          assert s['typed_semantic_contract_rows']==7
+          assert s['exact_source_link_rows']==3
+          assert len(j['rows'])==s['local_encoding_records']
+          assert all(not row['production_selection_eligible'] for row in j['rows'])
+          print('FULL_CATALOG_CENSUS_SUMMARY',s)
+          PY
+      - name: Attach full source-form ambiguity and blockers report
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-g10-pinned-intel-form-census
+          path: /tmp/x7-g10-census/full-iform-candidate-census.json
+          retention-days: 7
