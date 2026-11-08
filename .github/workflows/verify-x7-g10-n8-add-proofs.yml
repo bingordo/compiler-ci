@@ -1,0 +1,90 @@
+name: X7.G10.N8 ADD source flags SMT and native fault-context differential
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-x7-g10-n8-add-proofs.yml']
+permissions:
+  contents: read
+jobs:
+  postalloc-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Checkout exact compiler N8 proof implementation
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b133405b36611c58d7b02770b29f5684c7b63214
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Validate reviewed source/encoder constraints against pinned Intel
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = b133405b36611c58d7b02770b29f5684c7b63214
+          mkdir -p /tmp/x7-g10-intel
+          rev=35eface1b7ee003a1cda95005ec5fd83de658a64
+          for instruction in MOV ADD XOR; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 45 \
+              "https://raw.githubusercontent.com/intel/SDM/${rev}/data/instruction/${instruction}.xml" \
+              --output "/tmp/x7-g10-intel/${instruction}.xml"
+          done
+          python3 tools/x86_g10_regen_physical_forms.py --xml-dir /tmp/x7-g10-intel --check
+          python3 tools/regen_x86_forms.py --check
+      - name: Prove pinned Intel ADD source operand flow and six RFLAGS under helper assumption
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/x7-g10-n8-z3
+          /tmp/x7-g10-n8-z3/bin/python -m pip install --disable-pip-version-check 'z3-solver==4.13.4.0'
+          export X7_N8_PINNED_ADD_XML=/tmp/x7-g10-intel/ADD.xml
+          /tmp/x7-g10-n8-z3/bin/python -m unittest discover -s tools -p 'test_x86_g10_add_source_proof.py' -v
+          /tmp/x7-g10-n8-z3/bin/python tools/x86_g10_add_source_proof.py \
+            --intel-add-xml /tmp/x7-g10-intel/ADD.xml --output /tmp/x7-g10-n8-source-proof.json
+          /tmp/x7-g10-n8-z3/bin/python - <<'PY'
+          import json
+          r=json.load(open('/tmp/x7-g10-n8-source-proof.json'))
+          assert r['smt_result']=='all_6_unsat'
+          assert len(r['smt_equivalence_by_flag'])==6
+          assert all(v=='unsat' for v in r['smt_equivalence_by_flag'].values())
+          assert r['source_memory_reads']==1 and r['source_memory_writes']==0
+          assert not r['machine_faults_modeled'] and not r['production_selection_eligible']
+          print('N8_INTEL_SOURCE_Z3_PASS',r['form_sha256'],r['operation_sha256'])
+          PY
+      - name: Reexecute pinned Intel source native literal/GAS arithmetic+six-flag oracle
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/x7-g10-n8-native
+          python3 tools/x86_g10_native_iforms.py \
+            --xml-dir /tmp/x7-g10-intel --out-dir /tmp/x7-g10-n8-native
+          cc -std=c11 -O2 -Wall -Wextra -Werror -fno-strict-aliasing \
+            tools/tests/x86_g10_native_iforms.c /tmp/x7-g10-n8-native/native_forms.S \
+            -o /tmp/x7-g10-n8-native/native_oracle
+          /tmp/x7-g10-n8-native/native_oracle
+          python3 tools/x86_g10_validate_native_bytes.py \
+            --binary /tmp/x7-g10-n8-native/native_oracle \
+            --evidence /tmp/x7-g10-n8-native/source_form_evidence.json
+      - name: Verify real SSA fusion candidates, default backend and native GAS/ELF
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          """)
+          PY
+          cargo check -p compiler-backend-x86 --offline
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation \
+            --test x7_g10_n8_fault_context_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation \
+            --test x7_g10_n7_real_ssa_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation \
+            --lib x7_late_selector --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation \
+            --lib x7_native_form_bridge --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation \
+            --test x7_g10_late_selector_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation \
+            --test x7_g10_reviewed_physical_forms_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --test x7_g10_native_memory_oracle \
+            --offline -- --nocapture
