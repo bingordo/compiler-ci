@@ -1,0 +1,54 @@
+name: X7.G10.N6 opt-in generated memory-form post-RA selection
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-x7-g10-n6-late-selector.yml']
+permissions:
+  contents: read
+jobs:
+  postalloc-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Checkout exact compiler N6 implementation
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: befc5399ce328936e46fe77ff7ff3d8351605070
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Validate reviewed source/encoder constraints against pinned Intel
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = befc5399ce328936e46fe77ff7ff3d8351605070
+          mkdir -p /tmp/x7-g10-intel
+          rev=35eface1b7ee003a1cda95005ec5fd83de658a64
+          for instruction in MOV ADD XOR; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 45 \
+              "https://raw.githubusercontent.com/intel/SDM/${rev}/data/instruction/${instruction}.xml" \
+              --output "/tmp/x7-g10-intel/${instruction}.xml"
+          done
+          python3 tools/x86_g10_regen_physical_forms.py --xml-dir /tmp/x7-g10-intel --check
+          python3 tools/regen_x86_forms.py --check
+      - name: Verify default backend unaffected and opt-in actual selection with GAS/direct ELF
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          """)
+          PY
+          cargo check -p compiler-backend-x86 --offline
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation \
+            --lib x7_late_selector --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation \
+            --lib x7_native_form_bridge --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation \
+            --test x7_g10_late_selector_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation \
+            --test x7_g10_reviewed_physical_forms_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --test x7_g10_native_memory_oracle \
+            --offline -- --nocapture
