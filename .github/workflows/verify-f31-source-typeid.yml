@@ -1,0 +1,86 @@
+name: F3.1 checked source to native TypeId x86 GAS and ELF
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-f31-source-typeid.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  f31:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact source candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 295c32fdd3afdbb2d8c0746d6c9ef1fee23b2501
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source commit
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "295c32fdd3afdbb2d8c0746d6c9ef1fee23b2501"
+      - name: Resolve pinned public frontend dependencies
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: f31-source-typeid
+      - name: Native TypeId checked source bridge and rejection tests
+        working-directory: compiler
+        run: cargo test -p compiler-ir --test native_source_bridge -- --nocapture
+      - name: Checked Mini-C and Oberon real-source GAS and ELF C11 oracles
+        working-directory: compiler
+        run: cargo test -p compiler --bin compiler typeid_native_source -- --nocapture
+      - name: Exercise real CLI --ir typeid for C and Oberon and errors
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          mkdir -p target/f31-source
+          cat > target/f31-source/demo.c <<'EOF'
+          int add_native(int a,int b) { return a+b; }
+          EOF
+          cat > target/f31-source/demo.mod <<'EOF'
+          MODULE TypeCutover;
+          PROCEDURE Add*(a,b: INTEGER): INTEGER;
+          BEGIN RETURN a+b END Add;
+          END TypeCutover.
+          EOF
+          cat > target/f31-source/oracle.c <<'EOF'
+          #include <stdint.h>
+          extern int32_t add_native(int32_t,int32_t);
+          int main(void) { for(int i=0;i<100;i++) if(add_native(i,100-i)!=100)return 1;return 0; }
+          EOF
+          cargo run --quiet -p compiler --bin compiler -- target/f31-source/demo.c --language mini-c --ir typeid --emit obj -o target/f31-source/demo.o
+          cc -std=c11 -O2 target/f31-source/oracle.c target/f31-source/demo.o -o target/f31-source/oracle
+          target/f31-source/oracle
+          cargo run --quiet -p compiler --bin compiler -- target/f31-source/demo.c --language mini-c --ir typeid --emit asm -o target/f31-source/demo.s
+          cc -std=c11 -O2 target/f31-source/oracle.c target/f31-source/demo.s -o target/f31-source/oracle
+          target/f31-source/oracle
+          cargo run --quiet -p compiler --bin compiler -- target/f31-source/demo.mod --language oberon --ir typeid --emit obj -o target/f31-source/oberon.o
+          if cargo run --quiet -p compiler --bin compiler -- target/f31-source/demo.c --language mini-c --ir typeid --target aarch64 --emit obj -o target/f31-source/invalid.o; then
+            echo "unexpected AArch64 TypeId compiler success" >&2
+            exit 1
+          fi
+          test ! -f target/f31-source/invalid.o
+      - name: Regress older checked source compiler baseline
+        working-directory: compiler
+        run: cargo test -p compiler --bin compiler compiles_checked_oberon_in_process -- --nocapture
+      - name: AArch64 shared TypeId API compatibility
+        working-directory: compiler
+        run: cargo check -p compiler-backend-aarch64 --all-targets
+      - name: Strict compiler IR, x86 backend, and driver Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler -p compiler-ir -p compiler-backend-x86 --all-targets -- -D warnings
+      - name: Strict AArch64 production Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
+      - name: Full compiler IR, optimizer and backends core regression
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
