@@ -1,0 +1,59 @@
+name: AArch64 physical FP leaf native acceptance (compiler PR 557)
+on:
+  push:
+    paths:
+      - '.github/workflows/aarch64-fp-557.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: aarch64-fp-557
+  cancel-in-progress: true
+jobs:
+  native:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 0c4e7502a3957e6f95dee811bbe5736c6ff59608
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Minimal source-locked workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "0c4e7502a3957e6f95dee811bbe5736c6ff59608"
+          mkdir -p workspace/crates
+          cp -a compiler/crates/ir compiler/crates/backend compiler/crates/backend-aarch64 workspace/crates/
+          cat > workspace/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: workspace
+          key: aarch64-fp-leaf-557
+      - name: All-target warnings denied
+        working-directory: workspace
+        run: RUSTFLAGS="-D warnings" cargo check -p compiler-backend-aarch64 --all-targets
+      - name: Native independently C-linked F32/F64 FP leaf differential
+        working-directory: workspace
+        run: cargo test -p compiler-backend-aarch64 --test fp_leaf_native -- --nocapture
+      - name: Exhaustive isolated IR / backend regressions
+        working-directory: workspace
+        run: cargo test -p compiler-ir -p compiler-backend -p compiler-backend-aarch64 -- --test-threads=1
+      - name: Strict all-target AArch64 Clippy
+        working-directory: workspace
+        run: cargo clippy -p compiler-backend-aarch64 --all-targets -- -D warnings
+      - name: Recorded accepted source
+        run: echo 'Native AArch64 FP physical leaf and independent C ABI oracle verified 0c4e7502a3957e6f95dee811bbe5736c6ff59608' >> "$GITHUB_STEP_SUMMARY"
