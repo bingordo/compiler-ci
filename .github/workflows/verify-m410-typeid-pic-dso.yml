@@ -1,0 +1,65 @@
+name: M4.10 checked TypeId PIC ELF-GAS shared libraries
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-m410-typeid-pic-dso.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      COMPILER_ELF_REQUIRE_LLVM: '1'
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 60ba472c6991339b3b7a920767fe5b395a33b4e2
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify immutable source
+        working-directory: compiler
+        run: |
+          test "$(git rev-parse HEAD)" = "60ba472c6991339b3b7a920767fe5b395a33b4e2"
+          test -s crates/driver/tests/typeid_pic_shared.rs
+          echo "PIC TypeId ELF compiler SHA: 60ba472c6991339b3b7a920767fe5b395a33b4e2" >> "$GITHUB_STEP_SUMMARY"
+      - name: Public pinned frontend source dependencies
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - name: Install required toolchains and GDB
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y lld gdb
+          clang --version | head -1
+          ld.lld --version | head -1
+          gdb --version | head -1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m410-typeid-pic-dso-v1
+      - name: Checked TypeId PIC source GNU/LLVM shared library runtime
+        working-directory: compiler
+        run: cargo test -p compiler --test typeid_pic_shared -- --nocapture
+      - name: Supported TypeId ELF/GAS cross-linker matrix and frame negative
+        working-directory: compiler
+        run: cargo test -p compiler --test typeid_elf_linker_matrix -- --nocapture
+      - name: Full real checked Mini-C and Oberon driver coverage
+        working-directory: compiler
+        run: |
+          cargo test -p compiler --bin compiler
+          cargo test -p compiler --test mini_c_cli
+      - name: AArch64 API compatibility
+        working-directory: compiler
+        run: cargo check -p compiler-backend-aarch64 --all-targets
+      - name: Full core IR optimizer backend and x86 tests
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --features compiler-backend-x86/x7-native-form-validation
+      - name: Strict all-target lint
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --features compiler-backend-x86/x7-native-form-validation --all-targets -- -D warnings
+          cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
