@@ -1,0 +1,92 @@
+name: TypeId SSA cache-layout diagnostic 2026-11-09
+'on':
+  pull_request:
+    paths:
+      - '.github/workflows/typeid-ssa-cache-probe-20261109.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  layout-probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 928a0a4626330207d653dd63fed68f091c12b529
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source revision and host
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "928a0a4626330207d653dd63fed68f091c12b529"
+          rustc --version
+          cargo --version
+          uname -m
+          lscpu | grep -E 'Model name|CPU\(s\)|L1d cache|L2 cache|L3 cache' || true
+          test -s compiler/crates/ir/examples/ssa_cache_probe.rs
+      - name: Isolate core IR workspace
+        shell: bash
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-ssa-cache-layout
+      - name: Compile release probe and check Clippy
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release -p compiler-ir --example ssa_cache_probe
+          cargo clippy -p compiler-ir --example ssa_cache_probe -- -D warnings
+      - name: Capture release layout and allocation timings
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v ./target/release/examples/ssa_cache_probe > "$RUNNER_TEMP/ssa-probe.csv" 2> "$RUNNER_TEMP/ssa-probe-time.txt"
+          cat "$RUNNER_TEMP/ssa-probe.csv"
+          grep -E 'Maximum resident set size|User time|System time|Elapsed \(wall' "$RUNNER_TEMP/ssa-probe-time.txt"
+          {
+            echo '### TypeId SSA cache probe'
+            echo "Compiler SHA: 928a0a4626330207d653dd63fed68f091c12b529"
+            echo 'Columns: BENCH,name,SSA instructions,rounds,median nanoseconds,median allocations,median allocated bytes.'
+            echo 'Note: synthetic 10%-indirect-call stream is intentionally unverified and not source-representative.'
+            echo '~~~csv'
+            cat "$RUNNER_TEMP/ssa-probe.csv"
+            echo '~~~'
+            echo '~~~text'
+            cat "$RUNNER_TEMP/ssa-probe-time.txt"
+            echo '~~~'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Attempt hardware cache counters if runner permits them
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -u
+          if command -v perf >/dev/null 2>&1 && perf stat -e cycles,instructions,cache-references,cache-misses -- ./target/release/examples/ssa_cache_probe > /dev/null 2> "$RUNNER_TEMP/ssa-perf.txt"; then
+            echo 'Hardware counters available:'
+            cat "$RUNNER_TEMP/ssa-perf.txt"
+          else
+            echo 'Hardware counters unavailable (runner permissions / host restrictions). Do not infer cache-miss counts.'
+            test ! -e "$RUNNER_TEMP/ssa-perf.txt" || head -20 "$RUNNER_TEMP/ssa-perf.txt"
+          fi
+      - name: Upload raw probe output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: typeid-ssa-cache-probe-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/ssa-probe.csv
+            ${{ runner.temp }}/ssa-probe-time.txt
+            ${{ runner.temp }}/ssa-perf.txt
+          if-no-files-found: warn
