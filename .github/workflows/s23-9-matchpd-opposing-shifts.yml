@@ -1,0 +1,67 @@
+name: S23.9 GCC match.pd opposing constant shift masks and native oracles
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-9-matchpd-opposing-shifts.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/s23-9-matchpd-opposing-shifts.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-pinned-s23-9:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - name: Checkout compiler PR #687 exact source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b312d7c5dd35beddf7fd6e399007c90f3680ab9d
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and isolate four credential-independent crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = b312d7c5dd35beddf7fd6e399007c90f3680ab9d
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - name: Reuse self-contained Rust workspace compilation
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: s22-native-integer-generated
+      - name: S23.9 generated opposing-shift five-width SSA and negative guards
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test generated_native_opposing_shift -- --nocapture
+          cargo test -p compiler-opt --test generated_native_shift_affine -- --nocapture
+          cargo test -p compiler-opt --test generated_native_zero_compare -- --nocapture
+      - name: Existing generated comparison and extension regressions
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test generated_native_compare_dag -- --nocapture
+          cargo test -p compiler-opt --test generated_native_extension_literal -- --nocapture
+          cargo test -p compiler-opt --test generated_native_extension_compare -- --nocapture
+          cargo test -p compiler-opt --test generated_native_sign_order -- --nocapture
+      - name: Native C11/GAS/direct ELF oracle and actual .text cost
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend-x86 --test native_s23_profitability -- --nocapture
+          cargo test --release -p compiler-backend-x86 --test native_s23_profitability native_s239_matchpd_opposing_shift_gas_elf_and_code_size -- --nocapture
+      - name: Production-mode optimizer and direct ELF Clippy
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-opt --all-targets -- -D warnings
+          cargo clippy -p compiler-backend-x86 --bin typeid-x86 --test native_s23_profitability -- -D warnings
