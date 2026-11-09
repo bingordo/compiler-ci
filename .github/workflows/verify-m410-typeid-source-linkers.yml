@@ -1,0 +1,81 @@
+name: M4.10 checked TypeId C/Oberon ELF-GAS GNU-LLVM interop
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-m410-typeid-source-linkers.yml']
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact compiler source commit
+        required: true
+        type: string
+        default: 4edb7630082895c5b37383ae6d635d47c0126b95
+permissions:
+  contents: read
+concurrency:
+  group: m410-typeid-source-${{ github.event.inputs.source_ref || github.head_ref || 'candidate' }}
+  cancel-in-progress: true
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      COMPILER_ELF_REQUIRE_LLVM: '1'
+    steps:
+      - name: Checkout exact compiler commit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || '4edb7630082895c5b37383ae6d635d47c0126b95' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify immutable compiler SHA
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            test "$actual" = "4edb7630082895c5b37383ae6d635d47c0126b95"
+          fi
+          echo "Checked source ELF interop SHA: $actual" >> "$GITHUB_STEP_SUMMARY"
+          test -s crates/driver/tests/typeid_elf_linker_matrix.rs
+      - name: Public pinned frontend source dependencies
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - name: Install required native linkers and GDB
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y lld gdb
+          gcc --version | head -1
+          clang --version | head -1
+          ld.bfd --version | head -1
+          ld.lld --version | head -1
+          gdb --version | head -1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m410-typeid-source-linker-v1
+          cache-workspace-crates: 'true'
+      - name: Real TypeId checked-source ELF/GAS GNU/LLVM and negative modes
+        working-directory: compiler
+        run: cargo test -p compiler --test typeid_elf_linker_matrix -- --nocapture
+      - name: Existing native TypeId Mini-C/Oberon acceptance
+        working-directory: compiler
+        run: cargo test -p compiler --bin compiler typeid_native_source -- --nocapture
+      - name: Complete checked source driver regression
+        working-directory: compiler
+        run: |
+          cargo test -p compiler --bin compiler
+          cargo test -p compiler --test mini_c_cli
+      - name: AArch64 backend API compatibility
+        working-directory: compiler
+        run: cargo check -p compiler-backend-aarch64 --all-targets
+      - name: Full core IR optimizer backend and x86 regression
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --features compiler-backend-x86/x7-native-form-validation
+      - name: Strict all-target lint
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --features compiler-backend-x86/x7-native-form-validation --all-targets -- -D warnings
+          cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
