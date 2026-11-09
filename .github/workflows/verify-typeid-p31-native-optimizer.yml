@@ -1,0 +1,63 @@
+name: TypeId P3.1 native optimizer verifier migration
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-typeid-p31-native-optimizer.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  p31:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler P3.1 SHA
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 724e2b016f949c5142be28d1bd7054d05f22e44f
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify compiler source identity
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "724e2b016f949c5142be28d1bd7054d05f22e44f"
+      - name: Use public pinned compiler frontend dependencies
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-p31-optimizer-native-verifier
+      - name: Native-vs-legacy v1 verifier mutation parity and transactional typed-core
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typed_core_native_verifier -- --nocapture
+      - name: Zero legacy SSA verifier calls during actual TypeId optimizer
+        working-directory: compiler
+        run: cargo test -p compiler-opt --features verify-counts --test typed_core_native_verifier -- --nocapture
+      - name: Composed TypeId optimizer and CFG-inliner executable differential
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typed_core_pipeline -- --nocapture
+          cargo test -p compiler-opt --test typed_core_inline_integration -- --nocapture
+      - name: Real Mini-C and Oberon native TypeId C11 GAS/direct ELF
+        working-directory: compiler
+        run: cargo test -p compiler --bin compiler typeid_native_source -- --nocapture
+      - name: AArch64 shared TypeId and backend API
+        working-directory: compiler
+        run: cargo check -p compiler-backend-aarch64 --all-targets
+      - name: Strict optimizer IR frontend and x86 Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt -p compiler-ir -p compiler -p compiler-backend-x86 --all-targets -- -D warnings
+      - name: Strict AArch64 Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
+      - name: Install GDB for existing DWARF oracle
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gdb
+      - name: Full IR optimizer backend and x86 regression
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
