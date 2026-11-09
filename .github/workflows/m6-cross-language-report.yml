@@ -13,6 +13,11 @@ on:
         required: false
         type: boolean
         default: false
+      compile_profile:
+        description: Run opt-in checked-source M6 optimizer time diagnostics (extra CI work)
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -50,6 +55,7 @@ jobs:
       CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
       CARGO_INCREMENTAL: '0'
       M6_RUNTIME_PROFILE: ${{ inputs.runtime_profile && '1' || '0' }}
+      M6_COMPILE_PROFILE: ${{ inputs.compile_profile && '1' || '0' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -65,7 +71,7 @@ jobs:
           workspaces: compiler/tools/mini-c-driver -> target
           key: m6-cross-mini-c-v1
       - name: Record Mini-C runner and toolchain
-        if: ${{ inputs.runtime_profile }}
+        if: ${{ inputs.runtime_profile || inputs.compile_profile }}
         shell: bash
         run: |
           mkdir -p results
@@ -87,7 +93,7 @@ jobs:
           # A stable CPU affinity reduces migration noise, but
           # shared-runner interference and frequency changes still remain.
           affinity=()
-          if [[ "$M6_RUNTIME_PROFILE" == "1" ]]; then
+          if [[ "$M6_RUNTIME_PROFILE" == "1" || "$M6_COMPILE_PROFILE" == "1" ]]; then
             cpu="$(python3 -c 'import os; print(min(os.sched_getaffinity(0)))')"
             printf 'pinned_logical_cpu=%s\n' "$cpu" >> results/m6-mini-c-host.txt
             affinity=(taskset -c "$cpu")
@@ -116,6 +122,7 @@ jobs:
       CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
       CARGO_INCREMENTAL: '0'
       M6_RUNTIME_PROFILE: ${{ inputs.runtime_profile && '1' || '0' }}
+      M6_COMPILE_PROFILE: ${{ inputs.compile_profile && '1' || '0' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -131,7 +138,7 @@ jobs:
           workspaces: compiler -> target
           key: m6-cross-oberon-v1
       - name: Record Oberon runner and toolchain
-        if: ${{ inputs.runtime_profile }}
+        if: ${{ inputs.runtime_profile || inputs.compile_profile }}
         shell: bash
         run: |
           mkdir -p results
@@ -155,7 +162,7 @@ jobs:
           # A stable CPU affinity reduces migration noise, but
           # shared-runner interference and frequency changes still remain.
           affinity=()
-          if [[ "$M6_RUNTIME_PROFILE" == "1" ]]; then
+          if [[ "$M6_RUNTIME_PROFILE" == "1" || "$M6_COMPILE_PROFILE" == "1" ]]; then
             cpu="$(python3 -c 'import os; print(min(os.sched_getaffinity(0)))')"
             printf 'pinned_logical_cpu=%s\n' "$cpu" >> results/m6-oberon-host.txt
             affinity=(taskset -c "$cpu")
@@ -194,6 +201,26 @@ jobs:
           path: logs
       - name: Validate report parser
         run: python3 -m unittest discover -s compiler/tools/tests -p test_m6_source_corpus_summary.py -v
+      - name: Validate checked-source compile cost report parser
+        if: ${{ inputs.compile_profile }}
+        run: python3 -m unittest discover -s compiler/tools/tests -p test_m6_compile_summary.py -v
+      - name: Produce paired compile-cost CSV JSON and Markdown
+        if: ${{ inputs.compile_profile }}
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ needs.pin.outputs.sha }}
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/m6_compile_summary.py \
+            --source-sha "$SOURCE_SHA" \
+            --mini-c logs/m6-cross-mini-c/m6-mini-c-source.log \
+            --oberon logs/m6-cross-oberon/m6-oberon-source.log \
+            --mini-c-host logs/m6-cross-mini-c/m6-mini-c-host.txt \
+            --oberon-host logs/m6-cross-oberon/m6-oberon-host.txt \
+            --csv results/m6-compile-report.csv \
+            --json results/m6-compile-report.json \
+            --markdown results/m6-compile-report.md
+          cat results/m6-compile-report.md >> "$GITHUB_STEP_SUMMARY"
       - name: Validate paired runtime report parser
         if: ${{ inputs.runtime_profile }}
         run: python3 -m unittest discover -s compiler/tools/tests -p test_m6_runtime_summary.py -v
@@ -235,4 +262,5 @@ jobs:
           path: |
             results/m6-source-report.*
             results/m6-runtime-report.*
+            results/m6-compile-report.*
           retention-days: 30
