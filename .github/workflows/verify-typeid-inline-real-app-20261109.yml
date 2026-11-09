@@ -1,0 +1,112 @@
+name: TypeId checked real application call graph x86 A/B
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/verify-typeid-inline-real-app-20261109.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  mini-c:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 153df12f369e3e9e50d2c29bc1ad73572f86f191
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin compiler and frontend dependencies
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "153df12f369e3e9e50d2c29bc1ad73572f86f191"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: typeid-rolling-source-mini-c-20261109
+      - name: Source-to-native Mini-C modes plus GCC/GAS/ELF differential
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --release --features experimental-fusion-benchmark --test typeid_source_inline_profile checked_native_typeid_rolling_checksum_end_to_end -- --ignored --nocapture 2>&1 | tee "$RUNNER_TEMP/typeid-real-mini-c.log"
+          grep 'TYPEID_REAL_APP lang=mini_c' "$RUNNER_TEMP/typeid-real-mini-c.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: typeid-real-mini-c
+          path: ${{ runner.temp }}/typeid-real-mini-c.log
+          if-no-files-found: ignore
+
+  oberon:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 153df12f369e3e9e50d2c29bc1ad73572f86f191
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin compiler and frontend dependencies
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "153df12f369e3e9e50d2c29bc1ad73572f86f191"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-rolling-source-oberon-20261109
+      - name: Source-to-native Oberon modes plus GCC/GAS/ELF differential
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release -p compiler --bin compiler checked_native_oberon_rolling_checksum_end_to_end -- --ignored --nocapture 2>&1 | tee "$RUNNER_TEMP/typeid-real-oberon.log"
+          grep 'TYPEID_REAL_APP lang=oberon' "$RUNNER_TEMP/typeid-real-oberon.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: typeid-real-oberon
+          path: ${{ runner.temp }}/typeid-real-oberon.log
+          if-no-files-found: ignore
+
+  core-regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 153df12f369e3e9e50d2c29bc1ad73572f86f191
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin compiler and keep optimizer-only workspace
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "153df12f369e3e9e50d2c29bc1ad73572f86f191"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-rolling-inline-opt-20261109
+      - name: Native inliner regression and Clippy
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typed_core_inline_integration
+          cargo test -p compiler-opt --test typed_inline_cfg_native
+          cargo test -p compiler-opt --test typed_inline_memory_native
+          cargo clippy -p compiler-ir -p compiler-opt --all-targets -- -D warnings
