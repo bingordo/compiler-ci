@@ -1,0 +1,54 @@
+name: P0 indirect-call memory-barrier correctness #658
+'on':
+  pull_request:
+    paths:
+      - '.github/workflows/verify-indirect-call-memory-658.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  indirect-memory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 86c3a2d7747cfa98aed8ae1380657439e4d88ff4
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify immutable compiler source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "86c3a2d7747cfa98aed8ae1380657439e4d88ff4"
+          test -s compiler/crates/opt/tests/indirect_call_memory_barriers.rs
+          rustc --version
+      - name: Restrict self-contained compiler workspace
+        shell: bash
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: indirect-memory-658
+      - name: Execute newly added indirect-callback memory regressions
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test indirect_call_memory_barriers -- --nocapture
+      - name: All IR and optimizer unit/integration suites
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt
+      - name: Existing native x86 callback and alias-memory execution
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend-x86 --test native_typeid_memory_calls
+          cargo test -p compiler-backend-x86 --test typed_alias_calls_native
+      - name: Strict IR and optimizer Clippy including regression test
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt --all-targets -- -D warnings
