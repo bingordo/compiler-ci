@@ -1,0 +1,56 @@
+name: TypeId unmodified third-party C source admission census
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/verify-typeid-upstream-c-admission-20261109.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  upstream-c-admission:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d3d55bbb95e6ab25dc447238c1442006877b9001
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: levkropp/lccc
+          ref: a9987d0e8e97db148dbf91bf307b72a93357eb60
+          path: upstream
+          persist-credentials: false
+      - name: Verify exact source roots and hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "d3d55bbb95e6ab25dc447238c1442006877b9001"
+          test "$(git -C upstream rev-parse HEAD)" = "a9987d0e8e97db148dbf91bf307b72a93357eb60"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          test "$(find upstream/tests/benchmark/programs -maxdepth 1 -type f -name '*.c' | wc -l)" = 18
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: typeid-native-upstream-admission-20261109
+      - name: Classify all 18 unchanged C sources, including eligible inlines and ELF
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          export TYPEID_UPSTREAM_C_ROOT="$GITHUB_WORKSPACE/upstream/tests/benchmark/programs"
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --release --features experimental-fusion-benchmark --test typeid_source_inline_profile upstream_unmodified_c_source_admission_census -- --ignored --nocapture 2>&1 | tee "$RUNNER_TEMP/typeid-upstream-admission.log"
+          grep 'TYPEID_UPSTREAM_SUMMARY' "$RUNNER_TEMP/typeid-upstream-admission.log"
+          test "$(grep -c '^TYPEID_UPSTREAM_C name=' "$RUNNER_TEMP/typeid-upstream-admission.log")" = 18
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: typeid-upstream-c-admission
+          path: ${{ runner.temp }}/typeid-upstream-admission.log
+          if-no-files-found: ignore
