@@ -1,0 +1,67 @@
+name: TypeId P3.5 select-free existing CFG optimizer parity
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-typeid-p35-select-free-cfg.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  p35:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout pinned compiler P3.5 candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 8719bd42f895899bfc2a3278d8c7d28f175c39d3
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify immutable compiler source
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "8719bd42f895899bfc2a3278d8c7d28f175c39d3"
+      - name: Resolve public pinned frontend dependencies
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-p35-existing-cfg
+      - name: Direct TypeId vs legacy select-free CFG differential and production dispatch
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typed_identical_merges -- --nocapture
+      - name: Zero legacy SSA verification in select-free TypeId CFG pass
+        working-directory: compiler
+        run: cargo test -p compiler-opt --features verify-counts --test typed_identical_merges -- --nocapture
+      - name: Existing legacy if-conversion and typed CFG optimizer suites
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --lib if_conversion -- --nocapture
+          cargo test -p compiler-opt --test typed_core_pipeline
+          cargo test -p compiler-opt --test typed_core_inline_integration
+          cargo test -p compiler-opt --test typed_core_native_verifier
+      - name: Checked Mini-C/Oberon real TypeId GAS and ELF independent C11 oracles
+        working-directory: compiler
+        run: cargo test -p compiler --bin compiler typeid_native_source -- --nocapture
+      - name: Full checked Mini-C/Oberon driver suite including legacy compatibility
+        working-directory: compiler
+        run: cargo test -p compiler --bin compiler
+      - name: Shared AArch64 TypeId API acceptance
+        working-directory: compiler
+        run: cargo check -p compiler-backend-aarch64 --all-targets
+      - name: Strict TypeId IR optimizer compiler and target lint
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler -p compiler-backend-x86 --all-targets -- -D warnings
+          cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
+      - name: Install GDB needed by existing DWARF source oracle
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gdb
+      - name: Full IR optimizer backend and x86 regression
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
