@@ -1,0 +1,83 @@
+name: F3.3 TypeId static C internal linkage GAS ELF
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-typeid-f33-internal-linkage.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  f33:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f53d875e76d00361fe8831e614880a01e7be143a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source SHA
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "f53d875e76d00361fe8831e614880a01e7be143a"
+      - name: Resolve pinned public frontend dependencies
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: f33-internal-linkage
+      - name: Real Mini-C TypeId native GAS and ELF private-function and symbol oracles
+        working-directory: compiler
+        run: cargo test -p compiler --bin compiler typeid_native_source -- --nocapture
+      - name: Actual TypeId CLI static C function binding and link
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          mkdir -p target/f33-static
+          cat > target/f33-static/native.c <<'EOF'
+          static int private_native(int n) { if(n==0)return 19; return private_native(n-1)+1; }
+          int public_native(int n) { return private_native(n); }
+          EOF
+          cat > target/f33-static/oracle.c <<'EOF'
+          extern int public_native(int);
+          int main(void){for(int n=0;n<32;n++)if(public_native(n)!=n+19)return 1;return 0;}
+          EOF
+          for kind in obj asm; do
+            if [ "$kind" = obj ]; then ext=o; else ext=s; fi
+            cargo run --quiet -p compiler --bin compiler -- target/f33-static/native.c --language mini-c --ir typeid --emit "$kind" -o "target/f33-static/native.$ext"
+            if [ "$kind" = asm ]; then
+              cc -c target/f33-static/native.s -o target/f33-static/assembled.o
+              obj=target/f33-static/assembled.o
+            else
+              obj=target/f33-static/native.o
+            fi
+            readelf -Ws "$obj" | grep -Eq 'FUNC[[:space:]]+LOCAL[[:space:]]+DEFAULT[[:space:]]+[0-9]+[[:space:]]+private_native$'
+            readelf -Ws "$obj" | grep -Eq 'FUNC[[:space:]]+GLOBAL[[:space:]]+DEFAULT[[:space:]]+[0-9]+[[:space:]]+public_native$'
+            cc -std=c11 -O2 -Wall -Wextra -Werror target/f33-static/oracle.c "$obj" -o target/f33-static/oracle
+            target/f33-static/oracle
+          done
+      - name: Native TypeId source bridge linkage and negative ABI tests
+        working-directory: compiler
+        run: cargo test -p compiler-ir --test native_source_bridge -- --nocapture
+      - name: AArch64 shared TypeId API compatibility
+        working-directory: compiler
+        run: cargo check -p compiler-backend-aarch64 --all-targets
+      - name: Strict IR, driver and x86 Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler -p compiler-ir -p compiler-backend-x86 --all-targets -- -D warnings
+      - name: Strict AArch64 production Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
+      - name: Install GDB required by existing DWARF4 test
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gdb
+      - name: Full IR optimizer and backend regression
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
