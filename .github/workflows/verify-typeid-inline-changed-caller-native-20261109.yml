@@ -1,0 +1,82 @@
+name: TypeId native changed-caller inliner validation and ABBA
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/verify-typeid-inline-changed-caller-native-20261109.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  changed-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: bdf2d078546a1dabd4683c2ce4e7bfaec12166b4
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a5cb2414d43cb44bd16a65a81ea12df420fbcc4a
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact old and new source revisions
+        run: |
+          test "$(git -C after rev-parse HEAD)" = "bdf2d078546a1dabd4683c2ce4e7bfaec12166b4"
+          test "$(git -C before rev-parse HEAD)" = "a5cb2414d43cb44bd16a65a81ea12df420fbcc4a"
+      - name: Restrict both workspaces to optimizer and AArch64 core
+        shell: bash
+        run: |
+          for dir in before after; do
+            cat > "$dir/Cargo.toml" <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+            rm -f "$dir/Cargo.lock"
+          done
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: after -> target
+          key: typeid-native-scoped-inline-20261109
+      - name: Verify exact scoped/full differential, all native inline suites and Clippy
+        working-directory: after
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --lib
+          cargo test -p compiler-opt --test typed_core_inline_integration -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_cfg_native -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_memory_native -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_wide_void_native -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_leaf_native -- --nocapture
+          cargo test -p compiler-opt --lib typed_inline::tests -- --nocapture
+          cargo test -p compiler-opt --features verify-counts --test typed_core_inline_integration bounded_trial_cost_is_one_caller_not_full_module_per_inline -- --nocapture
+          cargo check -p compiler-backend-aarch64
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend-aarch64 --all-targets -- -D warnings
+      - name: Same-runner ABBA release 48 inlines and 33 padded inlines
+        shell: bash
+        run: |
+          set -euo pipefail
+          for iteration in 1 2 3 4; do
+            case "$iteration" in 1|4) dir=before ;; *) dir=after ;; esac
+            (
+              cd "$dir"
+              cargo test --release -p compiler-opt --test typed_core_inline_integration dense_caller_48_call_release_profile -- --nocapture
+              cargo test --release -p compiler-opt --test typed_core_inline_integration bounded_inliner_release_profile_reports_padded_module_time -- --nocapture
+            ) 2>&1 | tee "$RUNNER_TEMP/typeid-scoped-$iteration-$dir.log"
+          done
+          grep -H -E 'TYPEID_INLINER_DENSE_48 median_us=|TYPEID_INLINER_PADDED_ABLATION' "$RUNNER_TEMP"/typeid-scoped-*.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: typeid-changed-native-inliner
+          path: ${{ runner.temp }}/typeid-scoped-*.log
+          if-no-files-found: ignore
