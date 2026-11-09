@@ -1,0 +1,203 @@
+name: Borrowed SSA dependency graph and DCE ABBA
+'on':
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/borrowed-ssa-deps-20261109.yml'
+      - 'tools/ct10_borrowed_dependency_abba.py'
+permissions:
+  contents: read
+jobs:
+  core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '84c48e043605029f773fbdad651726ba224045aa'
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm exact candidate and isolate core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = '84c48e043605029f773fbdad651726ba224045aa'
+          rustc --version
+          lscpu | grep 'Model name' || true
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: borrowed-ssa-deps-core
+      - name: Full core IR and opt release suite
+        working-directory: compiler
+        run: cargo test --release -p compiler-ir -p compiler-opt
+      - name: Dedicated dead phi and TypeId DCE regression suites
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release -p compiler-opt --test typed_phi_dead_linear
+          cargo test --release -p compiler-opt --test typed_phi_cfg
+          cargo test --release -p compiler-opt --test typed_local
+          cargo test --release -p compiler-opt --test alias_phis
+      - name: Strict changed-library Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt --lib -- -D warnings
+
+  actual_pass_abba:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '98b50c6e74a1be56b35d2bfeb6c39bb19bb6fbe8'
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '84c48e043605029f773fbdad651726ba224045aa'
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm exact source revisions, fixture and CPU
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C before rev-parse HEAD)" = '98b50c6e74a1be56b35d2bfeb6c39bb19bb6fbe8'
+          test "$(git -C after rev-parse HEAD)" = '84c48e043605029f773fbdad651726ba224045aa'
+          rustc --version
+          lscpu | grep 'Model name' || true
+          mkdir -p results before/crates/opt/examples
+          cp after/crates/opt/examples/borrowed_dependency_probe.rs before/crates/opt/examples/borrowed_dependency_probe.rs
+          sha256sum before/crates/opt/examples/borrowed_dependency_probe.rs after/crates/opt/examples/borrowed_dependency_probe.rs
+          python3 -m py_compile harness/tools/ct10_borrowed_dependency_abba.py
+          for root in before after; do
+            cat > "$root/Cargo.toml" <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+            rm -f "$root/Cargo.lock"
+          done
+          echo '98b50c6e74a1be56b35d2bfeb6c39bb19bb6fbe8' > results/parent.txt
+          echo '84c48e043605029f773fbdad651726ba224045aa' > results/candidate.txt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before -> target
+            after -> target
+          key: borrowed-ssa-deps-pass-abba
+      - name: Build both release mode optimizer probes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path before/Cargo.toml -p compiler-opt --example borrowed_dependency_probe --target-dir "$PWD/before-target"
+          cargo build --release --manifest-path after/Cargo.toml -p compiler-opt --example borrowed_dependency_probe --target-dir "$PWD/after-target"
+      - name: ABBA 7-sample inner medians of actual DCE allocations and latency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct10_borrowed_dependency_abba.py \
+            --before before-target/release/examples/borrowed_dependency_probe \
+            --after after-target/release/examples/borrowed_dependency_probe \
+            --rounds 3 --raw results/pass-raw.csv --report results/pass-report.md
+          cat results/pass-report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Save pass-local allocations, CPU/RSS and raw timing
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: borrowed-ssa-dependency-pass-abba
+          path: results/
+          if-no-files-found: warn
+
+  source_abba:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    strategy:
+      fail-fast: false
+      matrix:
+        session: [a, b]
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '98b50c6e74a1be56b35d2bfeb6c39bb19bb6fbe8'
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '84c48e043605029f773fbdad651726ba224045aa'
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm source pins and toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C before rev-parse HEAD)" = '98b50c6e74a1be56b35d2bfeb6c39bb19bb6fbe8'
+          test "$(git -C after rev-parse HEAD)" = '84c48e043605029f773fbdad651726ba224045aa'
+          mkdir -p results
+          git -C before rev-parse HEAD > results/before.txt
+          git -C after rev-parse HEAD > results/after.txt
+          rustc --version | tee results/rustc.txt
+          lscpu | grep 'Model name' | tee results/cpu.txt || true
+          python3 -m py_compile harness/tools/ct06_abba.py harness/tools/ct06_large_corpus.py
+      - name: Enable pinned public frontend dependencies
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before/tools/mini-c-driver -> target
+            after/tools/mini-c-driver -> target
+          key: borrowed-ssa-deps-source-${{ matrix.session }}
+      - name: Build same-source release Mini-C compilers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path before/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+          cargo build --release --manifest-path after/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+      - name: Generate 12 checked C-source programs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct06_large_corpus.py --helpers after/tools --out corpus
+          cp corpus/manifest.csv results/source-manifest.csv
+      - name: Source-to-ELF ABBA and byte-for-byte object parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct06_abba.py --helpers after/tools --corpus corpus \
+            --before before/tools/mini-c-driver/target/release/compiler-mini-c \
+            --after after/tools/mini-c-driver/target/release/compiler-mini-c \
+            --extended-24-128 --require-identical-elf \
+            --samples 5 --raw results/source-raw.csv --report results/source-report.md
+          cat results/source-report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve raw source and parity results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: borrowed-ssa-deps-source-${{ matrix.session }}
+          path: results/
+          if-no-files-found: warn
