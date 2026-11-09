@@ -265,7 +265,14 @@ jobs:
             gcc -std=c11 -O2 -Wall -Wextra -Werror edg_d3_calls_native.o edg_native_d3_calls_driver.c -o compiler_edg_d3_calls
             ./gcc_edg_d3_calls
             ./compiler_edg_d3_calls
-            for source in edg_native_d3_calls_bad_indirect.c edg_native_d3_calls_bad_void.c edg_native_d3_calls_bad_variadic.c; do
+            # The source-proven GP-only variadic case is now an accepted
+            # object (no local definition needed for the relocatable ABI).
+            if ! "$binary" edg_d3_variadic_native.o --c11 edg_native_d3_calls_bad_variadic.c >edg_d3_variadic.log 2>&1; then
+              cat edg_d3_variadic.log
+              exit 1
+            fi
+            nm -u edg_d3_variadic_native.o | grep -q 'edg_d3_varargs'
+            for source in edg_native_d3_calls_bad_indirect.c edg_native_d3_calls_bad_void.c; do
               rm -f bad_edg_d3_calls.o bad_edg_d3_calls.log
               if "$binary" bad_edg_d3_calls.o --c11 "$source" >bad_edg_d3_calls.log 2>&1; then
                 echo "Unsupported direct C call unexpectedly compiled: $source"
@@ -600,15 +607,33 @@ jobs:
             ./native_puts_hello >native_puts.out
             test "$(cat native_puts.out)" = "$(cat gcc_puts.out)"
             test "$(cat native_puts.out)" = 'Hello, world!'
-            rm -f native_printf.o printf_rejected.log
-            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_stdio_hello_printf.c -o gcc_printf_hello
-            ./gcc_printf_hello >gcc_printf.out
-            test "$(cat gcc_printf.out)" = 'Hello, world!'
-            if "$binary" native_printf.o --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu edg_stdio_hello_printf.c >printf_rejected.log 2>&1; then
-              echo "Unexpected native variadic printf acceptance without ABI check"
+            # Real glibc variadic calls must use the existing x86
+            # source-checked GP-only SysV ABI path (AL=0).
+            for source in edg_stdio_hello_printf.c edg_stdio_printf_values.c edg_stdio_printf_many.c; do
+              case "$source" in
+                edg_stdio_hello_printf.c) expected='Hello, world!' ;;
+                edg_stdio_printf_values.c) expected='n=7 word=ready big=1234567890' ;;
+                edg_stdio_printf_many.c) expected='11:22:33:44:55:66:77' ;;
+              esac
+              if ! "$binary" native_printf.o --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu "$source" >printf_native.log 2>&1; then
+                cat printf_native.log
+                exit 1
+              fi
+              test "$(od -An -tx1 -N4 native_printf.o | tr -d '[:space:]')" = 7f454c46
+              nm -u native_printf.o | grep -q 'printf'
+              readelf -S native_printf.o | grep -q '\.rodata'
+              gcc -std=c11 -O2 -Wall -Wextra -Werror "$source" -o gcc_printf_hello
+              gcc -std=c11 -O2 -Wall -Wextra -Werror native_printf.o -o native_printf_hello
+              ./gcc_printf_hello >gcc_printf.out
+              ./native_printf_hello >native_printf.out
+              test "$(cat gcc_printf.out)" = "$expected"
+              test "$(cat native_printf.out)" = "$(cat gcc_printf.out)"
+            done
+            rm -f bad_printf.o bad_printf.log
+            if "$binary" bad_printf.o --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu edg_stdio_printf_bad_fp.c >bad_printf.log 2>&1; then
+              echo "Unsupported SSE-class source variadic call was unexpectedly emitted"
               exit 1
             fi
-            cat printf_rejected.log
-            grep -q 'variadic or unprototyped' printf_rejected.log
-            test ! -e native_printf.o
+            cat bad_printf.log
+            test ! -e bad_printf.o
           )
