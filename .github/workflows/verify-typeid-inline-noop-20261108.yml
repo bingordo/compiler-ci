@@ -1,0 +1,92 @@
+name: TypeId CFG inliner no-op short circuit and release A/B
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/verify-typeid-inline-noop-20261108.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  no-op-inline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5256d92cbb5ae35cb420e47587bb19b2b1d824f8
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 6ad1818fcdf31d56692beb9f186be9e20028d21d
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source SHA
+        shell: bash
+        run: |
+          test "$(git -C after rev-parse HEAD)" = "5256d92cbb5ae35cb420e47587bb19b2b1d824f8"
+          test "$(git -C before rev-parse HEAD)" = "6ad1818fcdf31d56692beb9f186be9e20028d21d"
+      - name: Restrict workspace to public optimizer crates
+        shell: bash
+        run: |
+          for dir in before after; do
+            cat > "$dir/Cargo.toml" <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+            rm -f "$dir/Cargo.lock"
+          done
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: after -> target
+          key: typeid-inliner-noop
+      - name: Verify no-op, malformed, positive and native regressions
+        working-directory: after
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_core_inline_integration -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_cfg_native -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_memory_native -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_wide_void_native -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_leaf_native -- --nocapture
+          cargo test -p compiler-opt --features verify-counts --test typed_core_inline_integration bounded_trial_cost_is_one_caller_not_full_module_per_inline -- --nocapture
+          cargo clippy -p compiler-opt --all-targets -- -D warnings
+      - name: Copy identical no-op benchmark to pinned previous source
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          relative = "crates/opt/tests/typed_core_inline_integration.rs"
+          original = Path("before") / relative
+          changed = Path("after") / relative
+          old, new = original.read_text(), changed.read_text()
+          marker = "#[test]\nfn bounded_inliner_release_profile_reports_padded_module_time()"
+          start = new.index("// 49 non-generated-instruction-shaped function bodies")
+          end = new.index(marker, start)
+          assert marker in old and "no_op_cfg_inliner_release_profile" not in old
+          original.write_text(old.replace(marker, new[start:end] + marker))
+          PY
+      - name: Same runner ABBA nine-sample no-op release measurements
+        shell: bash
+        run: |
+          set -euo pipefail
+          for iteration in 1 2 3 4; do
+            case "$iteration" in 1|4) dir=before ;; *) dir=after ;; esac
+            (
+              cd "$dir"
+              cargo test --release -p compiler-opt --test typed_core_inline_integration no_op_cfg_inliner_release_profile -- --nocapture
+            ) 2>&1 | tee "$RUNNER_TEMP/typeid-noop-$iteration-$dir.log"
+          done
+          grep -H 'TYPEID_INLINER_NOOP_49 median_us=' "$RUNNER_TEMP"/typeid-noop-*.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: typeid-inliner-noop
+          path: ${{ runner.temp }}/typeid-noop-*.log
+          if-no-files-found: ignore
