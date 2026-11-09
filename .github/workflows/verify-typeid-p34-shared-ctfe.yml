@@ -1,0 +1,67 @@
+name: TypeId P3.4 shared legacy CTFE bounded pure evaluator
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-typeid-p34-shared-ctfe.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  p34:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout pinned compiler CTFE candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 10f9fe978be46454d1a7c8fa6e98464657c31997
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify immutable source SHA
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "10f9fe978be46454d1a7c8fa6e98464657c31997"
+      - name: Resolve public GitHub pinned frontend dependencies
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: p34-existing-pure-ctfe
+      - name: TypeId versus legacy CTFE parity, trapping guards and source dispatcher
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typed_ctfe -- --nocapture
+      - name: Zero old SSA verification in native TypeId CTFE
+        working-directory: compiler
+        run: cargo test -p compiler-opt --features verify-counts --test typed_ctfe -- --nocapture
+      - name: Existing legacy CTFE and typed core/inliner/array optimizers
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --lib ctfe -- --nocapture
+          cargo test -p compiler-opt --test typed_core_pipeline
+          cargo test -p compiler-opt --test typed_core_inline_integration
+          cargo test -p compiler-opt --test typed_array_fold
+      - name: Real checked source GAS and direct ELF independent C11
+        working-directory: compiler
+        run: cargo test -p compiler --bin compiler typeid_native_source -- --nocapture
+      - name: Full checked Mini-C and Oberon driver regression
+        working-directory: compiler
+        run: cargo test -p compiler --bin compiler
+      - name: AArch64 shared TypeId API
+        working-directory: compiler
+        run: cargo check -p compiler-backend-aarch64 --all-targets
+      - name: Strict compiler opt IR x86 and AArch64 lint
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler -p compiler-backend-x86 --all-targets -- -D warnings
+          cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
+      - name: Install GDB for existing DWARF regression
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gdb
+      - name: Full IR optimizer backend and x86 regression suite
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
