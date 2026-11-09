@@ -90,6 +90,14 @@ jobs:
           test -s build/prebuilt-edg/lib/libedgcpfe.a
           cp build/prebuilt-edg/lib/libedgcpfe.a build/gcc-release/lib/libedgcpfe.a
 
+      - name: Check out C++0 EDG linker-symbol export candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/edgcpp-rust
+          ref: cranelift-codegen
+          path: edg-rust
+          persist-credentials: false
+
       - name: Install pinned Rust toolchain
         run: |
           if ! command -v cargo >/dev/null; then
@@ -516,4 +524,30 @@ jobs:
               cat bad_edg_struct.log
               test ! -e bad_edg_struct.o
             done
+          )
+      - name: EDG C++0 source authoritative linker names vs GCC Itanium nm
+        env:
+          EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+          EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+          EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+          EDGCPP_EDG_REVISION: ${{ env.EDG_SOURCE_SHA }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test --manifest-path edg-rust/Cargo.toml --lib decodes_exact_distinct_edg_cxx_link_names_without_demangling
+          cp edg-rust/tests/fixtures/cxx_link_names.cpp edgcpp/build/gcc-release/
+          (
+            cd edgcpp/build/gcc-release
+            source environment.sh
+            g++ -std=c++17 -O2 -Wall -Wextra -Werror -c cxx_link_names.cpp -o gxx_link_names.o
+            nm -g --defined-only gxx_link_names.o | grep -qF '_ZN5alpha10overloadedEi'
+            nm -g --defined-only gxx_link_names.o | grep -qF '_ZN5alpha10overloadedEl'
+            nm -g --defined-only gxx_link_names.o | grep -qF '_ZN5alpha4beta6nestedEi'
+            nm -g --defined-only gxx_link_names.o | grep -qF ' edg_c_abi'
+            cargo run --quiet --manifest-path ../../../edg-rust/Cargo.toml --example link_names -- cxx_link_names.cpp >edg_link_names.txt
+            cat edg_link_names.txt
+            grep -F $'\t1\t_ZN5alpha10overloadedEi\t' edg_link_names.txt
+            grep -F $'\t1\t_ZN5alpha10overloadedEl\t' edg_link_names.txt
+            grep -F $'\t1\t_ZN5alpha4beta6nestedEi\t' edg_link_names.txt
+            grep -F $'\t0\tedg_c_abi\t' edg_link_names.txt
           )
