@@ -1,0 +1,164 @@
+name: TypeId checked-source single transaction baseline ABBA
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/typeid-source-single-transaction.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/typeid-source-single-transaction.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  optimizer-abba:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact original compiler main
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: bc915eb1323898500283a4fa0174e2761415ed6f
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact single-transaction compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7e537d9472b6e82770cfa306791b4b938a122875
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source identity and use identical release benchmark fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C before rev-parse HEAD)" = bc915eb1323898500283a4fa0174e2761415ed6f
+          test "$(git -C after rev-parse HEAD)" = 7e537d9472b6e82770cfa306791b4b938a122875
+          for side in before after; do
+            cat > "$side/Cargo.toml" <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+            rm -f "$side/Cargo.lock"
+          done
+          # Baseline and candidate compile the identical *test harness*,
+          # while their optimizer implementation remains versioned.
+          cp after/crates/opt/tests/typed_ctfe.rs before/crates/opt/tests/typed_ctfe.rs
+          rustc --version
+          lscpu | grep 'Model name:' || true
+      - name: Cache optimizer release artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: after -> target
+          key: typeid-single-source-core-abba
+      - name: Build both optimizer benchmarks in release mode
+        run: |
+          cargo test --release --manifest-path before/Cargo.toml -p compiler-opt --test typed_ctfe --no-run
+          cargo test --release --manifest-path after/Cargo.toml -p compiler-opt --test typed_ctfe --no-run
+      - name: Compare exact canonical TypeId SSA and source optimizer time ABBA
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          python3 - <<'PY'
+          import os, pathlib, re, subprocess, statistics, hashlib
+          from collections import defaultdict
+          root=pathlib.Path.cwd()
+          results=root/'results'
+          samples=defaultdict(list)
+          expected=None
+          # Alternating order minimizes thermal/runner warm-up bias.
+          for i,side in enumerate(['before','after','after','before',
+                                  'after','before','before','after']):
+              out=results/f'{side}-{i}.ir'
+              env=os.environ.copy()
+              env['TYPEID_SOURCE_TX_OUTPUT']=str(out)
+              cmd=['cargo','test','--release','--manifest-path',str(root/side/'Cargo.toml'),
+                   '-p','compiler-opt','--test','typed_ctfe',
+                   'typeid_source_single_transaction_profile','--','--ignored','--nocapture']
+              p=subprocess.run(cmd,env=env,text=True,stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT,check=True)
+              (results/f'{side}-{i}.log').write_text(p.stdout)
+              m=re.search(r'TYPEID_SOURCE_TX_PROFILE groups=(\d+) funcs=(\d+) samples=(\d+) median_ns=(\d+) min_ns=(\d+) max_ns=(\d+) ir_bytes=(\d+)',p.stdout)
+              if not m:
+                  raise RuntimeError(f'missing benchmark output {side}/{i}: {p.stdout[-2000:]}')
+              groups,funcs,reps,median,mn,mx,nbytes=map(int,m.groups())
+              samples[side].append(median)
+              digest=hashlib.sha256(out.read_bytes()).hexdigest()
+              if expected is None: expected=digest
+              if digest!=expected:
+                  raise RuntimeError(f'canonical SSA mismatch: {side}/{i}: {digest} != {expected}')
+              print(f'TYPEID_SOURCE_ABBA side={side} order={i} funcs={funcs} groups={groups} median_ns={median} sha256={digest}',flush=True)
+          old=statistics.median(samples['before'])
+          new=statistics.median(samples['after'])
+          delta=(new/old-1)*100 if old else 0
+          summary=(f'# Source TypeId optimizer single-copy release A/B\n\n'
+                   f'Baseline: \\x60bc915eb1323898500283a4fa0174e2761415ed6f\\x60; candidate: \\x607e537d9472b6e82770cfa306791b4b938a122875\\x60\n\n'
+                   f'Fixture: 24 groups / 96 TypeId functions; bounded CTFE plus core rerun.\n'
+                   f'4 independent ABBA runs per version, nine timed calls/run; '
+                   f'input construction outside timed region.\n\n'
+                   f'- Baseline median: {old:.0f} ns\n'
+                   f'- Candidate median: {new:.0f} ns\n'
+                   f'- Candidate relative change: {delta:+.2f}%\n'
+                   f'- Canonical SSA SHA-256, all runs: \\x60{expected}\\x60\n'
+                   f'- All output verified byte-identical. Noise and workload specificity apply.\n')
+          # Convert escaped code tick notation after embedding safely in YAML.
+          summary=summary.replace('\\x60','`')
+          (results/'summary.md').write_text(summary)
+          print(summary)
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f: f.write(summary)
+          PY
+      - name: Cross-pass regression, native oracle and strict lint
+        working-directory: after
+        run: |
+          cargo test -p compiler-opt --test typed_ctfe -- --nocapture
+          cargo test -p compiler-opt --test typed_core_pipeline -- --nocapture
+          cargo test -p compiler-opt --test typed_identical_merges -- --nocapture
+          cargo test -p compiler-opt --test generated_native_zero_compare -- --nocapture
+          cargo test -p compiler-backend-x86 --test native_s23_profitability -- --nocapture
+          cargo clippy -p compiler-opt --all-targets -- -D warnings
+          cargo clippy -p compiler-backend-x86 --bin typeid-x86 --test native_s23_profitability -- -D warnings
+      - name: Upload exact output and release timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: typeid-single-transaction-abba
+          path: results/
+          retention-days: 30
+
+  checked-source-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7e537d9472b6e82770cfa306791b4b938a122875
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify checked-source revision and frontend dependencies
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = 7e537d9472b6e82770cfa306791b4b938a122875
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-single-source-cli-native
+      - name: Execute real checked Mini-C and Oberon TypeId C11 GAS/direct ELF oracles in release
+        working-directory: compiler
+        run: cargo test --release -p compiler --test typeid_elf_linker_matrix -- --nocapture
+      - name: Execute checked TypeId driver unit coverage and unsupported mode errors
+        working-directory: compiler
+        run: cargo test -p compiler --bin compiler typeid -- --nocapture
