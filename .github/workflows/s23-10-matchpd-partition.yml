@@ -1,0 +1,76 @@
+name: S23.10 match.pd arithmetic/bitwise partition SSA and native oracles
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-10-matchpd-partition.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/s23-10-matchpd-partition.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-pinned-s23-10:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - name: Checkout compiler S23.10 exact candidate source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b414751045af71ed9f0f81db89d77c1f5fcaef7a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and isolate four credential-independent crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = b414751045af71ed9f0f81db89d77c1f5fcaef7a
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - name: Reuse self-contained Rust workspace compilation
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: s22-native-integer-generated
+      - name: S23.10 generated four-family five-width SSA and negative guards
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test generated_native_matchpd_partition -- --nocapture
+          cargo test -p compiler-opt --test generated_native_opposing_shift -- --nocapture
+          cargo test -p compiler-opt --test generated_native_boolean_dag -- --nocapture
+          cargo test -p compiler-opt --test generated_native_complement_dag -- --nocapture
+          cargo test -p compiler-opt --test generated_native_shift_affine -- --nocapture
+          cargo test -p compiler-opt --test generated_native_zero_compare -- --nocapture
+      - name: Existing generated comparison and extension regressions
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test generated_native_compare_dag -- --nocapture
+          cargo test -p compiler-opt --test generated_native_extension_literal -- --nocapture
+          cargo test -p compiler-opt --test generated_native_extension_compare -- --nocapture
+          cargo test -p compiler-opt --test generated_native_sign_order -- --nocapture
+      - name: Production TypeId core, source CTFE and CFG parity regressions
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typed_core_pipeline -- --nocapture
+          cargo test -p compiler-opt --test typed_ctfe -- --nocapture
+          cargo test -p compiler-opt --test typed_identical_merges -- --nocapture
+      - name: Native C11/GAS/direct ELF oracle and actual .text cost
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend-x86 --test native_s23_profitability -- --nocapture
+          cargo test --release -p compiler-backend-x86 --test native_s23_profitability native_s2310_matchpd_arithmetic_partition_gas_elf_cost -- --nocapture
+      - name: Production-mode optimizer and direct ELF Clippy
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-opt --all-targets -- -D warnings
+          cargo clippy -p compiler-backend-x86 --bin typeid-x86 --test native_s23_profitability -- -D warnings
