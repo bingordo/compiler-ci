@@ -1,0 +1,98 @@
+name: TypeId P3.2 unified existing-pass source optimizer
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-typeid-p32-production-optimizer.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  p32:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact P3.2 compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1fc32da99c528a2f06ae3a544964a7b747ac1451
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify immutable compiler SHA
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "1fc32da99c528a2f06ae3a544964a7b747ac1451"
+      - name: Resolve pinned public frontend dependencies
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-p32-unified-production
+      - name: Real checked Mini-C and Oberon TypeId source optimizer and C11 ELF/GAS
+        working-directory: compiler
+        run: cargo test -p compiler --bin compiler typeid_native_source -- --nocapture
+      - name: Full checked C and Oberon frontend driver suite
+        working-directory: compiler
+        run: cargo test -p compiler --bin compiler
+      - name: Independent actual compiler CLI native C11 GAS ELF execution
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          mkdir -p target/p32
+          cat > target/p32/native.c <<'EOF'
+          int native_choose(int n) {
+            int scratch=n+3;
+            if(n>5) return scratch*2;
+            return scratch-1;
+          }
+          EOF
+          cat > target/p32/oracle.c <<'EOF'
+          extern int native_choose(int);
+          int main(void) {
+            for(int n=-20;n<50;n++) {
+              const int expected=n>5 ? (n+3)*2 : n+2;
+              if(native_choose(n)!=expected) return 1;
+            }
+            return 0;
+          }
+          EOF
+          for format in obj asm; do
+            if [ "$format" = obj ]; then ext=o; else ext=s; fi
+            cargo run --quiet -p compiler --bin compiler -- target/p32/native.c --language mini-c --ir typeid --emit "$format" -o "target/p32/native.$ext"
+            if [ "$format" = asm ]; then
+              cc -c target/p32/native.s -o target/p32/assembled.o
+              obj=target/p32/assembled.o
+            else
+              obj=target/p32/native.o
+            fi
+            cc -std=c11 -O2 -Wall -Wextra -Werror target/p32/oracle.c "$obj" -o target/p32/oracle
+            target/p32/oracle
+          done
+      - name: Existing native TypeId optimizer transactions and typed-core differential
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typed_core_native_verifier
+          cargo test -p compiler-opt --test typed_core_pipeline
+          cargo test -p compiler-opt --test typed_core_inline_integration
+      - name: Strict typed pass no legacy SSA verifier accounting
+        working-directory: compiler
+        run: cargo test -p compiler-opt --features verify-counts --test typed_core_native_verifier
+      - name: AArch64 native shared TypeId compatibility
+        working-directory: compiler
+        run: cargo check -p compiler-backend-aarch64 --all-targets
+      - name: Strict IR optimizer driver x86 and AArch64 lint
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-opt -p compiler-ir -p compiler -p compiler-backend-x86 --all-targets -- -D warnings
+          cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
+      - name: Install GDB required by existing DWARF oracle
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gdb
+      - name: Full IR optimizer and native backend regression
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
