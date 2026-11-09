@@ -1,0 +1,51 @@
+name: Combined TypeId CSR default and borrowed visitors
+'on':
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/typeid-csr-visitors-combined-20261109.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '483eaf60b3c008aa542ea6ff88586626fb8d44ae'
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin exact merged compiler and toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = '483eaf60b3c008aa542ea6ff88586626fb8d44ae'
+          rustc --version
+          cargo --version
+          lscpu | grep 'Model name' || true
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: combined-sccp-csr-visitor
+      - name: Full release core tests, CSR default
+        working-directory: compiler
+        run: cargo test --release -p compiler-ir -p compiler-opt
+      - name: Hash fallback SCCP and operand use ordering
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release -p compiler-opt --features experimental-sccp-hash sccp
+          cargo test --release -p compiler-ir --test op_operand_visitors
+      - name: Strict changed-library Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt --lib -- -D warnings
