@@ -1,0 +1,71 @@
+name: M4.10 TypeId ELF/GAS BFD-LLD native acceptance
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-m4-10-typeid-linkers.yml']
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact compiler SHA
+        required: true
+        default: caa349121ae3a8df05f5c57a2586357e608a2f76
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: m410-typeid-elf-${{ github.event.inputs.source_ref || github.head_ref || 'candidate' }}
+  cancel-in-progress: true
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact compiler commit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || 'caa349121ae3a8df05f5c57a2586357e608a2f76' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check source identity and toolchains
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            test "$actual" = "caa349121ae3a8df05f5c57a2586357e608a2f76"
+          fi
+          echo "Exact ELF source: $actual" >> "$GITHUB_STEP_SUMMARY"
+          gcc --version | head -1
+          clang --version | head -1
+          ld.bfd --version | head -1
+          ld.lld --version | head -1
+          readelf --version | head -1
+          test -s crates/backend-x86/tests/native_typeid_memory_calls.rs
+      - name: Keep build independent from private frontend checkout
+        working-directory: compiler
+        shell: bash
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m410-typeid-linker-gate
+          cache-workspace-crates: 'true'
+      - name: Execute mandatory GCC/BFD and Clang/LLD native TypeId ELF/GAS matrix
+        working-directory: compiler
+        env:
+          COMPILER_ELF_REQUIRE_LLVM: '1'
+        run: cargo test -p compiler-backend-x86 --test native_typeid_memory_calls -- --nocapture
+      - name: Full self-contained native/IR/optimizer/backend tests
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --features compiler-backend-x86/x7-native-form-validation
+      - name: Strict Clippy including native test
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --features compiler-backend-x86/x7-native-form-validation --all-targets -- -D warnings
