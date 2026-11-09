@@ -1,0 +1,63 @@
+name: P3 TypeId shared dead-use correctness
+on:
+  pull_request:
+    paths: ['.github/workflows/p3-typeid-dce-shared.yml']
+  push:
+    branches: [main]
+    paths: ['.github/workflows/p3-typeid-dce-shared.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dce:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out immutable TypeId DCE compiler PR source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 466f43163a93538f85b26790ae0f46896e5a7342
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and isolate self-contained core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 466f43163a93538f85b26790ae0f46896e5a7342
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: p3-shared-dce-core
+      - name: Original typed effect and atomic rollback tests
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typed_local -- --nocapture
+      - name: Generated five-width dead-use parity and simplifier regressions
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test generated_native_zero_compare -- --nocapture
+          cargo test -p compiler-opt --test generated_native_compare_dag -- --nocapture
+          cargo test -p compiler-opt --test generated_native_extension_literal -- --nocapture
+      - name: Existing TypeId optimizer pipeline and CFG effects
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typed_core_pipeline -- --nocapture
+          cargo test -p compiler-opt --test native_cfg_differential -- --nocapture
+      - name: Real native C11 oracles for direct ELF and GAS
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --test native_s23_profitability -- --nocapture
+      - name: Strict TypeId optimizer and native backend lint
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-opt --all-targets -- -D warnings
+          cargo clippy -p compiler-backend-x86 --bin typeid-x86 --test native_s23_profitability -- -D warnings
