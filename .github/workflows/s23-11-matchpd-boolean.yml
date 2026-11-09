@@ -1,0 +1,158 @@
+name: S23.11 match.pd Boolean DAG parity and native cost
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-11-matchpd-boolean.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/s23-11-matchpd-boolean.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-pinned-s23-11:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - name: Checkout exact S23.11 compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9cf15bddd2be5c116c398e50ff111d53a4ef5077
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and isolate four credential-independent crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 9cf15bddd2be5c116c398e50ff111d53a4ef5077
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - name: Reuse self-contained Rust workspace compilation
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: s22-native-integer-generated
+      - name: S23.11 four-family five-width Boolean DAG and malformed rollback
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test generated_native_matchpd_boolean_s2311 -- --nocapture
+          cargo test -p compiler-opt --test generated_native_matchpd_partition -- --nocapture
+          cargo test -p compiler-opt --test generated_native_opposing_shift -- --nocapture
+          cargo test -p compiler-opt --test generated_native_boolean_dag -- --nocapture
+          cargo test -p compiler-opt --test generated_native_complement_dag -- --nocapture
+          cargo test -p compiler-opt --test generated_native_shift_affine -- --nocapture
+          cargo test -p compiler-opt --test generated_native_zero_compare -- --nocapture
+      - name: Existing generated comparison and extension regressions
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test generated_native_compare_dag -- --nocapture
+          cargo test -p compiler-opt --test generated_native_extension_literal -- --nocapture
+          cargo test -p compiler-opt --test generated_native_extension_compare -- --nocapture
+          cargo test -p compiler-opt --test generated_native_sign_order -- --nocapture
+      - name: Production TypeId core, source CTFE and CFG parity regressions
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typed_core_pipeline -- --nocapture
+          cargo test -p compiler-opt --test typed_ctfe -- --nocapture
+          cargo test -p compiler-opt --test typed_identical_merges -- --nocapture
+      - name: Native C11/GAS/direct ELF oracle and actual .text cost
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend-x86 --test native_s23_profitability -- --nocapture
+          cargo test --release -p compiler-backend-x86 --test native_s23_profitability native_s2311_matchpd_boolean_dag_gas_elf_per_family -- --nocapture
+      - name: Production-mode optimizer and direct ELF Clippy
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-opt --all-targets -- -D warnings
+          cargo clippy -p compiler-backend-x86 --bin typeid-x86 --test native_s23_profitability -- -D warnings
+
+  no-match-release-abba:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact pre-S23.11 main baseline
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a191b425817202976a947eac71b62ba39906c469
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact S23.11 candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9cf15bddd2be5c116c398e50ff111d53a4ef5077
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin sources and isolate same four Rust crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C before rev-parse HEAD)" = a191b425817202976a947eac71b62ba39906c469
+          test "$(git -C after rev-parse HEAD)" = 9cf15bddd2be5c116c398e50ff111d53a4ef5077
+          for side in before after; do
+            cat > "$side/Cargo.toml" <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+            rm -f "$side/Cargo.lock"
+          done
+      - name: Compile identical 24-function native test in release
+        run: |
+          cargo test --release --manifest-path before/Cargo.toml -p compiler-backend-x86 --test native_s23_profitability --no-run
+          cargo test --release --manifest-path after/Cargo.toml -p compiler-backend-x86 --test native_s23_profitability --no-run
+      - name: Release ABBA optimizer-only no-new-family cost and SSA/output signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          python3 - <<'PY'
+          import pathlib, subprocess, statistics, re
+          root=pathlib.Path.cwd()
+          timings={'before':[],'after':[]}
+          signatures={'before':set(),'after':set()}
+          for i,side in enumerate(['before','after','after','before','after','before','before','after']):
+              cmd=['cargo','test','--release','--manifest-path',str(root/side/'Cargo.toml'),
+                   '-p','compiler-backend-x86','--test','native_s23_profitability',
+                   'native_s23_baseline_vs_optin_exact_elf_and_gas','--','--nocapture']
+              p=subprocess.run(cmd,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,check=True)
+              (root/'results'/f'{side}-{i}.log').write_text(p.stdout)
+              m=re.search(r'S23_OPTIMIZER_OVERHEAD funcs=24 standalone_twopass_ns_median=(\d+) combined_singleclone_ns_median=(\d+)',p.stdout)
+              s=re.search(r'S23_NATIVE_COST funcs=24 widths=8,16,32,64 baseline_text=(\d+) optimized_text=(\d+) optimizer_rewrites=(\d+) eliminated_dead=(\d+)',p.stdout)
+              if not m or not s:
+                  raise RuntimeError(f'missing benchmark evidence {side}/{i}: {p.stdout[-3000:]}')
+              timings[side].append(int(m.group(2)))
+              signatures[side].add(s.groups())
+              print(f'S2311_MISS_ABBA side={side} order={i} ns={m.group(2)} signature={s.groups()}',flush=True)
+          if len(signatures['before'])!=1 or signatures['before']!=signatures['after']:
+              raise RuntimeError(f'preexisting native corpus outputs changed: {signatures}')
+          before=statistics.median(timings['before'])
+          after=statistics.median(timings['after'])
+          pct=100*(after/before-1)
+          summary=f'S2311_MISS_COST baseline_ns={before:.0f} candidate_ns={after:.0f} change_pct={pct:+.2f} exact_signatures={signatures["before"]}'
+          print(summary,flush=True)
+          (root/'results'/'summary.txt').write_text(summary+'\n')
+          with open('/dev/stdout','a') as f: pass
+          PY
+      - name: Retain source-pinned release timing evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2311-matchpd-no-match-release-abba
+          path: results/
+          retention-days: 30
