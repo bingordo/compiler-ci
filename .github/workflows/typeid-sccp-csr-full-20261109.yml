@@ -1,0 +1,113 @@
+name: Full TypeId SCCP CSR differential and source ABBA
+'on':
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/typeid-sccp-csr-full-20261109.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '64726b85fe690daac2186d0dd78ddecab67969ba'
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned compiler SHA
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "64726b85fe690daac2186d0dd78ddecab67969ba"
+          rustc --version
+          lscpu | grep 'Model name' || true
+      - name: Isolate core workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-sccp-csr-core
+      - name: Full core + typed SCCP tests on hashed default
+        working-directory: compiler
+        run: |
+          cargo test --release -p compiler-ir -p compiler-opt
+      - name: Complete SCCP tests with opt-in CSR enabled
+        working-directory: compiler
+        run: |
+          cargo test --release -p compiler-opt --features experimental-sccp-csr
+          cargo clippy -p compiler-opt --all-targets --features experimental-sccp-csr -- -D warnings
+
+  source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        session: [a, b]
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '64726b85fe690daac2186d0dd78ddecab67969ba'
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm pinned source and tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "64726b85fe690daac2186d0dd78ddecab67969ba"
+          rustc --version
+          cargo --version
+          lscpu | grep 'Model name' || true
+          python3 -m py_compile harness/tools/ct06_abba.py harness/tools/ct06_large_corpus.py
+          mkdir -p results
+          git -C compiler rev-parse HEAD > results/compiler-sha.txt
+      - name: Pin public Mini-C git dependency
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: typeid-sccp-csr-source-${{ matrix.session }}
+      - name: Build two release compilers from identical source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c --target-dir "$PWD/baseline-target"
+          cargo build --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c --features compiler-opt/experimental-sccp-csr --target-dir "$PWD/indexed-target"
+          test -x baseline-target/release/compiler-mini-c
+          test -x indexed-target/release/compiler-mini-c
+          sha256sum baseline-target/release/compiler-mini-c indexed-target/release/compiler-mini-c > results/compiler-binaries.sha256
+      - name: Generate 12 checked Mini-C source programs
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct06_large_corpus.py --helpers compiler/tools --out corpus
+          cp corpus/manifest.csv results/source-manifest.csv
+      - name: Two-mode ABBA source to ELF byte parity and RSS
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct06_abba.py             --helpers compiler/tools --corpus corpus             --before baseline-target/release/compiler-mini-c             --after indexed-target/release/compiler-mini-c             --extended-24-128 --require-identical-elf             --samples 5 --raw results/raw.csv --report results/report.md
+          cat results/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Save raw source-to-ELF results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: typeid-sccp-csr-abba-${{ matrix.session }}
+          path: results/
+          if-no-files-found: warn
