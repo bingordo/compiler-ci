@@ -551,3 +551,64 @@ jobs:
             grep -F $'\t1\t_ZN5alpha4beta6nestedEi\t' edg_link_names.txt
             grep -F $'\t0\tedg_c_abi\t' edg_link_names.txt
           )
+      - name: EDG glibc stdio.h native C include, puts and hello acceptance
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cp tools/edg-driver/tests/fixtures/edg_stdio*.c ../edgcpp/build/gcc-release/
+          (
+            cd ../edgcpp/build/gcc-release
+            source environment.sh
+            binary="../../../compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+            gcc_include="$(gcc -print-file-name=include)"
+            test -f "$gcc_include/stddef.h"
+            if ! "$binary" edg_stdio_header_puts.o --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu edg_stdio_header_puts.c >stdio_header.log 2>&1; then
+              cat stdio_header.log
+              exit 1
+            fi
+            test "$(od -An -tx1 -N4 edg_stdio_header_puts.o | tr -d '[:space:]')" = 7f454c46
+            nm -g --defined-only edg_stdio_header_puts.o | grep -q edg_stdio_puts
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_stdio_header_puts.c edg_stdio_header_puts_driver.c -o gcc_stdio_puts
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_stdio_header_puts.o edg_stdio_header_puts_driver.c -o native_stdio_puts
+            ./gcc_stdio_puts >gcc_stdio.out
+            ./native_stdio_puts >native_stdio.out
+            test "$(cat gcc_stdio.out)" = "$(cat native_stdio.out)"
+            test "$(cat native_stdio.out)" = 'Hello, world!'
+            if ! "$binary" edg_stdio_putchar.o --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu edg_stdio_hello_putchar.c >putchar.log 2>&1; then
+              cat putchar.log
+              exit 1
+            fi
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_stdio_hello_putchar.c -o gcc_putchar_hello
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_stdio_putchar.o -o native_putchar_hello
+            ./gcc_putchar_hello >gcc_putchar.out
+            ./native_putchar_hello >native_putchar.out
+            test "$(cat native_putchar.out)" = "$(cat gcc_putchar.out)"
+            test "$(cat native_putchar.out)" = 'Hello, world!'
+            # No source modifications: real NUL-ended EDG ck_string data.
+            # The native x86 module must define immutable .rodata bytes and
+            # perform a normal glibc puts call from the compiled main.
+            if ! "$binary" native_puts_hello.o --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu edg_stdio_hello_puts.c >native_puts.log 2>&1; then
+              cat native_puts.log
+              exit 1
+            fi
+            test "$(od -An -tx1 -N4 native_puts_hello.o | tr -d '[:space:]')" = 7f454c46
+            nm -a native_puts_hello.o | grep -q _EDG_CSTR_
+            readelf -S native_puts_hello.o | grep -q '\.rodata'
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_stdio_hello_puts.c -o gcc_puts_hello
+            gcc -std=c11 -O2 -Wall -Wextra -Werror native_puts_hello.o -o native_puts_hello
+            ./gcc_puts_hello >gcc_puts.out
+            ./native_puts_hello >native_puts.out
+            test "$(cat native_puts.out)" = "$(cat gcc_puts.out)"
+            test "$(cat native_puts.out)" = 'Hello, world!'
+            rm -f native_printf.o printf_rejected.log
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_stdio_hello_printf.c -o gcc_printf_hello
+            ./gcc_printf_hello >gcc_printf.out
+            test "$(cat gcc_printf.out)" = 'Hello, world!'
+            if "$binary" native_printf.o --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu edg_stdio_hello_printf.c >printf_rejected.log 2>&1; then
+              echo "Unexpected native variadic printf acceptance without ABI check"
+              exit 1
+            fi
+            cat printf_rejected.log
+            grep -q 'variadic or unprototyped' printf_rejected.log
+            test ! -e native_printf.o
+          )
