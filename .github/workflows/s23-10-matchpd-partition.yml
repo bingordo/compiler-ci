@@ -74,3 +74,84 @@ jobs:
         run: |
           cargo clippy -p compiler-opt --all-targets -- -D warnings
           cargo clippy -p compiler-backend-x86 --bin typeid-x86 --test native_s23_profitability -- -D warnings
+
+  no-match-release-abba:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact pre-S23.10 baseline
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 6284a74cf958b1ce05ee1e8b826e4c896bc865de
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact S23.10 candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2867cb8d8ea0e2c9ebc1c77e14bc9cd128ea3b38
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin sources and isolate same four Rust crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C before rev-parse HEAD)" = 6284a74cf958b1ce05ee1e8b826e4c896bc865de
+          test "$(git -C after rev-parse HEAD)" = 2867cb8d8ea0e2c9ebc1c77e14bc9cd128ea3b38
+          for side in before after; do
+            cat > "$side/Cargo.toml" <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+            rm -f "$side/Cargo.lock"
+          done
+      - name: Compile identical 24-function native test in release
+        run: |
+          cargo test --release --manifest-path before/Cargo.toml -p compiler-backend-x86 --test native_s23_profitability --no-run
+          cargo test --release --manifest-path after/Cargo.toml -p compiler-backend-x86 --test native_s23_profitability --no-run
+      - name: Release ABBA optimizer-only no-new-family cost and SSA/output signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          python3 - <<'PY'
+          import pathlib, subprocess, statistics, re
+          root=pathlib.Path.cwd()
+          timings={'before':[],'after':[]}
+          signatures={'before':set(),'after':set()}
+          for i,side in enumerate(['before','after','after','before','after','before','before','after']):
+              cmd=['cargo','test','--release','--manifest-path',str(root/side/'Cargo.toml'),
+                   '-p','compiler-backend-x86','--test','native_s23_profitability',
+                   'native_s23_baseline_vs_optin_exact_elf_and_gas','--','--nocapture']
+              p=subprocess.run(cmd,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,check=True)
+              (root/'results'/f'{side}-{i}.log').write_text(p.stdout)
+              m=re.search(r'S23_OPTIMIZER_OVERHEAD funcs=24 standalone_twopass_ns_median=(\d+) combined_singleclone_ns_median=(\d+)',p.stdout)
+              s=re.search(r'S23_NATIVE_COST funcs=24 widths=8,16,32,64 baseline_text=(\d+) optimized_text=(\d+) optimizer_rewrites=(\d+) eliminated_dead=(\d+)',p.stdout)
+              if not m or not s:
+                  raise RuntimeError(f'missing benchmark evidence {side}/{i}: {p.stdout[-3000:]}')
+              timings[side].append(int(m.group(2)))
+              signatures[side].add(s.groups())
+              print(f'S2310_MISS_ABBA side={side} order={i} ns={m.group(2)} signature={s.groups()}',flush=True)
+          if len(signatures['before'])!=1 or signatures['before']!=signatures['after']:
+              raise RuntimeError(f'preexisting native corpus outputs changed: {signatures}')
+          before=statistics.median(timings['before'])
+          after=statistics.median(timings['after'])
+          pct=100*(after/before-1)
+          summary=f'S2310_MISS_COST baseline_ns={before:.0f} candidate_ns={after:.0f} change_pct={pct:+.2f} exact_signatures={signatures["before"]}'
+          print(summary,flush=True)
+          (root/'results'/'summary.txt').write_text(summary+'\n')
+          with open('/dev/stdout','a') as f: pass
+          PY
+      - name: Retain source-pinned release timing evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2310-matchpd-no-match-release-abba
+          path: results/
+          retention-days: 30
