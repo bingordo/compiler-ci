@@ -1,0 +1,62 @@
+name: TypeId native no-op transaction correctness PR672
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/native-noop-typeid-pr672.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/native-noop-typeid-pr672.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-pinned-native-noop:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - name: Checkout compiler PR #672 exact source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 08f721884f091faaae12567c75587db88cf84387
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and isolate four credential-independent crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 08f721884f091faaae12567c75587db88cf84387
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - name: Reuse self-contained Rust workspace compilation
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: s22-native-integer-generated
+      - name: Five-width repeated no-op, invalid rollback and generated SSA
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test generated_native_zero_compare -- --nocapture
+      - name: Verify common TypeId DCE, traps and optimizer graph\n        working-directory: compiler\n        run: |\n          cargo test -p compiler-opt --test typed_local -- --nocapture\n          cargo test -p compiler-opt --test typed_core_pipeline -- --nocapture\n      - name: Existing generated comparison and extension regressions
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test generated_native_compare_dag -- --nocapture
+          cargo test -p compiler-opt --test generated_native_extension_literal -- --nocapture
+          cargo test -p compiler-opt --test generated_native_extension_compare -- --nocapture
+          cargo test -p compiler-opt --test generated_native_sign_order -- --nocapture
+      - name: Native C11/GAS/direct ELF oracle and actual .text cost
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --test native_s23_profitability -- --nocapture
+      - name: Production-mode optimizer and direct ELF Clippy
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-opt --all-targets -- -D warnings
+          cargo clippy -p compiler-backend-x86 --bin typeid-x86 --test native_s23_profitability -- -D warnings
