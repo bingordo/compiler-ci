@@ -1,0 +1,109 @@
+name: TypeId P3.7 existing --no-inline CLI parity
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-typeid-p37-no-inline.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  p37:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact TypeId P3.7 compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9ad32c3184793fa596b3c7c237f0ea6c73933d58
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source checkout
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "9ad32c3184793fa596b3c7c237f0ea6c73933d58"
+      - name: Resolve pinned public frontend git dependencies
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-p37-no-inline-cli
+      - name: Native owned TypeId eligible leaf --no-inline policy and rollback
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typeid_source_no_inline -- --nocapture
+      - name: Native source --no-inline zero legacy SSA verifier
+        working-directory: compiler
+        run: cargo test -p compiler-opt --features verify-counts --test typeid_source_no_inline -- --nocapture
+      - name: Existing native optimizer mode and transitive phi regressions
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typed_core_pipeline
+          cargo test -p compiler-opt --test typed_core_inline_integration
+          cargo test -p compiler-opt --test typed_transitive_phi
+      - name: Checked Mini-C and Oberon native source C11 GAS ELF oracles in both inline modes
+        working-directory: compiler
+        run: cargo test -p compiler --bin compiler typeid_native_source -- --nocapture
+      - name: Actual compiler CLI --ir typeid --no-inline Mini-C/Oberon C11 GAS and direct ELF
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          mkdir -p target/p37
+          cat > target/p37/mini.c <<'EOF'
+          int p37_add(int a,int b){return a+b;}
+          int p37_compose(int a,int b){return p37_add(a,b)+3;}
+          EOF
+          cat > target/p37/mini_oracle.c <<'EOF'
+          extern int p37_compose(int,int);
+          int main(void){for(int a=-40;a<40;a++){
+            if(p37_compose(a,13)!=a+16)return 1;
+          }return 0;}
+          EOF
+          cat > target/p37/oberon.mod <<'EOF'
+          MODULE P37;
+          PROCEDURE Add*(a,b: INTEGER): INTEGER;
+          BEGIN RETURN a+b END Add;
+          END P37.
+          EOF
+          cat > target/p37/oberon_oracle.c <<'EOF'
+          extern int P37__Add(int,int);
+          int main(void){for(int a=-40;a<40;a++){
+            if(P37__Add(a,13)!=a+13)return 1;
+          }return 0;}
+          EOF
+          for lang in mini oberon; do
+            if [ "$lang" = mini ]; then source=target/p37/mini.c; language=mini-c; else source=target/p37/oberon.mod; language=oberon; fi
+            for format in obj asm; do
+              if [ "$format" = obj ]; then ext=o; else ext=s; fi
+              cargo run --quiet -p compiler --bin compiler -- "$source" --language "$language" --ir typeid --no-inline --emit "$format" -o "target/p37/$lang.$ext"
+              if [ "$format" = asm ]; then
+                cc -c "target/p37/$lang.s" -o "target/p37/$lang-gas.o"
+                object="target/p37/$lang-gas.o"
+              else
+                object="target/p37/$lang.o"
+              fi
+              cc -std=c11 -O2 -Wall -Wextra -Werror "target/p37/${lang}_oracle.c" "$object" -o "target/p37/$lang-oracle"
+              "target/p37/$lang-oracle"
+            done
+          done
+      - name: Complete checked source legacy and native driver regression
+        working-directory: compiler
+        run: cargo test -p compiler --bin compiler
+      - name: AArch64 shared TypeId backend API regression
+        working-directory: compiler
+        run: cargo check -p compiler-backend-aarch64 --all-targets
+      - name: Strict compiler IR optimizer and target Clippy
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler -p compiler-backend-x86 --all-targets -- -D warnings
+          cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
+      - name: Install GDB required by existing native DWARF oracle
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gdb
+      - name: Full IR optimizer native backend and x86 regression
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
