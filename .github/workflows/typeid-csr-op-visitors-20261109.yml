@@ -1,0 +1,196 @@
+name: Default TypeId CSR and zero-alloc operand visitor
+'on':
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/typeid-csr-op-visitors-20261109.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  core:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: csr_default
+            ref: '6e5060645276236b1e5e1f7066c0627fad34f656'
+          - variant: borrowed_visitor
+            ref: '63346ccf998b3f8bac825bcfa45985b17ff4f1fc'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ matrix.ref }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm immutable revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "${{ matrix.ref }}"
+          rustc --version
+          lscpu | grep 'Model name' || true
+      - name: Isolate core workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-csr-visitors-${{ matrix.variant }}
+      - name: Release complete core IR and opt suites
+        working-directory: compiler
+        run: cargo test --release -p compiler-ir -p compiler-opt
+      - name: Test hashed fallback or TypeId default CSR
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.variant }}" = csr_default ]; then
+            cargo test --release -p compiler-opt --features experimental-sccp-hash
+          else
+            cargo test --release -p compiler-ir --test op_operand_visitors
+          fi
+      - name: Strict library and test Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt --all-targets -- -D warnings
+
+  visitor_probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '63346ccf998b3f8bac825bcfa45985b17ff4f1fc'
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm immutable source and isolate IR workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = '63346ccf998b3f8bac825bcfa45985b17ff4f1fc'
+          rustc --version
+          lscpu | grep 'Model name' || true
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-op-visitor-probe
+      - name: Measure actual visitor allocations and wall timings
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release -p compiler-ir --example ssa_cache_probe
+          /usr/bin/time -v ./target/release/examples/ssa_cache_probe > "$RUNNER_TEMP/visitor-probe.csv" 2> "$RUNNER_TEMP/visitor-time.txt"
+          cat "$RUNNER_TEMP/visitor-probe.csv"
+          grep -E 'Maximum resident set size|User time|Elapsed' "$RUNNER_TEMP/visitor-time.txt" || true
+          {
+            echo '### Visitor vs owned SSA operand traversal (same binary)'
+            echo 'Source SHA 63346ccf998b3f8bac825bcfa45985b17ff4f1fc, medians of seven repeated timed samples.'
+            echo '~~~csv'
+            cat "$RUNNER_TEMP/visitor-probe.csv"
+            echo '~~~'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload raw visitor measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: actual-ssa-operand-visitor-probe
+          path: |
+            ${{ runner.temp }}/visitor-probe.csv
+            ${{ runner.temp }}/visitor-time.txt
+          if-no-files-found: warn
+
+  source_abba:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    strategy:
+      fail-fast: false
+      matrix:
+        session: [a, b]
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 'f0ff3729c9d562e183ee7e663950c93987643e19'
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '63346ccf998b3f8bac825bcfa45985b17ff4f1fc'
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify immutable revisions and host
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C before rev-parse HEAD)" = 'f0ff3729c9d562e183ee7e663950c93987643e19'
+          test "$(git -C after rev-parse HEAD)" = '63346ccf998b3f8bac825bcfa45985b17ff4f1fc'
+          mkdir -p results
+          rustc --version | tee results/rustc.txt
+          lscpu | grep 'Model name' | tee results/cpu.txt || true
+          git -C before rev-parse HEAD > results/parent.txt
+          git -C after rev-parse HEAD > results/visitor.txt
+          python3 -m py_compile harness/tools/ct06_abba.py harness/tools/ct06_large_corpus.py
+      - name: Allow pinned public Mini-C git dependencies
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before/tools/mini-c-driver -> target
+            after/tools/mini-c-driver -> target
+          key: op-visitor-abba-${{ matrix.session }}
+      - name: Build exact-parent and visitor source compilers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path before/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+          cargo build --release --manifest-path after/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+      - name: Generate 12 checked Mini-C programs
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct06_large_corpus.py --helpers after/tools --out corpus
+          cp corpus/manifest.csv results/source-manifest.csv
+      - name: Exact ELF parity and same-runner interleaved ABBA
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct06_abba.py --helpers after/tools --corpus corpus \
+            --before before/tools/mini-c-driver/target/release/compiler-mini-c \
+            --after after/tools/mini-c-driver/target/release/compiler-mini-c \
+            --extended-24-128 --require-identical-elf --samples 5 \
+            --raw results/source-raw.csv --report results/source-report.md
+          cat results/source-report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Archive raw source measurements and parity
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visitor-source-abba-${{ matrix.session }}
+          path: results/
+          if-no-files-found: warn
