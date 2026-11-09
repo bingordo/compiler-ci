@@ -1,0 +1,69 @@
+name: S23.9-S23.11 five-width SMT proof gate
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-native-matchpd-smt-proof.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/s23-native-matchpd-smt-proof.yml'
+  workflow_dispatch:
+    inputs:
+      compiler_sha:
+        description: 'Optional exact compiler commit SHA to prove; default latest main'
+        required: false
+        type: string
+  schedule:
+    - cron: '17 12 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  native-matchpd-smt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout pinned compiler source on PR; latest compiler main on schedule
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.compiler_sha || (github.event_name == 'pull_request' && '3885eddc503884f02fe3269096eb353533300f64') || 'main' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Validate exact PR source or explicit SHA and record revision
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_SHA: ${{ inputs.compiler_sha }}
+        run: |
+          set -euo pipefail
+          sha="$(git -C compiler rev-parse HEAD)"
+          echo "SMT_COMPILER_SOURCE_SHA=$sha"
+          if [[ "$EVENT_NAME" == "pull_request" && -z "$REQUESTED_SHA" ]]; then
+            test "$sha" = 3885eddc503884f02fe3269096eb353533300f64
+          fi
+          if [[ -n "$REQUESTED_SHA" ]]; then
+            [[ "$REQUESTED_SHA" =~ ^[[:xdigit:]]{40}$ ]]
+            test "$sha" = "$REQUESTED_SHA"
+          fi
+          test -f compiler/tools/prove_native_matchpd_s23.py
+      - name: Install offline QF_BV prover (never used by compiler runtime)
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends z3
+          z3 -version
+          python3 --version
+      - name: Retroactive 11-family times five-width SMT UNSAT and negative SAT checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/prove_native_matchpd_s23.py --timeout-ms 2500 --process-timeout 5
+      - name: Retain previous shared i32/i64 bitwise proof gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/prove_ir_bitwise_identities.py
