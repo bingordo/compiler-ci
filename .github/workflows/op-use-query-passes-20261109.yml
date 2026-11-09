@@ -1,0 +1,111 @@
+name: Allocation-free PRE LICM induction queries
+'on':
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/op-use-query-passes-20261109.yml']
+permissions:
+  contents: read
+jobs:
+  core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 'fadbbbe2c79d864f215bd764b4ac3c92c311becd'
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify immutable compiler source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 'fadbbbe2c79d864f215bd764b4ac3c92c311becd'
+          rustc --version
+          lscpu | grep 'Model name' || true
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: op-use-query-passes
+      - name: Complete core tests and strict changed-library Clippy
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release -p compiler-ir -p compiler-opt
+          cargo clippy -p compiler-ir -p compiler-opt --lib -- -D warnings
+  source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '9cd8bc2e0e0264343b154a32579997cf7a9a8059'
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 'fadbbbe2c79d864f215bd764b4ac3c92c311becd'
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact SHA and toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C before rev-parse HEAD)" = '9cd8bc2e0e0264343b154a32579997cf7a9a8059'
+          test "$(git -C after rev-parse HEAD)" = 'fadbbbe2c79d864f215bd764b4ac3c92c311becd'
+          rustc --version
+          lscpu | grep 'Model name' || true
+          mkdir -p results
+          echo '9cd8bc2e0e0264343b154a32579997cf7a9a8059' > results/before.txt
+          echo 'fadbbbe2c79d864f215bd764b4ac3c92c311becd' > results/after.txt
+      - name: Allow pinned public frontend dependency
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before/tools/mini-c-driver -> target
+            after/tools/mini-c-driver -> target
+          key: op-use-query-source
+      - name: Build before and after native source compilers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path before/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+          cargo build --release --manifest-path after/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+      - name: Source-to-ELF ABBA and mandatory exact parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct06_large_corpus.py --helpers after/tools --out corpus
+          cp corpus/manifest.csv results/source-manifest.csv
+          python3 harness/tools/ct06_abba.py --helpers after/tools --corpus corpus \
+            --before before/tools/mini-c-driver/target/release/compiler-mini-c \
+            --after after/tools/mini-c-driver/target/release/compiler-mini-c \
+            --extended-24-128 --require-identical-elf --samples 3 \
+            --raw results/source-raw.csv --report results/source-report.md
+          cat results/source-report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload exact parity and timing artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: op-use-query-parity
+          path: results/
+          if-no-files-found: warn
