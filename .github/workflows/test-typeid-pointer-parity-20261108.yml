@@ -1,0 +1,86 @@
+name: Exact-source TypeId pointer parity P3
+on:
+  push:
+    branches: [test/typeid-pointer-parity-20261108]
+  pull_request:
+    paths: [.github/workflows/test-typeid-pointer-parity-20261108.yml]
+permissions:
+  contents: read
+jobs:
+  core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 56233d2f9bca3d096e2132516e0fdedc3f89ea68
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm tested source and isolate core workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "56233d2f9bca3d096e2132516e0fdedc3f89ea68"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-pointer-parity-core
+      - name: Native TypeId core verifier, backend, GCC runtime
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir -p compiler-backend-x86 2>&1 | tee "$RUNNER_TEMP/typeid-pointer-core.log"
+          cargo clippy -p compiler-ir -p compiler-backend-x86 --lib -- -D warnings
+      - name: Keep core logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: typeid-pointer-core-failure
+          path: ${{ runner.temp }}/typeid-pointer-core.log
+          if-no-files-found: ignore
+  frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 56233d2f9bca3d096e2132516e0fdedc3f89ea68
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and use public Mini-C dependency
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "56233d2f9bca3d096e2132516e0fdedc3f89ea68"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-pointer-parity-driver
+      - name: Run real checked Mini-C TypeId pointer equality and null C11 ELF/GAS oracle
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --bin compiler checked_minic_null_pointer_and_equality_execute_through_native_typeid -- --nocapture 2>&1 | tee "$RUNNER_TEMP/typeid-pointer-source.log"
+          grep -F 'test tests::typeid_native_source::checked_minic_null_pointer_and_equality_execute_through_native_typeid ... ok' "$RUNNER_TEMP/typeid-pointer-source.log"
+          cargo test -p compiler --bin compiler
+          cargo clippy -p compiler --bin compiler -- -D warnings
+      - name: Keep source logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: typeid-pointer-source-failure
+          path: ${{ runner.temp }}/typeid-pointer-source.log
+          if-no-files-found: ignore
