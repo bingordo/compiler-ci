@@ -1,0 +1,136 @@
+name: CT SSA operand visitor mem2reg and TypeId if-conversion acceptance
+'on':
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ssa-mem2reg-ifconv-visitors-20261109.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '611d57b1ce8c70cbd07ecdd633eece4cd78a900d'
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm pinned compiler revision and toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = '611d57b1ce8c70cbd07ecdd633eece4cd78a900d'
+          rustc --version
+          cargo --version
+          lscpu | grep 'Model name' || true
+      - name: Isolate the core Rust workspace
+        shell: bash
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ssa-mem2reg-ifconv-visitors
+      - name: Complete release IR and optimizer tests
+        working-directory: compiler
+        run: cargo test --release -p compiler-ir -p compiler-opt
+      - name: Explicit TypeId mem2reg and if-conversion suites
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release -p compiler-opt --test typed_mem2reg
+          cargo test --release -p compiler-opt --test typed_if_conversion_pure
+          cargo test --release -p compiler-opt --test typed_if_conversion_native
+      - name: Strict changed-library Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt --lib -- -D warnings
+
+  source_abba:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      matrix:
+        session: [a,b]
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 'a191b425817202976a947eac71b62ba39906c469'
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '611d57b1ce8c70cbd07ecdd633eece4cd78a900d'
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm immutable compiler revisions and runner provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C before rev-parse HEAD)" = 'a191b425817202976a947eac71b62ba39906c469'
+          test "$(git -C after rev-parse HEAD)" = '611d57b1ce8c70cbd07ecdd633eece4cd78a900d'
+          mkdir -p results
+          git -C before rev-parse HEAD > results/before-sha.txt
+          git -C after rev-parse HEAD > results/after-sha.txt
+          rustc --version | tee results/rustc.txt
+          lscpu | grep 'Model name' | tee results/cpu.txt || true
+          python3 -m py_compile harness/tools/ct06_abba.py harness/tools/ct06_large_corpus.py
+      - name: Allow pinned public Mini-C frontend dependency
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before/tools/mini-c-driver -> target
+            after/tools/mini-c-driver -> target
+          key: mem2reg-ifconv-visitors-${{ matrix.session }}
+      - name: Build two release C-to-ELF compilers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path before/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+          cargo build --release --manifest-path after/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+      - name: Generate 12 checked Mini-C programs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct06_large_corpus.py --helpers after/tools --out corpus
+          cp corpus/manifest.csv results/source-manifest.csv
+      - name: Same-runner ABBA with mandatory exact ELF byte parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct06_abba.py --helpers after/tools --corpus corpus \
+            --before before/tools/mini-c-driver/target/release/compiler-mini-c \
+            --after after/tools/mini-c-driver/target/release/compiler-mini-c \
+            --extended-24-128 --require-identical-elf \
+            --samples 5 --raw results/source-raw.csv --report results/source-report.md
+          cat results/source-report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Archive parity, RSS, raw samples and provenance
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mem2reg-ifconv-visitors-${{ matrix.session }}
+          path: results/
+          if-no-files-found: warn
