@@ -1,0 +1,72 @@
+name: M4.10 ELF CFI record mutation acceptance
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-m410-elf-cfi-mutations.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  acceptance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      COMPILER_ELF_REQUIRE_LLVM: '1'
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c722f471027b668f1f6e916e5e84cdcb9821a09b
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify immutable candidate
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "c722f471027b668f1f6e916e5e84cdcb9821a09b"
+          test -s crates/backend/src/elf.rs
+          echo "M4.10 ELF CFI integrity: c722f471027b668f1f6e916e5e84cdcb9821a09b" >> "$GITHUB_STEP_SUMMARY"
+      - name: Resolve public pinned frontend dependencies
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - name: Install strict GNU and LLVM linkers and GDB
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y lld gdb
+          gcc --version | head -1
+          clang --version | head -1
+          ld.lld --version | head -1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m410-elf-cfi-mutations-v1
+      - name: Bounded CIE FDE record corruption matrix and cross-target PREL32
+        working-directory: compiler
+        run: cargo test -p compiler-backend elf::tests::shared_elf_rejects_mutated_cfi_metadata_before_object_emission -- --nocapture
+      - name: Combined PIC RBP real checked C GNU LLVM dlopen and CFI
+        working-directory: compiler
+        run: cargo test -p compiler --test typeid_pic_frame_shared -- --nocapture
+      - name: Existing independent PIC and framed and linker acceptance
+        working-directory: compiler
+        run: |
+          cargo test -p compiler --test typeid_pic_shared -- --nocapture
+          cargo test -p compiler --test typeid_frame_pointer -- --nocapture
+          cargo test -p compiler --test typeid_elf_linker_matrix -- --nocapture
+      - name: Full checked C Oberon and driver native TypeId suites
+        working-directory: compiler
+        run: |
+          cargo test -p compiler --bin compiler
+          cargo test -p compiler --test mini_c_cli
+      - name: AArch64 native backend API
+        working-directory: compiler
+        run: cargo check -p compiler-backend-aarch64 --all-targets
+      - name: Full IR optimizer backend native x86 and AArch64 core regression
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --features compiler-backend-x86/x7-native-form-validation
+      - name: Strict all-target Clippy
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --features compiler-backend-x86/x7-native-form-validation --all-targets -- -D warnings
+          cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
