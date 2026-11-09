@@ -1,0 +1,65 @@
+name: TypeId SCCP CSR isolated pass ABBA
+'on':
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/typeid-sccp-csr-isolated-abba-20261109.yml']
+permissions:
+  contents: read
+jobs:
+  isolated:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '3fa5e80026dcd041243f9347092381a60cf3ff96'
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned compiler and immutable fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = '3fa5e80026dcd041243f9347092381a60cf3ff96'
+          mkdir -p results
+          git -C compiler rev-parse HEAD > results/compiler-sha.txt
+          rustc --version | tee results/rustc.txt
+          lscpu | grep 'Model name' | tee results/cpu.txt || true
+          mkdir -p compiler/crates/opt/examples
+          cp harness/tools/ct03_typed_sccp_hotspot.rs compiler/crates/opt/examples/ct03_typed_sccp_hotspot.rs
+          sha256sum compiler/crates/opt/examples/ct03_typed_sccp_hotspot.rs > results/fixture-sha.txt
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-sccp-csr-isolated
+      - name: Build same-source baseline and CSR release binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path compiler/Cargo.toml -p compiler-opt --example ct03_typed_sccp_hotspot --target-dir "$PWD/baseline-target"
+          cargo build --release --manifest-path compiler/Cargo.toml -p compiler-opt --example ct03_typed_sccp_hotspot --features experimental-sccp-csr --target-dir "$PWD/indexed-target"
+      - name: Five-round isolated TypeId SCCP ABBA including SSA verifier and clones
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 harness/tools/ct04_hotspot_compare.py --pair ct03typed             --before baseline-target/release/examples/ct03_typed_sccp_hotspot             --after indexed-target/release/examples/ct03_typed_sccp_hotspot             --rounds 5 --raw results/pass-raw.csv --report results/pass-report.md
+          cat results/pass-report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve profiler results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: typeid-sccp-csr-isolated-pass
+          path: results/
+          if-no-files-found: warn
