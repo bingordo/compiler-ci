@@ -1,0 +1,115 @@
+name: P0 obsolete source import gate compiler PR820
+on:
+  push:
+    branches: [ci/verify-legacy-import-820-20261110]
+    paths: ['.github/workflows/verify-legacy-import-820.yml']
+permissions:
+  contents: read
+jobs:
+  core-ir:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f1b2ae40597ce4a3d66039216b9e56a162f8c901
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest compiler source and isolate dependency-free workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = f1b2ae40597ce4a3d66039216b9e56a162f8c901
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gdb
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-legacy-import-gate-820-core
+      - name: Default TypeId IR, optimizer and x86 backend full regression
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+      - name: Explicit obsolete source importer compatibility suite
+        working-directory: compiler
+        run: cargo test -p compiler-ir --features legacy-source-import --test native_source_bridge -- --nocapture
+      - name: Strict Clippy for default source IR and backends
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
+      - name: Strict Clippy for explicit legacy import feature
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir --all-targets --features legacy-source-import -- -D warnings
+  checked-frontends:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f1b2ae40597ce4a3d66039216b9e56a162f8c901
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and resolve pinned public frontends
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = f1b2ae40597ce4a3d66039216b9e56a162f8c901
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-legacy-import-gate-820-driver
+      - name: Unified Mini-C and Oberon TypeId and explicit rollback CLI
+        working-directory: compiler
+        run: cargo test -p compiler --bin compiler --test ir_default_cli --test mini_c_cli --test typeid_elf_linker_matrix -- --test-threads=2
+      - name: Unified source driver strict Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler --all-targets -- -D warnings
+  standalone-minic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f1b2ae40597ce4a3d66039216b9e56a162f8c901
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest source and resolve checked Mini-C
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = f1b2ae40597ce4a3d66039216b9e56a162f8c901
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: typeid-legacy-import-gate-820-minic
+      - name: Standalone checked Mini-C unit and default/rollback tests
+        working-directory: compiler
+        run: |
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib -- --test-threads=2
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --test typeid_cli -- --test-threads=2
+      - name: Build default TypeId compiler and differential C/GCC cases
+        working-directory: compiler
+        run: |
+          cargo build --manifest-path tools/mini-c-driver/Cargo.toml --bin compiler-mini-c
+          python3 tools/mini-c-driver/tests/differential.py \
+            --compiler tools/mini-c-driver/target/debug/compiler-mini-c \
+            --seed-count 2 --steps 60 --ct04-seed-count 1 --m10-compound-seed-count 1 \
+            --artifacts target/legacy-source-import-820-repro
+      - name: Standalone Mini-C strict Clippy
+        working-directory: compiler
+        run: cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml --all-targets -- -D warnings
