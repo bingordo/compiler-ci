@@ -46,7 +46,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ inputs.source_ref || 'ce32db46466674ad9a3a6e0f74ab89bb42c5e7a3' }}
+          ref: ${{ inputs.source_ref || 'e4fb0677e627a30d5c645cb68006f7f2973c36b5' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -157,6 +157,77 @@ jobs:
             echo "EDG source frontend regressed to legacy SSA block ownership"
             exit 1
           fi
+
+      - name: EDG T3 direct TypeId x86 ELF vs legacy and GCC executable parity
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cp tools/edg-driver/tests/fixtures/edg_native_ir_pilot*.c ../edgcpp/build/gcc-release/
+          cp tools/edg-driver/tests/fixtures/edg_native_cfg*.c ../edgcpp/build/gcc-release/
+          cp tools/edg-driver/tests/fixtures/edg_native_locals*.c ../edgcpp/build/gcc-release/
+          cp tools/edg-driver/tests/fixtures/edg_native_c99_loops*.c ../edgcpp/build/gcc-release/
+          cp tools/edg-driver/tests/fixtures/edg_native_pointer_memory*.c ../edgcpp/build/gcc-release/
+          cp tools/edg-driver/tests/fixtures/edg_native_local_arrays*.c ../edgcpp/build/gcc-release/
+          cp tools/edg-driver/tests/fixtures/edg_stdio*.c ../edgcpp/build/gcc-release/
+          (
+            cd ../edgcpp/build/gcc-release
+            source ./environment.sh
+            binary="../../../compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+            gcc_include="$(gcc -print-file-name=include)"
+            test -f "$gcc_include/stddef.h"
+            # Every original source is separately compiled by EDG into
+            # TypeId and legacy ELF. Independent GCC compiles the same
+            # source; all three executables must agree on exit and stdout.
+            for entry in \
+              'edg_native_ir_pilot.c edg_native_ir_pilot_driver.c' \
+              'edg_native_cfg.c edg_native_cfg_driver.c' \
+              'edg_native_locals.c edg_native_locals_driver.c' \
+              'edg_native_c99_loops.c edg_native_c99_loops_driver.c' \
+              'edg_native_pointer_memory.c edg_native_pointer_memory_driver.c' \
+              'edg_native_local_arrays.c edg_native_local_arrays_driver.c'
+            do
+              set -- $entry
+              source="$1"
+              driver="$2"
+              "$binary" native_typeid.o --typeid-native --c11 "$source"
+              "$binary" legacy_edg.o --c11 "$source"
+              gcc -std=c11 -O2 -Wall -Wextra -Werror "$source" "$driver" -o original_gcc
+              gcc -std=c11 -O2 -Wall -Wextra -Werror native_typeid.o "$driver" -o typeid_executable
+              gcc -std=c11 -O2 -Wall -Wextra -Werror legacy_edg.o "$driver" -o legacy_executable
+              ./original_gcc >gcc.out
+              ./typeid_executable >typeid.out
+              ./legacy_executable >legacy.out
+              test "$(od -An -tx1 gcc.out)" = "$(od -An -tx1 typeid.out)"
+              test "$(od -An -tx1 gcc.out)" = "$(od -An -tx1 legacy.out)"
+              test "$(od -An -tx1 -N4 native_typeid.o | tr -d '[:space:]')" = 7f454c46
+              echo "TypeId native/GCC parity: $source"
+            done
+            # Actual system glibc headers, immutable source string data,
+            # SysV GP variadic call AL=0 and 7 GP arguments crossing stack.
+            for source in edg_stdio_hello_puts.c edg_stdio_hello_printf.c edg_stdio_printf_values.c edg_stdio_printf_many.c
+            do
+              "$binary" native_typeid.o --typeid-native --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu "$source"
+              "$binary" legacy_edg.o --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu "$source"
+              gcc -std=c11 -O2 -Wall -Wextra -Werror "$source" -o original_gcc
+              gcc -std=c11 -O2 -Wall -Wextra -Werror native_typeid.o -o typeid_executable
+              gcc -std=c11 -O2 -Wall -Wextra -Werror legacy_edg.o -o legacy_executable
+              ./original_gcc >gcc.out
+              ./typeid_executable >typeid.out
+              ./legacy_executable >legacy.out
+              test "$(od -An -tx1 gcc.out)" = "$(od -An -tx1 typeid.out)"
+              test "$(od -An -tx1 gcc.out)" = "$(od -An -tx1 legacy.out)"
+              nm -u native_typeid.o | grep -Eq 'puts|printf'
+              readelf -S native_typeid.o | grep -q '\.rodata'
+              echo "TypeId native/glibc parity: $source"
+            done
+            # Rejection does not silently fall back or write an object.
+            rm -f typeid_bad.o typeid_bad.log
+            if "$binary" typeid_bad.o --typeid-native --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu edg_stdio_printf_bad_fp.c >typeid_bad.log 2>&1; then
+              echo "Unsupported FP variadic source unexpectedly emitted"
+              exit 1
+            fi
+            test ! -e typeid_bad.o
+          )
 
       - name: Native direct compiler IR x86 ELF versus GCC differential
         working-directory: compiler
@@ -676,73 +747,3 @@ jobs:
             test ! -e bad_printf.o
           )
 
-      - name: EDG T3 direct TypeId x86 ELF vs legacy and GCC executable parity
-        working-directory: compiler
-        run: |
-          set -euo pipefail
-          cp tools/edg-driver/tests/fixtures/edg_native_ir_pilot*.c ../edgcpp/build/gcc-release/
-          cp tools/edg-driver/tests/fixtures/edg_native_cfg*.c ../edgcpp/build/gcc-release/
-          cp tools/edg-driver/tests/fixtures/edg_native_locals*.c ../edgcpp/build/gcc-release/
-          cp tools/edg-driver/tests/fixtures/edg_native_c99_loops*.c ../edgcpp/build/gcc-release/
-          cp tools/edg-driver/tests/fixtures/edg_native_pointer_memory*.c ../edgcpp/build/gcc-release/
-          cp tools/edg-driver/tests/fixtures/edg_native_local_arrays*.c ../edgcpp/build/gcc-release/
-          cp tools/edg-driver/tests/fixtures/edg_stdio*.c ../edgcpp/build/gcc-release/
-          (
-            cd ../edgcpp/build/gcc-release
-            source ./environment.sh
-            binary="../../../compiler/tools/edg-driver/target/debug/compiler-edg-driver"
-            gcc_include="$(gcc -print-file-name=include)"
-            test -f "$gcc_include/stddef.h"
-            # Every original source is separately compiled by EDG into
-            # TypeId and legacy ELF. Independent GCC compiles the same
-            # source; all three executables must agree on exit and stdout.
-            for entry in \
-              'edg_native_ir_pilot.c edg_native_ir_pilot_driver.c' \
-              'edg_native_cfg.c edg_native_cfg_driver.c' \
-              'edg_native_locals.c edg_native_locals_driver.c' \
-              'edg_native_c99_loops.c edg_native_c99_loops_driver.c' \
-              'edg_native_pointer_memory.c edg_native_pointer_memory_driver.c' \
-              'edg_native_local_arrays.c edg_native_local_arrays_driver.c'
-            do
-              set -- $entry
-              source="$1"
-              driver="$2"
-              "$binary" native_typeid.o --typeid-native --c11 "$source"
-              "$binary" legacy_edg.o --c11 "$source"
-              gcc -std=c11 -O2 -Wall -Wextra -Werror "$source" "$driver" -o original_gcc
-              gcc -std=c11 -O2 -Wall -Wextra -Werror native_typeid.o "$driver" -o typeid_executable
-              gcc -std=c11 -O2 -Wall -Wextra -Werror legacy_edg.o "$driver" -o legacy_executable
-              ./original_gcc >gcc.out
-              ./typeid_executable >typeid.out
-              ./legacy_executable >legacy.out
-              test "$(od -An -tx1 gcc.out)" = "$(od -An -tx1 typeid.out)"
-              test "$(od -An -tx1 gcc.out)" = "$(od -An -tx1 legacy.out)"
-              test "$(od -An -tx1 -N4 native_typeid.o | tr -d '[:space:]')" = 7f454c46
-              echo "TypeId native/GCC parity: $source"
-            done
-            # Actual system glibc headers, immutable source string data,
-            # SysV GP variadic call AL=0 and 7 GP arguments crossing stack.
-            for source in edg_stdio_hello_puts.c edg_stdio_hello_printf.c edg_stdio_printf_values.c edg_stdio_printf_many.c
-            do
-              "$binary" native_typeid.o --typeid-native --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu "$source"
-              "$binary" legacy_edg.o --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu "$source"
-              gcc -std=c11 -O2 -Wall -Wextra -Werror "$source" -o original_gcc
-              gcc -std=c11 -O2 -Wall -Wextra -Werror native_typeid.o -o typeid_executable
-              gcc -std=c11 -O2 -Wall -Wextra -Werror legacy_edg.o -o legacy_executable
-              ./original_gcc >gcc.out
-              ./typeid_executable >typeid.out
-              ./legacy_executable >legacy.out
-              test "$(od -An -tx1 gcc.out)" = "$(od -An -tx1 typeid.out)"
-              test "$(od -An -tx1 gcc.out)" = "$(od -An -tx1 legacy.out)"
-              nm -u native_typeid.o | grep -Eq 'puts|printf'
-              readelf -S native_typeid.o | grep -q '\.rodata'
-              echo "TypeId native/glibc parity: $source"
-            done
-            # Rejection does not silently fall back or write an object.
-            rm -f typeid_bad.o typeid_bad.log
-            if "$binary" typeid_bad.o --typeid-native --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu edg_stdio_printf_bad_fp.c >typeid_bad.log 2>&1; then
-              echo "Unsupported FP variadic source unexpectedly emitted"
-              exit 1
-            fi
-            test ! -e typeid_bad.o
-          )
