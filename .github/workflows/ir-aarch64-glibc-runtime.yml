@@ -81,6 +81,32 @@ jobs:
             return 0;
           }
           EOF
+          # AAPCS64: X0-X7 are register parameters; arguments 9 and 10
+          # must travel through the caller's stack, both at entry and
+          # when calling a separately compiled C object.
+          cat > "$tmp/ten.c" <<'EOF'
+          int sum10(int a,int b,int c,int d,int e,
+                    int f,int g,int h,int i,int j) {
+            return a+b+c+d+e+f+g+h+i+j;
+          }
+          extern int foreign10(int,int,int,int,int,int,int,int,int,int);
+          int forward10(int first) {
+            return foreign10(first,2,3,4,5,6,7,8,9,10);
+          }
+          EOF
+          cat > "$tmp/ten-oracle.c" <<'EOF'
+          extern int sum10(int,int,int,int,int,int,int,int,int,int);
+          extern int forward10(int);
+          int foreign10(int a,int b,int c,int d,int e,
+                        int f,int g,int h,int i,int j) {
+            return a+b+c+d+e+f+g+h+i+j;
+          }
+          int main(void) {
+            return sum10(1,2,3,4,5,6,7,8,9,10)!=55 ||
+                   sum10(-4,2,3,4,5,6,7,8,9,10)!=50 ||
+                   forward10(1)!=55 || forward10(-4)!=50;
+          }
+          EOF
           aarch64-linux-gnu-gcc -fPIE -pie -O0 "$tmp/dlopen-oracle.c" -ldl -o "$tmp/dlopen-host"
           for fmt in obj asm; do
             ext=o
@@ -103,4 +129,19 @@ jobs:
             aarch64-linux-gnu-gcc -shared -fPIC -Wl,-z,now "$file" -o "$so"
             timeout 30 qemu-aarch64 -L /usr/aarch64-linux-gnu "$tmp/dlopen-host" "$so"
             echo "PASS glibc dlopen constructors, fmt=$fmt"
+          done
+          for fmt in obj asm; do
+            for pic in none pic; do
+              opts=()
+              if [ "$pic" = pic ]; then opts=(--pic); fi
+              ext=o
+              if [ "$fmt" = asm ]; then ext=s; fi
+              obj="$tmp/ten-$pic.$ext"
+              ./target/debug/compiler "$tmp/ten.c" --language mini-c \
+                --target aarch64 --ir typeid --emit "$fmt" "${opts[@]}" -o "$obj"
+              exe="$tmp/ten-$pic-$fmt"
+              aarch64-linux-gnu-gcc -fPIE -pie -O0 "$tmp/ten-oracle.c" "$obj" -o "$exe"
+              timeout 30 qemu-aarch64 -L /usr/aarch64-linux-gnu "$exe"
+              echo "PASS AAPCS64 10-argument entry and outbound calls, pic=$pic, fmt=$fmt"
+            done
           done
