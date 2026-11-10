@@ -1,0 +1,140 @@
+name: P0 TypeId vs legacy experimental SSA build-gate compiler PR821
+on:
+  push:
+    branches: [ci/verify-legacy-experimental-821-20261110]
+    paths: ['.github/workflows/verify-legacy-experimental-821.yml']
+permissions:
+  contents: read
+jobs:
+  core-default:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7e9500420358eaaa5e832d551570e4d21c000275
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest pinned source and isolate TypeId core workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 7e9500420358eaaa5e832d551570e4d21c000275
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gdb
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-default-no-legacy-experimental-821
+      - name: All default core IR/opt/backend/x86 tests, including TypeId production
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+      - name: Strict Clippy without old Function experimental SSA
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
+  optin-legacy-experiments:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7e9500420358eaaa5e832d551570e4d21c000275
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest source and isolate complete optimizer tests
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 7e9500420358eaaa5e832d551570e4d21c000275
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: optin-m6-egraph-memoryssa-slp-821
+      - name: Feature-enabled complete legacy M6/MemorySSA/SLP test suite
+        working-directory: compiler
+        run: cargo test -p compiler-opt --features legacy-experimental-ssa -- --test-threads=2
+      - name: Strict feature-enabled legacy experiment Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt --features legacy-experimental-ssa --all-targets -- -D warnings
+  checked-frontends:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7e9500420358eaaa5e832d551570e4d21c000275
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest source and route public frontend Git URLs
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 7e9500420358eaaa5e832d551570e4d21c000275
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-legacy-experiments-821-driver
+      - name: Unified Mini-C and Oberon native and explicit rollback source tests
+        working-directory: compiler
+        run: cargo test -p compiler --bin compiler --test ir_default_cli --test mini_c_cli --test typeid_elf_linker_matrix -- --test-threads=2
+      - name: Strict compiler source-driver Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler --all-targets -- -D warnings
+  standalone-minic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7e9500420358eaaa5e832d551570e4d21c000275
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source SHA and checked Mini-C frontend resolution
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 7e9500420358eaaa5e832d551570e4d21c000275
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: typeid-legacy-experiments-821-minic
+      - name: Mini-C TypeId default, explicit rollback and library regression
+        working-directory: compiler
+        run: |
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib -- --test-threads=2
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --test typeid_cli -- --test-threads=2
+      - name: Generated C GCC differential over native source output
+        working-directory: compiler
+        run: |
+          cargo build --manifest-path tools/mini-c-driver/Cargo.toml --bin compiler-mini-c
+          python3 tools/mini-c-driver/tests/differential.py \
+            --compiler tools/mini-c-driver/target/debug/compiler-mini-c \
+            --seed-count 2 --steps 60 --ct04-seed-count 1 --m10-compound-seed-count 1 \
+            --artifacts target/typeid-legacy-experiments-821-repro
+      - name: Strict standalone Mini-C Clippy
+        working-directory: compiler
+        run: cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml --all-targets -- -D warnings
