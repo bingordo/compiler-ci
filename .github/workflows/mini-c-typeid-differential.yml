@@ -1,0 +1,55 @@
+name: Mini-C TypeId broad GCC differential (source-pinned)
+on:
+  pull_request:
+    paths:
+      - .github/workflows/mini-c-typeid-differential.yml
+permissions:
+  contents: read
+jobs:
+  typeid-differential:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 77518057bf9317f7f29fcad1bf4ac85d0e531825
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build exact standalone Mini-C compiler
+        working-directory: compiler
+        run: |
+          test "$(git rev-parse HEAD)" = "77518057bf9317f7f29fcad1bf4ac85d0e531825"
+          cargo build --manifest-path tools/mini-c-driver/Cargo.toml --bin compiler-mini-c
+      - name: Run historical executable Mini-C/GCC differential through TypeId
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cat > typeid-mini-c <<'EOF'
+          #!/usr/bin/env bash
+          exec "$(dirname -- "$0")/tools/mini-c-driver/target/debug/compiler-mini-c" --ir typeid "$@"
+          EOF
+          chmod +x typeid-mini-c
+          python3 tools/mini-c-driver/tests/differential.py \
+            --compiler ./typeid-mini-c --seed-count 2 --steps 60 \
+            --ct04-seed-count 1 --m10-compound-seed-count 1 \
+            --artifacts target/mini-c-typeid-reproducers
+      - name: Record differential failure reproducers
+        if: failure()
+        working-directory: compiler
+        run: |
+          find target/mini-c-typeid-reproducers -name case.c -o -name run.json | head -40 || true
+          find target/mini-c-typeid-reproducers -name case.c -print -exec sed -n '1,180p' '{}' ';' | head -260 || true
+      - name: Archive exact failing test cases
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mini-c-typeid-differential-repro
+          path: compiler/target/mini-c-typeid-reproducers
+          if-no-files-found: ignore
