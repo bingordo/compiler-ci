@@ -28,7 +28,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: main
+          ref: 7547f2381d5464cf0416b23fcf890643613791c1
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -40,7 +40,8 @@ jobs:
       - name: Source-pinned build
         working-directory: compiler
         run: |
-          echo "compiler/main: $(git rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$(git rev-parse HEAD)" = "7547f2381d5464cf0416b23fcf890643613791c1"
+          echo "compiler TypeId cutover commit: $(git rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
           RUSTFLAGS="-D warnings" cargo check -p compiler --all-targets
           cargo test -p compiler -- --test-threads=2
           cargo clippy -p compiler --all-targets -- -D warnings
@@ -121,7 +122,10 @@ jobs:
               if [ "$pic" = ic ]; then opts=(--pic); fi
               file="$tmp/libc-$pic.$ext"
               ./target/debug/compiler "$tmp/libc.c" --language mini-c \
-                --target aarch64 --ir typeid --emit "$fmt" "${opts[@]}" -o "$file"
+                --target aarch64 --ir typeid --emit "$fmt" "${opts[@]}" -o "$tmp/libc-$pic-explicit.$ext"
+              ./target/debug/compiler "$tmp/libc.c" --language mini-c \
+                --target aarch64 --emit "$fmt" "${opts[@]}" -o "$file"
+              cmp "$file" "$tmp/libc-$pic-explicit.$ext"
               exe="$tmp/libc-$pic-$fmt"
               aarch64-linux-gnu-gcc -fPIE -pie -O0 "$tmp/libc-oracle.c" "$file" -o "$exe"
               timeout 30 qemu-aarch64 -L /usr/aarch64-linux-gnu "$exe"
@@ -129,7 +133,10 @@ jobs:
             done
             file="$tmp/init.$ext"
             ./target/debug/compiler "$tmp/Init.mod" --language oberon \
-              --target aarch64 --ir typeid --pic --emit "$fmt" -o "$file"
+              --target aarch64 --ir typeid --pic --emit "$fmt" -o "$tmp/init-explicit.$ext"
+            ./target/debug/compiler "$tmp/Init.mod" --language oberon \
+              --target aarch64 --pic --emit "$fmt" -o "$file"
+            cmp "$file" "$tmp/init-explicit.$ext"
             so="$tmp/libinit-$fmt.so"
             aarch64-linux-gnu-gcc -shared -fPIC -Wl,-z,now "$file" -o "$so"
             timeout 30 qemu-aarch64 -L /usr/aarch64-linux-gnu "$tmp/dlopen-host" "$so"
@@ -143,11 +150,14 @@ jobs:
               if [ "$fmt" = asm ]; then ext=s; fi
               obj="$tmp/ten-$pic.$ext"
               ./target/debug/compiler "$tmp/ten.c" --language mini-c \
-                --target aarch64 --ir typeid --emit "$fmt" "${opts[@]}" -o "$obj"
+                --target aarch64 --ir typeid --emit "$fmt" "${opts[@]}" -o "$tmp/ten-$pic-explicit.$ext"
+              ./target/debug/compiler "$tmp/ten.c" --language mini-c \
+                --target aarch64 --emit "$fmt" "${opts[@]}" -o "$obj"
+              cmp "$obj" "$tmp/ten-$pic-explicit.$ext"
               exe="$tmp/ten-$pic-$fmt"
               aarch64-linux-gnu-gcc -fPIE -pie -O0 "$tmp/ten-oracle.c" "$obj" -o "$exe"
               timeout 30 qemu-aarch64 -L /usr/aarch64-linux-gnu "$exe"
               echo "PASS AAPCS64 10-argument entry and outbound calls, pic=$pic, fmt=$fmt"
             done
           done
-          echo "Passed 10 real glibc/AArch64 QEMU executions: four puts cases, two dlopen constructor cases and four 10-GP entry/outbound AAPCS64 calls." >> "$GITHUB_STEP_SUMMARY"
+          echo "Passed 10 real AArch64 glibc QEMU executions from the implicit TypeId default, byte-identical against explicit TypeId (4 puts, 2 dlopen, 4 AAPCS64 10-GP cases)." >> "$GITHUB_STEP_SUMMARY"
