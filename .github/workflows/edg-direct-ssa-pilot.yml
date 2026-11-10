@@ -675,3 +675,55 @@ jobs:
             cat bad_printf.log
             test ! -e bad_printf.o
           )
+
+      - name: EDG source direct TypeId native x86 ELF runtime parity matrix
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cp tools/edg-driver/tests/fixtures/*.c ../edgcpp/build/gcc-release/
+          (
+            cd ../edgcpp/build/gcc-release
+            source environment.sh
+            binary="../../../compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+            gcc_include="$(gcc -print-file-name=include)"
+            probe() {
+              local source="$1" driver="$2" tag="$3"
+              echo "=== TypeId direct native ELF: $tag ==="
+              rm -f typeid_matrix.o typeid_matrix_native typeid_matrix_ref
+              if ! "$binary" typeid_matrix.o --typeid-native --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu "$source" >typeid_matrix.log 2>&1; then
+                cat typeid_matrix.log
+                return 1
+              fi
+              test "$(od -An -tx1 -N4 typeid_matrix.o | tr -d '[:space:]')" = 7f454c46
+              if test -n "$driver"; then
+                gcc -std=c11 -O2 "$source" "$driver" -o typeid_matrix_ref
+                gcc -std=c11 -O2 typeid_matrix.o "$driver" -o typeid_matrix_native
+              else
+                gcc -std=c11 -O2 "$source" -o typeid_matrix_ref
+                gcc -std=c11 -O2 typeid_matrix.o -o typeid_matrix_native
+              fi
+              set +e
+              ./typeid_matrix_ref >typeid_matrix_ref.out 2>typeid_matrix_ref.err
+              local refstatus=$?
+              ./typeid_matrix_native >typeid_matrix_native.out 2>typeid_matrix_native.err
+              local nativestatus=$?
+              set -e
+              diff -u typeid_matrix_ref.out typeid_matrix_native.out
+              diff -u typeid_matrix_ref.err typeid_matrix_native.err
+              test "$refstatus" = "$nativestatus"
+              echo "PASS $tag (exit=$refstatus)"
+            }
+            probe edg_native_ir_pilot.c edg_native_ir_pilot_driver.c integers
+            probe edg_native_cfg.c edg_native_cfg_driver.c cfg
+            probe edg_native_d3_calls.c edg_native_d3_calls_driver.c calls
+            probe edg_native_pointer_memory.c edg_native_pointer_memory_driver.c pointers
+            probe edg_native_struct_fields.c edg_native_struct_fields_driver.c records
+            probe edg_stdio_hello_puts.c '' glibc-puts
+            probe edg_stdio_printf_many.c '' glibc-printf-stack
+            rm -f typeid_bad_fp.o
+            if "$binary" typeid_bad_fp.o --typeid-native --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu edg_stdio_printf_bad_fp.c >typeid_bad_fp.log 2>&1; then
+              echo "TypeId native illegally accepted unsupported floating point vararg"
+              exit 1
+            fi
+            test ! -e typeid_bad_fp.o
+          )
