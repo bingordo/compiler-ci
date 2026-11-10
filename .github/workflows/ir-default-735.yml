@@ -1,0 +1,52 @@
+name: TypeId default cutover (compiler PR 735)
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ir-default-735.yml'
+permissions:
+  contents: read
+jobs:
+  default-ir:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 0df0a4a2adb6ccb492efed5178b80cafdb9695f2
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Verify pinned source
+        run: test "$(git -C compiler rev-parse HEAD)" = "0df0a4a2adb6ccb492efed5178b80cafdb9695f2"
+      - name: Warnings-denied all-target driver compilation
+        working-directory: compiler
+        run: RUSTFLAGS="-D warnings" cargo check -p compiler --all-targets
+      - name: Driver regression including native parity
+        working-directory: compiler
+        run: cargo test -p compiler --bin compiler -- --test-threads=2
+      - name: Strict Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler --all-targets -- -D warnings
+      - name: CLI default, explicit legacy, and AArch64 policy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo build -p compiler
+          printf 'MODULE Cutover; PROCEDURE Answer*(): INTEGER; BEGIN RETURN 42 END Answer; END Cutover.\n' > /tmp/cutover.mod
+          ./target/debug/compiler /tmp/cutover.mod --emit obj -o /tmp/cutover-default.o
+          ./target/debug/compiler /tmp/cutover.mod --emit obj --ir typeid -o /tmp/cutover-typeid.o
+          cmp /tmp/cutover-default.o /tmp/cutover-typeid.o
+          ./target/debug/compiler /tmp/cutover.mod --emit obj --ir legacy -o /tmp/cutover-legacy.o
+          ./target/debug/compiler /tmp/cutover.mod --emit obj --target aarch64 -o /tmp/cutover-a64.o
+          if ./target/debug/compiler /tmp/cutover.mod --emit obj --target aarch64 --ir typeid -o /tmp/cutover-bad.o; then
+            echo "AArch64 TypeId must reject until migrated" >&2
+            exit 1
+          fi
