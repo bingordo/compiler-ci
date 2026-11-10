@@ -1,0 +1,153 @@
+name: AArch64 TypeId glibc dynamic runtime (compiler cutover)
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ir-aarch64-glibc-runtime.yml'
+  workflow_dispatch:
+  schedule:
+    # Dynamic glibc/AAPCS64 parity is a heavier weekly companion to daily freestanding QEMU.
+    - cron: '17 10 * * 1'
+permissions:
+  contents: read
+jobs:
+  glibc-aarch64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install AArch64 glibc sysroot, cross-GCC and QEMU
+        run: |
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            libc6-arm64-cross libc6-dev-arm64-cross qemu-user
+          test -f "$(aarch64-linux-gnu-gcc -print-file-name=crt1.o)"
+          test -f /usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: main
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: ir-aarch64-glibc
+      - name: Source-pinned build
+        working-directory: compiler
+        run: |
+          echo "compiler/main: $(git rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
+          RUSTFLAGS="-D warnings" cargo check -p compiler --all-targets
+          cargo test -p compiler -- --test-threads=2
+          cargo clippy -p compiler --all-targets -- -D warnings
+          cargo build -p compiler --bin compiler
+      - name: Execute AArch64 TypeId with glibc and dlopen
+        working-directory: compiler
+        run: |
+          set -euxo pipefail
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          cat > "$tmp/libc.c" <<'EOF'
+          extern int puts(const char *);
+          int greet(void) { return puts("TypeId on AArch64 with glibc"); }
+          EOF
+          cat > "$tmp/libc-oracle.c" <<'EOF'
+          extern int greet(void);
+          int main(void) { return greet() < 0; }
+          EOF
+          cat > "$tmp/Init.mod" <<'EOF'
+          MODULE Init;
+          VAR counter*, runs*: INTEGER;
+          PROCEDURE Get*(): INTEGER;
+          BEGIN RETURN counter END Get;
+          BEGIN runs := runs + 1; counter := 37 END Init.
+          EOF
+          cat > "$tmp/dlopen-oracle.c" <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <stdio.h>
+          int main(int argc,char **argv) {
+            if (argc!=2) return 90;
+            void *handle=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL);
+            if (!handle) { fprintf(stderr,"dlopen: %s\n",dlerror()); return 91; }
+            int *counter=(int *)dlsym(handle,"Init__counter");
+            int *runs=(int *)dlsym(handle,"Init__runs");
+            int (*get)(void)=(int (*)(void))dlsym(handle,"Init__Get");
+            if (!counter||!runs||!get) return 92;
+            if (*counter!=37 || *runs!=1 || get()!=37) return 93;
+            void *again=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL);
+            if (!again || *runs!=1) return 94;
+            dlclose(again);
+            dlclose(handle);
+            return 0;
+          }
+          EOF
+          # AAPCS64: X0-X7 are register parameters; arguments 9 and 10
+          # must travel through the caller's stack, both at entry and
+          # when calling a separately compiled C object.
+          cat > "$tmp/ten.c" <<'EOF'
+          int sum10(int a,int b,int c,int d,int e,
+                    int f,int g,int h,int i,int j) {
+            return a+b+c+d+e+f+g+h+i+j;
+          }
+          extern int foreign10(int,int,int,int,int,int,int,int,int,int);
+          int forward10(int first) {
+            return foreign10(first,2,3,4,5,6,7,8,9,10);
+          }
+          EOF
+          cat > "$tmp/ten-oracle.c" <<'EOF'
+          extern int sum10(int,int,int,int,int,int,int,int,int,int);
+          extern int forward10(int);
+          int foreign10(int a,int b,int c,int d,int e,
+                        int f,int g,int h,int i,int j) {
+            return a+b+c+d+e+f+g+h+i+j;
+          }
+          int main(void) {
+            return sum10(1,2,3,4,5,6,7,8,9,10)!=55 ||
+                   sum10(-4,2,3,4,5,6,7,8,9,10)!=50 ||
+                   forward10(1)!=55 || forward10(-4)!=50;
+          }
+          EOF
+          aarch64-linux-gnu-gcc -fPIE -pie -O0 "$tmp/dlopen-oracle.c" -ldl -o "$tmp/dlopen-host"
+          for fmt in obj asm; do
+            ext=o
+            if [ "$fmt" = asm ]; then ext=s; fi
+            for pic in nop ic; do
+              opts=()
+              if [ "$pic" = ic ]; then opts=(--pic); fi
+              file="$tmp/libc-$pic.$ext"
+              ./target/debug/compiler "$tmp/libc.c" --language mini-c \
+                --target aarch64 --ir typeid --emit "$fmt" "${opts[@]}" -o "$file"
+              exe="$tmp/libc-$pic-$fmt"
+              aarch64-linux-gnu-gcc -fPIE -pie -O0 "$tmp/libc-oracle.c" "$file" -o "$exe"
+              timeout 30 qemu-aarch64 -L /usr/aarch64-linux-gnu "$exe"
+              echo "PASS glibc puts, pic=$pic, fmt=$fmt"
+            done
+            file="$tmp/init.$ext"
+            ./target/debug/compiler "$tmp/Init.mod" --language oberon \
+              --target aarch64 --ir typeid --pic --emit "$fmt" -o "$file"
+            so="$tmp/libinit-$fmt.so"
+            aarch64-linux-gnu-gcc -shared -fPIC -Wl,-z,now "$file" -o "$so"
+            timeout 30 qemu-aarch64 -L /usr/aarch64-linux-gnu "$tmp/dlopen-host" "$so"
+            echo "PASS glibc dlopen constructors, fmt=$fmt"
+          done
+          for fmt in obj asm; do
+            for pic in none pic; do
+              opts=()
+              if [ "$pic" = pic ]; then opts=(--pic); fi
+              ext=o
+              if [ "$fmt" = asm ]; then ext=s; fi
+              obj="$tmp/ten-$pic.$ext"
+              ./target/debug/compiler "$tmp/ten.c" --language mini-c \
+                --target aarch64 --ir typeid --emit "$fmt" "${opts[@]}" -o "$obj"
+              exe="$tmp/ten-$pic-$fmt"
+              aarch64-linux-gnu-gcc -fPIE -pie -O0 "$tmp/ten-oracle.c" "$obj" -o "$exe"
+              timeout 30 qemu-aarch64 -L /usr/aarch64-linux-gnu "$exe"
+              echo "PASS AAPCS64 10-argument entry and outbound calls, pic=$pic, fmt=$fmt"
+            done
+          done
+          echo "Passed 10 real glibc/AArch64 QEMU executions: four puts cases, two dlopen constructor cases and four 10-GP entry/outbound AAPCS64 calls." >> "$GITHUB_STEP_SUMMARY"
