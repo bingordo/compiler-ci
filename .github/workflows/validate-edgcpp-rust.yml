@@ -1,0 +1,152 @@
+name: EDG Rust atomic traversal validation
+
+on:
+  # Validate the compiler-ci PR itself, without consuming source-repo minutes.
+  push:
+    branches: [validate-edgcpp-atomic-pr86-20261110]
+    paths: ['.github/workflows/validate-edgcpp-rust.yml']
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/validate-edgcpp-rust.yml']
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'bingordo/edgcpp-rust branch, tag, or commit SHA'
+        required: false
+        default: cranelift-codegen
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: edg-atomic-validation-${{ github.ref }}-${{ inputs.source_ref || 'pr86' }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    container:
+      # Reuse the same pinned EDG CI environment as edg-yarpgen.yml.
+      image: ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8
+    defaults:
+      run:
+        shell: edg-container-exec "bash -eo pipefail {0}"
+    env:
+      EDG_SOURCE_SHA: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+      EDG_RELEASE_TAG: edgcpfe-ci-799603e0b5ab
+      EDG_RELEASE_SHA256: fa769825e70766fbefe017806816b2338acd03daa93bb5562369c293972ce64c
+      RUST_TOOLCHAIN_VERSION: 1.99.1
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+      EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+      EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+      EDGCPP_EDG_REVISION: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+    steps:
+      - name: Check out exact EDG Rust revision (PR #86 on compiler-ci PR/push)
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/edgcpp-rust
+          ref: ${{ inputs.source_ref || 'f7c79dce221dbb973de57b7d6808c81603dc9e79' }}
+          path: edgcpp-rust
+          persist-credentials: false
+      - name: Record exact revision
+        working-directory: edgcpp-rust
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          test "${#sha}" -eq 40
+          echo "EDG Rust commit: $sha" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [[ "${{ github.event_name }}" != workflow_dispatch ]]; then
+            test "$sha" = f7c79dce221dbb973de57b7d6808c81603dc9e79
+          fi
+      - name: Check out source headers matching the pinned EDG library
+        uses: actions/checkout@v4
+        with:
+          repository: bingundu/edgcpp
+          ref: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+          path: edgcpp
+          persist-credentials: false
+      - name: Configure EDG bridge metadata without rebuilding full EDG
+        working-directory: edgcpp
+        env:
+          EDG_BASE: ${{ github.workspace }}/edgcpp/bases/docker/dev-env/gcc
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EDG_SOURCE_SHA"
+          cmake --preset linux-gcc-release \
+            -DEDG_BUILD_LIB=OFF -DEDG_BUILD_CALLABLE_LIBRARY=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          cmake --build build/gcc-release --target error-info --parallel 2
+          test -s build/gcc-release/src/includes/err_codes.h
+          test -s build/gcc-release/src/includes/err_data.h
+      - name: Download and verify pinned prebuilt EDG archive
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          mkdir -p build/gcc-release/lib build/prebuilt-edg
+          curl --fail --location --silent --show-error --retry 4 --retry-delay 2 \
+            "https://github.com/bingundu/edgcpp/releases/download/$EDG_RELEASE_TAG/edgcpfe-ci-x86_64-callable-release-linux-x86_64.tar.gz" \
+            -o build/prebuilt-edg/archive.tar.gz
+          printf '%s  %s\n' "$EDG_RELEASE_SHA256" build/prebuilt-edg/archive.tar.gz | sha256sum -c -
+          tar -xzf build/prebuilt-edg/archive.tar.gz -C build/prebuilt-edg
+          grep -Fx "commit=$EDG_SOURCE_SHA" build/prebuilt-edg/BUILD-INFO.txt
+          grep -Fx 'platform=linux-x86_64' build/prebuilt-edg/BUILD-INFO.txt
+          test -s build/prebuilt-edg/lib/libedgcpfe.a
+          cp build/prebuilt-edg/lib/libedgcpfe.a build/gcc-release/lib/libedgcpfe.a
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          if ! command -v cargo >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN_VERSION"
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install "$RUST_TOOLCHAIN_VERSION" --profile minimal
+          rustup default "$RUST_TOOLCHAIN_VERSION"
+      - name: Restore Rust build cache
+        uses: actions/cache/restore@v4
+        id: rust-cache
+        with:
+          path: |
+            edgcpp-rust/target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: edg-atomic-v1-${{ hashFiles('edgcpp-rust/Cargo.lock', 'edgcpp-rust/build.rs') }}-${{ github.sha }}
+          restore-keys: |
+            rust-edgcpp-cranelift-v1-
+      - name: Run new atomic traversal regression tests
+        working-directory: edgcpp-rust
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          timeout --signal=TERM --kill-after=10s 20m \
+            cargo test --locked --features codegen --lib traversal_tests -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/edg-atomic-targeted.log"
+          grep -Eq 'test result: ok' "$RUNNER_TEMP/edg-atomic-targeted.log"
+      - name: Run all Rust library tests with codegen
+        working-directory: edgcpp-rust
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          timeout --signal=TERM --kill-after=10s 20m \
+            cargo test --locked --features codegen --lib \
+            2>&1 | tee "$RUNNER_TEMP/edg-atomic-library.log"
+          grep -Eq 'test result: ok' "$RUNNER_TEMP/edg-atomic-library.log"
+      - name: Summarize passing test logs
+        if: success()
+        run: |
+          echo "Atomic regression tests and full codegen library tests passed." >> "$GITHUB_STEP_SUMMARY"
+          grep 'test result: ok' "$RUNNER_TEMP/edg-atomic-targeted.log" >> "$GITHUB_STEP_SUMMARY"
+          grep 'test result: ok' "$RUNNER_TEMP/edg-atomic-library.log" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload validation logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: edg-atomic-validation-logs
+          path: |
+            ${{ runner.temp }}/edg-atomic-targeted.log
+            ${{ runner.temp }}/edg-atomic-library.log
+          if-no-files-found: ignore
+          retention-days: 14
