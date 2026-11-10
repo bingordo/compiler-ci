@@ -1,0 +1,49 @@
+name: P0 TypeId whole-module DCE PR 805 exact-source validation
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-ir-typeid-dce-pr805.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  typeid-dce:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out immutable candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: afefb907d5c7fb83700f063ea784958d68493f65
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check source pin and reduce workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = afefb907d5c7fb83700f063ea784958d68493f65
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          git -C compiler rev-parse HEAD >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-typeid-dce-pr805
+      - name: Opt-in native and legacy DCE differential regressions
+        working-directory: compiler
+        run: cargo test -p compiler-opt --lib dead_functions::tests -- --nocapture
+      - name: Core crate regression and independent ELF/GAS roots
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+          cargo test -p compiler-backend-x86 --test dead_function_relocation_native -- --nocapture
+      - name: Warnings denied and strict lint
+        working-directory: compiler
+        run: |
+          RUSTFLAGS='-D warnings' cargo check -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend-x86 --all-targets -- -D warnings
