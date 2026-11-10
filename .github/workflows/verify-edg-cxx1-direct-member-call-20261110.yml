@@ -1,0 +1,196 @@
+name: EDG C++1 direct local member call native TypeId and G++ differential
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/verify-edg-cxx1-direct-member-call-20261110.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: edg-cxx1-direct-member-call-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  direct-edg:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container:
+      image: ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8
+    defaults:
+      run:
+        shell: edg-container-exec "bash -eo pipefail {0}"
+    env:
+      EDG_SOURCE_SHA: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+      EDG_RELEASE_TAG: edgcpfe-ci-799603e0b5ab
+      EDG_RELEASE_SHA256: fa769825e70766fbefe017806816b2338acd03daa93bb5562369c293972ce64c
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUST_TOOLCHAIN_VERSION: 1.99.1
+    steps:
+      - name: Checkout private compiler pilot with scoped CI key
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2654399602f52207361d6f7bc2febda9062f96a7
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+
+      - name: Check out exact EDG headers and configuration
+        uses: actions/checkout@v7
+        with:
+          repository: bingundu/edgcpp
+          ref: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+          path: edgcpp
+          persist-credentials: false
+
+      - name: Record compiler and EDG source revision
+        run: |
+          test "$(git -C edgcpp rev-parse HEAD)" = "$EDG_SOURCE_SHA"
+          git -C compiler rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Configure matching EDG native metadata only
+        env:
+          EDG_BASE: ${{ github.workspace }}/edgcpp/bases/docker/dev-env/gcc
+        working-directory: edgcpp
+        run: |
+          cmake --preset linux-gcc-release \
+            -DEDG_BUILD_LIB=OFF \
+            -DEDG_BUILD_CALLABLE_LIBRARY=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          cmake --build build/gcc-release --target error-info --parallel 2
+
+      - name: Restore exact EDG prebuilt native archive
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          url="https://github.com/bingundu/edgcpp/releases/download/$EDG_RELEASE_TAG/edgcpfe-ci-x86_64-callable-release-linux-x86_64.tar.gz"
+          mkdir -p build/gcc-release/lib build/prebuilt-edg
+          curl --fail --location --silent --show-error --retry 4 --retry-delay 2 \
+            "$url" --output build/prebuilt-edg/archive.tar.gz
+          printf '%s  %s\n' "$EDG_RELEASE_SHA256" build/prebuilt-edg/archive.tar.gz | sha256sum --check --status
+          tar -xzf build/prebuilt-edg/archive.tar.gz -C build/prebuilt-edg
+          grep -Fx "commit=$EDG_SOURCE_SHA" build/prebuilt-edg/BUILD-INFO.txt
+          grep -Fx 'platform=linux-x86_64' build/prebuilt-edg/BUILD-INFO.txt
+          test -s build/prebuilt-edg/lib/libedgcpfe.a
+          cp build/prebuilt-edg/lib/libedgcpfe.a build/gcc-release/lib/libedgcpfe.a
+
+      - name: Check out C++0 EDG linker-symbol export candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/edgcpp-rust
+          ref: cbbce8db01722b7cc72edda073990718a2350107
+          path: edg-rust
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: |
+          if ! command -v cargo >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN_VERSION"
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install "$RUST_TOOLCHAIN_VERSION" --profile minimal
+          rustup default "$RUST_TOOLCHAIN_VERSION"
+
+      - name: Test source-authoritative EDG C++ dialect and class admission wire events
+        env:
+          EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+          EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+          EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+          EDGCPP_EDG_REVISION: ${{ env.EDG_SOURCE_SHA }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test --manifest-path edg-rust/Cargo.toml --lib decodes_cpp_dialect_and_immutable_record_triviality_proofs
+
+      - name: Verify TypeId-native SysV GP variadic ABI acceptance and rejection
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          # Isolate the dependency-free IR crate from the compiler workspace:
+          # Cargo otherwise resolves the private Mini-C Git dependency of
+          # the unrelated driver even when testing compiler-ir alone.
+          temp="$(mktemp -d)"
+          cp -a crates/ir "$temp/ir"
+          cargo test --manifest-path "$temp/ir/Cargo.toml" sysv_gp_variadic_tests --lib
+
+
+      - name: Run shared TypeId optimizer and inliner unit tests (isolated crates)
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          # Cargo otherwise resolves unrelated private frontend Git dependencies.
+          # Preserve all local path/dev dependencies in a standalone crate tree.
+          temp="$(mktemp -d)"
+          mkdir -p "$temp/crates"
+          cp -a crates/ir crates/opt crates/backend crates/backend-x86 "$temp/crates/"
+          cargo test --manifest-path "$temp/crates/opt/Cargo.toml" --lib
+
+      - name: Build direct EDG to compiler-ir and x86 backend adapter
+        working-directory: compiler
+        env:
+          EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+          EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+          EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+          EDGCPP_EDG_REVISION: ${{ env.EDG_SOURCE_SHA }}
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test --manifest-path tools/edg-driver/Cargo.toml
+          cargo build --manifest-path tools/edg-driver/Cargo.toml
+
+
+      - name: Real C++ member call native TypeId + independently built G++ oracle
+        working-directory: edgcpp/build/gcc-release
+        env:
+          CXX1_ARTIFACTS: ${{ runner.temp }}/edg-cxx1-p1b
+        run: |
+          set -euo pipefail
+          source ./environment.sh
+          compiler="${GITHUB_WORKSPACE}/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          fixtures="${GITHUB_WORKSPACE}/compiler/tools/edg-driver/tests/fixtures"
+          mkdir -p "$CXX1_ARTIFACTS"
+          cp "$fixtures"/edg_native_cxx1_member_call*.cpp "$CXX1_ARTIFACTS/"
+          cd "$CXX1_ARTIFACTS"
+          test "$(git -C "$GITHUB_WORKSPACE/compiler" rev-parse HEAD)" = "2654399602f52207361d6f7bc2febda9062f96a7"
+          g++ -std=c++17 -O2 -Wall -Wextra -Werror -c edg_native_cxx1_member_call.cpp -o gxx-calls.o
+          g++ -std=c++17 -O2 -Wall -Wextra -Werror -c edg_native_cxx1_member_call_driver.cpp -o gxx-driver.o
+          "$compiler" edg-native.o --typeid-native edg_native_cxx1_member_call.cpp >native.log 2>&1 || {
+            cat native.log
+            exit 1
+          }
+          test "$(od -An -tx1 -N4 edg-native.o | tr -d '[:space:]')" = 7f454c46
+          nm -g --defined-only edg-native.o | grep -Fq '_Z19native_member_callsi'
+          nm -g --defined-only edg-native.o | grep -Fq '_ZN7Counter3sumEi'
+          g++ gxx-driver.o gxx-calls.o -o reference
+          g++ gxx-driver.o edg-native.o -o native
+          timeout 15s ./reference >reference.out 2>reference.err
+          timeout 15s ./native >native.out 2>native.err
+          test "$(sha256sum reference.out|cut -d' ' -f1)" = "$(sha256sum native.out|cut -d' ' -f1)"
+          test "$(sha256sum reference.err|cut -d' ' -f1)" = "$(sha256sum native.err|cut -d' ' -f1)"
+          echo "EDG_CXX1_P1B gate=direct_local_member_call_native_gxx result=pass"
+          for kind in bad_virtual bad_ctor bad_pointer; do
+            source="edg_native_cxx1_member_call_${kind}.cpp"
+            g++ -std=c++17 -fsyntax-only "$source"
+            rm -f "bad-$kind.o"
+            if "$compiler" "bad-$kind.o" --typeid-native "$source" >"bad-$kind.log" 2>&1; then
+              echo "EDG_CXX1_P1B gate=negative_rejected source=$source emitted_success=1" >&2
+              exit 1
+            fi
+            test ! -e "bad-$kind.o"
+            echo "EDG_CXX1_P1B gate=negative_rejected source=$source no_partial_elf=1"
+          done
+
+      - name: Preserve source, native ELF and G++ P1b acceptance logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: edg-cxx1-member-call-p1b
+          path: ${{ runner.temp }}/edg-cxx1-p1b/
+          if-no-files-found: ignore
