@@ -1,0 +1,76 @@
+name: Standalone Mini-C TypeId default cutover PR 800
+on:
+  pull_request:
+    paths:
+      - .github/workflows/mini-c-typeid-default-800.yml
+permissions:
+  contents: read
+jobs:
+  standalone-default:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 22c39909b150597fb1dc79555b6df69373642211
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: mini-c-typeid-default-800
+      - name: Exact source and all-target warnings-denied build
+        working-directory: compiler
+        run: |
+          test "$(git rev-parse HEAD)" = "22c39909b150597fb1dc79555b6df69373642211"
+          RUSTFLAGS="-D warnings" cargo check --manifest-path tools/mini-c-driver/Cargo.toml --all-targets
+          RUSTFLAGS="-D warnings" cargo check -p compiler --all-targets
+      - name: Standalone default versus explicit TypeId ELF/GAS and M48 runtime
+        working-directory: compiler
+        run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml --test typeid_cli -- --nocapture
+      - name: Standalone Mini-C full library and integration tests
+        working-directory: compiler
+        run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml -- --test-threads=2
+      - name: Standalone TypeId DEFAULT full historical GCC differential
+        working-directory: compiler
+        run: |
+          cargo build --manifest-path tools/mini-c-driver/Cargo.toml --bin compiler-mini-c
+          python3 tools/mini-c-driver/tests/differential.py \
+            --compiler tools/mini-c-driver/target/debug/compiler-mini-c \
+            --seed-count 2 --steps 60 --ct04-seed-count 1 \
+            --m10-compound-seed-count 1 \
+            --artifacts target/mini-c-default-typeid-reproducers
+      - name: Explicit legacy rollback historical GCC differential
+        working-directory: compiler
+        run: |
+          python3 tools/mini-c-driver/tests/differential.py \
+            --compiler tools/mini-c-driver/target/debug/compiler-mini-c --ir legacy \
+            --seed-count 1 --steps 30 --ct04-seed-count 1 \
+            --m10-compound-seed-count 1 \
+            --artifacts target/mini-c-legacy-reproducers
+      - name: Unified driver remains TypeId default
+        working-directory: compiler
+        run: cargo test -p compiler --test ir_default_cli -- --nocapture
+      - name: Strict standalone and unified compiler Clippy
+        working-directory: compiler
+        run: |
+          cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml --all-targets -- -D warnings
+          cargo clippy -p compiler --all-targets -- -D warnings
+      - name: Archive failing differential reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: default-ir-differential-repro
+          path: |
+            compiler/target/mini-c-default-typeid-reproducers
+            compiler/target/mini-c-legacy-reproducers
+          if-no-files-found: ignore
