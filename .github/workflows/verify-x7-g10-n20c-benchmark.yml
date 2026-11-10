@@ -1,0 +1,108 @@
+name: X7.G10.N20.C paired I64 compilation and code-size benchmark
+on:
+  push:
+    branches: [ci/x7-g10-n20c-i64-benchmark-20261110]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  production-benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 28
+    steps:
+      - name: Checkout exact N20.C compiler commit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 8b3d0f28ed05741da25ce716da196a486ea794c9
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Isolate local x86+IR crates for offline reproducible benchmark
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 8b3d0f28ed05741da25ce716da196a486ea794c9
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          """)
+          PY
+      - name: Release-mode source to ELF baseline with I64 feature disabled
+        env:
+          X7_N20C_BENCH_EVIDENCE: /tmp/x7-n20c-unfused.json
+        run: |
+          set -euo pipefail
+          cargo test --release -p compiler-backend-x86 --no-default-features \
+            --features x7-native-form-validation \
+            --test x7_g10_n20c_compile_benchmark --offline -- --nocapture
+          cat /tmp/x7-n20c-unfused.json
+      - name: Release-mode source to ELF candidate with I64 memory forms enabled
+        env:
+          X7_N20C_BENCH_EVIDENCE: /tmp/x7-n20c-64-enabled.json
+        run: |
+          set -euo pipefail
+          cargo test --release -p compiler-backend-x86 --features x7-c-defined-64 \
+            --test x7_g10_n20c_compile_benchmark --offline -- --nocapture
+          cat /tmp/x7-n20c-64-enabled.json
+      - name: Validate paired metrics without flaky timing thresholds
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          a=json.loads(Path("/tmp/x7-n20c-unfused.json").read_text())
+          b=json.loads(Path("/tmp/x7-n20c-64-enabled.json").read_text())
+          assert a["features_64_enabled"] is False and b["features_64_enabled"] is True
+          assert a["functions"]==b["functions"]==180
+          assert a["selected_total"]==0 and a["text_bytes_saved"]==0
+          assert b["selected_total"]>0 and b["text_bytes_saved"]>0
+          assert a["text_bytes_raw"]==b["text_bytes_raw"]
+          for key in ("source_to_physical_median_ns","late_selector_with_clone_median_ns",
+                      "raw_elf_encode_median_ns","selected_elf_encode_median_ns",
+                      "normal_backend_emit_object_median_ns"):
+              assert a[key]>0 and b[key]>0, key
+          print("X7_N20C_PAIR_PASS baseline_bytes=%d selected_bytes=%d saved=%d "
+                "folds=%d selector_median_ns=%d raw_compile_median_ns=%d"
+                %(a["text_bytes_raw"],b["text_bytes_selected"],
+                  b["text_bytes_saved"],b["selected_total"],
+                  b["late_selector_with_clone_median_ns"],
+                  b["source_to_physical_median_ns"]))
+          PY
+      - name: Save paired benchmark evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-g10-n20c-i64-paired-benchmark
+          path: |
+            /tmp/x7-n20c-unfused.json
+            /tmp/x7-n20c-64-enabled.json
+          retention-days: 30
+  full-workspace:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact N20.C compiler commit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 8b3d0f28ed05741da25ce716da196a486ea794c9
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Private frontend dependency access
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub host and install debugger
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+          sudo apt-get update -qq
+          sudo apt-get install -y gdb
+      - name: Full workspace and 64-bit feature with fallback
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 8b3d0f28ed05741da25ce716da196a486ea794c9
+          cargo test --workspace
+          cargo test -p compiler-backend-x86 --features x7-c-defined-64
+          cargo test -p compiler-backend-x86 --no-default-features
+          echo X7_N20C_WORKSPACE_PASS
