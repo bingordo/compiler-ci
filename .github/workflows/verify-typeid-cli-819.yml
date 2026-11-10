@@ -1,0 +1,82 @@
+name: P0 default TypeId CLI no legacy setup PR819 exact source
+on:
+  push:
+    branches: [ci/verify-typeid-rollback-cli-819-20261110]
+    paths: ['.github/workflows/verify-typeid-cli-819.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  driver-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5614a1f7eb9545130b883bd0df4c68e5cd71ee41
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin and attest compiler source
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 5614a1f7eb9545130b883bd0df4c68e5cd71ee41
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git -C compiler rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-cutover-cli-rollback-819
+      - name: Full unified compiler driver unit tests (Mini-C and Oberon)
+        working-directory: compiler
+        run: cargo test -p compiler --bin compiler -- --test-threads=2
+      - name: Default TypeId and explicit legacy CLI parity including all inline policies
+        working-directory: compiler
+        run: cargo test -p compiler --test ir_default_cli -- --test-threads=2
+      - name: Source-to-ELF/GAS native and rollback driver integration tests
+        working-directory: compiler
+        run: |
+          cargo test -p compiler --test mini_c_cli --test typeid_elf_linker_matrix --test typeid_frame_pointer --test typeid_pic_shared --test typeid_pic_frame_shared -- --test-threads=2
+      - name: Full driver crate integration test matrix
+        working-directory: compiler
+        run: cargo test -p compiler --tests -- --test-threads=2
+      - name: Strict Rust driver Clippy including unit and integration tests
+        working-directory: compiler
+        run: cargo clippy -p compiler --all-targets -- -D warnings
+  core-backend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5614a1f7eb9545130b883bd0df4c68e5cd71ee41
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Isolate source-pinned TypeId optimizer and x86 native backend crates
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 5614a1f7eb9545130b883bd0df4c68e5cd71ee41
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gdb
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-cutover-cli-core-819
+      - name: Full IR/optimizer/backend/native x86 regression
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+      - name: Strict TypeId core/backend Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
