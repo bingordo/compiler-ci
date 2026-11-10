@@ -1,0 +1,742 @@
+name: P0 EDG shared TypeId rollback conversion PR 811 acceptance
+
+on:
+  push:
+    branches: [ci/verify-ir-edg-rollback-811-20261110]
+    paths: ['.github/workflows/verify-ir-edg-rollback-811.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: edg-native-ssa-${{ github.event.pull_request.number || inputs.source_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  direct-edg:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8
+    defaults:
+      run:
+        shell: edg-container-exec "bash -eo pipefail {0}"
+    env:
+      EDG_SOURCE_SHA: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+      EDG_RELEASE_TAG: edgcpfe-ci-799603e0b5ab
+      EDG_RELEASE_SHA256: fa769825e70766fbefe017806816b2338acd03daa93bb5562369c293972ce64c
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUST_TOOLCHAIN_VERSION: 1.99.1
+    steps:
+      - name: Checkout private compiler pilot with scoped CI key
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a190f38a477d57d1bcbe2f302e512c1956d2d5b0
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+
+      - name: Check out exact EDG headers and configuration
+        uses: actions/checkout@v7
+        with:
+          repository: bingundu/edgcpp
+          ref: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+          path: edgcpp
+          persist-credentials: false
+
+      - name: Record compiler and EDG source revision
+        run: |
+          test "$(git -C edgcpp rev-parse HEAD)" = "$EDG_SOURCE_SHA"
+          test "$(git -C compiler rev-parse HEAD)" = a190f38a477d57d1bcbe2f302e512c1956d2d5b0
+          git -C compiler rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Configure matching EDG native metadata only
+        env:
+          EDG_BASE: ${{ github.workspace }}/edgcpp/bases/docker/dev-env/gcc
+        working-directory: edgcpp
+        run: |
+          cmake --preset linux-gcc-release \
+            -DEDG_BUILD_LIB=OFF \
+            -DEDG_BUILD_CALLABLE_LIBRARY=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          cmake --build build/gcc-release --target error-info --parallel 2
+
+      - name: Restore exact EDG prebuilt native archive
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          url="https://github.com/bingundu/edgcpp/releases/download/$EDG_RELEASE_TAG/edgcpfe-ci-x86_64-callable-release-linux-x86_64.tar.gz"
+          mkdir -p build/gcc-release/lib build/prebuilt-edg
+          curl --fail --location --silent --show-error --retry 4 --retry-delay 2 \
+            "$url" --output build/prebuilt-edg/archive.tar.gz
+          printf '%s  %s\n' "$EDG_RELEASE_SHA256" build/prebuilt-edg/archive.tar.gz | sha256sum --check --status
+          tar -xzf build/prebuilt-edg/archive.tar.gz -C build/prebuilt-edg
+          grep -Fx "commit=$EDG_SOURCE_SHA" build/prebuilt-edg/BUILD-INFO.txt
+          grep -Fx 'platform=linux-x86_64' build/prebuilt-edg/BUILD-INFO.txt
+          test -s build/prebuilt-edg/lib/libedgcpfe.a
+          cp build/prebuilt-edg/lib/libedgcpfe.a build/gcc-release/lib/libedgcpfe.a
+
+      - name: Check out C++0 EDG linker-symbol export candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/edgcpp-rust
+          ref: cranelift-codegen
+          path: edg-rust
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: |
+          if ! command -v cargo >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN_VERSION"
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install "$RUST_TOOLCHAIN_VERSION" --profile minimal
+          rustup default "$RUST_TOOLCHAIN_VERSION"
+
+      - name: Exact common rollback-SSA TypeId regression tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          temp="$(mktemp -d)"
+          cp -a crates/ir "$temp/ir"
+          cargo test --manifest-path "$temp/ir/Cargo.toml" --test typed_ssa_body
+          cargo test --manifest-path "$temp/ir/Cargo.toml" --test typed_module_abi
+
+      - name: Verify TypeId-native SysV GP variadic ABI acceptance and rejection
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          # Isolate the dependency-free IR crate from the compiler workspace:
+          # Cargo otherwise resolves the private Mini-C Git dependency of
+          # the unrelated driver even when testing compiler-ir alone.
+          temp="$(mktemp -d)"
+          cp -a crates/ir "$temp/ir"
+          cargo test --manifest-path "$temp/ir/Cargo.toml" sysv_gp_variadic_tests --lib
+
+
+      - name: Build direct EDG to compiler-ir and x86 backend adapter
+        working-directory: compiler
+        env:
+          EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+          EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+          EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+          EDGCPP_EDG_REVISION: ${{ env.EDG_SOURCE_SHA }}
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test --manifest-path tools/edg-driver/Cargo.toml
+          cargo build --manifest-path tools/edg-driver/Cargo.toml
+
+      - name: EDG TypeId-native source producer contract
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          source=tools/edg-driver/src/lowering.rs
+          # The canonical source producer must construct TypeId-owned
+          # blocks, parameters and instructions directly. All subsequent
+          # native GCC/C++ smoke tests exercise this path.
+          grep -Fq 'blocks:Vec<TypedBlock>' "$source"
+          grep -Fq 'instructions.push(TypedInstruction {id,ty,op})' "$source"
+          grep -Fq 'params.push(TypedParameter {id,ty:type_id})' "$source"
+          grep -Fq 'pub fn lower_edg_to_typeid' "$source"
+          # Both module ABI entrypoints now transitively validate native
+          # TypeId value flow, opcode types and memory provenance; do not
+          # require the old redundant standalone value-flow invocation.
+          grep -Fq 'module.validate_module_abi()?' "$source"
+          grep -Fq 'module.validate_sysv_gp_variadic_abi()?' "$source"
+          grep -Fq 'native_gp!=legacy_gp' "$source"
+          grep -Fq 'let module=lower_edg_to_typeid(il,globals)?' "$source"
+          grep -Fq 'fn legacy_x86_compatibility' "$source"
+          grep -Fq 'module.legacy_compatibility_functions()?' "$source"
+          if grep -Fq 'blocks:Vec<Block>,' "$source"; then
+            echo "EDG source frontend regressed to legacy SSA block ownership"
+            exit 1
+          fi
+
+      - name: Native direct compiler IR x86 ELF versus GCC differential
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cp tools/edg-driver/tests/fixtures/edg_native_ir*.c ../edgcpp/build/gcc-release/
+          (
+            cd ../edgcpp/build/gcc-release
+            source environment.sh
+            binary="../../../compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+            if ! "$binary" native_edg.o --c11 edg_native_ir_pilot.c >native_edg.log 2>&1; then
+              cat native_edg.log
+              exit 1
+            fi
+            test "$(od -An -tx1 -N4 native_edg.o | tr -d ' \n')" = 7f454c46
+            nm -g --defined-only native_edg.o | grep -q edg_native_sum
+            nm -g --defined-only native_edg.o | grep -q edg_native_u64
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_native_ir_pilot.c edg_native_ir_pilot_driver.c -o gcc_edg_native_ir
+            gcc -std=c11 -O2 -Wall -Wextra -Werror native_edg.o edg_native_ir_pilot_driver.c -o compiler_edg_native_ir
+            ./gcc_edg_native_ir
+            ./compiler_edg_native_ir
+            # Source-checked C integer automatic locals are supported by D1.
+            for source in edg_native_ir_bad_global.c edg_native_ir_bad_fp.c; do
+              rm -f bad_native_edg.o bad_native_edg.log
+              if "$binary" bad_native_edg.o --c11 "$source" >bad_native_edg.log 2>&1; then
+                echo "Unsupported EDG/compiler-ir source unexpectedly compiled: $source"
+                exit 1
+              fi
+              grep -E 'compiler-ir|native pilot|unsupported|EDG|C operation|C expression|C return|source' bad_native_edg.log
+              test ! -e bad_native_edg.o
+            done
+          )
+
+      - name: Native EDG automatic INTEGER SSA local GCC differential
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cp tools/edg-driver/tests/fixtures/edg_native_locals*.c ../edgcpp/build/gcc-release/
+          (
+            cd ../edgcpp/build/gcc-release
+            source environment.sh
+            binary="../../../compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+            if ! "$binary" native_integer_locals.o --c11 edg_native_locals.c >native_locals.log 2>&1; then
+              cat native_locals.log
+              exit 1
+            fi
+            nm -g --defined-only native_integer_locals.o | grep -q edg_locals_reassign
+            nm -g --defined-only native_integer_locals.o | grep -q edg_locals_u64
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_native_locals.c edg_native_locals_driver.c -o gcc_edg_locals
+            gcc -std=c11 -O2 -Wall -Wextra -Werror native_integer_locals.o edg_native_locals_driver.c -o compiler_edg_locals
+            ./gcc_edg_locals
+            ./compiler_edg_locals
+            for source in edg_native_locals_bad_uninit.c edg_native_locals_bad_self_init.c edg_native_locals_bad_volatile.c edg_native_locals_bad_pointer.c; do
+              rm -f bad_native_locals.o bad_native_locals.log
+              if "$binary" bad_native_locals.o --c11 "$source" >bad_native_locals.log 2>&1; then
+                echo "Unsupported native EDG INTEGER automatic unexpectedly compiled: $source"
+                exit 1
+              fi
+              grep -E 'compiler-ir|INTEGER|automatic|unsupported|EDG|source|local|initializ|type|statement|declaration|C operation' bad_native_locals.log
+              test ! -e bad_native_locals.o
+            done
+          )
+
+      - name: EDG native if/while CFG SSA join and loop phi GCC differential
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cp tools/edg-driver/tests/fixtures/edg_native_cfg*.c ../edgcpp/build/gcc-release/
+          (
+            cd ../edgcpp/build/gcc-release
+            source environment.sh
+            binary="../../../compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+            if ! "$binary" edg_cfg_native.o --c11 edg_native_cfg.c >edg_cfg_native.log 2>&1; then
+              cat edg_cfg_native.log
+              exit 1
+            fi
+            test "$(od -An -tx1 -N4 edg_cfg_native.o | tr -d ' \n')" = 7f454c46
+            nm -g --defined-only edg_cfg_native.o | grep -q edg_cfg_while
+            nm -g --defined-only edg_cfg_native.o | grep -q edg_cfg_formal_phi
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_native_cfg.c edg_native_cfg_driver.c -o gcc_edg_cfg
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_cfg_native.o edg_native_cfg_driver.c -o compiler_edg_cfg
+            ./gcc_edg_cfg
+            ./compiler_edg_cfg
+            for source in edg_native_cfg_bad_uninit_if.c edg_native_cfg_bad_uninit_loop.c edg_native_cfg_bad_shadow_uninit.c edg_native_cfg_bad_condition_effect.c edg_native_cfg_bad_do.c edg_native_cfg_bad_goto.c edg_native_cfg_bad_volatile.c; do
+              rm -f bad_edg_cfg.o bad_edg_cfg.log
+              if "$binary" bad_edg_cfg.o --c11 "$source" >bad_edg_cfg.log 2>&1; then
+                echo "Unsupported source unexpectedly compiled: $source"
+                exit 1
+              fi
+              cat bad_edg_cfg.log
+              test ! -e bad_edg_cfg.o
+            done
+          )
+
+      - name: EDG D3 checked C integer promotions casts and scalar operations versus GCC
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cp tools/edg-driver/tests/fixtures/edg_native_d3*.c ../edgcpp/build/gcc-release/
+          (
+            cd ../edgcpp/build/gcc-release
+            source environment.sh
+            binary="../../../compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+            if ! "$binary" edg_d3_native.o --c11 edg_native_d3.c >edg_d3.log 2>&1; then
+              cat edg_d3.log
+              exit 1
+            fi
+            test "$(od -An -tx1 -N4 edg_d3_native.o | tr -d ' \n')" = 7f454c46
+            nm -g --defined-only edg_d3_native.o | grep -q edg_d3_sext
+            nm -g --defined-only edg_d3_native.o | grep -q edg_d3_mixed_add
+            nm -g --defined-only edg_d3_native.o | grep -q edg_d3_divu
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_native_d3.c edg_native_d3_driver.c -o gcc_edg_d3
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_d3_native.o edg_native_d3_driver.c -o compiler_edg_d3
+            ./gcc_edg_d3
+            ./compiler_edg_d3
+            for source in edg_native_d3_bad_bool.c edg_native_d3_bad_short.c edg_native_d3_bad_float.c edg_native_d3_bad_pointer.c edg_native_d3_bad_effect.c; do
+              rm -f bad_edg_d3.o bad_edg_d3.log
+              if "$binary" bad_edg_d3.o --c11 "$source" >bad_edg_d3.log 2>&1; then
+                echo "Unsupported EDG D3 C semantics unexpectedly compiled: $source"
+                exit 1
+              fi
+              test ! -e bad_edg_d3.o
+              cat bad_edg_d3.log
+            done
+          )
+
+      - name: EDG D3 checked direct integer SysV calls versus GCC
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cp tools/edg-driver/tests/fixtures/edg_native_d3_calls*.c ../edgcpp/build/gcc-release/
+          (
+            cd ../edgcpp/build/gcc-release
+            source environment.sh
+            binary="../../../compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+            if ! "$binary" edg_d3_calls_native.o --c11 edg_native_d3_calls.c >edg_d3_calls.log 2>&1; then
+              cat edg_d3_calls.log
+              exit 1
+            fi
+            test "$(od -An -tx1 -N4 edg_d3_calls_native.o | tr -d ' \n')" = 7f454c46
+            nm -g --defined-only edg_d3_calls_native.o | grep -q edg_d3_call_i32
+            nm -g --defined-only edg_d3_calls_native.o | grep -q edg_d3_call_external
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_native_d3_calls.c edg_native_d3_calls_driver.c -o gcc_edg_d3_calls
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_d3_calls_native.o edg_native_d3_calls_driver.c -o compiler_edg_d3_calls
+            ./gcc_edg_d3_calls
+            ./compiler_edg_d3_calls
+            # The source-proven GP-only variadic case is now an accepted
+            # object (no local definition needed for the relocatable ABI).
+            if ! "$binary" edg_d3_variadic_native.o --c11 edg_native_d3_calls_bad_variadic.c >edg_d3_variadic.log 2>&1; then
+              cat edg_d3_variadic.log
+              exit 1
+            fi
+            nm -u edg_d3_variadic_native.o | grep -q 'edg_d3_varargs'
+            for source in edg_native_d3_calls_bad_indirect.c edg_native_d3_calls_bad_void.c; do
+              rm -f bad_edg_d3_calls.o bad_edg_d3_calls.log
+              if "$binary" bad_edg_d3_calls.o --c11 "$source" >bad_edg_d3_calls.log 2>&1; then
+                echo "Unsupported direct C call unexpectedly compiled: $source"
+                exit 1
+              fi
+              test ! -e bad_edg_d3_calls.o
+              cat bad_edg_d3_calls.log
+            done
+          )
+
+      - name: EDG D3c C ternary and logical expressions as real SSA values
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cp tools/edg-driver/tests/fixtures/edg_native_d3c*.c ../edgcpp/build/gcc-release/
+          (
+            cd ../edgcpp/build/gcc-release
+            source environment.sh
+            binary="../../../compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+            if ! "$binary" edg_d3c_values.o --c11 edg_native_d3c_values.c >edg_d3c.log 2>&1; then
+              cat edg_d3c.log
+              exit 1
+            fi
+            test "$(od -An -tx1 -N4 edg_d3c_values.o | tr -d ' \n')" = 7f454c46
+            nm -g --defined-only edg_d3c_values.o | grep -q edg_d3c_ternary_external
+            nm -g --defined-only edg_d3c_values.o | grep -q edg_d3c_ternary_while
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_native_d3c_values.c edg_native_d3c_values_driver.c -o gcc_d3c
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_d3c_values.o edg_native_d3c_values_driver.c -o compiler_d3c
+            ./gcc_d3c
+            ./compiler_d3c
+            for source in edg_native_d3c_bad_ternary_assign.c edg_native_d3c_bad_effectful_logical.c edg_native_d3c_bad_pointer.c; do
+              rm -f bad_d3c.o bad_d3c.log
+              if "$binary" bad_d3c.o --c11 "$source" >bad_d3c.log 2>&1; then
+                echo "Source with unmodeled C expression effects unexpectedly compiled: $source"
+                exit 1
+              fi
+              test ! -e bad_d3c.o
+              cat bad_d3c.log
+            done
+          )
+
+      - name: EDG C99 for loops and scalar compound SSA updates vs GCC
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cp tools/edg-driver/tests/fixtures/edg_native_c99*.c ../edgcpp/build/gcc-release/
+          (
+            cd ../edgcpp/build/gcc-release
+            source environment.sh
+            binary="../../../compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+            if ! "$binary" edg_c99_loops.o --c11 edg_native_c99_loops.c >edg_c99.log 2>&1; then
+              cat edg_c99.log
+              exit 1
+            fi
+            test "$(od -An -tx1 -N4 edg_c99_loops.o | tr -d ' \n')" = 7f454c46
+            nm -g --defined-only edg_c99_loops.o | grep -q edg_c99_for_nested
+            nm -g --defined-only edg_c99_loops.o | grep -q edg_c99_compound_i64
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_native_c99_loops.c edg_native_c99_loops_driver.c -o gcc_edg_c99
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_c99_loops.o edg_native_c99_loops_driver.c -o compiler_edg_c99
+            ./gcc_edg_c99
+            ./compiler_edg_c99
+            for source in edg_native_c99_bad_break.c edg_native_c99_bad_continue.c edg_native_c99_bad_pointer_update.c edg_native_c99_bad_value_update.c edg_native_c99_bad_unbounded_for.c; do
+              rm -f bad_edg_c99.o bad_edg_c99.log
+              if "$binary" bad_edg_c99.o --c11 "$source" >bad_edg_c99.log 2>&1; then
+                echo "Unsupported native C99 control/effect semantics unexpectedly compiled: $source"
+                exit 1
+              fi
+              cat bad_edg_c99.log
+              test ! -e bad_edg_c99.o
+            done
+          )
+
+      - name: EDG C-fast P0 checked integer-pointer native memory GCC differential
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cp tools/edg-driver/tests/fixtures/edg_native_pointer_memory*.c ../edgcpp/build/gcc-release/
+          cp tools/edg-driver/tests/fixtures/edg_native_byte_strings*.c ../edgcpp/build/gcc-release/
+          (
+            cd ../edgcpp/build/gcc-release
+            source environment.sh
+            binary="../../../compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+            if ! "$binary" edg_ptr_native.o --c11 edg_native_pointer_memory.c >edg_ptr.log 2>&1; then
+              cat edg_ptr.log
+              exit 1
+            fi
+            test "$(od -An -tx1 -N4 edg_ptr_native.o | tr -d '[:space:]')" = 7f454c46
+            nm -g --defined-only edg_ptr_native.o | grep -q edg_ptr_sum
+            nm -g --defined-only edg_ptr_native.o | grep -q edg_ptr_store_index
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_native_pointer_memory.c edg_native_pointer_memory_driver.c -o gcc_edg_ptr
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_ptr_native.o edg_native_pointer_memory_driver.c -o compiler_edg_ptr
+            ./gcc_edg_ptr
+            ./compiler_edg_ptr
+            for source in edg_native_pointer_memory_bad_volatile.c edg_native_pointer_memory_bad_local.c edg_native_byte_strings_bad_short.c edg_native_pointer_memory_bad_unsigned_index.c; do
+              rm -f bad_edg_ptr.o bad_edg_ptr.log
+              if "$binary" bad_edg_ptr.o --c11 "$source" >bad_edg_ptr.log 2>&1; then
+                echo "Unsupported native C pointer source unexpectedly compiled: $source"
+                exit 1
+              fi
+              cat bad_edg_ptr.log
+              test ! -e bad_edg_ptr.o
+            done
+          )
+
+      - name: EDG C-fast P0b source byte memory and string kernels vs GCC
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cp tools/edg-driver/tests/fixtures/edg_native_byte_strings*.c ../edgcpp/build/gcc-release/
+          (
+            cd ../edgcpp/build/gcc-release
+            source environment.sh
+            binary="../../../compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+            if ! "$binary" edg_byte_native.o --c11 edg_native_byte_strings.c >edg_byte.log 2>&1; then
+              cat edg_byte.log
+              exit 1
+            fi
+            test "$(od -An -tx1 -N4 edg_byte_native.o | tr -d '[:space:]')" = 7f454c46
+            nm -g --defined-only edg_byte_native.o | grep -q edg_byte_length
+            nm -g --defined-only edg_byte_native.o | grep -q edg_byte_copy
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_native_byte_strings.c edg_native_byte_strings_driver.c -o gcc_edg_byte
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_byte_native.o edg_native_byte_strings_driver.c -o compiler_edg_byte
+            ./gcc_edg_byte
+            ./compiler_edg_byte
+            for source in edg_native_byte_strings_bad_volatile.c edg_native_byte_strings_bad_const_store.c edg_native_byte_strings_bad_short.c edg_native_byte_strings_bad_unsigned_index.c; do
+              rm -f bad_byte_native.o bad_byte.log
+              if "$binary" bad_byte_native.o --c11 "$source" >bad_byte.log 2>&1; then
+                echo "EDG byte source unexpectedly accepted unsupported code: $source"
+                exit 1
+              fi
+              cat bad_byte.log
+              test ! -e bad_byte_native.o
+            done
+          )
+      - name: EDG C-fast P1 source-typed pointer calls and libc puts vs GCC
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cp tools/edg-driver/tests/fixtures/edg_native_pointer_calls*.c ../edgcpp/build/gcc-release/
+          (
+            cd ../edgcpp/build/gcc-release
+            source environment.sh
+            binary="../../../compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+            if ! "$binary" edg_ptr_call_native.o --c11 edg_native_pointer_calls.c >edg_ptr_call.log 2>&1; then
+              cat edg_ptr_call.log
+              exit 1
+            fi
+            test "$(od -An -tx1 -N4 edg_ptr_call_native.o | tr -d '[:space:]')" = 7f454c46
+            nm -g --defined-only edg_ptr_call_native.o | grep -q edg_call_puts
+            nm -g --defined-only edg_ptr_call_native.o | grep -q edg_call_checksum
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_native_pointer_calls.c edg_native_pointer_calls_driver.c -o gcc_edg_ptr_calls
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_ptr_call_native.o edg_native_pointer_calls_driver.c -o compiler_edg_ptr_calls
+            ./gcc_edg_ptr_calls >gcc_pointer_call.out
+            ./compiler_edg_ptr_calls >native_pointer_call.out
+            test "$(cat gcc_pointer_call.out)" = "$(cat native_pointer_call.out)"
+            test "$(cat native_pointer_call.out)" = 'EDG native pointer direct call to libc puts'
+            for source in edg_native_pointer_calls_bad_void.c edg_native_pointer_calls_bad_nested.c edg_native_pointer_calls_bad_qualifier.c; do
+              rm -f bad_ptr_call_native.o bad_ptr_call.log
+              if "$binary" bad_ptr_call_native.o --c11 "$source" >bad_ptr_call.log 2>&1; then
+                echo "Unsupported pointer call source unexpectedly compiled: $source"
+                exit 1
+              fi
+              cat bad_ptr_call.log
+              test ! -e bad_ptr_call_native.o
+            done
+          )
+      - name: EDG C-fast P2 native local arrays and decay vs original GCC
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cp tools/edg-driver/tests/fixtures/edg_native_local_arrays*.c ../edgcpp/build/gcc-release/
+          (
+            cd ../edgcpp/build/gcc-release
+            source environment.sh
+            binary="../../../compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+            if ! "$binary" edg_arrays_native.o --c11 edg_native_local_arrays.c >edg_arrays.log 2>&1; then
+              cat edg_arrays.log
+              exit 1
+            fi
+            test "$(od -An -tx1 -N4 edg_arrays_native.o | tr -d '[:space:]')" = 7f454c46
+            nm -g --defined-only edg_arrays_native.o | grep -q edg_local_array_external
+            nm -g --defined-only edg_arrays_native.o | grep -q edg_local_scope_array
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_native_local_arrays.c edg_native_local_arrays_driver.c -o gcc_edg_arrays
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_arrays_native.o edg_native_local_arrays_driver.c -o compiler_edg_arrays
+            ./gcc_edg_arrays
+            ./compiler_edg_arrays
+            for source in edg_native_local_arrays_bad_vla.c edg_native_local_arrays_bad_init.c edg_native_local_arrays_bad_short.c edg_native_local_arrays_bad_ptrlocal.c; do
+              rm -f bad_edg_arrays.o bad_edg_arrays.log
+              if "$binary" bad_edg_arrays.o --c11 "$source" >bad_edg_arrays.log 2>&1; then
+                echo "Unsupported EDG native automatic array source unexpectedly compiled: $source"
+                exit 1
+              fi
+              cat bad_edg_arrays.log
+              test ! -e bad_edg_arrays.o
+            done
+          )
+      - name: EDG G7 self-contained native C main, crt link and exact exits
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cp tools/edg-driver/tests/fixtures/edg_native_c_main*.c ../edgcpp/build/gcc-release/
+          (
+            cd ../edgcpp/build/gcc-release
+            source environment.sh
+            binary="../../../compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+            for source in edg_native_c_main.c edg_native_c_main_exit.c; do
+              object="${source%.c}.o"
+              if ! "$binary" "$object" --c11 "$source" >native_main.log 2>&1; then
+                cat native_main.log
+                exit 1
+              fi
+              test "$(od -An -tx1 -N4 "$object" | tr -d '[:space:]')" = 7f454c46
+              nm -g --defined-only "$object" | grep -q ' main$'
+              gcc -std=c11 -O2 -Wall -Wextra -Werror "$source" -o gcc_standalone_main
+              gcc -std=c11 -O2 -Wall -Wextra -Werror "$object" -o native_standalone_main
+              set +e
+              ./gcc_standalone_main
+              reference_status="$?"
+              ./native_standalone_main
+              native_status="$?"
+              set -e
+              test "$reference_status" = "$native_status"
+              if test "$source" = edg_native_c_main.c; then
+                test "$native_status" -eq 0
+              else
+                test "$native_status" -eq 7
+              fi
+            done
+          )
+      - name: EDG C-fast P2b exact struct scalar fields vs original GCC
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cp tools/edg-driver/tests/fixtures/edg_native_struct_fields*.c ../edgcpp/build/gcc-release/
+          (
+            cd ../edgcpp/build/gcc-release
+            source environment.sh
+            binary="../../../compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+            if ! "$binary" edg_struct_native.o --c11 edg_native_struct_fields.c >edg_struct.log 2>&1; then
+              cat edg_struct.log
+              exit 1
+            fi
+            test "$(od -An -tx1 -N4 edg_struct_native.o | tr -d '[:space:]')" = 7f454c46
+            nm -g --defined-only edg_struct_native.o | grep -q edg_record_padding
+            nm -g --defined-only edg_struct_native.o | grep -q edg_record_loop
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_native_struct_fields.c edg_native_struct_fields_driver.c -o gcc_edg_struct
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_struct_native.o edg_native_struct_fields_driver.c -o compiler_edg_struct
+            ./gcc_edg_struct
+            ./compiler_edg_struct
+            for source in edg_native_struct_fields_bad_bitfield.c edg_native_struct_fields_bad_initializer.c edg_native_struct_fields_bad_union.c edg_native_struct_fields_bad_short.c edg_native_struct_fields_bad_arrow.c; do
+              rm -f bad_edg_struct.o bad_edg_struct.log
+              if "$binary" bad_edg_struct.o --c11 "$source" >bad_edg_struct.log 2>&1; then
+                echo "Unsupported C struct source unexpectedly compiled: $source"
+                exit 1
+              fi
+              cat bad_edg_struct.log
+              test ! -e bad_edg_struct.o
+            done
+          )
+      - name: EDG C++0 source authoritative linker names vs GCC Itanium nm
+        env:
+          EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+          EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+          EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+          EDGCPP_EDG_REVISION: ${{ env.EDG_SOURCE_SHA }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test --manifest-path edg-rust/Cargo.toml --lib decodes_exact_distinct_edg_cxx_link_names_without_demangling
+          cp edg-rust/tests/fixtures/cxx_link_names.cpp edgcpp/build/gcc-release/
+          (
+            cd edgcpp/build/gcc-release
+            source environment.sh
+            g++ -std=c++17 -O2 -Wall -Wextra -Werror -c cxx_link_names.cpp -o gxx_link_names.o
+            nm -g --defined-only gxx_link_names.o | grep -qF '_ZN5alpha10overloadedEi'
+            nm -g --defined-only gxx_link_names.o | grep -qF '_ZN5alpha10overloadedEl'
+            nm -g --defined-only gxx_link_names.o | grep -qF '_ZN5alpha4beta6nestedEi'
+            nm -g --defined-only gxx_link_names.o | grep -qF ' edg_c_abi'
+            cargo run --quiet --manifest-path ../../../edg-rust/Cargo.toml --example link_names -- cxx_link_names.cpp >edg_link_names.txt
+            cat edg_link_names.txt
+            grep -F $'\t1\t_ZN5alpha10overloadedEi\t' edg_link_names.txt
+            grep -F $'\t1\t_ZN5alpha10overloadedEl\t' edg_link_names.txt
+            grep -F $'\t1\t_ZN5alpha4beta6nestedEi\t' edg_link_names.txt
+            grep -F $'\t0\tedg_c_abi\t' edg_link_names.txt
+          )
+      - name: EDG glibc stdio.h native C include, puts and hello acceptance
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cp tools/edg-driver/tests/fixtures/edg_stdio*.c ../edgcpp/build/gcc-release/
+          (
+            cd ../edgcpp/build/gcc-release
+            source environment.sh
+            binary="../../../compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+            gcc_include="$(gcc -print-file-name=include)"
+            test -f "$gcc_include/stddef.h"
+            if ! "$binary" edg_stdio_header_puts.o --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu edg_stdio_header_puts.c >stdio_header.log 2>&1; then
+              cat stdio_header.log
+              exit 1
+            fi
+            test "$(od -An -tx1 -N4 edg_stdio_header_puts.o | tr -d '[:space:]')" = 7f454c46
+            nm -g --defined-only edg_stdio_header_puts.o | grep -q edg_stdio_puts
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_stdio_header_puts.c edg_stdio_header_puts_driver.c -o gcc_stdio_puts
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_stdio_header_puts.o edg_stdio_header_puts_driver.c -o native_stdio_puts
+            ./gcc_stdio_puts >gcc_stdio.out
+            ./native_stdio_puts >native_stdio.out
+            test "$(cat gcc_stdio.out)" = "$(cat native_stdio.out)"
+            test "$(cat native_stdio.out)" = 'Hello, world!'
+            if ! "$binary" edg_stdio_putchar.o --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu edg_stdio_hello_putchar.c >putchar.log 2>&1; then
+              cat putchar.log
+              exit 1
+            fi
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_stdio_hello_putchar.c -o gcc_putchar_hello
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_stdio_putchar.o -o native_putchar_hello
+            ./gcc_putchar_hello >gcc_putchar.out
+            ./native_putchar_hello >native_putchar.out
+            test "$(cat native_putchar.out)" = "$(cat gcc_putchar.out)"
+            test "$(cat native_putchar.out)" = 'Hello, world!'
+            # No source modifications: real NUL-ended EDG ck_string data.
+            # The native x86 module must define immutable .rodata bytes and
+            # perform a normal glibc puts call from the compiled main.
+            if ! "$binary" native_puts_hello.o --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu edg_stdio_hello_puts.c >native_puts.log 2>&1; then
+              cat native_puts.log
+              exit 1
+            fi
+            test "$(od -An -tx1 -N4 native_puts_hello.o | tr -d '[:space:]')" = 7f454c46
+            nm -a native_puts_hello.o | grep -q _EDG_CSTR_
+            readelf -S native_puts_hello.o | grep -q '\.rodata'
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_stdio_hello_puts.c -o gcc_puts_hello
+            gcc -std=c11 -O2 -Wall -Wextra -Werror native_puts_hello.o -o native_puts_hello
+            ./gcc_puts_hello >gcc_puts.out
+            ./native_puts_hello >native_puts.out
+            test "$(cat native_puts.out)" = "$(cat gcc_puts.out)"
+            test "$(cat native_puts.out)" = 'Hello, world!'
+            # Real glibc variadic calls must use the existing x86
+            # source-checked GP-only SysV ABI path (AL=0).
+            for source in edg_stdio_hello_printf.c edg_stdio_printf_values.c edg_stdio_printf_many.c; do
+              case "$source" in
+                edg_stdio_hello_printf.c) expected='Hello, world!' ;;
+                edg_stdio_printf_values.c) expected='n=7 word=ready big=1234567890' ;;
+                edg_stdio_printf_many.c) expected='11:22:33:44:55:66:77' ;;
+              esac
+              if ! "$binary" native_printf.o --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu "$source" >printf_native.log 2>&1; then
+                cat printf_native.log
+                exit 1
+              fi
+              test "$(od -An -tx1 -N4 native_printf.o | tr -d '[:space:]')" = 7f454c46
+              nm -u native_printf.o | grep -q 'printf'
+              readelf -S native_printf.o | grep -q '\.rodata'
+              gcc -std=c11 -O2 -Wall -Wextra -Werror "$source" -o gcc_printf_hello
+              gcc -std=c11 -O2 -Wall -Wextra -Werror native_printf.o -o native_printf_hello
+              ./gcc_printf_hello >gcc_printf.out
+              ./native_printf_hello >native_printf.out
+              test "$(cat gcc_printf.out)" = "$expected"
+              test "$(cat native_printf.out)" = "$(cat gcc_printf.out)"
+            done
+            rm -f bad_printf.o bad_printf.log
+            if "$binary" bad_printf.o --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu edg_stdio_printf_bad_fp.c >bad_printf.log 2>&1; then
+              echo "Unsupported SSE-class source variadic call was unexpectedly emitted"
+              exit 1
+            fi
+            cat bad_printf.log
+            test ! -e bad_printf.o
+          )
+
+      - name: EDG source direct TypeId native x86 ELF runtime parity matrix
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cp tools/edg-driver/tests/fixtures/*.c ../edgcpp/build/gcc-release/
+          (
+            cd ../edgcpp/build/gcc-release
+            source environment.sh
+            binary="../../../compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+            gcc_include="$(gcc -print-file-name=include)"
+            probe() {
+              local source="$1" driver="$2" tag="$3"
+              echo "=== TypeId direct native ELF: $tag ==="
+              rm -f typeid_matrix.o typeid_matrix_native typeid_matrix_ref
+              if ! "$binary" typeid_matrix.o --typeid-native --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu "$source" >typeid_matrix.log 2>&1; then
+                cat typeid_matrix.log
+                return 1
+              fi
+              test "$(od -An -tx1 -N4 typeid_matrix.o | tr -d '[:space:]')" = 7f454c46
+              if test -n "$driver"; then
+                gcc -std=c11 -O2 "$source" "$driver" -o typeid_matrix_ref
+                gcc -std=c11 -O2 typeid_matrix.o "$driver" -o typeid_matrix_native
+              else
+                gcc -std=c11 -O2 "$source" -o typeid_matrix_ref
+                gcc -std=c11 -O2 typeid_matrix.o -o typeid_matrix_native
+              fi
+              set +e
+              ./typeid_matrix_ref >typeid_matrix_ref.out 2>typeid_matrix_ref.err
+              local refstatus=$?
+              ./typeid_matrix_native >typeid_matrix_native.out 2>typeid_matrix_native.err
+              local nativestatus=$?
+              set -e
+              # Minimal pinned EDG runner image lacks diff(1); compare
+              # exact output bytes via the already available sha256sum.
+              local refout nativeout referr nativeerr
+              refout="$(sha256sum typeid_matrix_ref.out)"
+              nativeout="$(sha256sum typeid_matrix_native.out)"
+              referr="$(sha256sum typeid_matrix_ref.err)"
+              nativeerr="$(sha256sum typeid_matrix_native.err)"
+              test "${refout%% *}" = "${nativeout%% *}"
+              test "${referr%% *}" = "${nativeerr%% *}"
+              test "$refstatus" = "$nativestatus"
+              echo "PASS $tag (exit=$refstatus)"
+            }
+            probe edg_native_ir_pilot.c edg_native_ir_pilot_driver.c integers
+            probe edg_native_cfg.c edg_native_cfg_driver.c cfg
+            probe edg_native_d3_calls.c edg_native_d3_calls_driver.c calls
+            probe edg_native_pointer_memory.c edg_native_pointer_memory_driver.c pointers
+            probe edg_native_struct_fields.c edg_native_struct_fields_driver.c records
+            probe edg_stdio_hello_puts.c '' glibc-puts
+            probe edg_stdio_printf_many.c '' glibc-printf-stack
+            # Temporary controlled rollback remains usable on the same
+            # original source, but the unflagged command above is TypeId.
+            "$binary" rollback_legacy.o --legacy-x86 --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu edg_stdio_hello_puts.c >rollback.log 2>&1
+            gcc -std=c11 -O2 rollback_legacy.o -o rollback_legacy
+            ./rollback_legacy >rollback.out
+            test "$(cat rollback.out)" = 'Hello, world!'
+            rm -f typeid_bad_fp.o
+            if "$binary" typeid_bad_fp.o --typeid-native --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu edg_stdio_printf_bad_fp.c >typeid_bad_fp.log 2>&1; then
+              echo "TypeId native illegally accepted unsupported floating point vararg"
+              exit 1
+            fi
+            test ! -e typeid_bad_fp.o
+          )
