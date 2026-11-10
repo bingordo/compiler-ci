@@ -1,0 +1,62 @@
+name: AArch64 shifted codegen test (compiler PR 787)
+on:
+  push:
+    paths:
+      - '.github/workflows/aarch64-subs-787.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: aarch64-subs-787
+  cancel-in-progress: true
+jobs:
+  verify:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ee91ac6cc46826ca9194f278473d9dc382c7630c
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Exact-source isolated workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "ee91ac6cc46826ca9194f278473d9dc382c7630c"
+          mkdir -p workspace/crates
+          cp -a compiler/crates/ir compiler/crates/backend compiler/crates/backend-aarch64 workspace/crates/
+          cat > workspace/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: workspace
+          key: aarch64-subs-787
+      - name: Warnings-denied all-target compilation
+        working-directory: workspace
+        run: RUSTFLAGS="-D warnings" cargo check -p compiler-backend-aarch64 --all-targets
+      - name: Targeted AArch64 tied repairs with machine allocator
+        working-directory: workspace
+        run: cargo test -p compiler-backend-aarch64 subs_loop_native::subs_selection_preserves_result_and_only_fuses_final_sub -- --nocapture
+      - name: Targeted generic allocator regression
+        working-directory: workspace
+        run: cargo test -p compiler-backend-aarch64 subs_loop_native::native_subs_flags_branch_and_countdown_loop_c_oracle -- --nocapture
+      - name: Full self-contained IR/shared/backend/AArch64 regression
+        working-directory: workspace
+        run: cargo test -p compiler-ir -p compiler-backend -p compiler-backend-aarch64 -- --test-threads=1
+      - name: Strict production backend Clippy
+        working-directory: workspace
+        run: cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
+      - name: Accepted source
+        run: echo 'Native AArch64 tied repairs verified exact SHA ee91ac6cc46826ca9194f278473d9dc382c7630c' >> "$GITHUB_STEP_SUMMARY"
