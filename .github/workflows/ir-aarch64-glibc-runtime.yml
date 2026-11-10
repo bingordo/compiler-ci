@@ -1,0 +1,106 @@
+name: AArch64 TypeId glibc dynamic runtime (compiler cutover)
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ir-aarch64-glibc-runtime.yml'
+permissions:
+  contents: read
+jobs:
+  glibc-aarch64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install AArch64 glibc sysroot, cross-GCC and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            libc6-arm64-cross libc6-dev-arm64-cross qemu-user
+          test -f "$(aarch64-linux-gnu-gcc -print-file-name=crt1.o)"
+          test -f /usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 32dddeb9aa75dfef0f2216cfd742cab3c13fce20
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: ir-aarch64-glibc
+      - name: Source-pinned build
+        working-directory: compiler
+        run: |
+          test "$(git rev-parse HEAD)" = "32dddeb9aa75dfef0f2216cfd742cab3c13fce20"
+          RUSTFLAGS="-D warnings" cargo check -p compiler --all-targets
+          cargo build -p compiler --bin compiler
+      - name: Execute AArch64 TypeId with glibc and dlopen
+        working-directory: compiler
+        run: |
+          set -euxo pipefail
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          cat > "$tmp/libc.c" <<'EOF'
+          extern int puts(const char *);
+          int greet(void) { return puts("TypeId on AArch64 with glibc"); }
+          EOF
+          cat > "$tmp/libc-oracle.c" <<'EOF'
+          extern int greet(void);
+          int main(void) { return greet() < 0; }
+          EOF
+          cat > "$tmp/Init.mod" <<'EOF'
+          MODULE Init;
+          VAR counter*, runs*: INTEGER;
+          PROCEDURE Get*(): INTEGER;
+          BEGIN RETURN counter END Get;
+          BEGIN runs := runs + 1; counter := 37 END Init.
+          EOF
+          cat > "$tmp/dlopen-oracle.c" <<'EOF'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <stdio.h>
+          int main(int argc,char **argv) {
+            if (argc!=2) return 90;
+            void *handle=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL);
+            if (!handle) { fprintf(stderr,"dlopen: %s\n",dlerror()); return 91; }
+            int *counter=(int *)dlsym(handle,"Init__counter");
+            int *runs=(int *)dlsym(handle,"Init__runs");
+            int (*get)(void)=(int (*)(void))dlsym(handle,"Init__Get");
+            if (!counter||!runs||!get) return 92;
+            if (*counter!=37 || *runs!=1 || get()!=37) return 93;
+            void *again=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL);
+            if (!again || *runs!=1) return 94;
+            dlclose(again);
+            dlclose(handle);
+            return 0;
+          }
+          EOF
+          aarch64-linux-gnu-gcc -fPIE -pie -O0 "$tmp/dlopen-oracle.c" -ldl -o "$tmp/dlopen-host"
+          for fmt in obj asm; do
+            ext=o
+            if [ "$fmt" = asm ]; then ext=s; fi
+            for pic in nop ic; do
+              opts=()
+              if [ "$pic" = ic ]; then opts=(--pic); fi
+              file="$tmp/libc-$pic.$ext"
+              ./target/debug/compiler "$tmp/libc.c" --language mini-c \
+                --target aarch64 --ir typeid --emit "$fmt" "${opts[@]}" -o "$file"
+              exe="$tmp/libc-$pic-$fmt"
+              aarch64-linux-gnu-gcc -fPIE -pie -O0 "$tmp/libc-oracle.c" "$file" -o "$exe"
+              timeout 30 qemu-aarch64 -L /usr/aarch64-linux-gnu "$exe"
+              echo "PASS glibc puts, pic=$pic, fmt=$fmt"
+            done
+            file="$tmp/init.$ext"
+            ./target/debug/compiler "$tmp/Init.mod" --language oberon \
+              --target aarch64 --ir typeid --pic --emit "$fmt" -o "$file"
+            so="$tmp/libinit-$fmt.so"
+            aarch64-linux-gnu-gcc -shared -fPIC -Wl,-z,now "$file" -o "$so"
+            timeout 30 qemu-aarch64 -L /usr/aarch64-linux-gnu "$tmp/dlopen-host" "$so"
+            echo "PASS glibc dlopen constructors, fmt=$fmt"
+          done
