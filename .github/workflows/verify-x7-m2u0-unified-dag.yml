@@ -1,0 +1,98 @@
+name: X7 M2.U0 shared ADD CTZ generated DAG admission
+on:
+  push:
+    branches: [ci/x7-m2u0-unified-dag-20261110]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  shared-dag-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 22
+    steps:
+      - name: Checkout exact shared-engine compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: bc002bf845bd633347929e11645c5b81f5acc8c1
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Isolate x86 and generic IR locally for deterministic offline tests
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = bc002bf845bd633347929e11645c5b81f5acc8c1
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          """)
+          PY
+      - name: Run all generated ADD and CTZ selection/legality regression tests
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib dag_add_match --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --lib dag_ctz_match --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --lib dag_match --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --lib --offline
+      - name: Verify full x86 native backend and disabled-feature fallback
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --offline
+          cargo test -p compiler-backend-x86 --no-default-features --offline
+      - name: Measure no-regression matched form counts and ELF native .text
+        run: |
+          set -euo pipefail
+          cargo test --release -p compiler-backend-x86 \
+            --features x7-c-defined-64 \
+            --test x7_g10_n20c_compile_benchmark \
+            --offline -- --nocapture | tee /tmp/x7-m2u0-benchmark.log
+          grep 'X7_N20C_BENCH_JSON' /tmp/x7-m2u0-benchmark.log > /tmp/x7-m2u0-evidence.log
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          lines=Path("/tmp/x7-m2u0-evidence.log").read_text().splitlines()
+          assert len(lines)==1
+          d=json.loads(lines[0].split("X7_N20C_BENCH_JSON ",1)[1])
+          assert d["functions"]==180 and d["selected_total"]==120, d
+          assert d["selected_single"]==60 and d["selected_branch"]==60, d
+          assert d["selected_pressure"]==0 and d["text_bytes_saved"]==360, d
+          print("X7_M2U0_GENERATED_NATIVE_PARITY_PASS forms=120 bytes_saved=360")
+          PY
+      - name: Preserve native parity evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-m2u0-generated-dag-parity
+          path: |
+            /tmp/x7-m2u0-evidence.log
+          retention-days: 30
+  full-workspace:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout exact shared-engine compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: bc002bf845bd633347929e11645c5b81f5acc8c1
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Authorize private frontend git sources
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Host trust and debugger
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+          sudo apt-get update -qq
+          sudo apt-get install -y gdb
+      - name: Check entire compiler workspace and actual native TypeId driver
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = bc002bf845bd633347929e11645c5b81f5acc8c1
+          cargo test --workspace
+          cargo test -p compiler-backend-x86 --features x7-c-defined-64
+          cargo test -p compiler-backend-x86 --no-default-features
+          echo X7_M2U0_FULL_WORKSPACE_PASS
