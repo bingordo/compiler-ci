@@ -1,0 +1,65 @@
+name: X7.G10.N16 source-linked bitwise memory form proof
+on:
+  push:
+    branches: [ci/x7-g10-n16-bitwise-20261109]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - name: Checkout exact compiler N16 candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 4fbc22bb49981c0fd2676bfba9f7d11a12bfcac4
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Generate exact Intel-linked bitwise forms and exercise independent oracle
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 4fbc22bb49981c0fd2676bfba9f7d11a12bfcac4
+          mkdir -p /tmp/n16-intel /tmp/n16-native
+          revision=35eface1b7ee003a1cda95005ec5fd83de658a64
+          for name in MOV ADD SUB AND OR XOR; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 45 \
+              "https://raw.githubusercontent.com/intel/SDM/${revision}/data/instruction/${name}.xml" \
+              -o "/tmp/n16-intel/${name}.xml"
+          done
+          python3 tools/x86_g10_regen_physical_forms.py --xml-dir /tmp/n16-intel --write
+          echo X7_N16_GENERATED_FORMS_START
+          cat crates/backend-x86/src/generated_x7_g10_physical_forms.rs
+          echo X7_N16_GENERATED_FORMS_END
+          python3 tools/x86_g10_regen_physical_forms.py --xml-dir /tmp/n16-intel --check
+          python3 tools/regen_x86_forms.py --check
+          python3 -m unittest discover -s tools -p 'test_x86_g10_native_iforms.py' -v
+          python3 tools/x86_g10_native_iforms.py --xml-dir /tmp/n16-intel --out-dir /tmp/n16-native
+          cc -O2 -std=c11 -Wall -Wextra -Werror -fno-strict-aliasing \
+            tools/tests/x86_g10_native_iforms.c /tmp/n16-native/native_forms.S \
+            -o /tmp/n16-native/oracle
+          /tmp/n16-native/oracle
+          python3 tools/x86_g10_validate_native_bytes.py \
+            --binary /tmp/n16-native/oracle \
+            --evidence /tmp/n16-native/source_form_evidence.json
+      - name: Real SSA opt-in bitwise GAS and direct ELF native tests
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          """)
+          PY
+          cargo test -p compiler-backend-x86 --features x7-c-defined-bitwise \
+            --test x7_g10_n16_bitwise_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-c-defined-bitwise \
+            --lib x7_native_form_bridge --offline
+          cargo test -p compiler-backend-x86 --features x7-c-defined-bitwise \
+            --lib x7_late_selector --offline
+          cargo test -p compiler-backend-x86 --lib x7_late_selector --offline
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --test x7_g10_n15_no_default_fallback --offline
+          echo X7_N16_BITWISE_NATIVE_PASS
