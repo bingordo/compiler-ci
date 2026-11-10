@@ -1,0 +1,102 @@
+name: CT-11 native typed LICM forward-only exact-parent ABBA
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/ct11-typed-licm-forward-only-abba.yml']
+permissions:
+  contents: read
+concurrency:
+  group: ct11-typed-licm-forward-only-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c77eae35d49255972ff9b5e723879f28825245c5
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin toolchain and source
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = c77eae35d49255972ff9b5e723879f28825245c5
+          rustc --version
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ct11-typed-licm-forward-only-core
+      - name: Complete typed LICM native correctness and strict lint
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt --test typed_licm_native -- --nocapture
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-opt --lib
+          cargo clippy --manifest-path compiler/Cargo.toml -p compiler-opt --lib -- -D warnings
+  abba:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [a, b]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2d9f6f03e77c49ca64959b67a46af9041d50193f
+          path: parent
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c77eae35d49255972ff9b5e723879f28825245c5
+          path: candidate
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record exact SHA, toolchain, and checked corpus
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          git -C parent rev-parse HEAD | tee results/parent.sha
+          git -C candidate rev-parse HEAD | tee results/candidate.sha
+          test "$(cat results/parent.sha)" = 2d9f6f03e77c49ca64959b67a46af9041d50193f
+          test "$(cat results/candidate.sha)" = c77eae35d49255972ff9b5e723879f28825245c5
+          rustc --version | tee results/toolchain.txt
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: candidate -> target
+          key: ct11-typed-licm-forward-only-${{ matrix.runner }}
+      - name: Build two pinned release native C compilers
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path parent/Cargo.toml -p compiler --bin compiler
+          cargo build --release --manifest-path candidate/Cargo.toml -p compiler --bin compiler
+      - name: Independent exact-source Mini-C ABBA and GCC execution oracle
+        run: |
+          set -euo pipefail
+          python3 candidate/tools/s23_real_source_abba.py \
+            --before-root parent --after-root candidate \
+            --before-bin parent/target/release/compiler \
+            --after-bin candidate/target/release/compiler \
+            --output results/abba-${{ matrix.runner }}.json --rounds 3 \
+            2>&1 | tee results/abba-${{ matrix.runner }}.log
+          grep '^S2315_SOURCE_SUMMARY ' results/abba-${{ matrix.runner }}.log | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$(grep -c '^S2315_SOURCE_CASE ' results/abba-${{ matrix.runner }}.log)" -eq 12
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ct11-typed-licm-abba-${{ matrix.runner }}
+          path: results/
+          retention-days: 30
