@@ -1,0 +1,52 @@
+name: P0 Shared EDG rollback IR core PR 811 pinned checks
+on:
+  push:
+    branches: [ci/verify-ir-shared-compat-core-811-20261110]
+    paths: ['.github/workflows/verify-ir-shared-compat-core-811.yml']
+permissions:
+  contents: read
+jobs:
+  ir-rollback:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a190f38a477d57d1bcbe2f302e512c1956d2d5b0
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify immutable compiler source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = a190f38a477d57d1bcbe2f302e512c1956d2d5b0
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-edg-compat-811-core
+      - name: Install GDB required by existing DWARF integration tests
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gdb
+      - name: Shared compatibility representation and native/legacy verifier tests
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-ir --test typed_ssa_body -- --nocapture
+          cargo test -p compiler-ir --test typed_module_abi -- --nocapture
+          cargo test -p compiler-ir --test sysv_gp_variadics -- --nocapture
+      - name: Full IR optimizer backend and native x86 regressions
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+      - name: Warnings-denied and strict Clippy
+        working-directory: compiler
+        run: |
+          RUSTFLAGS='-D warnings' cargo check -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
