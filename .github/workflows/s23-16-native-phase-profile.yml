@@ -1,0 +1,99 @@
+name: S23.16 native TypeId opt-in phase profile and musl C audit
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-16-native-phase-profile.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/s23-16-native-phase-profile.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-pinned-native-profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact S23.16 native TypeId source profile candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5e52f0fe95277b7fc0832aaebca2762f22c157a2
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source pin and public checked Mini-C dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 5e52f0fe95277b7fc0832aaebca2762f22c157a2
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          rustc --version
+          cc --version | head -1
+          python3 -m py_compile compiler/tools/s23_native_profile_source.py
+      - name: Cache built Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: s2316-native-source-profile
+      - name: Prove existing 21 exact-width S23 identities (no weakened SMT acceptance)
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends z3
+          python3 tools/prove_native_matchpd_s23.py
+      - name: Profile/native regular-parity and transactional rollback tests
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test --release -p compiler-opt --test native_s2316_profile -- --nocapture
+          cargo test --release -p compiler-opt --test generated_native_dag_snapshot_s2313 -- --nocapture
+          cargo test --release -p compiler-opt --test generated_native_matchpd_boolean_factor_s2314 -- --nocapture
+      - name: Actual production C source compiler profiling CLI tests
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test --release -p compiler --test typeid_native_s2316_profile -- --nocapture
+          cargo build --release -p compiler --bin compiler
+      - name: All original musl bodies plus a grouped source unit with raw phase timings
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          python3 compiler/tools/s23_native_profile_source.py \
+            --root compiler --compiler compiler/target/release/compiler \
+            --output results/s2316-native-source-profile.json --rounds 5 \
+            2>&1 | tee results/s2316-native-source-profile.log
+          test "$(grep -c '^S2316_SOURCE_PROFILE ' results/s2316-native-source-profile.log)" -eq 14
+          grep '^S2316_SOURCE_SUMMARY ' results/s2316-native-source-profile.log | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Existing x86 native C11/GAS/ELF oracle and emitted text
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test --release -p compiler-backend-x86 --test native_s23_profitability native_s2314_matchpd_factor_gas_elf_per_family -- --nocapture
+      - name: Strict native optimizer and source compiler Clippy
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --all-targets -- -D warnings
+          cargo clippy -p compiler --bin compiler --test typeid_native_s2316_profile -- -D warnings
+      - name: Preserve actual counters, compiler timing and source provenance
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2316-profiled-real-source-ssa
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
