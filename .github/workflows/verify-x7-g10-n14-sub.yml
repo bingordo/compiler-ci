@@ -1,0 +1,201 @@
+name: X7.G10.N14 reviewed memory SUB form extension
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-x7-g10-n14-sub.yml']
+permissions:
+  contents: read
+jobs:
+  postalloc-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Checkout exact compiler N8 proof implementation
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 939360d2fbd4e0b631443deb537bf393ea700aa1
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Validate reviewed source/encoder constraints against pinned Intel
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 939360d2fbd4e0b631443deb537bf393ea700aa1
+          mkdir -p /tmp/x7-g10-intel
+          rev=35eface1b7ee003a1cda95005ec5fd83de658a64
+          for instruction in MOV ADD XOR SUB; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 45 \
+              "https://raw.githubusercontent.com/intel/SDM/${rev}/data/instruction/${instruction}.xml" \
+              --output "/tmp/x7-g10-intel/${instruction}.xml"
+          done
+          python3 tools/x86_g10_regen_physical_forms.py --xml-dir /tmp/x7-g10-intel --write
+          echo N14_GENERATED_START
+          cat crates/backend-x86/src/generated_x7_g10_physical_forms.rs
+          echo N14_GENERATED_END
+          python3 tools/x86_g10_regen_physical_forms.py --xml-dir /tmp/x7-g10-intel --check
+          python3 tools/regen_x86_forms.py --check
+      - name: Discover actual Intel Add helper and nested dependencies
+        run: |
+          set -euo pipefail
+          rev=35eface1b7ee003a1cda95005ec5fd83de658a64
+          curl --fail --silent --show-error --location --retry 2 --max-time 45 \
+            "https://raw.githubusercontent.com/intel/SDM/${rev}/data/definitions.xml.gz" \
+            --output /tmp/x7-g10-intel/definitions.xml.gz
+          python3 -m venv /tmp/x7-g10-n9-z3
+          /tmp/x7-g10-n9-z3/bin/python -m pip install --disable-pip-version-check 'z3-solver==4.13.4.0'
+          export X7_N9_INTEL_DEFINITIONS_GZ=/tmp/x7-g10-intel/definitions.xml.gz
+          /tmp/x7-g10-n9-z3/bin/python -m unittest discover -s tools -p 'test_x86_g10_add_helper_proof.py' -v
+          /tmp/x7-g10-n9-z3/bin/python tools/x86_g10_add_helper_proof.py \
+            --definitions-gz /tmp/x7-g10-intel/definitions.xml.gz \
+            --output /tmp/x7-g10-n9-helper-proof.json
+          python3 - <<'PY'
+          import json
+          r=json.load(open('/tmp/x7-g10-n9-helper-proof.json'))
+          assert r['smt_status']=='all_8_unsat' and all(
+              v=='unsat' for v in r['smt_checks'].values())
+          assert not r['selection_eligible'] and not r['machine_faults_verified']
+          PY
+      - name: Prove pinned Intel ADD source operand flow and six RFLAGS under helper assumption
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/x7-g10-n8-z3
+          /tmp/x7-g10-n8-z3/bin/python -m pip install --disable-pip-version-check 'z3-solver==4.13.4.0'
+          export X7_N8_PINNED_ADD_XML=/tmp/x7-g10-intel/ADD.xml
+          /tmp/x7-g10-n8-z3/bin/python -m unittest discover -s tools -p 'test_x86_g10_add_source_proof.py' -v
+          /tmp/x7-g10-n8-z3/bin/python tools/x86_g10_add_source_proof.py \
+            --intel-add-xml /tmp/x7-g10-intel/ADD.xml --output /tmp/x7-g10-n8-source-proof.json
+          /tmp/x7-g10-n8-z3/bin/python - <<'PY'
+          import json
+          r=json.load(open('/tmp/x7-g10-n8-source-proof.json'))
+          assert r['smt_result']=='all_6_unsat'
+          assert len(r['smt_equivalence_by_flag'])==6
+          assert all(v=='unsat' for v in r['smt_equivalence_by_flag'].values())
+          assert r['source_memory_reads']==1 and r['source_memory_writes']==0
+          assert not r['machine_faults_modeled'] and not r['production_selection_eligible']
+          print('N8_INTEL_SOURCE_Z3_PASS',r['form_sha256'],r['operation_sha256'])
+          PY
+      - name: Reexecute pinned Intel source native literal/GAS arithmetic+six-flag oracle
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/x7-g10-n8-native
+          python3 tools/x86_g10_native_iforms.py \
+            --xml-dir /tmp/x7-g10-intel --out-dir /tmp/x7-g10-n8-native
+          cc -std=c11 -O2 -Wall -Wextra -Werror -fno-strict-aliasing \
+            tools/tests/x86_g10_native_iforms.c /tmp/x7-g10-n8-native/native_forms.S \
+            -o /tmp/x7-g10-n8-native/native_oracle
+          /tmp/x7-g10-n8-native/native_oracle
+          python3 tools/x86_g10_validate_native_bytes.py \
+            --binary /tmp/x7-g10-n8-native/native_oracle \
+            --evidence /tmp/x7-g10-n8-native/source_form_evidence.json
+      - name: Verify real SSA fusion candidates, default backend and native GAS/ELF
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          """)
+          PY
+          cargo check -p compiler-backend-x86 --offline
+          X7_N11_CFG_SPILL_EVIDENCE=/tmp/x7-g10-n11-evidence.json \
+            cargo test -p compiler-backend-x86 --features x7-native-form-validation \
+            --test x7_g10_n11_cfg_spill_probe --offline -- --nocapture
+          X7_N10_REAL_SSA_EVIDENCE=/tmp/x7-g10-n10-native-proof.json \
+            cargo test -p compiler-backend-x86 --features x7-native-form-validation \
+            --test x7_g10_n10_real_ssa_native --offline -- --nocapture
+          X7_N9_ADMISSION_EVIDENCE=/tmp/x7-g10-n9-native-proof.json \
+            cargo test -p compiler-backend-x86 --features x7-native-form-validation \
+            --test x7_g10_n9_adjacent_fault_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation \
+            --test x7_g10_n8_fault_context_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation \
+            --test x7_g10_n7_real_ssa_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation \
+            --lib x7_late_selector --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation \
+            --lib x7_native_form_bridge --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation \
+            --test x7_g10_late_selector_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation \
+            --test x7_g10_reviewed_physical_forms_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --test x7_g10_native_memory_oracle \
+            --offline -- --nocapture
+      - name: Join pinned source, actual helper SMT and native fault-cost proof with strict production gate
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools -p 'test_x86_g10_n9_admission.py' -v
+          python3 tools/x86_g10_n9_admission.py \
+            --source-report /tmp/x7-g10-n8-source-proof.json \
+            --helper-report /tmp/x7-g10-n9-helper-proof.json \
+            --native-report /tmp/x7-g10-n9-native-proof.json \
+            --output /tmp/x7-g10-n9-admission.json
+          python3 - <<'PY'
+          import json
+          r=json.load(open('/tmp/x7-g10-n9-admission.json'))
+          assert r['smt_helper_outputs']==8 and r['smt_arithmetic_flag_outputs']==6
+          assert r['tested_machine_fault_contexts']==240
+          assert r['proven_bounded_adjacent_class'] is True
+          assert r['production_selection_eligible'] is False
+          print('X7_G10_N9_CI_PASS native_strict=1 production=0')
+          PY
+      - name: Join prior pinned source and N10 real SSA native proof with fail-closed production gate
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools -p 'test_x86_g10_n10_admission.py' -v
+          python3 tools/x86_g10_n10_admission.py \
+            --n9-report /tmp/x7-g10-n9-admission.json \
+            --ssa-report /tmp/x7-g10-n10-native-proof.json \
+            --output /tmp/x7-g10-n10-admission.json
+          python3 - <<'PY'
+          import json
+          r=json.load(open('/tmp/x7-g10-n10-admission.json'))
+          assert r['real_verified_ssa_strict_adjacency_witness'] is True
+          assert r['real_ssa_verified_admitted_cases']==3
+          assert r['synchronous_native_fault_pairs']==360
+          assert r['production_selection_eligible'] is False
+          print('X7_G10_N10_EVIDENCE PASS strict_real_SSA=3 default_production=0')
+          PY
+      - name: N11 fail-closed join of Intel source-helper-N10 SSA proof and actual CFG/spill native evidence
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools -p 'test_x86_g10_n11_admission.py' -v
+          python3 tools/x86_g10_n11_admission.py \
+            --n10-report /tmp/x7-g10-n10-admission.json \
+            --n11-report /tmp/x7-g10-n11-evidence.json \
+            --output /tmp/x7-g10-n11-admission.json
+          python3 - <<'PY'
+          import json
+          r=json.load(open('/tmp/x7-g10-n11-admission.json'))
+          assert r['real_ssa_conditional_cfg_selected']==2
+          assert r['real_ssa_genuine_stack_spill_proven_fallback']==1
+          assert r['exact_allocator_mode_matches_default_x86_64'] is True
+          assert r['native_fault_comparison_pairs']==30
+          assert r['production_selection_eligible'] is False
+          print('X7_G10_N11_EVIDENCE PASS cfg=2 pressure=1 phi_fallback=1 spill_fallback=1 production=0')
+          PY
+      - name: Exercise new practical C-defined source-linked ADD in normal backend GAS/direct ELF
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-backend-x86 --features x7-c-defined-add --offline
+          cargo test -p compiler-backend-x86 --features x7-c-defined-add \
+            --test x7_g10_n12_c_defined_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-c-defined-add \
+            --lib x7_late_selector --offline -- --nocapture
+      - name: Cross-check ordinary backend and all historical validation tests with C-defined selection enabled
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 \
+            --features x7-c-defined-add,x7-native-form-validation --offline
+      - name: Install system debugger required by compiler-backend DWARF native tests
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gdb
+      - name: Run default-enabled whole workspace tests and no-default-features baseline
+        run: |
+          set -euo pipefail
+          cargo test --workspace --offline
+          cargo test -p compiler-backend-x86 --no-default-features --offline
+          cargo test -p compiler-backend-x86 \
+            --test x7_g10_n12_c_defined_native --offline -- --nocapture
