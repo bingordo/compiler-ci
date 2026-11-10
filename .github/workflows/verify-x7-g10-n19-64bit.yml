@@ -1,0 +1,91 @@
+name: X7.G10.N19 source-linked x86-64 memory form gate
+on:
+  push:
+    branches: [ci/x7-g10-n19-64bit-20261109]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 22
+    steps:
+      - name: Checkout exact N19 compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5f963b8947b3e925aa724344ea509e98f1a9e468
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify 12 exact Intel source-width/operand contracts
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 5f963b8947b3e925aa724344ea509e98f1a9e468
+          mkdir -p /tmp/n19-intel /tmp/n19-native
+          revision=35eface1b7ee003a1cda95005ec5fd83de658a64
+          for n in MOV ADD SUB AND OR XOR; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 45 \
+              "https://raw.githubusercontent.com/intel/SDM/${revision}/data/instruction/${n}.xml" \
+              -o "/tmp/n19-intel/${n}.xml"
+          done
+          python3 tools/x86_g10_regen_physical_forms.py --xml-dir /tmp/n19-intel --check
+          python3 tools/regen_x86_forms.py --check
+          python3 -m unittest discover -s tools -p 'test_x86_g10_source_operand_roles.py' -v
+          python3 -m unittest discover -s tools -p 'test_x86_g10_native_iforms.py' -v
+          python3 tools/x86_g10_native_iforms.py --xml-dir /tmp/n19-intel --out-dir /tmp/n19-native
+          cc -O2 -std=c11 -Wall -Wextra -Werror \
+            tools/tests/x86_g10_native_iforms.c /tmp/n19-native/native_forms.S \
+            -o /tmp/n19-native/native_oracle
+          /tmp/n19-native/native_oracle
+          python3 tools/x86_g10_validate_native_bytes.py \
+            --binary /tmp/n19-native/native_oracle \
+            --evidence /tmp/n19-native/source_form_evidence.json
+      - name: Execute five native 64-bit SSA forms through GAS and direct ELF
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          """)
+          PY
+          cargo test -p compiler-backend-x86 --features x7-c-defined-64 \
+            --test x7_g10_n19_64_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-c-defined-64 \
+            --lib x7_native_form_bridge --offline
+          cargo test -p compiler-backend-x86 --features x7-c-defined-64 \
+            --lib x7_late_selector --offline
+          cargo test -p compiler-backend-x86 --lib x7_late_selector --offline
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --test x7_g10_n15_no_default_fallback --offline
+          echo X7_G10_N19_NATIVE_PASS
+  complete-workspace:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact N19 compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5f963b8947b3e925aa724344ea509e98f1a9e468
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Enable private frontend git dependencies
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Install debugger and trust GitHub SSH host
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+          sudo apt-get update -qq
+          sudo apt-get install -y gdb
+      - name: Full workspace and opted-in 64-bit source form suite
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 5f963b8947b3e925aa724344ea509e98f1a9e468
+          cargo test --workspace
+          cargo test -p compiler-backend-x86 --features x7-c-defined-64
+          cargo test -p compiler-backend-x86 --no-default-features
+          echo X7_G10_N19_FULL_WORKSPACE_PASS
