@@ -1,0 +1,96 @@
+name: X7 M2.U3.B native generated address operands
+on:
+  push:
+    branches: [ci/x7-m2u3b-native-address-20261110]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-address:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 32
+    steps:
+      - name: Checkout exact compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d14a12b278d06f258c6c6567c2df8a4bbc85c45d
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact source and generate sixteen address modes
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = d14a12b278d06f258c6c6567c2df8a4bbc85c45d
+          python3 tools/regen_x86_lea_patterns.py --check
+          python3 - <<'PY'
+          from pathlib import Path
+          dag=Path("crates/backend-x86/src/dag_match.rs").read_text()
+          assert "fn select_native_function(" in dag
+          assert "plan.memory_replacements.get(&inst.id)" in dag
+          assert "plan.addresses.get(&inst.id)" in dag
+          assert "select_address_modes(block,counts,&mut combined)" in dag
+          assert Path("crates/backend-x86/src/generated_lea_patterns.rs").read_text().count("    AddressRule {")==16
+          print("X7_M2U3B_SHARED_ADDRESS_FORMS_PASS count=16")
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          """)
+          PY
+      - name: Shared native signed address/CFG/overflow/operand tests
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib dag_match::tests::native_address_selector --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --lib dag_match --offline
+      - name: Native x86 complete GAS/ELF C tests, flags and fallback
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --offline
+          cargo test -p compiler-backend-x86 --no-default-features --offline
+          cargo test -p compiler-backend-x86 --features x7-c-defined-64 --offline
+      - name: Existing reviewed memory-form machine-byte census
+        run: |
+          set -euo pipefail
+          cargo test --release -p compiler-backend-x86 --features x7-c-defined-64 \
+            --test x7_g10_n20c_compile_benchmark --offline -- --nocapture \
+            | tee /tmp/x7-m2u3b-census.log
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          lines=[s for s in Path("/tmp/x7-m2u3b-census.log").read_text().splitlines()
+                 if "X7_N20C_BENCH_JSON " in s]
+          assert len(lines)==1
+          d=json.loads(lines[0].split("X7_N20C_BENCH_JSON ",1)[1])
+          assert (d["selected_total"],d["selected_single"],d["selected_branch"],
+                  d["selected_pressure"],d["text_bytes_saved"])==(120,60,60,0,360),d
+          print("X7_M2U3B_NATIVE_MACHINE_PARITY_PASS folds=120 bytes=360")
+          PY
+  full-workspace:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout exact compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d14a12b278d06f258c6c6567c2df8a4bbc85c45d
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Private frontend source authorization
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub SSH and install gdb
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+          sudo apt-get update -qq
+          sudo apt-get install -y gdb
+      - name: Whole compiler TypeId, fallback, and opt-in 64-bit
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = d14a12b278d06f258c6c6567c2df8a4bbc85c45d
+          cargo test --workspace
+          cargo test -p compiler-backend-x86 --no-default-features
+          cargo test -p compiler-backend-x86 --features x7-c-defined-64
+          echo X7_M2U3B_FULL_WORKSPACE_PASS
