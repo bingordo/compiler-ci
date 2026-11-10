@@ -1,0 +1,90 @@
+name: X7.G10.N21 real-C compiler-driver 64-bit source-form differential
+on:
+  push:
+    branches: [ci/x7-g10-n21-real-c-20261110]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  real-c-driver:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact N21 compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 0dbeabcbd95d3577dcdcc460a86c429e63ad2bb0
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Authorize private Mini-C and Oberon dependencies
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Verify pinned compiler and test harness syntax
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 0dbeabcbd95d3577dcdcc460a86c429e63ad2bb0
+          mkdir -p ~/.ssh
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+          python3 -m py_compile tools/x86_g10_n21_real_c_validate.py
+          mkdir -p /tmp/n21-c-differential
+      - name: Build actual Mini-C compiler driver with 64-bit selector off
+        run: |
+          set -euo pipefail
+          cargo build -p compiler --release
+          cp target/release/compiler /tmp/n21-c-differential/compiler-baseline
+      - name: Build actual Mini-C compiler driver with 64-bit selector on
+        run: |
+          set -euo pipefail
+          cargo build -p compiler --release \
+            --features compiler-backend-x86/x7-c-defined-64
+          cp target/release/compiler /tmp/n21-c-differential/compiler-candidate
+      - name: Compile and execute unmodified C via GCC and both Mini-C drivers
+        run: |
+          set -euo pipefail
+          python3 tools/x86_g10_n21_real_c_validate.py \
+            --baseline-driver /tmp/n21-c-differential/compiler-baseline \
+            --candidate-driver /tmp/n21-c-differential/compiler-candidate \
+            --out-dir /tmp/n21-c-differential/results
+          cat /tmp/n21-c-differential/results/x7_n21_real_c_evidence.json
+      - name: Save actual C compiler-run and machine-code evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-g10-n21-real-c-differential
+          path: |
+            /tmp/n21-c-differential/results/x7_n21_real_c_evidence.json
+            /tmp/n21-c-differential/results/baseline-frameless-obj.o
+            /tmp/n21-c-differential/results/candidate-frameless-obj.o
+            /tmp/n21-c-differential/results/baseline-frameless-asm.s
+            /tmp/n21-c-differential/results/candidate-frameless-asm.s
+          retention-days: 30
+  full-workspace:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout exact N21 compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 0dbeabcbd95d3577dcdcc460a86c429e63ad2bb0
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Authorize private Mini-C and Oberon dependencies
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Install compiler tests dependencies
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+          sudo apt-get update -qq
+          sudo apt-get install -y gdb
+      - name: Full workspace, 64-bit feature and feature-off fallback
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 0dbeabcbd95d3577dcdcc460a86c429e63ad2bb0
+          cargo test --workspace
+          cargo test -p compiler-backend-x86 --features x7-c-defined-64
+          cargo test -p compiler-backend-x86 --no-default-features
+          echo X7_G10_N21_FULL_WORKSPACE_PASS
