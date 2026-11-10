@@ -1,0 +1,122 @@
+name: X7 M2.U2 shared generated address rules
+on:
+  push:
+    branches: [ci/x7-m2u2-unified-address-rules-20261110]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  address-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact M2.U2 compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ee0366e5f1e4b6849deb918f4525d00241c6d2f0
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source and generated address table
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = ee0366e5f1e4b6849deb918f4525d00241c6d2f0
+          python3 tools/regen_x86_lea_patterns.py --check
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          root=Path("crates/backend-x86/src")
+          assert not (root/"lea_patterns.rs").exists()
+          assert "mod lea_patterns;" not in (root/"lib.rs").read_text()
+          source=(root/"dag_match.rs").read_text()
+          assert "select_address_modes(" in source and "fn select_rules<" in source
+          assert "include!(\"generated_lea_patterns.rs\")" in source
+          table=(root/"generated_lea_patterns.rs").read_text()
+          assert table.count("    AddressRule {")==16
+          assert table.count("AddressMode::Displacement")==8
+          assert table.count("AddressMode::SignedScaledIndex")==8
+          ids=re.findall(r'        id: "([^"]+)"',table)
+          assert len(set(ids))==len(ids)==16
+          assert all(s.startswith("X5_LEA_") for s in ids)
+          test=(root/"dag_match_tests.rs").read_text()
+          assert "mod address {" in test
+          print("X7_M2U2_GENERATED_ADDRESS_PASS forms=16 normalized=1")
+          PY
+      - name: Isolate core and backend crates for offline native tests
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          """)
+          PY
+      - name: Execute original address safety tests in common matcher
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib dag_match::tests::address \
+            --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --lib dag_match --offline
+      - name: Validate complete x86 backend native gas/elf and feature off/on
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --offline
+          cargo test -p compiler-backend-x86 --no-default-features --offline
+          cargo test -p compiler-backend-x86 --features x7-c-defined-64 --offline
+      - name: Preserve previously source-proven 180-SSA machine-code census
+        run: |
+          set -euo pipefail
+          cargo test --release -p compiler-backend-x86 \
+            --features x7-c-defined-64 \
+            --test x7_g10_n20c_compile_benchmark --offline -- --nocapture \
+            | tee /tmp/x7-m2u2-code-size.log
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          lines=[l for l in Path("/tmp/x7-m2u2-code-size.log").read_text().splitlines()
+                 if "X7_N20C_BENCH_JSON " in l]
+          assert len(lines)==1
+          d=json.loads(lines[0].split("X7_N20C_BENCH_JSON ",1)[1])
+          assert (d["selected_total"],d["selected_single"],d["selected_branch"],
+                  d["selected_pressure"],d["text_bytes_saved"])==(120,60,60,0,360),d
+          print("X7_M2U2_NATIVE_PARITY_PASS forms=120 saved_bytes=360")
+          PY
+      - name: Archive native machine proof evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-m2u2-address-native-evidence
+          path: /tmp/x7-m2u2-code-size.log
+          if-no-files-found: warn
+          retention-days: 30
+  full-workspace:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout exact compiler commit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ee0366e5f1e4b6849deb918f4525d00241c6d2f0
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Authorize private Mini-C and Oberon dependencies
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Install gdb and trust GitHub SSH
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+          sudo apt-get update -qq
+          sudo apt-get install -y gdb
+      - name: Complete workspace, 64-bit feature and no-default fallback
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = ee0366e5f1e4b6849deb918f4525d00241c6d2f0
+          cargo test --workspace
+          cargo test -p compiler-backend-x86 --features x7-c-defined-64
+          cargo test -p compiler-backend-x86 --no-default-features
+          echo X7_M2U2_FULL_WORKSPACE_PASS
