@@ -1,0 +1,79 @@
+name: AArch64 A3.1 source-pinned independent encoding oracle
+on:
+  push:
+    branches: [ci/aarch64-a31-encoding-oracle-20261110]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: aarch64-a31-source-oracle
+  cancel-in-progress: true
+jobs:
+  independent-assemblers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout pinned compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 3f260b691ecc8c2878aec49162a953286bdff1f0
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check candidate and unit tests
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 3f260b691ecc8c2878aec49162a953286bdff1f0
+          python3 -m py_compile compiler/tools/aarch64_mrs_catalog.py compiler/tools/aarch64_a31_encoding_oracle.py compiler/tools/test_aarch64_mrs_catalog.py compiler/tools/test_aarch64_a31_encoding_oracle.py
+          python3 -m unittest discover -s compiler/tools -p 'test_aarch64*oracle.py' -v
+          python3 -m unittest discover -s compiler/tools -p 'test_aarch64_mrs_catalog.py' -v
+      - name: Require distinct LLVM and GNU AArch64 assemblers
+        run: |
+          set -euo pipefail
+          command -v clang
+          clang --version | head -1
+          if ! command -v aarch64-linux-gnu-as; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq binutils-aarch64-linux-gnu
+          fi
+          aarch64-linux-gnu-as --version | head -1
+      - name: Verify the independently pinned Arm dataset
+        run: |
+          set -euo pipefail
+          git clone --quiet --depth 1 --filter=blob:none \
+            https://kernel.googlesource.com/pub/scm/linux/kernel/git/maz/AARCHMRS mrs
+          test "$(git -C mrs rev-parse HEAD)" = 1346b16d47619400448f3cb6d4f22d62d3b76848
+          echo "ef75f3ec02df1b9b9c0612f4ea259d6710ac3de686b097d8f9c83d1d97aa800a  mrs/Instructions.json" | sha256sum -c -
+      - name: Regenerate full A64 inventory and compare GNU versus LLVM
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/aarch64_mrs_catalog.py \
+            --instructions mrs/Instructions.json \
+            --expect-sha256 ef75f3ec02df1b9b9c0612f4ea259d6710ac3de686b097d8f9c83d1d97aa800a \
+            --out /tmp/aarch64-catalog.json
+          python3 compiler/tools/aarch64_a31_encoding_oracle.py \
+            --catalog /tmp/aarch64-catalog.json --gnu-as aarch64-linux-gnu-as \
+            --out /tmp/aarch64-a31-evidence.json
+          python3 compiler/tools/aarch64_a31_encoding_oracle.py \
+            --catalog /tmp/aarch64-catalog.json --gnu-as aarch64-linux-gnu-as \
+            --out /tmp/aarch64-a31-evidence.json --check
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          d=json.loads(Path('/tmp/aarch64-a31-evidence.json').read_text())
+          assert d['cases_verified'] == 26
+          assert d['independent_assemblers'] == ['llvm-clang','gnu-binutils']
+          assert d['selection_eligible'] is False
+          assert all(not w['selection_eligible'] and not w['asl_semantics_verified']
+                     and not w['operand_legality_verified'] for w in d['witnesses'])
+          print('A3.1_PASS: 26 32-bit source/LLVM/GNU witnesses, 0 admitted rules')
+          PY
+      - name: Save encoding evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aarch64-a31-encoding-oracle
+          path: |
+            /tmp/aarch64-a31-evidence.json
+          retention-days: 14
