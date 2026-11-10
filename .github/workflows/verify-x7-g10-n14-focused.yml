@@ -1,0 +1,64 @@
+name: X7.G10.N14 focused SUB production and native regression
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-x7-g10-n14-focused.yml']
+permissions:
+  contents: read
+jobs:
+  n14-focused:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Checkout exact N14 source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5bde4888125f9fd594adeaca8c0d8b86d8403e42
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check pinned Intel source generation and five native memory form oracle
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 5bde4888125f9fd594adeaca8c0d8b86d8403e42
+          mkdir -p /tmp/n14-intel /tmp/n14-native
+          rev=35eface1b7ee003a1cda95005ec5fd83de658a64
+          for name in MOV ADD XOR SUB; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 45 \
+              "https://raw.githubusercontent.com/intel/SDM/${rev}/data/instruction/${name}.xml" \
+              -o "/tmp/n14-intel/${name}.xml"
+          done
+          python3 tools/x86_g10_regen_physical_forms.py --xml-dir /tmp/n14-intel --check
+          python3 tools/regen_x86_forms.py --check
+          python3 -m unittest discover -s tools -p 'test_x86_g10_native_iforms.py' -v
+          python3 tools/x86_g10_native_iforms.py --xml-dir /tmp/n14-intel --out-dir /tmp/n14-native
+          cc -O2 -std=c11 -Wall -Wextra -Werror -fno-strict-aliasing \
+            tools/tests/x86_g10_native_iforms.c /tmp/n14-native/native_forms.S \
+            -o /tmp/n14-native/native_oracle
+          /tmp/n14-native/native_oracle
+          python3 tools/x86_g10_validate_native_bytes.py \
+            --binary /tmp/n14-native/native_oracle --evidence /tmp/n14-native/source_form_evidence.json
+      - name: Native real SSA SUB GAS/direct ELF, ADD and disabled-feature regressions
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          """)
+          PY
+          cargo test -p compiler-backend-x86 --features x7-c-defined-sub \
+            --test x7_g10_n14_sub_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-c-defined-sub \
+            --lib x7_late_selector --offline
+          cargo test -p compiler-backend-x86 --features x7-c-defined-sub \
+            --lib x7_native_form_bridge --offline
+          cargo test -p compiler-backend-x86 \
+            --lib x7_late_selector --offline
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --lib x7_late_selector --offline
+          cargo test -p compiler-backend-x86 \
+            --test x7_g10_n12_c_defined_native --offline
+          echo X7_G10_N14_FOCUSED_PASS
