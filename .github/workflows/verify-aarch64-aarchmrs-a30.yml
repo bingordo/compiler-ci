@@ -1,0 +1,65 @@
+name: AArch64 AARCHMRS A3.0 pinned importer validation
+on:
+  push:
+    branches: [ci/aarch64-mrs-a30-20261110]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: aarch64-mrs-a30
+  cancel-in-progress: true
+jobs:
+  importer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout pinned compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f830dcf4473e035c360680e99c96066163f72565
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Unit tests and Python compile
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = f830dcf4473e035c360680e99c96066163f72565
+          python3 -m py_compile compiler/tools/aarch64_mrs_catalog.py compiler/tools/test_aarch64_mrs_catalog.py
+          python3 -m unittest discover -s compiler/tools -p test_aarch64_mrs_catalog.py -v
+      - name: Fetch pinned 2026-09 AARCHMRS source
+        run: |
+          set -euo pipefail
+          git clone --quiet --depth 1 --filter=blob:none \
+            https://kernel.googlesource.com/pub/scm/linux/kernel/git/maz/AARCHMRS mrs
+          test "$(git -C mrs rev-parse HEAD)" = 1346b16d47619400448f3cb6d4f22d62d3b76848
+          sha256sum mrs/Instructions.json | tee /tmp/aarchmrs-sha256.txt
+      - name: Full A64 catalog, determinism and disabled-rule invariant
+        run: |
+          set -euo pipefail
+          SHA=$(cut -d' ' -f1 /tmp/aarchmrs-sha256.txt)
+          python3 compiler/tools/aarch64_mrs_catalog.py --instructions mrs/Instructions.json \
+            --expect-sha256 "$SHA" --out /tmp/aarch64-mrs-catalog.json
+          python3 compiler/tools/aarch64_mrs_catalog.py --instructions mrs/Instructions.json \
+            --expect-sha256 "$SHA" --out /tmp/aarch64-mrs-catalog.json --check
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          d = json.loads(Path('/tmp/aarch64-mrs-catalog.json').read_text())
+          assert d['source_commit'] == '1346b16d47619400448f3cb6d4f22d62d3b76848'
+          assert d['accepted_count'] > 0, 'no A64 records'
+          assert d['selection_eligible'] is False
+          assert all(r['selection_eligible'] is False for r in d['instructions'])
+          print('A3.0 census', d['accepted_count'], 'accepted', d['rejected_count'], 'rejected')
+          from collections import Counter
+          print('Rejection reasons:', Counter(x['reason'] for x in d['rejected']))
+          PY
+      - name: Save corpus census artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aarch64-mrs-a30-census
+          path: |
+            /tmp/aarchmrs-sha256.txt
+            /tmp/aarch64-mrs-catalog.json
+          retention-days: 14
