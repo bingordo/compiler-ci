@@ -98,24 +98,124 @@ jobs:
           extern int Init__value;
           int main(void) { return Init__value != 42; }
           EOF
-          for example in mini oberon ctor; do
+          cat > "$tmp/Flow.mod" <<'EOF'
+          MODULE Flow;
+          PROCEDURE Eval*(n: INTEGER): INTEGER;
+          VAR i, s: INTEGER;
+          BEGIN
+            i := 0; s := 0;
+            WHILE i < n DO s := s + i; i := i + 1 END;
+            IF s > 10 THEN s := s + 3 ELSE s := s - 1 END;
+            RETURN s
+          END Eval;
+          END Flow.
+          EOF
+          cat > "$tmp/flow-oracle.c" <<'EOF'
+          extern int Flow__Eval(int);
+          int main(void) {
+            return (Flow__Eval(6) != 18) || (Flow__Eval(4) != 5);
+          }
+          EOF
+          cat > "$tmp/Calls.mod" <<'EOF'
+          MODULE Calls;
+          PROCEDURE Inc*(x: INTEGER): INTEGER;
+          BEGIN RETURN x + 1 END Inc;
+          PROCEDURE Twice*(x: INTEGER): INTEGER;
+          BEGIN RETURN Inc(x) + Inc(x + 1) END Twice;
+          END Calls.
+          EOF
+          cat > "$tmp/calls-oracle.c" <<'EOF'
+          extern int Calls__Inc(int), Calls__Twice(int);
+          int main(void) {
+            return (Calls__Inc(7) != 8) || (Calls__Twice(4) != 11);
+          }
+          EOF
+          cat > "$tmp/State.mod" <<'EOF'
+          MODULE State;
+          VAR global*: INTEGER;
+          PROCEDURE Bump*(x: INTEGER): INTEGER;
+          BEGIN global := global + x; RETURN global END Bump;
+          END State.
+          EOF
+          cat > "$tmp/state-oracle.c" <<'EOF'
+          extern int State__global, State__Bump(int);
+          int main(void) {
+            return State__global != 0 || State__Bump(7) != 7 ||
+              State__Bump(-2) != 5 || State__global != 5;
+          }
+          EOF
+          cat > "$tmp/Arrays.mod" <<'EOF'
+          MODULE Arrays;
+          VAR cells*: ARRAY 4 OF INTEGER;
+          PROCEDURE Store*(i, v: INTEGER): INTEGER;
+          BEGIN cells[i] := v; RETURN cells[i] END Store;
+          END Arrays.
+          EOF
+          cat > "$tmp/arrays-oracle.c" <<'EOF'
+          extern int Arrays__cells[4], Arrays__Store(int,int);
+          int main(void) {
+            return Arrays__cells[2] != 0 || Arrays__Store(2, 91) != 91 ||
+              Arrays__cells[2] != 91 || Arrays__Store(0, -7) != -7;
+          }
+          EOF
+          cat > "$tmp/wide.c" <<'EOF'
+          long wide(long x) { return x * 2 + 7; }
+          EOF
+          cat > "$tmp/wide-oracle.c" <<'EOF'
+          extern long wide(long);
+          int main(void) {
+            return wide(12345678901L) != 24691357809L ||
+              wide(-4000000000L) != -7999999993L;
+          }
+          EOF
+          cat > "$tmp/division.c" <<'EOF'
+          int divrem(int a, int b) { return a / b + a % b; }
+          EOF
+          cat > "$tmp/division-oracle.c" <<'EOF'
+          extern int divrem(int,int);
+          int main(void) {
+            return divrem(14,3) != 6 || divrem(-14,3) != -6;
+          }
+          EOF
+          cat > "$tmp/memory.c" <<'EOF'
+          int modify(int *p) { *p = *p + 4; return *p; }
+          EOF
+          cat > "$tmp/memory-oracle.c" <<'EOF'
+          extern int modify(int*);
+          int main(void) {
+            int value = 17;
+            return modify(&value) != 21 || value != 21;
+          }
+          EOF
+          for example in mini oberon ctor flow calls state arrays wide division memory; do
             case "$example" in
               mini) src="$tmp/mini.c"; oracle="$tmp/mini-oracle.c"; lang=mini-c ;;
               oberon) src="$tmp/Sample.mod"; oracle="$tmp/oberon-oracle.c"; lang=oberon ;;
               ctor) src="$tmp/Init.mod"; oracle="$tmp/ctor-oracle.c"; lang=oberon ;;
+              flow) src="$tmp/Flow.mod"; oracle="$tmp/flow-oracle.c"; lang=oberon ;;
+              calls) src="$tmp/Calls.mod"; oracle="$tmp/calls-oracle.c"; lang=oberon ;;
+              state) src="$tmp/State.mod"; oracle="$tmp/state-oracle.c"; lang=oberon ;;
+              arrays) src="$tmp/Arrays.mod"; oracle="$tmp/arrays-oracle.c"; lang=oberon ;;
+              wide) src="$tmp/wide.c"; oracle="$tmp/wide-oracle.c"; lang=mini-c ;;
+              division) src="$tmp/division.c"; oracle="$tmp/division-oracle.c"; lang=mini-c ;;
+              memory) src="$tmp/memory.c"; oracle="$tmp/memory-oracle.c"; lang=mini-c ;;
             esac
             for mode in legacy typeid; do
-              for fmt in obj asm; do
+              for pic in none pic; do
+                pic_opts=()
+                if [ "$pic" = pic ]; then pic_opts=(--pic); fi
+                for fmt in obj asm; do
                 ext=o
                 if [ "$fmt" = asm ]; then ext=s; fi
-                artifact="$tmp/$example-$mode.$ext"
+                artifact="$tmp/$example-$mode-$pic.$ext"
                 "$PWD/target/debug/compiler" "$src" --language "$lang" \
-                  --target aarch64 --ir "$mode" --emit "$fmt" -o "$artifact"
-                exe="$tmp/$example-$mode-$fmt"
+                  --target aarch64 --ir "$mode" --emit "$fmt" "${pic_opts[@]}" -o "$artifact"
+                exe="$tmp/$example-$mode-$pic-$fmt"
                 aarch64-linux-gnu-gcc -nostdlib -static -no-pie -fno-pie \
                   -fno-stack-protector -O0 "$tmp/start.S" "$oracle" "$artifact" -o "$exe"
                 timeout 30 qemu-aarch64 "$exe"
-                printf "PASS %s %s %s\n" "$example" "$mode" "$fmt"
+                printf "PASS %s %s %s %s\n" "$example" "$mode" "$pic" "$fmt"
+                done
               done
             done
           done
