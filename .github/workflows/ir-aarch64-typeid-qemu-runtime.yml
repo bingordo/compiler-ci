@@ -1,0 +1,91 @@
+name: AArch64 TypeId source runtime parity via QEMU
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ir-aarch64-typeid-qemu-runtime.yml'
+permissions:
+  contents: read
+jobs:
+  qemu-parity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install AArch64 cross tools and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu qemu-user
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: fe4e33137b7cba2d4f10f1a843a9ed91e4028fa0
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: ir-typeid-aarch64-qemu
+      - name: Build exact compiler source
+        working-directory: compiler
+        run: |
+          test "$(git rev-parse HEAD)" = "fe4e33137b7cba2d4f10f1a843a9ed91e4028fa0"
+          cargo build -p compiler --bin compiler
+      - name: Execute legacy and native TypeId objects against C oracles
+        working-directory: compiler
+        run: |
+          set -euxo pipefail
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          cat > "$tmp/mini.c" <<'EOF'
+          int answer(int x) { return x + 7; }
+          EOF
+          cat > "$tmp/mini-oracle.c" <<'EOF'
+          extern int answer(int);
+          int main(void) { return (answer(5) != 12) || (answer(-9) != -2); }
+          EOF
+          cat > "$tmp/Sample.mod" <<'EOF'
+          MODULE Sample;
+          PROCEDURE Answer*(x: INTEGER): INTEGER;
+          BEGIN RETURN x + 7 END Answer;
+          END Sample.
+          EOF
+          cat > "$tmp/oberon-oracle.c" <<'EOF'
+          extern int Sample__Answer(int);
+          int main(void) {
+            return (Sample__Answer(5) != 12) || (Sample__Answer(-9) != -2);
+          }
+          EOF
+          cat > "$tmp/Init.mod" <<'EOF'
+          MODULE Init;
+          VAR value*: INTEGER;
+          BEGIN value := 42 END Init.
+          EOF
+          cat > "$tmp/ctor-oracle.c" <<'EOF'
+          extern int Init__value;
+          int main(void) { return Init__value != 42; }
+          EOF
+          for example in mini oberon ctor; do
+            case "$example" in
+              mini) src="$tmp/mini.c"; oracle="$tmp/mini-oracle.c"; lang=mini-c ;;
+              oberon) src="$tmp/Sample.mod"; oracle="$tmp/oberon-oracle.c"; lang=oberon ;;
+              ctor) src="$tmp/Init.mod"; oracle="$tmp/ctor-oracle.c"; lang=oberon ;;
+            esac
+            for mode in legacy typeid; do
+              for fmt in obj asm; do
+                ext=o
+                if [ "$fmt" = asm ]; then ext=s; fi
+                artifact="$tmp/$example-$mode.$ext"
+                "$PWD/target/debug/compiler" "$src" --language "$lang" \
+                  --target aarch64 --ir "$mode" --emit "$fmt" -o "$artifact"
+                exe="$tmp/$example-$mode-$fmt"
+                aarch64-linux-gnu-gcc -static -no-pie -O0 "$oracle" "$artifact" -o "$exe"
+                timeout 30 qemu-aarch64 "$exe"
+                printf "PASS %s %s %s\n" "$example" "$mode" "$fmt"
+              done
+            done
+          done
