@@ -1,4 +1,4 @@
-name: AArch64 TypeId source runtime parity via QEMU
+name: AArch64 TypeId freestanding runtime parity via QEMU
 on:
   pull_request:
     paths:
@@ -13,7 +13,7 @@ jobs:
       - name: Install AArch64 cross tools and QEMU
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu libc6-arm64-cross libc6-dev-arm64-cross qemu-user
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu qemu-user
       - uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.CI_KEY }}
@@ -41,6 +41,36 @@ jobs:
           set -euxo pipefail
           tmp="$(mktemp -d)"
           trap 'rm -rf "$tmp"' EXIT
+          # Use the actual AArch64 Linux syscall ABI for process exit and
+          # invoke ELF .init_array entries explicitly; this smoke test does
+          # not require a cross-glibc installation.
+          cat > "$tmp/start.S" <<'EOF'
+          .text
+          .global _start
+          .type _start,%function
+          _start:
+            bl __run_constructors
+            bl main
+            mov x8,#93
+            svc #0
+          __run_constructors:
+            stp x19,x30,[sp,#-16]!
+            stp x20,x21,[sp,#-16]!
+            adrp x19,__init_array_start
+            add x19,x19,:lo12:__init_array_start
+            adrp x20,__init_array_end
+            add x20,x20,:lo12:__init_array_end
+          1:
+            cmp x19,x20
+            b.hs 2f
+            ldr x16,[x19],#8
+            blr x16
+            b 1b
+          2:
+            ldp x20,x21,[sp],#16
+            ldp x19,x30,[sp],#16
+            ret
+          EOF
           cat > "$tmp/mini.c" <<'EOF'
           int answer(int x) { return x + 7; }
           EOF
@@ -83,7 +113,8 @@ jobs:
                 "$PWD/target/debug/compiler" "$src" --language "$lang" \
                   --target aarch64 --ir "$mode" --emit "$fmt" -o "$artifact"
                 exe="$tmp/$example-$mode-$fmt"
-                aarch64-linux-gnu-gcc -static -no-pie -O0 "$oracle" "$artifact" -o "$exe"
+                aarch64-linux-gnu-gcc -nostdlib -static -no-pie -fno-pie \
+                  -fno-stack-protector -O0 "$tmp/start.S" "$oracle" "$artifact" -o "$exe"
                 timeout 30 qemu-aarch64 "$exe"
                 printf "PASS %s %s %s\n" "$example" "$mode" "$fmt"
               done
