@@ -1,0 +1,96 @@
+name: S23.15 pinned musl real C TypeId compiler ABBA
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-15-musl-typeid-source.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/s23-15-musl-typeid-source.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  real-musl-source-abba:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout pinned pre-S23.14 TypeId source compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f021254e38491526bc6ce4cf6f8c16c466c6cb97
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout pinned S23.14 TypeId source compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 73f04f1c3115cf369650447adee50e4f62f10fb1
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert source SHAs and identical input corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C before rev-parse HEAD)" = f021254e38491526bc6ce4cf6f8c16c466c6cb97
+          test "$(git -C after rev-parse HEAD)" = 73f04f1c3115cf369650447adee50e4f62f10fb1
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          cc --version | head -n 1
+      - name: Checkout exact S23.15 benchmark harness revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d643bfed3b922260e6810061e72d6734250c5291
+          path: benchmark
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify harness revision and compile Python
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C benchmark rev-parse HEAD)" = d643bfed3b922260e6810061e72d6734250c5291
+          python3 -m py_compile benchmark/tools/s23_real_source_abba.py
+      - name: Reuse Rust compiler caches
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before -> target
+            after -> target
+          key: s23-real-musl-compiler-v1
+      - name: Build both real production TypeId C source compilers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path before/Cargo.toml -p compiler --bin compiler
+          cargo build --release --manifest-path after/Cargo.toml -p compiler --bin compiler
+          test -x before/target/release/compiler
+          test -x after/target/release/compiler
+      - name: Validate all pinned bodies, run ABBA and independently execute GCC/C11 oracles
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          python3 benchmark/tools/s23_real_source_abba.py \
+            --before-root before --after-root after \
+            --before-bin before/target/release/compiler \
+            --after-bin after/target/release/compiler \
+            --output results/s23-15-real-musl.json --rounds 3 \
+            2>&1 | tee results/s23-15-real-musl.log
+          grep '^S2315_SOURCE_SUMMARY ' results/s23-15-real-musl.log | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$(grep -c '^S2315_SOURCE_CASE ' results/s23-15-real-musl.log)" -eq 12
+      - name: Preserve provenance, all rejected inputs and per-function results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2315-real-musl-typeid-source-abba
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
