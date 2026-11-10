@@ -35,7 +35,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 55d3360f5241a70e59790674692dde12efadaa61
+          ref: 88fd191558e8888af048d59908ad73fc99c9a369
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -163,18 +163,20 @@ jobs:
           mkdir -p "$CXX2_ARTIFACTS"
           cp "$fixtures"/edg_native_cxx2_lifetime_*.cpp "$CXX2_ARTIFACTS/"
           cd "$CXX2_ARTIFACTS"
-          test "$(git -C "$GITHUB_WORKSPACE/compiler" rev-parse HEAD)" = "55d3360f5241a70e59790674692dde12efadaa61"
+          test "$(git -C "$GITHUB_WORKSPACE/compiler" rev-parse HEAD)" = "88fd191558e8888af048d59908ad73fc99c9a369"
           g++ -std=c++17 -O2 -Wall -Wextra -Werror -c edg_native_cxx2_lifetime_caller.cpp -o caller-gxx.o
           g++ -std=c++17 -O2 -Wall -Wextra -Werror -c edg_native_cxx2_lifetime_gxx.cpp -o methods-gxx.o
           g++ -std=c++17 -O2 -Wall -Wextra -Werror -c edg_native_cxx2_lifetime_driver.cpp -o driver-gxx.o
           g++ caller-gxx.o methods-gxx.o driver-gxx.o -o reference
           timeout 15s ./reference | tee reference.out
           cargo run --quiet --manifest-path "${GITHUB_WORKSPACE}/edg-rust/Cargo.toml" --example parse -- edg_native_cxx2_lifetime_caller.cpp >probe.log 2>&1 || { cat probe.log; exit 1; }
-          grep -F 'lifetime' probe.log | tee lifetime-notes.log
-          grep -F 'routine attributes' probe.log | tee routine-notes.log
-          grep -F 'statement initialization' probe.log | tee initializer-notes.log
-          grep -Fq 'special=' routine-notes.log
-          grep -Fq 'lifetime' lifetime-notes.log
+          python3 "${GITHUB_WORKSPACE}/compiler/tools/edg-driver/tests/cxx2_lifetime_audit.py" probe.log | tee audit.log
+          # Some EDG lowering configurations consume the lifetime lists and
+          # expose cleanup solely as generated executable statement calls.
+          # Capture empty region lists explicitly; never infer destruction
+          # ordering from an absent region or from source spelling.
+          grep -E '^(object lifetime|scope lifetime|init lifetime|lifetime destruction)' probe.log >lifetime-regions.log || true
+          grep -F 'routine attributes' probe.log >routine-notes.log
           rm -f native-caller.o
           if "$compiler" native-caller.o --typeid-native edg_native_cxx2_lifetime_caller.cpp >native-rejected.log 2>&1; then
             echo "EDG_CXX2_PROBE gate=nontrivial_lifetime_must_reject unexpected_success" >&2
@@ -182,7 +184,7 @@ jobs:
           fi
           test ! -e native-caller.o
           echo "EDG_CXX2_PROBE gate=GXX_lifetime_reference pass=1"
-          echo "EDG_CXX2_PROBE gate=source_lifetime_metadata present=1"
+          echo "EDG_CXX2_PROBE gate=explicit_source_cleanup_calls verified=1"
           echo "EDG_CXX2_PROBE gate=nontrivial_lifetime_must_reject no_partial_elf=1"
 
       - name: Preserve EDG lifetime graph and independent G++ execution evidence
