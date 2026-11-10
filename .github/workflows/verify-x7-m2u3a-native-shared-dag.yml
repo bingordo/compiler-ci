@@ -1,0 +1,106 @@
+name: X7 M2.U3.A native TypeId shares source-proven ADD CTZ selector
+on:
+  push:
+    branches: [ci/x7-m2u3a-native-shared-dag-20261110]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-shared-selector:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact native shared-selector compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9a2b09e9d2f94f7cc3cb2c6c48ee1810188eb281
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and isolate core x86 workspace
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 9a2b09e9d2f94f7cc3cb2c6c48ee1810188eb281
+          python3 - <<'PY'
+          from pathlib import Path
+          source=Path("crates/backend-x86/src/dag_match.rs").read_text()
+          native=Path("crates/backend-x86/src/native_typeid.rs").read_text()
+          assert "fn select_native_function(" in source
+          assert "fn pure_native_view(" in source
+          assert "fn native_use_counts(" in source
+          assert "let selected=crate::dag_match::select_native_function(f)?;" in native
+          assert native.index("let selected=crate::dag_match::select_native_function(f)?;") < native.index("let frame=Frame::new(f,preserve_frame_pointer)?;")
+          print("X7_M2U3A_SINGLE_GENERATED_PLANNER_PASS")
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          """)
+          PY
+      - name: Native TypeId ADD32/ADD64/CTZ and pressure/phi/call safety tests
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib dag_match::tests::native_selector \
+            --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --lib dag_match --offline
+      - name: All native x86 unit, integration, GAS and ELF tests
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --offline
+          cargo test -p compiler-backend-x86 --no-default-features --offline
+          cargo test -p compiler-backend-x86 --features x7-c-defined-64 --offline
+      - name: Preserve prior native memory form and .text census
+        run: |
+          set -euo pipefail
+          cargo test --release -p compiler-backend-x86 \
+            --features x7-c-defined-64 \
+            --test x7_g10_n20c_compile_benchmark --offline -- --nocapture \
+            | tee /tmp/x7-m2u3a-native.log
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          lines=[x for x in Path("/tmp/x7-m2u3a-native.log").read_text().splitlines()
+                 if "X7_N20C_BENCH_JSON " in x]
+          assert len(lines)==1
+          d=json.loads(lines[0].split("X7_N20C_BENCH_JSON ",1)[1])
+          assert (d["selected_total"],d["selected_single"],d["selected_branch"],
+                  d["selected_pressure"],d["text_bytes_saved"])==(120,60,60,0,360),d
+          print("X7_M2U3A_OLD_NATIVE_PARITY_PASS forms=120 saved_bytes=360")
+          PY
+      - name: Upload shared selector evidence
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-m2u3a-shared-source-patterns
+          path: /tmp/x7-m2u3a-native.log
+          if-no-files-found: warn
+          retention-days: 30
+  full-workspace:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout exact M2.U3.A compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9a2b09e9d2f94f7cc3cb2c6c48ee1810188eb281
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Private frontend source access
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub and install test dependencies
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+          sudo apt-get update -qq
+          sudo apt-get install -y gdb
+      - name: Entire compiler workspace and native TypeId opt-in/opt-out
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 9a2b09e9d2f94f7cc3cb2c6c48ee1810188eb281
+          cargo test --workspace
+          cargo test -p compiler-backend-x86 --features x7-c-defined-64
+          cargo test -p compiler-backend-x86 --no-default-features
+          echo X7_M2U3A_FULL_WORKSPACE_PASS
