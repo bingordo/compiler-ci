@@ -1,0 +1,263 @@
+name: S23.14 proven match.pd XOR and factoring SSA/native cost
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-14-matchpd-factor.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/s23-14-matchpd-factor.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-pinned-s23-14:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - name: Checkout exact S23.14 five-family proof candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 73f04f1c3115cf369650447adee50e4f62f10fb1
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and isolate four credential-independent crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 73f04f1c3115cf369650447adee50e4f62f10fb1
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - name: Reuse self-contained Rust workspace compilation
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: s22-native-integer-generated
+      - name: Install offline SMT bitvector prover
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends z3
+          z3 -version
+      - name: Prove every S23.9–S23.14 family in all five widths
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/prove_native_matchpd_s23.py --timeout-ms 2500 --process-timeout 5
+          python3 tools/prove_ir_bitwise_identities.py
+      - name: S23.14 five-family generated SSA and all prior native rules
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test generated_native_matchpd_boolean_factor_s2314 -- --nocapture
+          cargo test -p compiler-opt --test generated_native_dag_snapshot_s2313 -- --nocapture
+          cargo test -p compiler-opt --test generated_native_matchpd_complement_s2312 -- --nocapture
+          cargo test -p compiler-opt --test generated_native_matchpd_boolean_s2311 -- --nocapture
+          cargo test -p compiler-opt --test generated_native_matchpd_partition -- --nocapture
+          cargo test -p compiler-opt --test generated_native_opposing_shift -- --nocapture
+          cargo test -p compiler-opt --test generated_native_boolean_dag -- --nocapture
+          cargo test -p compiler-opt --test generated_native_complement_dag -- --nocapture
+          cargo test -p compiler-opt --test generated_native_shift_affine -- --nocapture
+          cargo test -p compiler-opt --test generated_native_zero_compare -- --nocapture
+      - name: Existing generated comparison and extension regressions
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test generated_native_compare_dag -- --nocapture
+          cargo test -p compiler-opt --test generated_native_extension_literal -- --nocapture
+          cargo test -p compiler-opt --test generated_native_extension_compare -- --nocapture
+          cargo test -p compiler-opt --test generated_native_sign_order -- --nocapture
+      - name: Production TypeId core, source CTFE and CFG parity regressions
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typed_core_pipeline -- --nocapture
+          cargo test -p compiler-opt --test typed_ctfe -- --nocapture
+          cargo test -p compiler-opt --test typed_identical_merges -- --nocapture
+      - name: Native C11/GAS/direct ELF oracle and actual .text cost
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend-x86 --test native_s23_profitability -- --nocapture
+          cargo test --release -p compiler-backend-x86 --test native_s23_profitability native_s2314_matchpd_factor_gas_elf_per_family -- --nocapture
+      - name: Production-mode optimizer and direct ELF Clippy
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-opt --all-targets -- -D warnings
+          cargo clippy -p compiler-backend-x86 --bin typeid-x86 --test native_s23_profitability -- -D warnings
+
+  no-match-release-abba:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact pre-S23.14 compiler main baseline
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f021254e38491526bc6ce4cf6f8c16c466c6cb97
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact S23.14 candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 73f04f1c3115cf369650447adee50e4f62f10fb1
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin sources and isolate same four Rust crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C before rev-parse HEAD)" = f021254e38491526bc6ce4cf6f8c16c466c6cb97
+          test "$(git -C after rev-parse HEAD)" = 73f04f1c3115cf369650447adee50e4f62f10fb1
+          for side in before after; do
+            cat > "$side/Cargo.toml" <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+            rm -f "$side/Cargo.lock"
+          done
+      - name: Compile identical 24-function native test in release
+        run: |
+          cargo test --release --manifest-path before/Cargo.toml -p compiler-backend-x86 --test native_s23_profitability --no-run
+          cargo test --release --manifest-path after/Cargo.toml -p compiler-backend-x86 --test native_s23_profitability --no-run
+      - name: Release ABBA optimizer-only no-new-family cost and SSA/output signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          python3 - <<'PY'
+          import pathlib, subprocess, statistics, re
+          root=pathlib.Path.cwd()
+          timings={'before':[],'after':[]}
+          signatures={'before':set(),'after':set()}
+          for i,side in enumerate(['before','after','after','before','after','before','before','after']):
+              cmd=['cargo','test','--release','--manifest-path',str(root/side/'Cargo.toml'),
+                   '-p','compiler-backend-x86','--test','native_s23_profitability',
+                   'native_s23_baseline_vs_optin_exact_elf_and_gas','--','--nocapture']
+              p=subprocess.run(cmd,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,check=True)
+              (root/'results'/f'{side}-{i}.log').write_text(p.stdout)
+              m=re.search(r'S23_OPTIMIZER_OVERHEAD funcs=24 standalone_twopass_ns_median=(\d+) combined_singleclone_ns_median=(\d+)',p.stdout)
+              s=re.search(r'S23_NATIVE_COST funcs=24 widths=8,16,32,64 baseline_text=(\d+) optimized_text=(\d+) optimizer_rewrites=(\d+) eliminated_dead=(\d+)',p.stdout)
+              if not m or not s:
+                  raise RuntimeError(f'missing benchmark evidence {side}/{i}: {p.stdout[-3000:]}')
+              timings[side].append(int(m.group(2)))
+              signatures[side].add(s.groups())
+              print(f'S2314_MISS_ABBA side={side} order={i} ns={m.group(2)} signature={s.groups()}',flush=True)
+          if len(signatures['before'])!=1 or signatures['before']!=signatures['after']:
+              raise RuntimeError(f'preexisting native corpus outputs changed: {signatures}')
+          before=statistics.median(timings['before'])
+          after=statistics.median(timings['after'])
+          pct=100*(after/before-1)
+          summary=f'S2314_MISS_COST baseline_ns={before:.0f} candidate_ns={after:.0f} change_pct={pct:+.2f} exact_signatures={signatures["before"]}'
+          print(summary,flush=True)
+          (root/'results'/'summary.txt').write_text(summary+'\n')
+          with open('/dev/stdout','a') as f: pass
+          PY
+      - name: Retain source-pinned release timing evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2314-factor-no-match-release-abba
+          path: results/
+          retention-days: 30
+
+  large-typeid-release-abba:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact old native optimizer
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f021254e38491526bc6ce4cf6f8c16c466c6cb97
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact S23.14 candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 73f04f1c3115cf369650447adee50e4f62f10fb1
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Install identical 240-function fixtures and isolate Rust crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C before rev-parse HEAD)" = f021254e38491526bc6ce4cf6f8c16c466c6cb97
+          test "$(git -C after rev-parse HEAD)" = 73f04f1c3115cf369650447adee50e4f62f10fb1
+          cp after/crates/opt/tests/native_s2314_cost.rs before/crates/opt/tests/native_s2314_cost.rs
+          for side in before after; do
+            cat > "$side/Cargo.toml" <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+            rm -f "$side/Cargo.lock"
+          done
+      - name: Compile baseline and candidate optimizer cost tests in release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release --manifest-path before/Cargo.toml -p compiler-opt --test native_s2314_cost --no-run
+          cargo test --release --manifest-path after/Cargo.toml -p compiler-opt --test native_s2314_cost --no-run
+      - name: Run ABBA 240-function boolean, comparison and matching workloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          python3 - <<'PY'
+          import pathlib,re,subprocess,statistics
+          root=pathlib.Path.cwd()
+          groups={}
+          sig={}
+          order=["before","after","after","before"]
+          pattern=re.compile(r"S2314_LARGE_COST workload=(\w+) functions=240 source_bytes=(\d+) optimize_ns_median=(\d+) rewrites=(\d+) dead=(\d+) output_bytes=(\d+) fingerprint=([a-f0-9]+)")
+          for i,side in enumerate(order):
+              p=subprocess.run(["cargo","test","--release","--manifest-path",
+                  str(root/side/"Cargo.toml"),"-p","compiler-opt","--test",
+                  "native_s2314_cost","--","--nocapture"],
+                  text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,check=False)
+              (root/"results"/f"{side}-{i}.log").write_text(p.stdout)
+              if p.returncode:
+                  raise RuntimeError(f"large TypeId fixture failure for {side}/{i} exit={p.returncode}: {p.stdout[-6000:]}")
+              found=pattern.findall(p.stdout)
+              if len(found)!=3:raise RuntimeError(f"missing S23.14 large cost entries {side}: {p.stdout[-4000:]}")
+              for workload,source_bytes,ns,rewrites,dead,outlen,digest in found:
+                  groups.setdefault((side,workload),[]).append(int(ns))
+                  sig.setdefault((side,workload),set()).add((source_bytes,rewrites,dead,outlen,digest))
+                  print(f"S2314_LARGE_ABBA side={side} order={i} workload={workload} ns={ns} rewrites={rewrites} digest={digest}",flush=True)
+          for work in ["boolean","compare","matching"]:
+              a=sig.get(("before",work),set());b=sig.get(("after",work),set())
+              if len(a)!=1 or len(b)!=1:raise RuntimeError(f"non-deterministic signatures for {work}: {a} / {b}")
+              if work!="matching" and a!=b:
+                  raise RuntimeError(f"unexpected old source output delta {work}: {a} -> {b}")
+              if work=="matching" and int(next(iter(b))[1])<=int(next(iter(a))[1]):
+                  raise RuntimeError(f"no additional matching families exercised: {a} -> {b}")
+              old=statistics.median(groups[("before",work)])
+              new=statistics.median(groups[("after",work)])
+              print(f"S2314_LARGE_COST_SUMMARY workload={work} funcs=240 before_ns={old:.0f} after_ns={new:.0f} change_pct={100*(new/old-1):+.2f} old_signature={next(iter(a))} new_signature={next(iter(b))}",flush=True)
+          PY
+      - name: Preserve large workload timing and fingerprint logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2314-large-typeid-release-abba
+          path: results/
+          retention-days: 30
