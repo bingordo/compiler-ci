@@ -1,0 +1,109 @@
+name: P0 TypeId if-conversion shared policy compiler PR831
+on:
+  push:
+    branches: [ci/verify-typed-ifconv-policy-831-20261110]
+    paths: ['.github/workflows/verify-typed-ifconv-policy-831.yml']
+permissions:
+  contents: read
+jobs:
+  core-native-and-legacy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a6e1e5fb987a3e984be2ca24d5d51790b4ac9e62
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source and isolate standalone IR optimizer and both backends
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = a6e1e5fb987a3e984be2ca24d5d51790b4ac9e62
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gdb
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-ifconv-shared-policy-831-core
+      - name: Full default core and both backends regressions including legacy and typed if-conversion
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 -- --test-threads=2
+      - name: Strict full core default Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --all-targets -- -D warnings
+  checked-frontends:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a6e1e5fb987a3e984be2ca24d5d51790b4ac9e62
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest exact source and resolve pinned frontends
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = a6e1e5fb987a3e984be2ca24d5d51790b4ac9e62
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-ifconv-shared-policy-831-driver
+      - name: Unified Oberon and Mini-C native and explicit legacy rollback CLI tests
+        working-directory: compiler
+        run: cargo test -p compiler --bin compiler --test ir_default_cli --test mini_c_cli --test typeid_elf_linker_matrix -- --test-threads=2
+      - name: Checked frontend strict Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler --all-targets -- -D warnings
+  standalone-minic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a6e1e5fb987a3e984be2ca24d5d51790b4ac9e62
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest exact source and resolve C syntax/sema
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = a6e1e5fb987a3e984be2ca24d5d51790b4ac9e62
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: typeid-ifconv-shared-policy-831-minic
+      - name: Standalone Mini-C native/default and explicit legacy library tests
+        working-directory: compiler
+        run: |
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib -- --test-threads=2
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --test typeid_cli -- --test-threads=2
+      - name: GCC original C source differential
+        working-directory: compiler
+        run: |
+          cargo build --manifest-path tools/mini-c-driver/Cargo.toml --bin compiler-mini-c
+          python3 tools/mini-c-driver/tests/differential.py \
+            --compiler tools/mini-c-driver/target/debug/compiler-mini-c \
+            --seed-count 2 --steps 60 --ct04-seed-count 1 --m10-compound-seed-count 1 \
+            --artifacts target/typeid-shared-ifconv-831-repro
+      - name: Strict standalone Mini-C Clippy
+        working-directory: compiler
+        run: cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml --all-targets -- -D warnings
