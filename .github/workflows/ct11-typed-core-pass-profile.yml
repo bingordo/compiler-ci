@@ -1,0 +1,68 @@
+name: CT-11 pinned native TypeId per-pass core profile
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/ct11-typed-core-pass-profile.yml']
+permissions:
+  contents: read
+concurrency:
+  group: ct11-typed-core-pass-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  checked-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c35eddda10da265f076c3fbe006bb073ccc44664
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pinned source and toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          test "$(git -C compiler rev-parse HEAD)" = c35eddda10da265f076c3fbe006bb073ccc44664
+          git -C compiler rev-parse HEAD | tee results/sha.txt
+          rustc --version | tee results/toolchain.txt
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          python3 -m py_compile compiler/tools/s23_native_profile_source.py
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ct11-typed-core-pass-profile
+      - name: Opt-in CLI phase records and exact ELF and GAS parity
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test --release -p compiler --test typeid_native_s2316_profile -- --nocapture
+          cargo test --release -p compiler-opt --test native_s2316_profile -- --nocapture
+          cargo clippy -p compiler-opt --lib -- -D warnings
+          cargo clippy -p compiler --bin compiler --test typeid_native_s2316_profile -- -D warnings
+          cargo build --release -p compiler --bin compiler
+      - name: Pinned C source phase census and ELF/GAS checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/s23_native_profile_source.py \
+            --root compiler --compiler compiler/target/release/compiler \
+            --output results/ct11-typed-core-pass-profile.json --rounds 3 \
+            2>&1 | tee results/corpus.log
+          test "$(grep -c '^S2316_SOURCE_PROFILE ' results/corpus.log)" -eq 14
+          test "$(grep -c '^CT11_PASS_SUMMARY ' results/corpus.log)" -eq 294
+          grep '^CT11_PASS_SUMMARY name=combined_12_extracted ' results/corpus.log | tee -a "$GITHUB_STEP_SUMMARY"
+          grep '^S2316_SOURCE_SUMMARY ' results/corpus.log | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ct11-typed-core-pass-profile
+          path: results/
+          retention-days: 30
