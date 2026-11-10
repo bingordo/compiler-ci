@@ -1,0 +1,238 @@
+name: AArch64 TypeId freestanding runtime parity via QEMU
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ir-aarch64-typeid-qemu-runtime.yml'
+  workflow_dispatch:
+  schedule:
+    # compiler-ci owns the recurring cross-target gate; no compiler GH minutes.
+    - cron: '31 9 * * *'
+permissions:
+  contents: read
+jobs:
+  qemu-parity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install AArch64 cross tools and QEMU
+        run: |
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu qemu-user
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: main
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: ir-typeid-aarch64-qemu
+      - name: Build exact compiler source
+        working-directory: compiler
+        run: |
+          echo "Compiler main commit: $(git rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
+          RUSTFLAGS="-D warnings" cargo check -p compiler -p compiler-backend-aarch64 -p compiler-backend --all-targets
+          cargo test -p compiler-backend --lib
+          cargo test -p compiler --bin compiler -- --test-threads=2
+          cargo build -p compiler --bin compiler
+          cargo clippy -p compiler -p compiler-backend-aarch64 -p compiler-backend --all-targets -- -D warnings
+      - name: Execute legacy and native TypeId objects against C oracles
+        working-directory: compiler
+        run: |
+          set -euxo pipefail
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          # Use the actual AArch64 Linux syscall ABI for process exit and
+          # invoke ELF .init_array entries explicitly; this smoke test does
+          # not require a cross-glibc installation.
+          cat > "$tmp/start.S" <<'EOF'
+          .text
+          .global _start
+          .type _start,%function
+          _start:
+            bl __run_constructors
+            bl main
+            mov x8,#93
+            svc #0
+          __run_constructors:
+            stp x19,x30,[sp,#-16]!
+            stp x20,x21,[sp,#-16]!
+            adrp x19,__init_array_start
+            add x19,x19,:lo12:__init_array_start
+            adrp x20,__init_array_end
+            add x20,x20,:lo12:__init_array_end
+          1:
+            cmp x19,x20
+            b.hs 2f
+            ldr x16,[x19],#8
+            blr x16
+            b 1b
+          2:
+            ldp x20,x21,[sp],#16
+            ldp x19,x30,[sp],#16
+            ret
+          EOF
+          cat > "$tmp/mini.c" <<'EOF'
+          int answer(int x) { return x + 7; }
+          EOF
+          cat > "$tmp/mini-oracle.c" <<'EOF'
+          extern int answer(int);
+          int main(void) { return (answer(5) != 12) || (answer(-9) != -2); }
+          EOF
+          cat > "$tmp/Sample.mod" <<'EOF'
+          MODULE Sample;
+          PROCEDURE Answer*(x: INTEGER): INTEGER;
+          BEGIN RETURN x + 7 END Answer;
+          END Sample.
+          EOF
+          cat > "$tmp/oberon-oracle.c" <<'EOF'
+          extern int Sample__Answer(int);
+          int main(void) {
+            return (Sample__Answer(5) != 12) || (Sample__Answer(-9) != -2);
+          }
+          EOF
+          cat > "$tmp/Init.mod" <<'EOF'
+          MODULE Init;
+          VAR value*: INTEGER;
+          BEGIN value := 42 END Init.
+          EOF
+          cat > "$tmp/ctor-oracle.c" <<'EOF'
+          extern int Init__value;
+          int main(void) { return Init__value != 42; }
+          EOF
+          cat > "$tmp/Flow.mod" <<'EOF'
+          MODULE Flow;
+          PROCEDURE Eval*(n: INTEGER): INTEGER;
+          VAR i, s: INTEGER;
+          BEGIN
+            i := 0; s := 0;
+            WHILE i < n DO s := s + i; i := i + 1 END;
+            IF s > 10 THEN s := s + 3 ELSE s := s - 1 END;
+            RETURN s
+          END Eval;
+          END Flow.
+          EOF
+          cat > "$tmp/flow-oracle.c" <<'EOF'
+          extern int Flow__Eval(int);
+          int main(void) {
+            return (Flow__Eval(6) != 18) || (Flow__Eval(4) != 5);
+          }
+          EOF
+          cat > "$tmp/Calls.mod" <<'EOF'
+          MODULE Calls;
+          PROCEDURE Inc*(x: INTEGER): INTEGER;
+          BEGIN RETURN x + 1 END Inc;
+          PROCEDURE Twice*(x: INTEGER): INTEGER;
+          BEGIN RETURN Inc(x) + Inc(x + 1) END Twice;
+          END Calls.
+          EOF
+          cat > "$tmp/calls-oracle.c" <<'EOF'
+          extern int Calls__Inc(int), Calls__Twice(int);
+          int main(void) {
+            return (Calls__Inc(7) != 8) || (Calls__Twice(4) != 11);
+          }
+          EOF
+          cat > "$tmp/State.mod" <<'EOF'
+          MODULE State;
+          VAR global*: INTEGER;
+          PROCEDURE Bump*(x: INTEGER): INTEGER;
+          BEGIN global := global + x; RETURN global END Bump;
+          END State.
+          EOF
+          cat > "$tmp/state-oracle.c" <<'EOF'
+          extern int State__global, State__Bump(int);
+          int main(void) {
+            return State__global != 0 || State__Bump(7) != 7 ||
+              State__Bump(-2) != 5 || State__global != 5;
+          }
+          EOF
+          cat > "$tmp/Arrays.mod" <<'EOF'
+          MODULE Arrays;
+          VAR cells*: ARRAY 4 OF INTEGER;
+          PROCEDURE Store*(i, v: INTEGER): INTEGER;
+          BEGIN cells[i] := v; RETURN cells[i] END Store;
+          END Arrays.
+          EOF
+          cat > "$tmp/arrays-oracle.c" <<'EOF'
+          extern int Arrays__cells[4], Arrays__Store(int,int);
+          int main(void) {
+            return Arrays__cells[2] != 0 || Arrays__Store(2, 91) != 91 ||
+              Arrays__cells[2] != 91 || Arrays__Store(0, -7) != -7;
+          }
+          EOF
+          cat > "$tmp/wide.c" <<'EOF'
+          long wide(long x) { return x * 2 + 7; }
+          EOF
+          cat > "$tmp/wide-oracle.c" <<'EOF'
+          extern long wide(long);
+          int main(void) {
+            return wide(12345678901L) != 24691357809L ||
+              wide(-4000000000L) != -7999999993L;
+          }
+          EOF
+          cat > "$tmp/division.c" <<'EOF'
+          int divrem(int a, int b) { return a / b + a % b; }
+          EOF
+          cat > "$tmp/division-oracle.c" <<'EOF'
+          extern int divrem(int,int);
+          int main(void) {
+            return divrem(14,3) != 6 || divrem(-14,3) != -6;
+          }
+          EOF
+          cat > "$tmp/memory.c" <<'EOF'
+          int modify(int *p) { *p = *p + 4; return *p; }
+          EOF
+          cat > "$tmp/memory-oracle.c" <<'EOF'
+          extern int modify(int*);
+          int main(void) {
+            int value = 17;
+            return modify(&value) != 21 || value != 21;
+          }
+          EOF
+          for example in mini oberon ctor flow calls state arrays wide division memory; do
+            case "$example" in
+              mini) src="$tmp/mini.c"; oracle="$tmp/mini-oracle.c"; lang=mini-c ;;
+              oberon) src="$tmp/Sample.mod"; oracle="$tmp/oberon-oracle.c"; lang=oberon ;;
+              ctor) src="$tmp/Init.mod"; oracle="$tmp/ctor-oracle.c"; lang=oberon ;;
+              flow) src="$tmp/Flow.mod"; oracle="$tmp/flow-oracle.c"; lang=oberon ;;
+              calls) src="$tmp/Calls.mod"; oracle="$tmp/calls-oracle.c"; lang=oberon ;;
+              state) src="$tmp/State.mod"; oracle="$tmp/state-oracle.c"; lang=oberon ;;
+              arrays) src="$tmp/Arrays.mod"; oracle="$tmp/arrays-oracle.c"; lang=oberon ;;
+              wide) src="$tmp/wide.c"; oracle="$tmp/wide-oracle.c"; lang=mini-c ;;
+              division) src="$tmp/division.c"; oracle="$tmp/division-oracle.c"; lang=mini-c ;;
+              memory) src="$tmp/memory.c"; oracle="$tmp/memory-oracle.c"; lang=mini-c ;;
+            esac
+            # Legacy AArch64 has a pre-existing allocation failure on the
+            # full-width Mini-C wide fixture. Do not make old-IR feature gaps
+            # block new-IR C-oracle validation. The first seven fixtures still
+            # compare both IR pipelines for real executions.
+            modes=(legacy typeid)
+            case "$example" in
+              wide|division|memory) modes=(typeid) ;;
+            esac
+            for mode in "${modes[@]}"; do
+              for pic in none pic; do
+                pic_opts=()
+                if [ "$pic" = pic ]; then pic_opts=(--pic); fi
+                for fmt in obj asm; do
+                ext=o
+                if [ "$fmt" = asm ]; then ext=s; fi
+                artifact="$tmp/$example-$mode-$pic.$ext"
+                "$PWD/target/debug/compiler" "$src" --language "$lang" \
+                  --target aarch64 --ir "$mode" --emit "$fmt" "${pic_opts[@]}" -o "$artifact"
+                exe="$tmp/$example-$mode-$pic-$fmt"
+                aarch64-linux-gnu-gcc -nostdlib -static -no-pie -fno-pie \
+                  -fno-stack-protector -O0 "$tmp/start.S" "$oracle" "$artifact" -o "$exe"
+                timeout 30 qemu-aarch64 "$exe"
+                printf "PASS %s %s %s %s\n" "$example" "$mode" "$pic" "$fmt"
+                done
+              done
+            done
+          done
+          echo "Passed 68 AArch64 QEMU runtime oracle cases (56 legacy/TypeId parity, 12 native TypeId only)." >> "$GITHUB_STEP_SUMMARY"
