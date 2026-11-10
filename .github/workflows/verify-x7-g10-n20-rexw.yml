@@ -1,0 +1,95 @@
+name: X7.G10.N20 independently checked 64-bit REX.W forms
+on:
+  push:
+    branches: [ci/x7-g10-n20-rexw-20261109]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact N20 compiler commit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 487bf2271c8d7192f43e337adf9c02dfb3d81168
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Source-verify ten fixtures against Intel and test corruption rejection
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 487bf2271c8d7192f43e337adf9c02dfb3d81168
+          mkdir -p /tmp/n20-intel /tmp/n20-native
+          revision=35eface1b7ee003a1cda95005ec5fd83de658a64
+          for n in MOV ADD SUB AND OR XOR; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 45 \
+              "https://raw.githubusercontent.com/intel/SDM/${revision}/data/instruction/${n}.xml" \
+              -o "/tmp/n20-intel/${n}.xml"
+          done
+          python3 tools/x86_g10_regen_physical_forms.py \
+            --xml-dir /tmp/n20-intel --check
+          python3 tools/regen_x86_forms.py --check
+          python3 -m unittest discover -s tools \
+            -p 'test_x86_g10_n20_rexw_native.py' -v
+          python3 -m unittest discover -s tools \
+            -p 'test_x86_g10_source_operand_roles.py' -v
+          python3 tools/x86_g10_n20_rexw_native.py \
+            --xml-dir /tmp/n20-intel --out-dir /tmp/n20-native
+      - name: Execute GAS and literal REX.W with independent 64-bit C flags oracle
+        run: |
+          set -euo pipefail
+          cc -O2 -std=c11 -Wall -Wextra -Werror -fno-strict-aliasing \
+            tools/tests/x86_g10_n20_rexw_native.c \
+            /tmp/n20-native/n20_rexw_forms.S -o /tmp/n20-native/oracle
+          /tmp/n20-native/oracle
+          python3 tools/x86_g10_n20_validate_bytes.py \
+            --binary /tmp/n20-native/oracle \
+            --evidence /tmp/n20-native/n20_rexw_evidence.json
+      - name: Verify production 64-bit post-RA GAS/direct ELF remains equivalent
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          """)
+          PY
+          cargo test -p compiler-backend-x86 --features x7-c-defined-64 \
+            --test x7_g10_n19_64_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-c-defined-64 \
+            --lib x7_late_selector --offline
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --test x7_g10_n15_no_default_fallback --offline
+          echo X7_G10_N20_NATIVE_AND_PRODUCTION_PASS
+  full-workspace:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact N20 compiler commit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 487bf2271c8d7192f43e337adf9c02dfb3d81168
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Authorize private frontend git dependencies
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub host and install debugger
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+          sudo apt-get update -qq
+          sudo apt-get install -y gdb
+      - name: Full workspace with 64-bit feature and disabled fallback
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 487bf2271c8d7192f43e337adf9c02dfb3d81168
+          cargo test --workspace
+          cargo test -p compiler-backend-x86 --features x7-c-defined-64
+          cargo test -p compiler-backend-x86 --no-default-features
+          echo X7_G10_N20_FULL_WORKSPACE_PASS
