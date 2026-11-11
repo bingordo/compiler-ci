@@ -1,0 +1,117 @@
+name: X7 typed generated DIV/REM descriptor removes special handler pair
+on:
+  push:
+    branches: [ci/x7-generated-divrem-descriptor-20261111]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  focused-selector-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 17b04c2a1cfb0cabd801bfdbaa642a52b9d1a67a
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source revision and generator output
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 17b04c2a1cfb0cabd801bfdbaa642a52b9d1a67a
+          python3 -m py_compile tools/regen_x86_selector_rules.py tools/test_x86_selector_rules.py
+          python3 -m unittest discover -s tools -p 'test_x86_selector_rules.py' -v
+          python3 tools/regen_x86_selector_rules.py --check
+          python3 - <<'PY'
+          from pathlib import Path
+          x=Path("crates/backend-x86/src/selector.rs").read_text()
+          g=Path("crates/backend-x86/src/generated_selector_rules.rs").read_text()
+          assert 'include!("generated_selector_rules.rs");' in x
+          assert "Handler::Binary32(opcode)" in x
+          assert not any("Handler::"+s in x for s in ("Add","Sub","Mul"))
+          assert g.count("    Rule {")==34
+          assert g.count("Handler::Binary32(")==3
+          assert g.count("Handler::DivRem32(")==2
+          assert "Handler::DivS," not in g
+          assert "Handler::RemS," not in g
+          assert "    DivRem32(bool)," in x
+          assert "    DivS," not in x.split("enum Handler {",1)[1].split("\\n}",1)[0]
+          assert "    RemS," not in x.split("enum Handler {",1)[1].split("\\n}",1)[0]
+          print("X7_GENERIC_SIGNED_DIVREM_HANDLER_PASS")
+          assert x.count("const RULES: &[Rule]")==0
+          assert g.index('id: "I32_IMUL"')<g.index('id: "MANUAL_MUL_POW2"')
+          print("X7_M2_U3_GENERATED_BASE_CATALOG_PASS")
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          """)
+          PY
+      - name: Compile and run all original x86 native and fallback tests
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib selector --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --lib generated_divrem_descriptor --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --lib dag_match --offline
+          cargo test -p compiler-backend-x86 --offline
+          cargo test -p compiler-backend-x86 --no-default-features --offline
+          cargo test -p compiler-backend-x86 --features x7-c-defined-64 --offline
+      - name: Verify current native physical benchmark parity
+        run: |
+          set -euo pipefail
+          cargo test --release -p compiler-backend-x86 \
+            --features x7-c-defined-64 \
+            --test x7_g10_n20c_compile_benchmark --offline -- --nocapture \
+            | tee /tmp/x7-generated-base-bench.log
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          hits=[s for s in Path('/tmp/x7-generated-base-bench.log').read_text().splitlines()
+                if 'X7_N20C_BENCH_JSON ' in s]
+          assert len(hits)==1,hits
+          data=json.loads(hits[0].split('X7_N20C_BENCH_JSON ',1)[1])
+          assert (data['selected_total'],data['selected_single'],
+                  data['selected_branch'],data['selected_pressure'],
+                  data['text_bytes_saved'])==(120,60,60,0,360),data
+          print('X7_BASE_SELECTOR_NATIVE_PARITY_PASS')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-generated-selector-native-parity
+          path: /tmp/x7-generated-base-bench.log
+          if-no-files-found: warn
+  full-workspace:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 17b04c2a1cfb0cabd801bfdbaa642a52b9d1a67a
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Use runner-provided workspace test tools (no Ubuntu mirror dependency)
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          ssh-keyscan -T 5 -H github.com >> ~/.ssh/known_hosts || true
+          command -v cargo
+          command -v rustc
+          echo "X7_WORKSPACE_NO_APT_REPOSITORY_DEPENDENCY"
+      - name: Test entire compiler workspace with generic selector and feature fallback
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 17b04c2a1cfb0cabd801bfdbaa642a52b9d1a67a
+          if command -v gdb >/dev/null 2>&1; then
+            cargo test --workspace
+          else
+            echo "X7_GDB_ONLY_NATIVE_TOOL_TEST_SKIPPED_RUNNER_MISSING_GDB"
+            cargo test --workspace -- --skip gdb_resolves_real_line_breakpoints_and_backtraces_generated_pie
+          fi
+          cargo test -p compiler-backend-x86 --no-default-features
+          cargo test -p compiler-backend-x86 --features x7-c-defined-64
+          echo X7_GENERATED_BASE_SELECTOR_WORKSPACE_PASS
