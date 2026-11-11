@@ -1,0 +1,80 @@
+name: T5 native TypeId pointer PHI and external-call stress PR881
+on:
+  push:
+    branches: [ci/verify-t5-native-pointer-call-881-20261110]
+    paths: ['.github/workflows/verify-t5-native-pointer-call-881.yml']
+permissions:
+  contents: read
+jobs:
+  direct-typeid-c11-oracle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 975e298640372bfacfff26c78f33ebfc077a11c3
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin exact compiler revision and isolate core workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 975e298640372bfacfff26c78f33ebfc077a11c3
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gdb
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: t5-native-pointer-call-881
+      - name: Run 8 direct TypeId C11/GAS/ELF/fp combinations with checked evidence
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_core_pipeline optimized_typeid_core_emits_correct_gas_and_direct_elf -- --nocapture 2>&1 | tee "$RUNNER_TEMP/direct-native-core.log"
+          test "$(grep -c 'TYPEID_CORE_PIPELINE_NATIVE route=direct-typeid .*status=PASS' "$RUNNER_TEMP/direct-native-core.log")" -eq 8
+          for variant in original optimized; do
+            for mode in frameless framed; do
+              for sink in gas elf; do
+                grep -F "TYPEID_CORE_PIPELINE_NATIVE route=direct-typeid variant=$variant mode=$mode format=$sink inputs=377 status=PASS" "$RUNNER_TEMP/direct-native-core.log"
+              done
+            done
+          done
+          cargo test -p compiler-opt --test typed_core_pipeline
+          cargo test -p compiler-opt --test typed_array_fold --test typed_ctfe
+          cargo test -p compiler-opt --test typed_native_parity typed_loop_pass_orders_match_independent_c_in_gas_and_elf -- --nocapture 2>&1 | tee "$RUNNER_TEMP/direct-t5-loop.log"
+          grep -F 'T5_TYPED_NATIVE functions=24 formats=2 cases_per_function=128' "$RUNNER_TEMP/direct-t5-loop.log"
+          grep -F 'route=direct-typeid' "$RUNNER_TEMP/direct-t5-loop.log"
+          cargo test -p compiler-opt --test typed_native_parity typed_pointer_phi_pressure_matches_independent_c_in_gas_and_elf -- --nocapture 2>&1 | tee "$RUNNER_TEMP/direct-t5-pointer.log"
+          grep -F 'T5_TYPED_ALIAS_NATIVE functions=8 formats=2 cases_per_function=128' "$RUNNER_TEMP/direct-t5-pointer.log"
+          grep -F 'route=direct-typeid' "$RUNNER_TEMP/direct-t5-pointer.log"
+          cargo test -p compiler-opt --test typed_native_parity typed_external_calls_preserve_spills_phi_edges_and_clobbered_volatile_registers -- --nocapture 2>&1 | tee "$RUNNER_TEMP/direct-t5-call.log"
+          grep -F 'T5_TYPED_CALL_NATIVE functions=8 formats=2 checks=2048' "$RUNNER_TEMP/direct-t5-call.log"
+          grep -F 'route=direct-typeid' "$RUNNER_TEMP/direct-t5-call.log"
+      - name: Core optimizer, x86 native and generic allocator regressions
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+      - name: Strict default and legacy experimental lint
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
+          cargo clippy -p compiler-opt --features legacy-experimental-ssa --all-targets -- -D warnings
+      - name: Preserve actual oracle logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: t5-native-pointer-call-failure
+          path: |
+            ${{ runner.temp }}/direct-native-core.log
+            ${{ runner.temp }}/direct-t5-loop.log
+            ${{ runner.temp }}/direct-t5-pointer.log
+            ${{ runner.temp }}/direct-t5-call.log
+          if-no-files-found: ignore
+          retention-days: 14
