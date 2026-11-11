@@ -38,7 +38,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: de45065572fcbdf38218288492e65f476395e183
+          ref: 701e8812af9655c4fb9e853464502551f5eb5f5f
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -178,6 +178,39 @@ jobs:
             exit 1
           fi
           echo "EDG_CXX5 gate=system_libstdcxx_header_parse result=pass"
+          fixtures="${GITHUB_WORKSPACE}/compiler/tools/edg-driver/tests/fixtures"
+          cp "$fixtures/edg_native_cxx5_header_roots.h" .
+          for label in header_roots header_unused; do
+            cp "$fixtures/edg_native_cxx5_$label.cpp" "source_$label.cpp"
+            g++ -std=c++17 -Wall -Wextra -Werror "source_$label.cpp" -o "reference_$label"
+            timeout 15s "./reference_$label" >"reference_$label.out" 2>"reference_$label.err"
+            rm -f "native_$label.o"
+            "$compiler" "native_$label.o" --typeid-native "${edg_options[@]}" "${include_flags[@]}" "source_$label.cpp" >"native_$label.log" 2>&1 || {
+              echo "EDG_CXX5 source-rooted header fixture rejected: $label" >&2
+              tail -n 20 "native_$label.log" >&2
+              test ! -e "native_$label.o"
+              exit 1
+            }
+            test "$(od -An -tx1 -N4 "native_$label.o" | tr -d '[:space:]')" = 7f454c46
+            g++ "native_$label.o" -o "native_$label"
+            timeout 15s "./native_$label" >"native_$label.out" 2>"native_$label.err"
+            test "$(sha256sum "reference_$label.out" | cut -d' ' -f1)" = "$(sha256sum "native_$label.out" | cut -d' ' -f1)"
+            test "$(sha256sum "reference_$label.err" | cut -d' ' -f1)" = "$(sha256sum "native_$label.err" | cut -d' ' -f1)"
+            echo "EDG_CXX5 gate=source_rooted_header_runtime fixture=$label result=pass"
+          done
+          cp "$fixtures/edg_native_cxx5_header_effectful.cpp" effectful.cpp
+          g++ -std=c++17 -Wall -Wextra -Werror -fsyntax-only effectful.cpp
+          rm -f effectful.o
+          if "$compiler" effectful.o --typeid-native "${edg_options[@]}" "${include_flags[@]}" effectful.cpp >effectful-native.log 2>&1; then
+            echo "EDG_CXX5 unsafe omission of dynamic global side effects" >&2
+            exit 1
+          fi
+          test ! -e effectful.o
+          grep -E -m1 'dynamic initialization|global memory' effectful-native.log || {
+            tail -n 12 effectful-native.log >&2
+            exit 1
+          }
+          echo "EDG_CXX5 gate=source_global_dynamic_effect_rejected result=pass"
           cp "${GITHUB_WORKSPACE}/compiler/tools/edg-driver/tests/fixtures/edg_native_cxx5_bare_main.cpp" bare.cpp
           cp "${GITHUB_WORKSPACE}/compiler/tools/edg-driver/tests/fixtures/edg_native_cxx5_iosfwd_unused.cpp" iosfwd.cpp
           cat >iostream_unused.cpp <<'EOF'
