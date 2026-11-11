@@ -26,3 +26,93 @@ jobs:
           /tmp/x7-z3/bin/python -m unittest discover -s tools -p 'test_x86_isl_smt_verify.py' -v
           /tmp/x7-z3/bin/python -m unittest discover -s tools -p 'test_x86_iform_proof_work_dag.py' -v
           /tmp/x7-z3/bin/python -m py_compile tools/x86_iform_operation_proof_worker.py
+
+  pinned-intel-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5d1152441cf04534e31deb08c27349deda2912d0
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: 5.4.1
+      - name: Install pinned parser toolchain and Python Z3
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 5d1152441cf04534e31deb08c27349deda2912d0
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libgmp-dev pkg-config cmake libz3-dev
+          python3 -m venv /tmp/x7-z3
+          /tmp/x7-z3/bin/python -m pip install --disable-pip-version-check 'z3-solver==4.13.4.0'
+          git clone --filter=blob:none https://github.com/IntelLabs/isa-tools.git /tmp/isa-tools
+          git -C /tmp/isa-tools checkout 16260979137c38339743a04b7fd5d9f0fa8a6ee5
+          git -C /tmp/isa-tools submodule update --init --recursive
+          cp tools/x86_isl_ast_export.ml tools/x86_isl_ast_json.ml /tmp/isa-tools/bin/
+          cat >> /tmp/isa-tools/bin/dune <<'EOF'
+          (executable
+           (name x86_isl_ast_export)
+           (modules x86_isl_ast_export x86_isl_ast_json)
+           (libraries libISA yojson))
+          EOF
+          cd /tmp/isa-tools
+          opam install --switch="$GITHUB_WORKSPACE" . --deps-only --yes
+          opam exec --switch="$GITHUB_WORKSPACE" -- dune build bin/x86_isl_ast_export.exe
+      - name: Fetch exact Intel XML revision
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --sparse https://github.com/intel/SDM.git /tmp/intel-sdm
+          git -C /tmp/intel-sdm fetch --depth 1 origin 35eface1b7ee003a1cda95005ec5fd83de658a64
+          git -C /tmp/intel-sdm checkout 35eface1b7ee003a1cda95005ec5fd83de658a64
+          git -C /tmp/intel-sdm sparse-checkout set data/instruction
+          test "$(git -C /tmp/intel-sdm rev-parse HEAD)" = 35eface1b7ee003a1cda95005ec5fd83de658a64
+      - name: Run exact-source task DAG and real Intel operation SMT checks
+        run: |
+          set -euo pipefail
+          /tmp/x7-z3/bin/python tools/x86_iform_helper_dependencies.py \
+            --xml-dir /tmp/intel-sdm/data/instruction --out /tmp/x7-deps.json --shards 16
+          /tmp/x7-z3/bin/python tools/x86_iform_proof_work_dag.py \
+            --dependency-index /tmp/x7-deps.json --out /tmp/x7-dag.json --shards 16
+          /tmp/x7-z3/bin/python tools/x86_iform_operation_proof_worker.py \
+            --dependency-index /tmp/x7-deps.json --proof-work-dag /tmp/x7-dag.json \
+            --xml-dir /tmp/intel-sdm/data/instruction \
+            --parser /tmp/isa-tools/_build/default/bin/x86_isl_ast_export.exe \
+            --operation MOV --operation NOT --operation LEA --max-cases 12 \
+            --cache-dir /tmp/x7-semantic-cache --out /tmp/x7-real-source-proofs.json
+          /tmp/x7-z3/bin/python tools/x86_iform_operation_proof_worker.py \
+            --dependency-index /tmp/x7-deps.json --proof-work-dag /tmp/x7-dag.json \
+            --xml-dir /tmp/intel-sdm/data/instruction \
+            --parser /tmp/isa-tools/_build/default/bin/x86_isl_ast_export.exe \
+            --operation MOV --max-cases 4 \
+            --cache-dir /tmp/x7-semantic-cache --out /tmp/x7-real-source-cache-hits.json
+          /tmp/x7-z3/bin/python - <<'PY'
+          import json
+          one=json.load(open('/tmp/x7-real-source-proofs.json'))
+          two=json.load(open('/tmp/x7-real-source-cache-hits.json'))
+          assert one['summary']['processed']==12
+          mov=[row for row in one['cases'] if row['operation']=='MOV']
+          assert len(mov)==4, mov
+          assert all(row['status']=='equivalent_to_supported_isl_model' for row in mov),mov
+          assert all('result' in row['checked_outputs'] for row in mov)
+          assert all(row['selection_eligible'] is False for row in one['cases'])
+          assert two['summary']['processed']==4
+          assert all(row['cache_hit'] and row['status']=='equivalent_to_supported_isl_model'
+                     for row in two['cases']), two
+          assert one['summary']['selection_eligible_forms']==0
+          assert one['summary']['completed_iform_proof_gates']==0
+          print('X7_PINNED_INTEL_OPERATION_PROOFS',
+                json.dumps(one['summary'],sort_keys=True))
+          print('X7_PINNED_INTEL_OPERATION_CACHE',
+                json.dumps(two['summary'],sort_keys=True))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-pinned-intel-operation-source-proof
+          path: |
+            /tmp/x7-real-source-proofs.json
+            /tmp/x7-real-source-cache-hits.json
+          if-no-files-found: ignore
