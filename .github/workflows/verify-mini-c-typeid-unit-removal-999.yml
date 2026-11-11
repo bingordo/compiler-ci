@@ -1,0 +1,59 @@
+name: Mini-C TypeId optimized-source unit migration PR999
+on:
+  push:
+    branches: [ci/verify-mini-c-typeid-unit-removal-999-20261111]
+    paths: ['.github/workflows/verify-mini-c-typeid-unit-removal-999.yml']
+permissions:
+  contents: read
+jobs:
+  native-verified-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a9a50755971705435e1eebfc714b751f744ba28a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest source pin and physical retirement of ordinary Function tests
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = a9a50755971705435e1eebfc714b751f744ba28a
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path('compiler/tools/mini-c-driver/tests/unit/lib.rs').read_text()
+          assert s.count('lower_source(')==1, 'unexpected old source Function test calls'
+          assert s.count('optimized_native_source_functions(')>=17
+          assert 'fn optimized_native_source_functions(' in s
+          assert 'use compiler_backend::Backend;' not in s
+          assert 'module.validate_module_abi()?;' in s
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: minic-native-unit-probes-999
+      - name: Full standalone checked C tests and GCC/ELF/TLS/C11 acceptance
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib -- --test-threads=2
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --test typeid_cli -- --test-threads=2
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --test m4_8_source_native -- --test-threads=1
+          cargo build --manifest-path tools/mini-c-driver/Cargo.toml --bin compiler-mini-c
+          python3 tools/mini-c-driver/tests/differential.py --compiler tools/mini-c-driver/target/debug/compiler-mini-c --seed-count 2 --steps 60 --ct04-seed-count 1 --m10-compound-seed-count 1 --artifacts target/ir-pr999-diff
+          cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml --all-targets -- -D warnings
+      - name: Unified TypeId x86 checked-source execution and strict lint
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test f6_source_runtime_parity f6_x86_source_default_and_explicit_typeid_execute_same_c11_oracle -- --test-threads=1
+          cargo test -p compiler --test mini_c_cli --test ir_default_cli -- --test-threads=2
+          cargo test -p compiler --bin compiler -- --test-threads=2
+          cargo test -p compiler-ir -p compiler-opt --lib -- --test-threads=2
+          cargo clippy -p compiler -p compiler-ir -p compiler-opt --all-targets -- -D warnings
