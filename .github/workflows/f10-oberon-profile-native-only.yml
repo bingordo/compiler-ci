@@ -1,0 +1,62 @@
+name: IR F10 Oberon source inliner profiles native TypeId only
+on:
+  push:
+    branches: [ci/f10-oberon-profile-native-only-20261111]
+    paths: ['.github/workflows/f10-oberon-profile-native-only.yml']
+permissions:
+  contents: read
+jobs:
+  native-source-inline-profiles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ea8f323b92cffcd2f0227b5db7de4cb7484bcd3c
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest TypeId source without any old Function import/export
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = ea8f323b92cffcd2f0227b5db7de4cb7484bcd3c
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('compiler/crates/driver/tests/unit/typeid_source_inline_profile.rs')
+          s=p.read_text()
+          for phrase in ('typed_checked(', 'TypedSsaModule::from_legacy',
+                         'module.to_legacy()', 'super::lower(', 'X86_64.emit_object(',
+                         'legacy_function_signature', 'ModuleSnapshot'):
+              assert phrase not in s, phrase
+          assert s.count('super::lower_oberon_native_typeid_with_initializers(&source)')==2
+          assert 'X86_64.emit_typeid_object(module)' in s
+          assert 'TYPEID_SOURCE_RUNTIME lang=oberon' in s
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: oberon-native-only-profile-f10
+      - name: Full compiler source tests and strict lint
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --bin compiler -- --test-threads=2
+          cargo test -p compiler --test f6_source_runtime_parity -- --test-threads=1
+          cargo test -p compiler-ir -p compiler-opt --lib -- --test-threads=2
+          cargo clippy -p compiler -p compiler-ir -p compiler-opt --all-targets -- -D warnings
+      - name: Execute release-only checked Oberon source A/B, native ELF and GCC oracles
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test --release -p compiler --bin compiler source_checked_oberon_policy_profile -- --ignored --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/f10-oberon-inline-profile.log"
+          grep -F 'TYPEID_SOURCE_RUNTIME lang=oberon case=call_graph' "$RUNNER_TEMP/f10-oberon-inline-profile.log"
+          grep -F 'TYPEID_SOURCE_RUNTIME lang=oberon case=identity_chain' "$RUNNER_TEMP/f10-oberon-inline-profile.log"
+          grep -F 'TYPEID_SOURCE_RUNTIME lang=oberon case=arithmetic_fanout' "$RUNNER_TEMP/f10-oberon-inline-profile.log"
+          cargo test --release -p compiler --bin compiler source_checked_oberon_repository_examples_noop -- --ignored --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/f10-oberon-repo-noop.log"
+          grep -F 'TYPEID_REAL_OBERON_NOOP name=Math.mod' "$RUNNER_TEMP/f10-oberon-repo-noop.log"
+          grep -F 'TYPEID_REAL_OBERON_NOOP name=Flow.mod' "$RUNNER_TEMP/f10-oberon-repo-noop.log"
