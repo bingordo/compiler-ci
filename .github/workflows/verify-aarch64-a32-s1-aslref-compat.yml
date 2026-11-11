@@ -29,8 +29,62 @@ jobs:
           opam switch create default --packages=ocaml-system -y
           eval "$(opam env --switch=default)"
           opam install -y aslref.1.0-EAC1
+          BIN="$(opam var bin --switch=default)"
+          echo "OPAM_BIN=$BIN"
+          ls -la "$BIN" | head -60
+          opam list --installed --short | grep -E '^(aslref|dune|menhir|zarith)
+      - name: Download official pinned 2026-09 Arm A64 XML
+        run: |
+          set -euo pipefail
+          curl -fLsS --retry 2 --connect-timeout 15 --max-time 180 --max-filesize 200000000 \
+            -o /tmp/arm-a64.xml.tgz \
+            https://developer.arm.com/-/cdn-downloads/permalink/Exploration-Tools-A64-ISA/ISA_A64/ISA_A64_xml_A_profile-2026-09.tar.gz
+          echo "44cfb89c763c7eea8e59de0ad2221e3c012e6aa77899bd7f1c3e1f24537191d7  /tmp/arm-a64.xml.tgz" | sha256sum -c -
+      - name: Generate source-specific ASL and probe parser versus typechecker
+        run: |
+          set -euo pipefail
+          eval "$(opam env --switch=default --set-switch)"
+          export PATH="$(opam var bin --switch=default):$PATH"
           aslref --version
-          opam list --installed --short | grep -E '^(aslref|dune|menhir|zarith)$'
+          python3 - <<'PY'
+          import hashlib, importlib.util, pathlib, subprocess, tarfile
+          name='herd/libdir/asl-pseudocode/bundler.py'
+          p=pathlib.Path(name)
+          spec=importlib.util.spec_from_file_location('arm_bundler',p)
+          bundler=importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(bundler)
+          base='ISA_A64_xml_A_profile-2026-09/'
+          funcs=('add_addsub_imm','add_addsub_shift','and_log_shift','movz')
+          with tarfile.open('/tmp/arm-a64.xml.tgz','r:gz') as tar:
+              pathlib.Path('/tmp/aslref-opns').mkdir(exist_ok=True)
+              for func in funcs:
+                  m=tar.getmember(base+func+'.xml')
+                  assert m.isfile() and m.size < 1_000_000
+                  source=tar.extractfile(m).read()
+                  path=pathlib.Path('/tmp/aslref-opns')/(func+'.xml')
+                  path.write_bytes(source)
+                  opn=bundler.one_instruction_to_string(path)
+                  assert len(opn)>150 and 'func instr_' in opn
+                  target=path.with_suffix('.opn')
+                  target.write_text(opn)
+                  print('GENERATED',func,'XML_SHA',hashlib.sha256(source).hexdigest(),
+                        'OPN_SHA',hashlib.sha256(opn.encode()).hexdigest(),
+                        'OPN_BYTES',len(opn),flush=True)
+                  for label,args in (
+                     ('parse_v0', ['--no-exec','--no-type-check','--no-stdlib','--serialize','--opn',str(target)]),
+                     ('typecheck', ['--no-exec','--no-stdlib','--type-check-strict','--opn',str(target)])):
+                      try:
+                          result=subprocess.run(['aslref']+args,capture_output=True,timeout=75)
+                          stderr=result.stderr.decode(errors='replace').strip()
+                          print('RESULT',func,label,'RETURN',result.returncode,
+                                'AST_BYTES',len(result.stdout),
+                                'ERROR',stderr[:350].replace('\n',' | '),flush=True)
+                      except subprocess.TimeoutExpired:
+                          print('RESULT',func,label,'TIMEOUT',flush=True)
+          PY
+
+          echo "$BIN" >> "$GITHUB_PATH"
+          test -x "$BIN/aslref"
       - name: Download official pinned 2026-09 Arm A64 XML
         run: |
           set -euo pipefail
