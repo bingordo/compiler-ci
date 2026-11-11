@@ -1,0 +1,102 @@
+name: S23.38 source-pinned native DAG matcher compile-cost ABBA
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-38-native-source-cost.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/s23-38-native-source-cost.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-typeid-source-cost:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact direct pre-S23.37 parent
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 06f3ca0804025b346b15aaaab1b923396434b7ae
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact S23.37 fully proved source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b1392507031adc22da97b46bad9157a542559b9c
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact S23.38 harness and provenance contract
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 333fcc01aff14a3a0718ea92a26049fa301c39bd
+          path: benchmark
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify three immutable source pins, harness syntax and machine context
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C before rev-parse HEAD)" = 06f3ca0804025b346b15aaaab1b923396434b7ae
+          test "$(git -C after rev-parse HEAD)" = b1392507031adc22da97b46bad9157a542559b9c
+          test "$(git -C benchmark rev-parse HEAD)" = 333fcc01aff14a3a0718ea92a26049fa301c39bd
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          python3 -m py_compile benchmark/tools/s23_native_real_source_abba.py
+          python3 -m py_compile benchmark/tools/s23_native_profile_source.py
+          python3 -m py_compile benchmark/tools/source_compile_corpus.py
+          python3 -m py_compile benchmark/tools/typeid_inline_source_corpus.py
+          rustc --version
+          cc --version | head -1
+          nproc
+          uname -m
+      - name: Reuse production source compiler build caches
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before -> target
+            after -> target
+          key: s2338-real-source-native-compiler
+      - name: Build both original production checked TypeId source compilers in release mode
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path before/Cargo.toml -p compiler --bin compiler
+          cargo build --release --manifest-path after/Cargo.toml -p compiler --bin compiler
+          test -x before/target/release/compiler
+          test -x after/target/release/compiler
+      - name: Actual checked C source ABBA, native profiler counters and byte parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          python3 -u benchmark/tools/s23_native_real_source_abba.py \
+            --root after \
+            --before-bin before/target/release/compiler \
+            --after-bin after/target/release/compiler \
+            --before-sha 06f3ca0804025b346b15aaaab1b923396434b7ae \
+            --after-sha b1392507031adc22da97b46bad9157a542559b9c \
+            --output results/s2338-real-source-abba.json --rounds 3 \
+            2>&1 | tee results/s2338-real-source-abba.log
+          test "$(grep -c '^S2338_CASE ' results/s2338-real-source-abba.log)" -eq 31
+          test "$(grep -c '^S2338_COHORT ' results/s2338-real-source-abba.log)" -eq 4
+          grep '^S2338_SUMMARY ' results/s2338-real-source-abba.log | tee -a "$GITHUB_STEP_SUMMARY"
+          grep '^S2338_COHORT ' results/s2338-real-source-abba.log | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Preserve exact source, case counters, noise and emitted ELF hashes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2338-source-cost-abba-results
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
