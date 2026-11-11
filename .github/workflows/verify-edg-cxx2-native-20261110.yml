@@ -287,10 +287,52 @@ jobs:
           grep -F 'EDG_GENERATED_ROUTINE' global-effect.log | head -n 25
           grep -Eq 'EDG_GENERATED_ROUTINE id=[0-9]+ name=Some\("__sti__[^"]+"\)' global-effect.log
           grep -F 'EDG_STARTUP_BODY' global-effect.log | head -n 15
+          grep -E 'EDG_CXX5_SOURCE_CLOSURE startup_id=[0-9]+ retained=true' global-effect.log
           grep -E 'STARTUP_CALLSITE|STARTUP_REF' global-effect.log | head -n 60 || true
           echo "EDG_CXX5_NATIVE gate=generated_startup_provenance result=pass"
           echo "EDG_CXX5_NATIVE gate=global_scope_destructor_provenance result=pass"
           echo "EDG_CXX5_NATIVE gate=global_constructor_fail_closed result=pass"
+          # #837 original GNU libstdc++ Hello World oracle and no-endl control.
+          cp "$fixtures/edg_native_cxx5_iostream.cpp" hello-world.cpp
+          cat >hello-no-endl.cpp <<'CPP'
+          #include <iostream>
+          int main() { std::cout << "Hello, world!"; }
+          CPP
+          for variant in hello-world hello-no-endl; do
+            g++ -std=c++17 -Wall -Wextra -Werror "$variant.cpp" -o "$variant-reference"
+            timeout 15s "./$variant-reference" >"$variant-reference.out" 2>"$variant-reference.err"
+            test ! -s "$variant-reference.err"
+            if test "$variant" = hello-world; then
+              test "$(printf 'Hello, world!\n' | sha256sum | cut -d' ' -f1)" = "$(sha256sum "$variant-reference.out" | cut -d' ' -f1)"
+            else
+              test "$(printf 'Hello, world!' | sha256sum | cut -d' ' -f1)" = "$(sha256sum "$variant-reference.out" | cut -d' ' -f1)"
+            fi
+            rm -f "$variant.o"
+            if timeout 90s "$compiler" "$variant.o" --typeid-native --dump-edg-global-provenance "${edg_flags[@]}" "${include_flags[@]}" "$variant.cpp" >"$variant-native-compile.log" 2>&1; then
+              test -s "$variant.o"
+              test "$(od -An -tx1 -N4 "$variant.o" | tr -d '[:space:]')" = 7f454c46
+              g++ "$variant.o" -o "$variant-native"
+              timeout 15s "./$variant-native" >"$variant-native.out" 2>"$variant-native.err"
+              test "$(sha256sum "$variant-reference.out" | cut -d' ' -f1)" = "$(sha256sum "$variant-native.out" | cut -d' ' -f1)"
+              test "$(sha256sum "$variant-reference.err" | cut -d' ' -f1)" = "$(sha256sum "$variant-native.err" | cut -d' ' -f1)"
+              echo "EDG_CXX5_NATIVE gate=iostream_executable fixture=$variant result=pass"
+            else
+              status=$?
+              test ! -e "$variant.o"
+              test "$status" -ne 124
+              tail -n 8 "$variant-native-compile.log"
+              grep -F 'EDG_CXX5_SOURCE_CLOSURE startup_id=' "$variant-native-compile.log" | head -n 20 || true
+              echo "EDG_CXX5_NATIVE fixture=$variant status=$status" | tee -a "$GITHUB_STEP_SUMMARY"
+              # Report the exact source-owned first rejected member without
+              # relying on changing per-TU SymbolId allocation numbers.
+              rejected_member="$(sed -nE 's/.*C\+\+ member SymbolId\(([0-9]+)\) source admission:.*/\1/p' "$variant-native-compile.log" | head -n 1)"
+              if test -n "$rejected_member"; then
+                grep -F "ROUTINE_ID RoutineIdentity { routine: SymbolId($rejected_member)," "$variant-native-compile.log" | head -n 1 | tee -a "$GITHUB_STEP_SUMMARY" || true
+              fi
+              grep -E "^Error:|EDG -> compiler-ir rejected" "$variant-native-compile.log" | tail -n 1 | tee -a "$GITHUB_STEP_SUMMARY" || true
+              echo "EDG_CXX5_NATIVE gate=iostream_fail_closed fixture=$variant result=pass"
+            fi
+          done
 
       - name: Preserve native C++17 minimal-header reference/ELF evidence
         if: always()
