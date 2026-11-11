@@ -1,0 +1,63 @@
+name: IR F11 Oberon memory and array checked-source TypeId cutover
+on:
+  push:
+    branches: [ci/f11-oberon-memory-typeid-1014-20261111]
+    paths: ['.github/workflows/f11-oberon-memory-typeid-1014.yml']
+permissions:
+  contents: read
+jobs:
+  native-oberon-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9d8e198e05dbb484c63c38d01f7a65dc639d4577
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest exact source and Oberon checked-source test migration
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 9d8e198e05dbb484c63c38d01f7a65dc639d4577
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path("compiler/crates/driver/tests/unit/driver_cases.rs").read_text()
+          cases=[
+              "checked_oberon_locals_lower_to_initialized_memory_not_scalar_phis",
+              "checked_oberon_local_memory_executes_assembly_and_direct_elf",
+              "many_source_local_values_promote_and_execute_correctly",
+              "bulk_zero_preserves_sysv_argument_registers_and_adjacent_arrays",
+              "large_fixed_array_uses_full_width_bound_and_nonoverlapping_frame_words",
+              "scalar_locals_promote_through_loops_without_losing_array_memory",
+              "source_fixed_array_bounds_and_indexed_updates_execute_in_asm_and_elf",
+          ]
+          for name in cases:
+              part=s.split("fn "+name+"()",1)[1].split("\\n    #[",1)[0]
+              assert "lower_oberon_native_typeid(" in part, name
+              assert "lower_functions(" not in part, name
+              assert "compile_object(" not in part, name
+              assert "compile(src" not in part, name
+              assert "let raw = lower(" not in part, name
+          for name in cases[1:]:
+              part=s.split("fn "+name+"()",1)[1].split("\\n    #[",1)[0]
+              assert 'emit_typeid_source(' in part, name
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: oberon-memory-typeid-f11
+      - name: Full real Oberon checked-source tests, native ELF/GAS and x86 runtime
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --bin compiler -- --test-threads=2
+          cargo test -p compiler --test f6_source_runtime_parity -- --test-threads=1
+          cargo test -p compiler --test mini_c_cli --test ir_default_cli -- --test-threads=2
+          cargo test -p compiler-ir -p compiler-opt --lib -- --test-threads=2
+          cargo clippy -p compiler -p compiler-ir -p compiler-opt --all-targets -- -D warnings
