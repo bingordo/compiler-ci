@@ -1,0 +1,72 @@
+name: O2b Oberon inherited record native AArch64 validation
+on:
+  pull_request:
+    paths: ['.github/workflows/o2b-oberon-native-aarch64.yml']
+permissions:
+  contents: read
+jobs:
+  native-arm:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 83ddf86ebb92cf8e8f8301c9810d6dd81d41677f
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source revision
+        run: |
+          test "$(uname -m)" = aarch64
+          test "$(git -C compiler rev-parse HEAD)" = 83ddf86ebb92cf8e8f8301c9810d6dd81d41677f
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: o2b-oberon-native-aarch64
+      - name: Compile and execute inherited records with both native ARM64 outputs
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo build -p compiler --bin compiler
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          cat > "$tmp/NativeRecord.mod" <<'EOF'
+          MODULE NativeRecord;
+          TYPE Parent = RECORD left,right: INTEGER END;
+               Child = RECORD (Parent) tail: INTEGER END;
+          VAR parent: Parent; child: Child;
+          PROCEDURE Read*(): INTEGER;
+          BEGIN RETURN parent.left+10*parent.right+100*child.tail END Read;
+          PROCEDURE Eval*(n: INTEGER): INTEGER;
+          VAR local: Child;
+          BEGIN
+              local.left:=n; local.right:=n+1; local.tail:=n+2;
+              child:=local; parent:=child;
+              RETURN Read()
+          END Eval;
+          BEGIN parent.left:=3; parent.right:=4; child.tail:=5 END NativeRecord.
+          EOF
+          cat > "$tmp/oracle.c" <<'EOF'
+          extern int NativeRecord__Read(void),NativeRecord__Eval(int);
+          int main(void) {
+              if (NativeRecord__Read()!=543) return 1;
+              if (NativeRecord__Eval(1)!=321) return 2;
+              if (NativeRecord__Read()!=321) return 3;
+              if (NativeRecord__Eval(7)!=987) return 4;
+              return NativeRecord__Read()!=987;
+          }
+          EOF
+          for fmt in obj asm; do
+            ext=o
+            if [ "$fmt" = asm ]; then ext=s; fi
+            ./target/debug/compiler "$tmp/NativeRecord.mod" --language oberon \
+              --target aarch64 --ir typeid --emit "$fmt" -o "$tmp/native.$ext"
+            cc -std=c11 -O2 -no-pie "$tmp/oracle.c" "$tmp/native.$ext" -o "$tmp/test-$fmt"
+            "$tmp/test-$fmt"
+            echo "O2B_ARM_NATIVE_PASS format=$fmt" >> "$GITHUB_STEP_SUMMARY"
+          done
