@@ -1,0 +1,80 @@
+name: AArch64 A3.1.M2 deterministic source-pinned operand matrix
+on:
+  push:
+    branches: [ci/aarch64-a31-matrix-20261110]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: aarch64-a31-matrix-verification
+  cancel-in-progress: true
+jobs:
+  dual-assembler:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out pinned compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 776d26aeed3ff290fda70997760aafae5696e4fd
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Run unit tests without Rust workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 776d26aeed3ff290fda70997760aafae5696e4fd
+          python3 -m py_compile compiler/tools/aarch64_mrs_catalog.py compiler/tools/aarch64_a31_encoding_oracle.py compiler/tools/aarch64_a31_operand_matrix.py
+          python3 -m unittest discover -s compiler/tools -p 'test_aarch64_a31_operand_matrix.py' -v
+          python3 -m unittest discover -s compiler/tools -p 'test_aarch64_a31_encoding_oracle.py' -v
+          python3 -m unittest discover -s compiler/tools -p 'test_aarch64_mrs_catalog.py' -v
+      - name: Install independent GNU AArch64 assembler
+        run: |
+          set -euo pipefail
+          clang --version | head -1
+          if ! command -v aarch64-linux-gnu-as; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq binutils-aarch64-linux-gnu
+          fi
+          aarch64-linux-gnu-as --version | head -1
+      - name: Fetch and verify immutable Arm source
+        run: |
+          set -euo pipefail
+          git clone --quiet --depth 1 --filter=blob:none https://kernel.googlesource.com/pub/scm/linux/kernel/git/maz/AARCHMRS mrs
+          test "$(git -C mrs rev-parse HEAD)" = 1346b16d47619400448f3cb6d4f22d62d3b76848
+          echo "ef75f3ec02df1b9b9c0612f4ea259d6710ac3de686b097d8f9c83d1d97aa800a  mrs/Instructions.json" | sha256sum -c -
+      - name: Reproduce 245 complete-word witnesses against LLVM and GNU
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/aarch64_mrs_catalog.py \
+            --instructions mrs/Instructions.json \
+            --expect-sha256 ef75f3ec02df1b9b9c0612f4ea259d6710ac3de686b097d8f9c83d1d97aa800a \
+            --out /tmp/aarch64-mrs-catalog.json
+          python3 compiler/tools/aarch64_a31_encoding_oracle.py \
+            --catalog /tmp/aarch64-mrs-catalog.json \
+            --gnu-as aarch64-linux-gnu-as --matrix \
+            --out /tmp/aarch64-a31-matrix.json
+          python3 compiler/tools/aarch64_a31_encoding_oracle.py \
+            --catalog /tmp/aarch64-mrs-catalog.json \
+            --gnu-as aarch64-linux-gnu-as --matrix \
+            --out /tmp/aarch64-a31-matrix.json --check
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          d=json.loads(Path('/tmp/aarch64-a31-matrix.json').read_text())
+          assert (d['cases_verified'],d['baseline_cases'],d['matrix_cases']) == (245,26,219)
+          assert d['independent_assemblers'] == ['llvm-clang','gnu-binutils']
+          assert d['selection_eligible'] is False
+          assert all(w['selection_eligible'] is False and w['asl_semantics_verified'] is False
+                     and w['operand_legality_verified'] is False and len(w['source_record_sha256'])==64
+                     for w in d['witnesses'])
+          print('A3.1_MATRIX_PASS: 245 full-word witnesses, 0 generated rules')
+          PY
+      - name: Save independent test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aarch64-a31-matrix-witnesses
+          path: /tmp/aarch64-a31-matrix.json
+          retention-days: 14
