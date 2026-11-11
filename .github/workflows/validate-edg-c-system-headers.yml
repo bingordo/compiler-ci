@@ -1,0 +1,158 @@
+name: EDG native hosted C headers without manual include paths
+
+on:
+  push:
+    branches: [validate-edg-c-system-headers-*]
+    paths: ['.github/workflows/validate-edg-c-system-headers.yml']
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/validate-edg-c-system-headers.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: edg-c-system-headers-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-c-headers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    container:
+      image: ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8
+    defaults:
+      run:
+        shell: edg-container-exec "bash -eo pipefail {0}"
+    env:
+      EDG_SOURCE_SHA: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+      EDG_RELEASE_TAG: edgcpfe-ci-799603e0b5ab
+      EDG_RELEASE_SHA256: fa769825e70766fbefe017806816b2338acd03daa93bb5562369c293972ce64c
+      RUST_TOOLCHAIN_VERSION: 1.99.1
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+      EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+      EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+      EDGCPP_EDG_REVISION: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+    steps:
+      - name: Check out exact native compiler source PR #871
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 72ca938e3eaab1b717019d11f46a5b02140b10cf
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify compiler revision
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 72ca938e3eaab1b717019d11f46a5b02140b10cf
+          echo "Native compiler SHA: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Check out pinned EDG headers
+        uses: actions/checkout@v4
+        with:
+          repository: bingundu/edgcpp
+          ref: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+          path: edgcpp
+          persist-credentials: false
+      - name: Configure matching EDG metadata and error headers
+        working-directory: edgcpp
+        env:
+          EDG_BASE: ${{ github.workspace }}/edgcpp/bases/docker/dev-env/gcc
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EDG_SOURCE_SHA"
+          cmake --preset linux-gcc-release \
+            -DEDG_BUILD_LIB=OFF -DEDG_BUILD_CALLABLE_LIBRARY=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          cmake --build build/gcc-release --target error-info --parallel 2
+      - name: Download and SHA256-verify prebuilt EDG archive
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          mkdir -p build/gcc-release/lib build/prebuilt-edg
+          curl --fail --location --silent --show-error --retry 4 --retry-delay 2 \
+            "https://github.com/bingundu/edgcpp/releases/download/$EDG_RELEASE_TAG/edgcpfe-ci-x86_64-callable-release-linux-x86_64.tar.gz" \
+            --output build/prebuilt-edg/archive.tar.gz
+          printf '%s  %s\n' "$EDG_RELEASE_SHA256" build/prebuilt-edg/archive.tar.gz | sha256sum --check
+          tar -xzf build/prebuilt-edg/archive.tar.gz -C build/prebuilt-edg
+          grep -Fx "commit=$EDG_SOURCE_SHA" build/prebuilt-edg/BUILD-INFO.txt
+          test -s build/prebuilt-edg/lib/libedgcpfe.a
+          cp build/prebuilt-edg/lib/libedgcpfe.a build/gcc-release/lib/libedgcpfe.a
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          if ! command -v cargo >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN_VERSION"
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install "$RUST_TOOLCHAIN_VERSION" --profile minimal
+          rustup default "$RUST_TOOLCHAIN_VERSION"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/edg-driver -> target
+          key: edg-hosted-c-system-includes-v1
+      - name: Test auto-system-header selection and build the native EDG driver
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test --manifest-path tools/edg-driver/Cargo.toml \
+            --bin compiler-edg-driver system_includes::tests -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/system-headers-unit.log"
+          grep -Eq 'test result: ok[.] [3-9][0-9]* passed; 0 failed' "$RUNNER_TEMP/system-headers-unit.log" || \
+            grep -Eq 'test result: ok[.] 3 passed; 0 failed' "$RUNNER_TEMP/system-headers-unit.log"
+          cargo build --manifest-path tools/edg-driver/Cargo.toml --bin compiler-edg-driver
+      - name: Compile unmodified hosted stdio C without any system -I arguments
+        working-directory: edgcpp/build/gcc-release
+        run: |
+          set -euo pipefail
+          source ./environment.sh
+          bin="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          test -x "$bin"
+          echo "GCC builtin: $(gcc -print-file-name=include)"
+          echo "GCC multiarch: $(gcc -print-multiarch)"
+          cat > hello_puts.c <<'EOF'
+          #include <stdio.h>
+          int main(void) {
+              return puts("Native C header discovery works") < 0;
+          }
+          EOF
+          cat > hello_printf.c <<'EOF'
+          #include <stdio.h>
+          int main(void) {
+              return printf("hello %d %s %ld\n", 17, "native", 123L) < 0;
+          }
+          EOF
+          for source in hello_puts hello_printf; do
+            # Deliberately NO -I flags here: the actual product improvement.
+            "$bin" "$source.native.o" --c11 "$source.c" \
+              > "$RUNNER_TEMP/$source.compiler.log" 2>&1 || {
+              cat "$RUNNER_TEMP/$source.compiler.log"; exit 1;
+            }
+            test "$(od -An -tx1 -N4 "$source.native.o" | tr -d '[:space:]')" = 7f454c46
+            gcc -std=c11 -O2 "$source.c" -o "$source.gcc"
+            gcc "$source.native.o" -o "$source.native"
+            timeout 15s "./$source.gcc" > "$source.gcc.out"
+            timeout 15s "./$source.native" > "$source.native.out"
+            test "$(sha256sum "$source.gcc.out" | cut -d' ' -f1)" = \
+                 "$(sha256sum "$source.native.out" | cut -d' ' -f1)"
+            test "$(wc -c < "$source.gcc.out")" = "$(wc -c < "$source.native.out")"
+            echo "EDG_HOSTED_C source=$source result=pass" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Save diagnostics for failed hosted C runs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: edg-hosted-c-system-headers
+          path: |
+            ${{ runner.temp }}/system-headers-unit.log
+            ${{ runner.temp }}/hello_puts.compiler.log
+            ${{ runner.temp }}/hello_printf.compiler.log
+          if-no-files-found: ignore
+          retention-days: 10
