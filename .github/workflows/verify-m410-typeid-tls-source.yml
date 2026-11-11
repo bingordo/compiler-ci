@@ -1,0 +1,74 @@
+name: M4.10 checked TypeId TLS ELF/GAS linker acceptance
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-m410-typeid-tls-source.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  acceptance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      COMPILER_ELF_REQUIRE_LLVM: '1'
+    steps:
+      - name: Checkout exact TypeId TLS source candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 3a386ca7d90dbf09d5d22a3d26237fcf455897ce
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify immutable candidate
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "3a386ca7d90dbf09d5d22a3d26237fcf455897ce"
+          test -s crates/driver/tests/typeid_tls_linker_matrix.rs
+          echo "M4.10 source TLS candidate: 3a386ca7d90dbf09d5d22a3d26237fcf455897ce" >> "$GITHUB_STEP_SUMMARY"
+      - name: Resolve public pinned frontend dependencies
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - name: Verify GCC Clang LLD and readelf
+        run: |
+          set -euo pipefail
+          if ! command -v ld.lld >/dev/null || ! command -v gdb >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y lld gdb
+          fi
+          command -v gcc
+          command -v clang
+          command -v ld.lld
+          command -v readelf
+          command -v nm
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m410-source-typeid-tls-v1
+      - name: New source TLS ELF/GAS threaded linker matrix
+        working-directory: compiler
+        run: cargo test -p compiler --test typeid_tls_linker_matrix -- --nocapture
+      - name: Existing TypeId PIC frame and ELF source linker matrices
+        working-directory: compiler
+        run: |
+          cargo test -p compiler --test typeid_pic_frame_shared
+          cargo test -p compiler --test typeid_pic_shared
+          cargo test -p compiler --test typeid_frame_pointer
+          cargo test -p compiler --test typeid_elf_linker_matrix
+      - name: Existing checked TLS and shared ELF tests
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend --test x86_elf_tls_native
+          cargo test -p compiler-backend-x86 --test m4_8_ssa_tls_native
+          cargo test -p compiler-backend --test x86_elf_contract
+      - name: Full shared IR optimizer x86 AArch64 regression
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --features compiler-backend-x86/x7-native-form-validation
+      - name: Strict Clippy all targets
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --features compiler-backend-x86/x7-native-form-validation --all-targets -- -D warnings
+          cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
