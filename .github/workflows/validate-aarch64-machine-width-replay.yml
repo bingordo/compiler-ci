@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: a0362a4df5e7d89b25ca2b86511747a389d167df
+          ref: 3f40cbb2930ba61fc26669a3417854c7de745284
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -24,14 +24,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C compiler rev-parse HEAD)" = "a0362a4df5e7d89b25ca2b86511747a389d167df"
+          test "$(git -C compiler rev-parse HEAD)" = "3f40cbb2930ba61fc26669a3417854c7de745284"
           cat > compiler/Cargo.toml <<'EOF'
           [workspace]
           resolver = "2"
           members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
           EOF
           rm -f compiler/Cargo.lock
-          echo "Source SHA: a0362a4df5e7d89b25ca2b86511747a389d167df" >> "$GITHUB_STEP_SUMMARY"
+          echo "Source SHA: 3f40cbb2930ba61fc26669a3417854c7de745284" >> "$GITHUB_STEP_SUMMARY"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: compiler -> target
@@ -44,6 +44,90 @@ jobs:
           cargo test --offline -p compiler-backend-aarch64 --test machine_text_v2 -- --nocapture
           cargo test --offline -p compiler-backend-aarch64 --test machine_text_v1
           cargo test --offline -p compiler-backend-aarch64 --lib real_native_typeid_aarch64_selection_is_machine_text_replayable
+      - name: Execute decoded AArch64 machine objects against independent C oracles under QEMU
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends gcc-aarch64-linux-gnu qemu-user
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          cat > "$tmp/answer32.ir" <<'EOF'
+          compiler-ir-native-module 3
+          compiler-ir-native-types 3
+          types 1
+          type 0 int 32
+          signatures 0
+          layout little 0
+          endtypes
+          definitions 1
+          definition answer external c fixed 0 1 0
+          externals 0
+          globals 0
+          functions 1
+          function answer
+          block ^0 (%0:t0)
+            %1:t0 = const.i32 7
+            %2:t0 = add %0 %1
+            return %2
+          endblock
+          endfunction
+          endmodule
+          EOF
+          cat > "$tmp/answer64.ir" <<'EOF'
+          compiler-ir-native-module 3
+          compiler-ir-native-types 3
+          types 1
+          type 0 int 64
+          signatures 0
+          layout little 0
+          endtypes
+          definitions 1
+          definition answer external c fixed 0 1 0
+          externals 0
+          globals 0
+          functions 1
+          function answer
+          block ^0 (%0:t0)
+            %1:t0 = const.i64 7
+            %2:t0 = intbin.add.64 %0 %1
+            return %2
+          endblock
+          endfunction
+          endmodule
+          EOF
+          cat > "$tmp/oracle32.c" <<'EOF'
+          extern int answer(int);
+          int main(void) {
+            for (int n=-1000; n<=1000; n++)
+              if (answer(n)!=n+7) return 1;
+            return 0;
+          }
+          EOF
+          cat > "$tmp/oracle64.c" <<'EOF'
+          extern long answer(long);
+          int main(void) {
+            const long cases[] = {-4294967300L,-7L,0L,1L,4294967300L};
+            for (unsigned i=0;i<sizeof(cases)/sizeof(cases[0]);i++)
+              if (answer(cases[i])!=cases[i]+7) return 1;
+            return 0;
+          }
+          EOF
+          for bits in 32 64; do
+            cargo run --offline -p compiler-backend-aarch64 --bin aarch64-machine-ir -- \
+              select-typeid "$tmp/answer$bits.ir" "$tmp/answer$bits.mir"
+            cargo run --offline -p compiler-backend-aarch64 --bin aarch64-machine-ir -- \
+              roundtrip "$tmp/answer$bits.mir"
+            cargo run --offline -p compiler-backend-aarch64 --bin aarch64-machine-ir -- \
+              emit-object "$tmp/answer$bits.mir" "$tmp/answer$bits.o"
+            cargo run --offline -p compiler-backend-aarch64 --bin aarch64-machine-ir -- \
+              emit-asm "$tmp/answer$bits.mir" "$tmp/answer$bits.s"
+            aarch64-linux-gnu-gcc -static -O2 -fno-pie -no-pie -Wall -Wextra -Werror \
+              "$tmp/oracle$bits.c" "$tmp/answer$bits.o" -o "$tmp/answer$bits"
+            timeout 30 qemu-aarch64 "$tmp/answer$bits"
+            echo "PASS: native TypeId > selected v2 width-carrying machine SSA > AArch64 ELF > C$bits QEMU oracle"
+          done
       - name: Strict backend Clippy
         working-directory: compiler
         run: |
