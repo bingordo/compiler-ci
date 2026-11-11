@@ -86,7 +86,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/edgcpp-rust
-          ref: 56969d6d85abf483793629e3270406ce7917c14d
+          ref: 47db6477df35d9b473fdb59736ad8353acbe4f64
           path: edg-rust
           persist-credentials: false
 
@@ -120,11 +120,11 @@ jobs:
           file=Path("tools/edg-driver/Cargo.toml")
           text=file.read_text()
           old="2bd6d1f6c38304d200231089f06cf6c42f6366a2"
-          new="56969d6d85abf483793629e3270406ce7917c14d"
+          new="47db6477df35d9b473fdb59736ad8353acbe4f64"
           assert text.count(old)==1
           file.write_text(text.replace(old,new))
           PY
-          grep -Fq '56969d6d85abf483793629e3270406ce7917c14d' tools/edg-driver/Cargo.toml
+          grep -Fq '47db6477df35d9b473fdb59736ad8353acbe4f64' tools/edg-driver/Cargo.toml
 
       - name: Build direct EDG to compiler-ir and x86 backend adapter
         working-directory: compiler
@@ -187,6 +187,38 @@ jobs:
             exit 1
           fi
           echo "EDG_CXX5 gate=system_libstdcxx_header_parse result=pass"
+          cat >bare.cpp <<'EOF'
+          int main() { return 0; }
+          EOF
+          cat >iosfwd.cpp <<'EOF'
+          #include <iosfwd>
+          int main() { return 0; }
+          EOF
+          cat >iostream_unused.cpp <<'EOF'
+          #include <iostream>
+          int main() { return 0; }
+          EOF
+          for label in bare iosfwd iostream_unused; do
+            if ! g++ -std=c++17 -Wall -Wextra -Werror -fsyntax-only "$label.cpp"; then
+              echo "EDG_CXX5 G++ control source invalid: $label" >&2
+              exit 1
+            fi
+            set +e
+            timeout 30s "$compiler" "$label.o" --typeid-native "${edg_options[@]}" "${include_flags[@]}" "$label.cpp" >"$label-native.log" 2>&1
+            control_status=$?
+            set -e
+            echo "$label=$control_status" | tee -a native-control-status.txt
+            if test "$control_status" -eq 139 || test "$control_status" -eq 124; then
+              echo "EDG_CXX5 unsafe crash/timeout in source control $label" >&2
+              exit 1
+            fi
+            if test "$control_status" -ne 0; then
+              test ! -e "$label.o"
+              grep -E -m1 '^Error:' "$label-native.log" || tail -n 4 "$label-native.log"
+            else
+              test "$(od -An -tx1 -N4 "$label.o" | tr -d '[:space:]')" = 7f454c46
+            fi
+          done
           # Observe the real status and runtime resource envelope. if ! cmd hides 124/137/139 and makes a killed process look
           # like an ordinary unsupported-IR diagnostic.
           echo "memory.max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || true)" >native-resource.log
