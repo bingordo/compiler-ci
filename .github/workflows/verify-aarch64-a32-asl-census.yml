@@ -51,3 +51,55 @@ jobs:
                   if v.get('code') is not None:ops_with_code+=1
           print('OP_TYPES',typecount,'CODE_COUNT',ops_with_code)
           PY
+      - name: Classify placeholder versus actual operation text
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from collections import Counter
+          root=json.load(open("mrs/Instructions.json"))
+          operations=root["operations"]
+          count=Counter()
+          lengths=Counter()
+          nonempty=[]
+          for key,val in operations.items():
+              op=val.get("operation") if isinstance(val,dict) else None
+              if not isinstance(op,str):
+                  count["missing"]+=1
+              elif op.strip() in ("", "// Not specified"):
+                  count["placeholder"]+=1
+              else:
+                  count["concrete"]+=1
+                  nonempty.append((key,len(op),op[:100]))
+              lengths[len(op) if isinstance(op,str) else -1]+=1
+          print("AARCHMRS_OPERATIONS",len(operations),"CLASS",dict(count))
+          print("SOURCE_LENGTHS",lengths.most_common(8))
+          print("NON_PLACEHOLDER_EXAMPLES",nonempty[:8])
+          PY
+      - name: Inspect official Arm A64 XML semantic-source package
+        run: |
+          set -euo pipefail
+          URL=https://developer.arm.com/-/cdn-downloads/permalink/Exploration-Tools-A64-ISA/ISA_A64/ISA_A64_xml_A_profile-2026-06.tar.gz
+          curl -fLsS --retry 2 --connect-timeout 15 --max-time 180 --max-filesize 200000000 -o /tmp/arm-a64-isa.xml.tgz "$URL"
+          test -s /tmp/arm-a64-isa.xml.tgz
+          file /tmp/arm-a64-isa.xml.tgz
+          sha256sum /tmp/arm-a64-isa.xml.tgz
+          tar tzf /tmp/arm-a64-isa.xml.tgz | grep -E '/(add_addsub_shift|and_log_shift|shared_pseudocode)\\.xml$' | head -12
+          python3 - <<'PY'
+          from collections import Counter
+          import tarfile
+          import xml.etree.ElementTree as ET
+          archive=tarfile.open("/tmp/arm-a64-isa.xml.tgz","r:gz")
+          choices=[p for p in archive.getmembers()
+                   if p.name.endswith(('/add_addsub_shift.xml','/and_log_shift.xml')) and p.isfile()]
+          print('XML_SELECTED',[(p.name,p.size) for p in choices])
+          for entry in choices:
+              if entry.size>2_000_000:raise SystemExit('oversized XML')
+              doc=ET.parse(archive.extractfile(entry)).getroot()
+              counts=Counter(x.tag for x in doc.iter())
+              pseudo=[x for x in doc.iter() if x.tag in ('ps','pstext','ps_section')]
+              print('XML_FILE',entry.name,'ROOT',doc.tag,
+                    'ROOT_ATTRS',doc.attrib,'TOP_TAGS',counts.most_common(15),
+                    'PS',[(x.tag,sorted(x.attrib),len(''.join(x.itertext()))) for x in pseudo[:12]])
+              if not pseudo:raise SystemExit('ASL pseudocode absent from XML')
+          PY
