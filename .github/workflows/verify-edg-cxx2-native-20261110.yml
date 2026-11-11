@@ -1,4 +1,4 @@
-name: EDG C++2 native executable constructor destructor G++ differential
+name: EDG C++2 lifetime and minimal GNU C++17 executable differential
 
 on:
   push:
@@ -216,6 +216,64 @@ jobs:
           done
           test "$checked_negatives" = 6
           echo "EDG_CXX2_NATIVE gate=all_six_unsupported_shapes_rejected result=pass"
+
+      - name: Execute native C++17 bare and iosfwd control programs against G++
+        working-directory: edgcpp/build/gcc-release
+        env:
+          CXX5_ARTIFACTS: ${{ runner.temp }}/edg-cxx5-basic-controls
+          EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+          EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+          EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+          EDGCPP_EDG_REVISION: ${{ env.EDG_SOURCE_SHA }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source ./environment.sh
+          compiler="${GITHUB_WORKSPACE}/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          fixtures="${GITHUB_WORKSPACE}/compiler/tools/edg-driver/tests/fixtures"
+          mkdir -p "$CXX5_ARTIFACTS"
+          cd "$CXX5_ARTIFACTS"
+          g++ -std=c++17 -v -E -x c++ /dev/null >include-search.log 2>&1
+          mapfile -t include_dirs < <(awk '
+            /#include <\.\.\.> search starts here:/{active=1;next}
+            /^End of search list/{active=0}
+            active && /^ /{sub(/^[[:space:]]+/,"");print}
+          ' include-search.log)
+          test "${#include_dirs[@]}" -ge 3
+          include_flags=()
+          for dir in "${include_dirs[@]}"; do
+            test -d "$dir"
+            include_flags+=("-I$dir")
+          done
+          version="$(g++ -dumpfullversion -dumpversion)"
+          IFS=. read -r major minor patch <<<"$version"
+          gnu_number=$((10#${major}*10000+10#${minor:-0}*100+10#${patch:-0}))
+          edg_flags=(--g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number")
+          for unit in edg_native_cxx5_bare_main edg_native_cxx5_iosfwd_unused; do
+            cp "$fixtures/$unit.cpp" "$unit.cpp"
+            g++ -std=c++17 -Wall -Wextra -Werror "$unit.cpp" -o "$unit-reference"
+            timeout 15s "./$unit-reference" >"$unit-reference.out" 2>"$unit-reference.err"
+            rm -f "$unit.o"
+            "$compiler" "$unit.o" --typeid-native "${edg_flags[@]}" "${include_flags[@]}" "$unit.cpp" >"$unit-native-compile.log" 2>&1 || {
+              tail -n 25 "$unit-native-compile.log" >&2
+              test ! -e "$unit.o"
+              exit 1
+            }
+            test "$(od -An -tx1 -N4 "$unit.o" | tr -d '[:space:]')" = 7f454c46
+            g++ "$unit.o" -o "$unit-native"
+            timeout 15s "./$unit-native" >"$unit-native.out" 2>"$unit-native.err"
+            test "$(sha256sum "$unit-reference.out" | cut -d' ' -f1)" = "$(sha256sum "$unit-native.out" | cut -d' ' -f1)"
+            test "$(sha256sum "$unit-reference.err" | cut -d' ' -f1)" = "$(sha256sum "$unit-native.err" | cut -d' ' -f1)"
+            echo "EDG_CXX5_NATIVE gate=gxx_executable_parity fixture=$unit result=pass"
+          done
+
+      - name: Preserve native C++17 minimal-header reference/ELF evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: edg-cxx5-basic-executables
+          path: ${{ runner.temp }}/edg-cxx5-basic-controls/
+          if-no-files-found: ignore
 
       - name: Preserve EDG lifetime graph and independent G++ execution evidence
         if: always()
