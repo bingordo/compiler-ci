@@ -1,0 +1,100 @@
+name: F6 TypeId direct inline five C11 GAS ELF oracles PR898
+on:
+  push:
+    branches: [ci/verify-t5-five-inline-native-898-20261110]
+    paths: ['.github/workflows/verify-t5-five-inline-native-898.yml']
+permissions:
+  contents: read
+jobs:
+  direct-typeid-c11-oracle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 906a5110c77f54a57f8192ed6ea06bc11b2315a2
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin exact compiler revision and isolate core workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 906a5110c77f54a57f8192ed6ea06bc11b2315a2
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gdb
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: t5-inline-five-898
+      - name: Exact-source direct TypeId five-inliner C11 oracle executions
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_core_inline_integration composed_typed_core_native_oracle_and_compile_time_ablation -- --nocapture 2>&1 | tee "$RUNNER_TEMP/inline-typed-core-inline-integration.log"
+          test "$(grep -c 'TYPED_CORE_ABLATION_NATIVE route=direct-typeid' "$RUNNER_TEMP/inline-typed-core-inline-integration.log")" -eq 12
+          cargo test -p compiler-opt --test typed_inline_cfg_native typed_cfg_inlining_matches_independent_c_oracle_in_gas_and_elf -- --nocapture 2>&1 | tee "$RUNNER_TEMP/inline-typed-inline-cfg-native.log"
+          test "$(grep -c 'TYPEID_CFG_INLINE_NATIVE route=direct-typeid' "$RUNNER_TEMP/inline-typed-inline-cfg-native.log")" -eq 4
+          cargo test -p compiler-opt --test typed_inline_leaf_native scalar_leaf_typeid_inlining_matches_c11_oracle_in_four_native_modes -- --nocapture 2>&1 | tee "$RUNNER_TEMP/inline-typed-inline-leaf-native.log"
+          test "$(grep -c 'TYPEID_INLINE_NATIVE route=direct-typeid' "$RUNNER_TEMP/inline-typed-inline-leaf-native.log")" -eq 4
+          cargo test -p compiler-opt --test typed_inline_memory_native cloned_local_memory_matches_independent_c11_oracle_in_four_native_modes -- --nocapture 2>&1 | tee "$RUNNER_TEMP/inline-typed-inline-memory-native.log"
+          test "$(grep -c 'TYPEID_INLINE_MEMORY_NATIVE route=direct-typeid' "$RUNNER_TEMP/inline-typed-inline-memory-native.log")" -eq 4
+          cargo test -p compiler-opt --test typed_inline_wide_void_native wide_ptr_and_void_native_inlining_matches_independent_c_oracle -- --nocapture 2>&1 | tee "$RUNNER_TEMP/inline-typed-inline-wide-void-native.log"
+          test "$(grep -c 'TYPEID_WIDE_VOID_NATIVE route=direct-typeid' "$RUNNER_TEMP/inline-typed-inline-wide-void-native.log")" -eq 4
+          cargo test -p compiler-opt --test typed_core_pipeline optimized_typeid_core_emits_correct_gas_and_direct_elf
+          cargo test -p compiler-opt --test typed_native_parity typed_loop_pass_orders_match_independent_c_in_gas_and_elf
+      - name: Core optimizer, x86 native and generic allocator regressions
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+      - name: Strict default and legacy experimental lint
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
+          cargo clippy -p compiler-opt --features legacy-experimental-ssa --all-targets -- -D warnings
+      - name: Preserve inliner oracle logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: t5-inline-five-failure
+          path: ${{ runner.temp }}/inline-*.log
+          if-no-files-found: ignore
+          retention-days: 14
+  aarch64-typeid-regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 906a5110c77f54a57f8192ed6ea06bc11b2315a2
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin shared TypeId legalizer across both native targets
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 906a5110c77f54a57f8192ed6ea06bc11b2315a2
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/backend","crates/backend-x86","crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gdb
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: t5-inline-five-898-aarch64
+      - name: Full AArch64 TypeId and shared legalizer regression
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend -p compiler-backend-aarch64
+          cargo clippy -p compiler-backend -p compiler-backend-aarch64 --all-targets -- -D warnings
