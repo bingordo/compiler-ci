@@ -1,0 +1,179 @@
+name: AArch64 A3.2.S2.1 pinned Arm feature declaration typing audit
+on:
+  push:
+    branches: [ci/aarch64-a32-s21-feature-typeenv-20261110]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: aarch64-a32-s21-feature-typeenv
+  cancel-in-progress: true
+jobs:
+  aslref-compat:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout source-pinned compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 74948131dbb2ee005def66becb1dcf5c3c731cc4
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact upstream Arm XML-to-ASL bundler
+        uses: actions/checkout@v4
+        with:
+          repository: herd/herdtools7
+          ref: cfc4f56c522ec0d701acaf5a23139b47e8711299
+          path: herd
+          sparse-checkout: |
+            herd/libdir/asl-pseudocode/bundler.py
+            herd/libdir/asl-pseudocode/build_features.py
+          persist-credentials: false
+      - name: Checkout ASLRef 1.0-EAC1 release sources
+        uses: actions/checkout@v4
+        with:
+          repository: herd/herdtools7
+          ref: 66820445b78246a5c3672c798b8297dd612d1687
+          path: aslref-tag
+          sparse-checkout: asllib
+          persist-credentials: false
+      - name: Check candidate and Python provenance/guard tests
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 74948131dbb2ee005def66becb1dcf5c3c731cc4
+          test "$(git -C herd rev-parse HEAD)" = cfc4f56c522ec0d701acaf5a23139b47e8711299
+          test "$(git -C aslref-tag rev-parse HEAD)" = 66820445b78246a5c3672c798b8297dd612d1687
+          python3 -m py_compile compiler/tools/aarch64_a32_aslref_compat.py compiler/tools/aarch64_a32_asl_typeenv.py compiler/tools/aarch64_a32_feature_source.py
+          python3 -m unittest discover -s compiler/tools -p test_aarch64_a32_feature_source.py -v
+          python3 -m unittest discover -s compiler/tools -p test_aarch64_a32_asl_typeenv.py -v
+          python3 -m unittest discover -s compiler/tools -p test_aarch64_a32_aslref_compat.py -v
+          python3 -m unittest discover -s compiler/tools -p test_aarch64_a32_asl_source_links.py -v
+          python3 -m unittest discover -s compiler/tools -p test_aarch64_a31_operand_matrix.py -v
+          python3 -m unittest discover -s compiler/tools -p test_aarch64_a31_encoding_oracle.py -v
+          python3 -m unittest discover -s compiler/tools -p test_aarch64_mrs_catalog.py -v
+      - name: Install pinned ASLRef CLI and AArch64 assemblers
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq opam ocaml-nox m4 pkg-config libgmp-dev binutils-aarch64-linux-gnu
+          opam init -a --disable-sandboxing -y --bare
+          opam switch create default --packages=ocaml-system -y
+          eval "$(opam env --switch=default --set-switch)"
+          opam install -y aslref.1.0-EAC1
+          export PATH="$(opam var bin --switch=default):$PATH"
+          (cd aslref-tag/asllib && dune build ./aslref.exe)
+          BIN="$(opam var bin --switch=default)"
+          install -m 755 aslref-tag/_build/default/asllib/aslref.exe "$BIN/aslref"
+          "$BIN/aslref" --version
+          echo "$BIN" >> "$GITHUB_PATH"
+          aarch64-linux-gnu-as --version | head -1
+      - name: Download exact 2026-09 Arm encoding and ASL sources
+        run: |
+          set -euo pipefail
+          git clone --quiet --depth 1 --filter=blob:none https://kernel.googlesource.com/pub/scm/linux/kernel/git/maz/AARCHMRS mrs
+          test "$(git -C mrs rev-parse HEAD)" = 1346b16d47619400448f3cb6d4f22d62d3b76848
+          echo "ef75f3ec02df1b9b9c0612f4ea259d6710ac3de686b097d8f9c83d1d97aa800a  mrs/Instructions.json" | sha256sum -c -
+          curl -fLsS --retry 2 --connect-timeout 15 --max-time 180 --max-filesize 200000000 \
+            -o /tmp/ISA_A64_xml_A_profile-2026-09.tar.gz \
+            https://developer.arm.com/-/cdn-downloads/permalink/Exploration-Tools-A64-ISA/ISA_A64/ISA_A64_xml_A_profile-2026-09.tar.gz
+          echo "44cfb89c763c7eea8e59de0ad2221e3c012e6aa77899bd7f1c3e1f24537191d7  /tmp/ISA_A64_xml_A_profile-2026-09.tar.gz" | sha256sum -c -
+      - name: Verify release-matched Arm Features.json package
+        run: |
+          set -euo pipefail
+          curl -fLsS --retry 2 --connect-timeout 15 --max-time 120 --max-filesize 2000000 \
+            -o /tmp/Arm_AARCHMRS_Features_2026-09.tar.gz \
+            https://developer.arm.com/-/cdn-downloads/permalink/Exploration-Tools-Arm-Architecture-Features/AARCHMRS/AARCHMRS_A_profile_FAT-2026-09.tar.gz
+          echo "f7b1a960e81dc32d657599f0a83a3f22054198df4133320bfbdd1d8b6a9f1982  /tmp/Arm_AARCHMRS_Features_2026-09.tar.gz" | sha256sum -c -
+      - name: Reproduce full encoding -> source link -> ASLRef compatibility chain
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/aarch64_mrs_catalog.py \
+            --instructions mrs/Instructions.json \
+            --expect-sha256 ef75f3ec02df1b9b9c0612f4ea259d6710ac3de686b097d8f9c83d1d97aa800a \
+            --out /tmp/aarch64-catalog.json
+          python3 compiler/tools/aarch64_a31_encoding_oracle.py \
+            --catalog /tmp/aarch64-catalog.json --gnu-as aarch64-linux-gnu-as \
+            --matrix --out /tmp/aarch64-evidence.json
+          python3 compiler/tools/aarch64_a32_asl_source_links.py \
+            --isa-xml-archive /tmp/ISA_A64_xml_A_profile-2026-09.tar.gz \
+            --a31-evidence /tmp/aarch64-evidence.json --out /tmp/aarch64-source-links.json
+          python3 compiler/tools/aarch64_a32_aslref_compat.py \
+            --source-links /tmp/aarch64-source-links.json \
+            --archive /tmp/ISA_A64_xml_A_profile-2026-09.tar.gz \
+            --bundler herd/herd/libdir/asl-pseudocode/bundler.py \
+            --aslref "$(opam var bin --switch=default)/aslref" \
+            --out /tmp/aarch64-aslref-compat.json --require-parsed 4
+          python3 compiler/tools/aarch64_a32_aslref_compat.py \
+            --source-links /tmp/aarch64-source-links.json \
+            --archive /tmp/ISA_A64_xml_A_profile-2026-09.tar.gz \
+            --bundler herd/herd/libdir/asl-pseudocode/bundler.py \
+            --aslref "$(opam var bin --switch=default)/aslref" \
+            --out /tmp/aarch64-aslref-compat.json --check --require-parsed 4
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          d=json.loads(Path("/tmp/aarch64-aslref-compat.json").read_text())
+          assert (d["source_count"],d["parse_count"]) == (4,4)
+          assert not d["full_architectural_typechecked"]
+          assert not d["semantic_translation_verified"] and not d["selection_eligible"]
+          assert all(not x["semantic_translation_verified"] and not x["selection_eligible"]
+                     and not x["full_architectural_typechecked"]
+                     for x in d["operations"])
+          print("A32_S1_ASLREF_COMPAT",d["parse_count"],"of",d["source_count"],
+                "source ASL parsed;",d["strict_typecheck_count"],
+                "standalone typed; zero proven/selected rules")
+          PY
+      - name: Audit published shared ASL helper typing without stubs or rule admission
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/aarch64_a32_asl_typeenv.py \
+            --source-links /tmp/aarch64-source-links.json \
+            --archive /tmp/ISA_A64_xml_A_profile-2026-09.tar.gz \
+            --bundler herd/herd/libdir/asl-pseudocode/bundler.py \
+            --aslref "$(opam var bin --switch=default)/aslref" \
+            --features-archive /tmp/Arm_AARCHMRS_Features_2026-09.tar.gz \
+            --feature-generator herd/herd/libdir/asl-pseudocode/build_features.py \
+            --out /tmp/aarch64-a32-typeenv.json
+          python3 compiler/tools/aarch64_a32_asl_typeenv.py \
+            --source-links /tmp/aarch64-source-links.json \
+            --archive /tmp/ISA_A64_xml_A_profile-2026-09.tar.gz \
+            --bundler herd/herd/libdir/asl-pseudocode/bundler.py \
+            --aslref "$(opam var bin --switch=default)/aslref" \
+            --features-archive /tmp/Arm_AARCHMRS_Features_2026-09.tar.gz \
+            --feature-generator herd/herd/libdir/asl-pseudocode/build_features.py \
+            --out /tmp/aarch64-a32-typeenv.json --check
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          r=json.loads(Path("/tmp/aarch64-a32-typeenv.json").read_text())
+          assert len(r["instruction_types"]) == 4
+          assert r["shared_asl_bytes"] > 1000000
+          assert r["feature_source"]["release"] == "2026-09"
+          assert r["feature_source"]["feature_count"] > 100
+          assert r["feature_source"]["archive_sha256"] == "f7b1a960e81dc32d657599f0a83a3f22054198df4133320bfbdd1d8b6a9f1982"
+          assert r["feature_source"]["selection_eligible"] is False
+          assert r["feature_strict_passes"] is not None
+          assert all(row["with_features_and_shared"] is not None for row in r["instruction_types"])
+          assert r["shared_asl_sha256"] == "18009e539831c6ccc3e3d40eea34f040ddeb6bbb40f35d02b864dd043957d297"
+          assert not r["selection_eligible"] and not r["semantic_equivalence_proven"]
+          assert not r["full_architectural_typechecked"]
+          assert all(not row["selection_eligible"] and not row["semantic_equivalence_proven"]
+                     and not row["full_architectural_typechecked"]
+                     for row in r["instruction_types"])
+          print("A32_S2_HELPER_GATE",r["standalone_strict_passes"],
+                "standalone,",r["shared_strict_passes"],
+                "strict typed with published shared ASL;",
+                r["feature_strict_passes"], "with feature declarations; 0 approved rules")
+          PY
+
+      - name: Store concise provenance and parser status (not Arm ASL source)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aarch64-a32-s2-helper-typing
+          path: |
+            /tmp/aarch64-aslref-compat.json
+            /tmp/aarch64-a32-typeenv.json
+          retention-days: 14
