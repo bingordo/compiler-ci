@@ -1,0 +1,64 @@
+name: Mini-C native TypeId linked module tests and deleted legacy Function wrappers PR1000
+on:
+  push:
+    branches: [ci/verify-mini-c-linked-typeid-1000-20261111]
+    paths: ['.github/workflows/verify-mini-c-linked-typeid-1000.yml']
+permissions:
+  contents: read
+jobs:
+  native-verified-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 44f0a4513942c6a1a4b17818a423bf6f36d084e7
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest source pin and physical retirement of ordinary Function tests
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 44f0a4513942c6a1a4b17818a423bf6f36d084e7
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path('compiler/tools/mini-c-driver/tests/unit/lib.rs').read_text()
+          assert s.count('lower_source(')==1, 'unexpected old source Function test calls'
+          assert 'lower_source_module(' not in s
+          assert 'lower_source_module_abi_with_inlining(' not in s
+          assert 'lower_source_raw_module_abi(' not in s
+          assert 'fn optimized_native_source_functions(' in s
+          lib=Path('compiler/tools/mini-c-driver/src/lib.rs').read_text()
+          assert 'fn lower_source_module(' not in lib
+          assert 'fn lower_source_module_abi_with_inlining(' not in lib
+          assert 'fn lower_source_module_abi_with_body_policy(' not in lib
+          assert 'typed_minic_to_legacy(' in lib, 'separate legacy profile adapter kept until retirement'
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: minic-native-linked-1000
+      - name: Full standalone checked C tests and GCC/ELF/TLS/C11 acceptance
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib -- --test-threads=2
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --test typeid_cli -- --test-threads=2
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --test m4_8_source_native -- --test-threads=1
+          cargo build --manifest-path tools/mini-c-driver/Cargo.toml --bin compiler-mini-c
+          python3 tools/mini-c-driver/tests/differential.py --compiler tools/mini-c-driver/target/debug/compiler-mini-c --seed-count 2 --steps 60 --ct04-seed-count 1 --m10-compound-seed-count 1 --artifacts target/ir-pr1000-diff
+          cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml --all-targets -- -D warnings
+      - name: Unified TypeId x86 checked-source execution and strict lint
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test f6_source_runtime_parity f6_x86_source_default_and_explicit_typeid_execute_same_c11_oracle -- --test-threads=1
+          cargo test -p compiler --test mini_c_cli --test ir_default_cli -- --test-threads=2
+          cargo test -p compiler --bin compiler -- --test-threads=2
+          cargo test -p compiler-ir -p compiler-opt --lib -- --test-threads=2
+          cargo clippy -p compiler -p compiler-ir -p compiler-opt --all-targets -- -D warnings
