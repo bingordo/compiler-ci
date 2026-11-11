@@ -18,12 +18,13 @@ jobs:
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Verify immutable compiler source and regression fixture
+      - name: Verify immutable compiler source and regression fixtures
         run: |
           test "$(git -C compiler rev-parse HEAD)" = "52e89430524ea5c033c07869327db987cece6bcc"
           test -s compiler/crates/opt/tests/typeid_fuzz_bias.rs
           test -s compiler/crates/opt/tests/support/typeid_fuzz.rs
           test -s compiler/crates/opt/tests/support/typeid_fuzz_profile.rs
+          test -s compiler/crates/opt/tests/fixtures/typeid_fuzz_cse.toml
           test -s compiler/crates/opt/examples/typeid_fuzz.rs
       - name: Restrict Cargo to credential-independent core crates
         shell: bash
@@ -38,28 +39,28 @@ jobs:
           workspaces: compiler -> target
           key: fz2-typeid-bias
           cache-workspace-crates: 'true'
-      - name: Run biased TypeId generator acceptance and existing verifier smoke
+      - name: Run biased TypeId generator acceptance and verifier smoke
         working-directory: compiler
         run: |
           cargo test -p compiler-opt --test typeid_fuzz_bias -- --nocapture
           cargo test -p compiler-opt --test typed_core_native_verifier -- --nocapture
-      - name: Execute the profile CLI and validate real CSE ledger
+      - name: Execute replayable TypeId profile and verify CSE changes
         working-directory: compiler
+        shell: bash
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/fz2-replay"
-          cargo run -p compiler-opt --example typeid_fuzz -- \
-            crates/opt/tests/fixtures/typeid_fuzz_cse.toml "$out"
+          cargo run -p compiler-opt --example typeid_fuzz -- crates/opt/tests/fixtures/typeid_fuzz_cse.toml "$out"
           test -s "$out/profile.toml"
           test -s "$out/final-weights.toml"
           test -s "$out/coverage.tsv"
           test "$(wc -l < "$out/coverage.tsv")" -eq 25
           test "$(find "$out" -name '*-before.ir' | wc -l)" -eq 24
           test "$(find "$out" -name '*-after-cse.ir' | wc -l)" -eq 24
-          ! grep -q 
+          awk -F '\t' 'NR>1 && $4!="true" {exit 1} END {if(NR!=25) exit 1}' "$out/coverage.tsv"
+      - name: Strict targeted Clippy
         working-directory: compiler
         run: cargo clippy -p compiler-opt --test typeid_fuzz_bias --example typeid_fuzz -- -D warnings
-\\tfalse\\t' "$out/coverage.tsv"
       - name: Preserve canonical TypeId replay evidence
         if: success()
         uses: actions/upload-artifact@v4
@@ -67,6 +68,3 @@ jobs:
           name: fz2-typeid-replay-exact-sha
           path: ${{ runner.temp }}/fz2-replay/
           retention-days: 7
-      - name: Strict targeted Clippy
-        working-directory: compiler
-        run: cargo clippy -p compiler-opt --test typeid_fuzz_bias -- -D warnings
