@@ -1,0 +1,69 @@
+name: IR F13 native Oberon source diagnostic cutover
+on:
+  push:
+    branches: [ci/f13-oberon-typeid-source-profile-1028-20261111]
+    paths: ['.github/workflows/f13-oberon-typeid-source-profile-1028.yml']
+permissions:
+  contents: read
+jobs:
+  native-only-oberon-profiles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 6004149f26a5ce501e2070bc32101b8d305fae67
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest exact-source profile cutover
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 6004149f26a5ce501e2070bc32101b8d305fae67
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path("compiler/crates/driver/tests/unit/driver_cases.rs").read_text()
+          for name in ("oberon_memory_source_profile",
+                       "oberon_register_allocation_profile",
+                       "full_optimizer_stage_profile_oberon"):
+              section=s.split("fn "+name+"()",1)[1].split("\n    #[",1)[0]
+              for phrase in ("lower_functions(", "let raw:Vec<Function>", "X86_64.emit_object(",
+                             "compiler_opt::optimize_module(", "profile_allocation(",
+                             "verify_defined_call_signatures(", "lower(&"):
+                  assert phrase not in section,(name,phrase)
+              assert "lower_oberon_native_typeid(" in section,name
+          assert "TYPEID_M3_MEMORY" in s
+          assert "TYPEID_M4_ALLOCATION" in s
+          assert "TYPEID_SOURCE_STAGE,oberon" in s
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: oberon-source-diagnostics-f13
+      - name: Full default compiler and native source runtime
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --bin compiler -- --test-threads=2
+          cargo test -p compiler --test f6_source_runtime_parity -- --test-threads=1
+          cargo test -p compiler-ir -p compiler-opt --lib -- --test-threads=2
+          cargo clippy -p compiler -p compiler-ir -p compiler-opt --all-targets -- -D warnings
+      - name: Execute ignored M3 M4 and full optimizer diagnostics on actual TypeId
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          MEMORY_REPETITIONS=3 cargo test -p compiler --bin compiler tests::oberon_memory_source_profile -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/f13-memory.log"
+          grep -F 'TYPEID_M3_MEMORY,scalar_loop,' "$RUNNER_TEMP/f13-memory.log"
+          grep -F 'TYPEID_M3_MEMORY,array_bulk,' "$RUNNER_TEMP/f13-memory.log"
+          M4_REPETITIONS=3 cargo test -p compiler --bin compiler tests::oberon_register_allocation_profile -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/f13-allocation.log"
+          grep -F 'TYPEID_M4_ALLOCATION,pressure_16_locals,' "$RUNNER_TEMP/f13-allocation.log"
+          grep -F 'TYPEID_M4_ALLOCATION,calls,' "$RUNNER_TEMP/f13-allocation.log"
+          OPT_PROFILE_REPETITIONS=3 cargo test -p compiler --bin compiler tests::full_optimizer_stage_profile_oberon -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/f13-optimizer.log"
+          grep -F 'TYPEID_SOURCE_PROFILE,oberon,scalar_loop,' "$RUNNER_TEMP/f13-optimizer.log"
+          grep -F 'TYPEID_SOURCE_PROFILE,oberon,call' "$RUNNER_TEMP/f13-optimizer.log"
+          grep -F 'TYPEID_SOURCE_STAGE,oberon,' "$RUNNER_TEMP/f13-optimizer.log"
