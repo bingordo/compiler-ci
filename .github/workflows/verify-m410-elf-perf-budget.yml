@@ -1,0 +1,107 @@
+name: M4.10 reproducible TypeId ELF performance baseline
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-m410-elf-perf-budget.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      COMPILER_ELF_REQUIRE_LLVM: '1'
+    steps:
+      - name: Checkout exact current candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 41c8e9201ea0768ef6620addb56e3afa8addc251
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact pre-hardening TypeId baseline
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9c7bb6fece0ca5e0b3c6229326e8895c911fabe5
+          path: baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify immutable source revisions
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "41c8e9201ea0768ef6620addb56e3afa8addc251"
+          test "$(git -C baseline rev-parse HEAD)" = "9c7bb6fece0ca5e0b3c6229326e8895c911fabe5"
+          test -s compiler/tools/m410_elf_perf_baseline.py
+          test -s compiler/tools/source_compile_corpus.py
+          echo "Current: 41c8e9201ea0768ef6620addb56e3afa8addc251; baseline: 9c7bb6fece0ca5e0b3c6229326e8895c911fabe5" >> "$GITHUB_STEP_SUMMARY"
+      - name: Resolve pinned frontend revisions and verify toolchains
+        run: |
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          command -v gcc
+          command -v python3
+          command -v rustc
+          command -v cargo
+          if ! command -v ld.lld >/dev/null || ! command -v gdb >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y lld gdb
+          fi
+          gcc --version | head -1
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            compiler -> target
+            baseline -> target
+          key: m410-elf-perf-release-v1
+      - name: Python metric parser, boundary and aggregation unit tests
+        working-directory: compiler
+        run: |
+          python3 -m py_compile tools/m410_elf_perf_baseline.py tools/test_m410_elf_perf_baseline.py
+          python3 -m unittest discover -s tools -p 'test_m410_elf_perf_baseline.py' -v
+      - name: Strict native ELF and TypeId regression precheck
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend --test x86_elf_contract
+          cargo test -p compiler --test typeid_pic_frame_shared
+          cargo test -p compiler --test typeid_frame_pointer
+          cargo clippy -p compiler -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --all-targets -- -D warnings
+      - name: Build exact candidate release executable
+        working-directory: compiler
+        run: cargo build --release -p compiler --bin compiler
+      - name: Build exact pre-hardening baseline release executable
+        working-directory: baseline
+        run: cargo build --release -p compiler --bin compiler
+      - name: Record source/toolchain dependency lockfiles
+        run: |
+          mkdir -p m410-perf
+          if test -f compiler/Cargo.lock; then cp compiler/Cargo.lock m410-perf/current-Cargo.lock; fi
+          if test -f baseline/Cargo.lock; then cp baseline/Cargo.lock m410-perf/baseline-Cargo.lock; fi
+      - name: Compare ELF vs GAS and pinned previous TypeId
+        working-directory: compiler
+        run: |
+          python3 tools/m410_elf_perf_baseline.py \
+            --current-compiler "$GITHUB_WORKSPACE/compiler/target/release/compiler" \
+            --baseline-compiler "$GITHUB_WORKSPACE/baseline/target/release/compiler" \
+            --current-sha 41c8e9201ea0768ef6620addb56e3afa8addc251 \
+            --baseline-sha 9c7bb6fece0ca5e0b3c6229326e8895c911fabe5 \
+            --out "$GITHUB_WORKSPACE/m410-perf" \
+            --warmups 1 --samples 3
+          cat "$GITHUB_WORKSPACE/m410-perf/summary.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload exact-source performance measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m410-elf-performance-41c8e9201ea0
+          path: |
+            m410-perf/summary.json
+            m410-perf/summary.md
+            m410-perf/samples.csv
+            m410-perf/corpus/manifest.csv
+            m410-perf/current-Cargo.lock
+            m410-perf/baseline-Cargo.lock
+          if-no-files-found: warn
+          retention-days: 30
