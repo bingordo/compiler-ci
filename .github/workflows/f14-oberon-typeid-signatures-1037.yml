@@ -1,0 +1,53 @@
+name: IR F14 checked native TypeId signature verifier migration
+on:
+  push:
+    branches: [ci/f14-oberon-typeid-signatures-1037-20261111]
+    paths: ['.github/workflows/f14-oberon-typeid-signatures-1037.yml']
+permissions:
+  contents: read
+jobs:
+  native-source-signatures:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 716d28fe48dd84a0fe6aab4580e27a69f90f312f
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest source pin and physical removal of Function verifier
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 716d28fe48dd84a0fe6aab4580e27a69f90f312f
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path("compiler/crates/driver/src/main.rs").read_text()
+          t=Path("compiler/crates/driver/tests/unit/driver_cases.rs").read_text()
+          assert "fn verify_defined_call_signatures(" not in s
+          assert "use compiler_ir::{Block, Instruction, Parameter};" not in s
+          assert "cfg(all(test, feature = \"legacy-experimental-ssa\"))" in s
+          f=t.split("fn defined_direct_call_signatures_are_checked_before_linking()",1)[1].split("    #[test]",1)[0]
+          assert "lower_oberon_native_typeid(src)" in f
+          assert f.count("validate_module_abi()")>=4
+          assert "Function{" not in f and "verify_defined_call_signatures(" not in f
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: native-signatures-f14
+      - name: Source TypeId signature regression, entire compiler runtime and strict Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --bin compiler tests::defined_direct_call_signatures_are_checked_before_linking -- --exact --nocapture --test-threads=1
+          cargo test -p compiler --bin compiler -- --test-threads=2
+          cargo test -p compiler --test f6_source_runtime_parity -- --test-threads=1
+          cargo test -p compiler-ir -p compiler-opt --lib -- --test-threads=2
+          cargo clippy -p compiler -p compiler-ir -p compiler-opt --all-targets -- -D warnings
+          cargo check -p compiler --all-targets --features legacy-experimental-ssa
