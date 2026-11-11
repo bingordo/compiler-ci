@@ -1,0 +1,154 @@
+name: P0 TypeId induction proof extraction compiler PR836
+on:
+  push:
+    branches: [ci/verify-induction-proof-836-20261110]
+    paths: ['.github/workflows/verify-induction-proof-836.yml']
+permissions:
+  contents: read
+jobs:
+  core-native-and-legacy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 522c849fb729a3ae94beee6727f798affdc4127e
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source and isolate standalone IR optimizer and both backends
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 522c849fb729a3ae94beee6727f798affdc4127e
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gdb
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-induction-proof-836-core
+      - name: Full native and legacy optimizer and both backends regression
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64
+      - name: Strict full core default Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --all-targets -- -D warnings
+  checked-frontends:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 522c849fb729a3ae94beee6727f798affdc4127e
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest exact source and resolve pinned frontends
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 522c849fb729a3ae94beee6727f798affdc4127e
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-induction-proof-836-driver
+      - name: Unified Oberon and Mini-C native and explicit legacy rollback CLI tests
+        working-directory: compiler
+        run: cargo test -p compiler --bin compiler --test ir_default_cli --test mini_c_cli --test typeid_elf_linker_matrix
+      - name: Checked frontend strict Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler --all-targets -- -D warnings
+  standalone-minic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 522c849fb729a3ae94beee6727f798affdc4127e
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest exact source and resolve C syntax/sema
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 522c849fb729a3ae94beee6727f798affdc4127e
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: typeid-induction-proof-836-minic
+      - name: Standalone Mini-C native/default and explicit legacy library tests
+        working-directory: compiler
+        run: |
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib -- --test-threads=2
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --test typeid_cli -- --test-threads=2
+      - name: GCC original C source differential
+        working-directory: compiler
+        run: |
+          cargo build --manifest-path tools/mini-c-driver/Cargo.toml --bin compiler-mini-c
+          python3 tools/mini-c-driver/tests/differential.py \
+            --compiler tools/mini-c-driver/target/debug/compiler-mini-c \
+            --seed-count 2 --steps 60 --ct04-seed-count 1 --m10-compound-seed-count 1 \
+            --artifacts target/typeid-induction-proof-836-repro
+      - name: Strict standalone Mini-C Clippy
+        working-directory: compiler
+        run: cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml --all-targets -- -D warnings
+
+  native-and-legacy-induction-proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 522c849fb729a3ae94beee6727f798affdc4127e
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest exact source and isolate core optimizer
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 522c849fb729a3ae94beee6727f798affdc4127e
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-induction-proof-836-focused
+      - name: Shared signed trip-count, profitable multiplier and overflow proof unit tests
+        working-directory: compiler
+        run: cargo test -p compiler-opt --lib induction_proof
+      - name: TypeId counted induction native/ELF/GAS and LICM parity tests
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typed_induction_native
+          cargo test -p compiler-opt --test typed_licm_native
+      - name: Legacy counted induction and LICM executable oracle
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test induction_analysis
+          cargo test -p compiler-opt --test induction_native
+          cargo test -p compiler-opt --test licm_native
+          cargo test -p compiler-opt --test licm_preheaders
+          cargo test -p compiler-opt --test loop_trap_semantics
+      - name: Strict optimizer Clippy under default TypeId build
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt --all-targets -- -D warnings
