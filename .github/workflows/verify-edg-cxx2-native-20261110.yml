@@ -291,6 +291,40 @@ jobs:
           echo "EDG_CXX5_NATIVE gate=generated_startup_provenance result=pass"
           echo "EDG_CXX5_NATIVE gate=global_scope_destructor_provenance result=pass"
           echo "EDG_CXX5_NATIVE gate=global_constructor_fail_closed result=pass"
+          # #837 original GNU libstdc++ Hello World oracle and no-endl control.
+          cp "$fixtures/edg_native_cxx5_iostream.cpp" hello-world.cpp
+          cat >hello-no-endl.cpp <<'CPP'
+          #include <iostream>
+          int main() { std::cout << "Hello, world!"; }
+          CPP
+          for variant in hello-world hello-no-endl; do
+            g++ -std=c++17 -Wall -Wextra -Werror "$variant.cpp" -o "$variant-reference"
+            timeout 15s "./$variant-reference" >"$variant-reference.out" 2>"$variant-reference.err"
+            test ! -s "$variant-reference.err"
+            if test "$variant" = hello-world; then
+              printf 'Hello, world!\n' | cmp - "$variant-reference.out"
+            else
+              printf 'Hello, world!' | cmp - "$variant-reference.out"
+            fi
+            rm -f "$variant.o"
+            if timeout 90s "$compiler" "$variant.o" --typeid-native "${edg_flags[@]}" "${include_flags[@]}" "$variant.cpp" >"$variant-native-compile.log" 2>&1; then
+              test -s "$variant.o"
+              test "$(od -An -tx1 -N4 "$variant.o" | tr -d '[:space:]')" = 7f454c46
+              g++ "$variant.o" -o "$variant-native"
+              timeout 15s "./$variant-native" >"$variant-native.out" 2>"$variant-native.err"
+              cmp "$variant-reference.out" "$variant-native.out"
+              cmp "$variant-reference.err" "$variant-native.err"
+              echo "EDG_CXX5_NATIVE gate=iostream_executable fixture=$variant result=pass"
+            else
+              status=$?
+              test ! -e "$variant.o"
+              test "$status" -ne 124
+              tail -n 8 "$variant-native-compile.log"
+              echo "EDG_CXX5_NATIVE fixture=$variant status=$status" | tee -a "$GITHUB_STEP_SUMMARY"
+              grep -E "^Error:|EDG -> compiler-ir rejected" "$variant-native-compile.log" | tail -n 1 | tee -a "$GITHUB_STEP_SUMMARY" || true
+              echo "EDG_CXX5_NATIVE gate=iostream_fail_closed fixture=$variant result=pass"
+            fi
+          done
 
       - name: Preserve native C++17 minimal-header reference/ELF evidence
         if: always()
