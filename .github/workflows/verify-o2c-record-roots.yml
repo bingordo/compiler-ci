@@ -1,0 +1,99 @@
+name: O2c checked record-root native validation
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-o2c-record-roots.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  roots:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      COMPILER_SHA: e54352543b30edd673f1d159638155603bf06eda
+      OBERON_SHA: 49cc7c307f2262da1a66c2889fb20075f1e6e4fb
+    steps:
+      - name: Checkout exact private compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e54352543b30edd673f1d159638155603bf06eda
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source pins and resolve public frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          grep -F "$OBERON_SHA" compiler/crates/driver/Cargo.toml
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          echo "compiler=$COMPILER_SHA frontend=$OBERON_SHA target=${{ matrix.target }}" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: o2c-roots-${{ matrix.target }}
+      - name: Test verifier and native compiler
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test aggregate_layout
+          cargo test -p compiler-ir --test aggregate_roots
+          if [ "${{ matrix.target }}" = x86_64 ]; then
+            cargo test -p compiler --bin compiler
+            cargo clippy -p compiler-ir -p compiler --all-targets -- -D warnings
+          else
+            # Existing driver test binaries unconditionally emit x86 objects.
+            cargo test -p compiler --bin compiler --no-run
+            cargo clippy -p compiler-ir --all-targets -- -D warnings
+            cargo clippy -p compiler --bin compiler -- -D warnings
+          fi
+          cargo build -p compiler --bin compiler
+      - name: Native checked source to GAS/direct ELF and independent C executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p oracle
+          cat > oracle/Roots.mod <<'EOF'
+          MODULE Roots;
+          TYPE Pair = RECORD a,b: INTEGER END;
+          Node = RECORD x,y: Pair END;
+          VAR g: Node;
+          PROCEDURE Go*(n: INTEGER): INTEGER;
+          VAR l: Node;
+          BEGIN
+            l.x.a := n; l.x.b := n+1;
+            l.y := l.x;
+            g := l;
+            RETURN g.x.a + g.x.b + g.y.a + g.y.b
+          END Go;
+          END Roots.
+          EOF
+          cat > oracle/main.c <<'EOF'
+          #include <stdint.h>
+          extern int32_t Roots__Go(int32_t);
+          int main(void) {
+            return Roots__Go(20) != 82 || Roots__Go(5) != 22;
+          }
+          EOF
+          for format in obj asm; do
+            if [ "$format" = obj ]; then suffix=o; else suffix=s; fi
+            compiler/target/debug/compiler oracle/Roots.mod \
+              --language oberon --target ${{ matrix.target }} \
+              --emit "$format" -o "oracle/Roots.$suffix"
+            cc -O2 oracle/main.c "oracle/Roots.$suffix" -o "oracle/run-$format"
+            "oracle/run-$format"
+            echo "O2c verified record roots (${{ matrix.target }} $format): PASS" >> "$GITHUB_STEP_SUMMARY"
+          done
