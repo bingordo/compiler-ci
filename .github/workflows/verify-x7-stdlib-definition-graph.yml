@@ -1,0 +1,113 @@
+name: X7 pinned complete Intel stdlib and source helper dependency index
+on:
+  push:
+    branches: [ci/x7-stdlib-definition-graph-20261111]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fixture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 15e5515c56ae587f64b57217a23efafc671385a0
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Source-only definition index negative fixtures
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 15e5515c56ae587f64b57217a23efafc671385a0
+          python3 -m py_compile tools/x86_isl_stdlib_definition_index.py
+          python3 -m unittest discover -s tools -p 'test_x86_isl_stdlib_definition_index.py' -v
+          python3 -m unittest discover -s tools -p 'test_x86_iform_helper_dependencies.py' -v
+          echo X7_STDLIB_DEFINITION_FIXTURE_PASS
+  full-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 15e5515c56ae587f64b57217a23efafc671385a0
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Download pinned Intel SDM and extract all instruction and stdlib definitions
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 15e5515c56ae587f64b57217a23efafc671385a0
+          mkdir -p /tmp/x7-std/iform-xml /tmp/x7-std/out
+          rev=35eface1b7ee003a1cda95005ec5fd83de658a64
+          curl --fail --silent --show-error --location --retry 2 --max-time 180 \
+            "https://codeload.github.com/intel/SDM/tar.gz/${rev}" -o /tmp/x7-std/intel.tar.gz
+          python3 - <<'PY'
+          from pathlib import Path
+          import re,tarfile
+          count=0
+          gz=0
+          with tarfile.open('/tmp/x7-std/intel.tar.gz','r:gz') as tar:
+              for m in tar:
+                  if not m.isfile():
+                      continue
+                  if m.name.endswith('/data/definitions.xml.gz'):
+                      assert gz==0 and 0<m.size<4*1024*1024
+                      raw=tar.extractfile(m).read()
+                      assert len(raw)==m.size
+                      Path('/tmp/x7-std/definitions.xml.gz').write_bytes(raw)
+                      gz+=1
+                  elif re.fullmatch(r'[^/]+/data/instruction/[^/]+\.xml',m.name):
+                      assert 0<m.size<4*1024*1024
+                      raw=tar.extractfile(m).read()
+                      assert len(raw)==m.size
+                      Path('/tmp/x7-std/iform-xml',m.name.rsplit('/',1)[-1]).write_bytes(raw)
+                      count+=1
+                      assert count<=900
+          assert count==741 and gz==1,(count,gz)
+          PY
+      - name: Produce full source/operation and actual stdlib helper candidate graph
+        run: |
+          set -euo pipefail
+          /usr/bin/time -f '%e' -o /tmp/x7-std/out/dep-seconds.txt \
+            python3 tools/x86_iform_helper_dependencies.py \
+              --xml-dir /tmp/x7-std/iform-xml \
+              --out /tmp/x7-std/out/operation-index.json
+          /usr/bin/time -f '%e' -o /tmp/x7-std/out/stdlib-seconds.txt \
+            python3 tools/x86_isl_stdlib_definition_index.py \
+              --definitions-gzip /tmp/x7-std/definitions.xml.gz \
+              --source-index /tmp/x7-std/out/operation-index.json \
+              --out /tmp/x7-std/out/stdlib-source-links.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          root=Path('/tmp/x7-std/out')
+          x=json.loads((root/'stdlib-source-links.json').read_text())
+          s=x['summary']
+          assert x['intel_sdm_commit']=='35eface1b7ee003a1cda95005ec5fd83de658a64'
+          assert x['stdlib_gzip_sha256']=='c5607c5774d45e2300410e519a65c7d48981afc55a50c4219ee9e6b2eb1f301e'
+          assert x['stdlib_xml_sha256']=='280877406ee78c0cf57623106a6ca13fbde59f83e19b6862d22b8fad96bba6c1'
+          assert x['definitions_indexed']==749,x['definitions_indexed']
+          assert x['source_operations_indexed']==1641,x['source_operations_indexed']
+          assert len({d['definition_id'] for d in x['definitions']})==749
+          assert len({o['operation_id'] for o in x['source_operation_helper_links']})==1641
+          assert s['source_operations']==1641
+          assert s['candidate_function_edges']>0,s
+          assert x['verified_helper_implementations']==0
+          assert x['verified_machine_forms']==0
+          assert x['selection_eligible_forms']==0
+          assert all(not row['stdlib_helper_semantics_proven'] and
+                     not row['production_selection_eligible']
+                     for row in x['source_operation_helper_links'])
+          print('X7_ALL_749_STDLIB_DEFINITIONS_LINKED',s)
+          print('X7_STDLIB_SECONDS',float((root/'stdlib-seconds.txt').read_text()))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-pinned-stdlib-source-dependency-graph
+          path: |
+            /tmp/x7-std/out/stdlib-source-links.json
+            /tmp/x7-std/out/stdlib-seconds.txt
+          if-no-files-found: warn
+          retention-days: 14
