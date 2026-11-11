@@ -1,0 +1,96 @@
+name: Probe AArch64 A3.2 shared ASL type environment
+on:
+  push:
+    branches: [ci/aarch64-a32-s2-helpers-probe-20261110]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 28
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: herd/herdtools7
+          ref: cfc4f56c522ec0d701acaf5a23139b47e8711299
+          path: herd
+          sparse-checkout: herd/libdir/asl-pseudocode/bundler.py
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: herd/herdtools7
+          ref: 66820445b78246a5c3672c798b8297dd612d1687
+          path: aslref-tag
+          sparse-checkout: asllib
+          persist-credentials: false
+      - name: Install pinned ASLRef executable
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -qq -y opam ocaml-nox m4 pkg-config libgmp-dev
+          opam init -a --disable-sandboxing -y --bare
+          opam switch create default --packages=ocaml-system -y
+          eval "$(opam env --switch=default --set-switch)"
+          opam install -y aslref.1.0-EAC1
+          export PATH="$(opam var bin --switch=default):$PATH"
+          (cd aslref-tag/asllib && dune build ./aslref.exe)
+          BIN="$(opam var bin --switch=default)"
+          install -m 755 aslref-tag/_build/default/asllib/aslref.exe "$BIN/aslref"
+          "$BIN/aslref" --version
+          echo "$BIN" >> "$GITHUB_PATH"
+      - name: Download pinned Arm A64 2026-09 archive
+        run: |
+          set -euo pipefail
+          curl -fLsS --retry 2 --connect-timeout 15 --max-time 180 --max-filesize 200000000 \
+            -o /tmp/arm-a64-isa-2026-09.tgz \
+            https://developer.arm.com/-/cdn-downloads/permalink/Exploration-Tools-A64-ISA/ISA_A64/ISA_A64_xml_A_profile-2026-09.tar.gz
+          echo "44cfb89c763c7eea8e59de0ad2221e3c012e6aa77899bd7f1c3e1f24537191d7  /tmp/arm-a64-isa-2026-09.tgz" | sha256sum -c -
+      - name: Measure shared helper ASL and strict type-check acceptance
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, importlib.util, pathlib, subprocess, sys, tarfile, tempfile
+          from argparse import Namespace
+          p=pathlib.Path('herd/herd/libdir/asl-pseudocode/bundler.py')
+          assert hashlib.sha1(b'blob '+str(len(p.read_bytes())).encode()+b'\0'+p.read_bytes()).hexdigest() == '938d34fe4d74f38f20ff9932f994c359e2266a9f'
+          spec=importlib.util.spec_from_file_location('arm_bundle',p)
+          bundle=importlib.util.module_from_spec(spec);sys.modules[spec.name]=bundle;spec.loader.exec_module(bundle)
+          base='ISA_A64_xml_A_profile-2026-09/'
+          selected=['add_addsub_imm','add_addsub_shift','and_log_shift','movz']
+          with tempfile.TemporaryDirectory() as td:
+            directory=pathlib.Path(td)
+            with tarfile.open('/tmp/arm-a64-isa-2026-09.tgz','r:gz') as tar:
+              for filename in ['shared_pseudocode']+selected:
+                member=tar.getmember(base+filename+'.xml')
+                assert member.size < 100_000_000 and member.isfile()
+                f=directory/(filename+'.xml')
+                f.write_bytes(tar.extractfile(member).read())
+                if filename=='shared_pseudocode':
+                  out=directory/'shared_pseudocode.asl'
+                  bundle.make_shared_pseudocode(Namespace(i_files=[f],o_dir=out))
+                  assert out.is_file()
+                else:
+                  out=f.with_suffix('.asl')
+                  out.write_text(bundle.one_instruction_to_string(f))
+                data=out.read_bytes()
+                print('SOURCE',filename,'bytes',len(data),'sha256',hashlib.sha256(data).hexdigest(),flush=True)
+            def check(label,files,timeout=95):
+              args=['aslref','--no-exec','--type-check-strict','--version-eac1']
+              for file in files:args+=['-1',file]
+              try:
+                r=subprocess.run(args,cwd=directory,capture_output=True,timeout=timeout)
+                err=r.stderr.decode('utf8','replace')
+                # Never emit proprietary source or error snippets; record counts
+                # and a digest for inspecting changed failures offline only.
+                print('PROBE',label,'rc',r.returncode,'stderr_bytes',len(r.stderr),
+                      'stderr_sha256',hashlib.sha256(r.stderr).hexdigest(),
+                      'type_errors',err.count('Type error'),'grammar_errors',err.count('Grammar error'),
+                      'stdout_bytes',len(r.stdout),flush=True)
+              except subprocess.TimeoutExpired:
+                print('PROBE',label,'TIMEOUT',timeout,flush=True)
+            for f in selected:
+              check('standalone:'+f,[f+'.asl'],timeout=25)
+            check('shared-alone',['shared_pseudocode.asl'],timeout=90)
+            check('shared+four',['shared_pseudocode.asl']+[f+'.asl' for f in selected],timeout=90)
+          PY
