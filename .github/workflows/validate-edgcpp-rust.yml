@@ -48,7 +48,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/edgcpp-rust
-          ref: ${{ inputs.source_ref || '7dfde7384413e0be9ff0205d699b726ddf47c6bd' }}
+          ref: ${{ inputs.source_ref || '8f52a7a260e657b9c32f7dc41afb13910061dd26' }}
           path: edgcpp-rust
           persist-credentials: false
       - name: Record exact revision
@@ -59,7 +59,7 @@ jobs:
           test "${#sha}" -eq 40
           echo "EDG Rust commit: $sha" | tee -a "$GITHUB_STEP_SUMMARY"
           if [[ "${{ github.event_name }}" != workflow_dispatch ]]; then
-            test "$sha" = 7dfde7384413e0be9ff0205d699b726ddf47c6bd
+            test "$sha" = 8f52a7a260e657b9c32f7dc41afb13910061dd26
           fi
       - name: Check out source headers matching the pinned EDG library
         uses: actions/checkout@v4
@@ -162,6 +162,37 @@ jobs:
           grep -Eq 'routine attributes name=__sti__[^ ]+ .*generated=true defined=true' "$RUNNER_TEMP/edg-init-probe.log"
           grep -F 'scope dynamic init scope=' "$RUNNER_TEMP/edg-init-probe.log" || true
           grep -F 'file scope init root position=' "$RUNNER_TEMP/edg-init-probe.log" || true
+      - name: Probe EDG direct base offsets for C++17 std::cout and multiple inheritance
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source build/gcc-release/environment.sh
+          cat >build/gcc-release/base-offset-probe.cpp <<'CPP'
+          struct A { int a; };
+          struct B { int b; };
+          struct Derived : A, B { int c; };
+          int main() { Derived d{}; return d.b; }
+          CPP
+          cat >build/gcc-release/cout-base-offset.cpp <<'CPP'
+          #include <iostream>
+          int main() { std::cout << "Hello, world!"; }
+          CPP
+          cd build/gcc-release
+          version="$(g++ -dumpfullversion -dumpversion)"
+          IFS=. read -r major minor patch <<<"$version"
+          gnu_number=$((10#${major}*10000+10#${minor:-0}*100+10#${patch:-0}))
+          args=(--g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number")
+          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" --example parse -- "${args[@]}" base-offset-probe.cpp >"$RUNNER_TEMP/base-offset-probe.log" 2>&1
+          grep -F 'EDG_BASE_OFFSET derived=' "$RUNNER_TEMP/base-offset-probe.log" | head -n 20
+          g++ -std=c++17 -v -E -x c++ /dev/null >"$RUNNER_TEMP/cout-include-search.log" 2>&1
+          mapfile -t include_dirs < <(awk '/#include <\.\.\.> search starts here:/{active=1;next} /^End of search list/{active=0} active && /^ /{sub(/^[[:space:]]+/,"");print}' "$RUNNER_TEMP/cout-include-search.log")
+          test "${#include_dirs[@]}" -ge 3
+          include_flags=()
+          for dir in "${include_dirs[@]}"; do test -d "$dir" && include_flags+=("-I$dir"); done
+          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" --example parse -- "${args[@]}" "${include_flags[@]}" cout-base-offset.cpp >"$RUNNER_TEMP/cout-base-offset.log" 2>&1
+          grep -F 'EDG_BASE_OFFSET derived=' "$RUNNER_TEMP/cout-base-offset.log" | head -n 35
+          echo 'Original std::cout inheritance base offset snapshot captured' >> "$GITHUB_STEP_SUMMARY"
       - name: Run all Rust library tests with codegen
         working-directory: edgcpp-rust
         run: |
@@ -186,5 +217,8 @@ jobs:
             ${{ runner.temp }}/edg-cfg-targeted.log
             ${{ runner.temp }}/edg-cfg-library.log
             ${{ runner.temp }}/edg-init-probe.log
+            ${{ runner.temp }}/base-offset-probe.log
+            ${{ runner.temp }}/cout-base-offset.log
+            ${{ runner.temp }}/cout-include-search.log
           if-no-files-found: ignore
           retention-days: 14
