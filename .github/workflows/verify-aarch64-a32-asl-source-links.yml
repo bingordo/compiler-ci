@@ -1,0 +1,95 @@
+name: AArch64 A3.2.S0 pinned XML/ASL source provenance
+on:
+  push:
+    branches: [ci/aarch64-a32-asl-source-links-20261110]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: aarch64-a32-asl-source-provenance
+  cancel-in-progress: true
+jobs:
+  source-link:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 22
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9c77fa365d5d2ff69e8e1f54badec97af821e5c9
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source SHA and test-only Python
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 9c77fa365d5d2ff69e8e1f54badec97af821e5c9
+          python3 -m py_compile compiler/tools/aarch64_a32_asl_source_links.py
+          python3 -m unittest discover -s compiler/tools -p test_aarch64_a32_asl_source_links.py -v
+          python3 -m unittest discover -s compiler/tools -p test_aarch64_a31_operand_matrix.py -v
+          python3 -m unittest discover -s compiler/tools -p test_aarch64_a31_encoding_oracle.py -v
+          python3 -m unittest discover -s compiler/tools -p test_aarch64_mrs_catalog.py -v
+      - name: Require GNU and Clang independent assemblers
+        run: |
+          set -euo pipefail
+          clang --version | head -1
+          if ! command -v aarch64-linux-gnu-as; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq binutils-aarch64-linux-gnu
+          fi
+          aarch64-linux-gnu-as --version | head -1
+      - name: Download externally pinned Arm encoding and semantic data
+        run: |
+          set -euo pipefail
+          git clone --quiet --depth 1 --filter=blob:none https://kernel.googlesource.com/pub/scm/linux/kernel/git/maz/AARCHMRS mrs
+          test "$(git -C mrs rev-parse HEAD)" = 1346b16d47619400448f3cb6d4f22d62d3b76848
+          echo "ef75f3ec02df1b9b9c0612f4ea259d6710ac3de686b097d8f9c83d1d97aa800a  mrs/Instructions.json" | sha256sum -c -
+          curl -fLsS --retry 2 --connect-timeout 15 --max-time 180 --max-filesize 200000000 \
+            -o /tmp/ISA_A64_xml_A_profile-2026-09.tar.gz \
+            https://developer.arm.com/-/cdn-downloads/permalink/Exploration-Tools-A64-ISA/ISA_A64/ISA_A64_xml_A_profile-2026-09.tar.gz
+          echo "44cfb89c763c7eea8e59de0ad2221e3c012e6aa77899bd7f1c3e1f24537191d7  /tmp/ISA_A64_xml_A_profile-2026-09.tar.gz" | sha256sum -c -
+      - name: Verify 245 encodings then link unique ASL operation IDs
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/aarch64_mrs_catalog.py \
+            --instructions mrs/Instructions.json \
+            --expect-sha256 ef75f3ec02df1b9b9c0612f4ea259d6710ac3de686b097d8f9c83d1d97aa800a \
+            --out /tmp/aarch64-catalog.json
+          python3 compiler/tools/aarch64_a31_encoding_oracle.py \
+            --catalog /tmp/aarch64-catalog.json --gnu-as aarch64-linux-gnu-as \
+            --matrix --out /tmp/aarch64-evidence.json
+          python3 compiler/tools/aarch64_a32_asl_source_links.py \
+            --isa-xml-archive /tmp/ISA_A64_xml_A_profile-2026-09.tar.gz \
+            --a31-evidence /tmp/aarch64-evidence.json \
+            --out /tmp/aarch64-a32-links.json
+          python3 compiler/tools/aarch64_a32_asl_source_links.py \
+            --isa-xml-archive /tmp/ISA_A64_xml_A_profile-2026-09.tar.gz \
+            --a31-evidence /tmp/aarch64-evidence.json \
+            --out /tmp/aarch64-a32-links.json --check
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          x=json.loads(Path("/tmp/aarch64-a32-links.json").read_text())
+          assert x["selection_eligible"] is False and x["semantic_translation_verified"] is False
+          assert x["requested_operations"] >= 15, x["requested_operations"]
+          assert x["linked_operations"] > 0, x
+          assert len(x["shared_pseudocode_sha256"])==64
+          assert all(link["selection_eligible"] is False
+                     and link["semantic_translation_verified"] is False
+                     and link["helper_effects_verified"] is False
+                     and any(s["kind"]=="Execute" for s in link["sections"])
+                     for link in x["links"])
+          print("A32_SOURCE_LINK_PASS",x["linked_operations"],"linked/",
+                x["requested_operations"],"requested",
+                x["unresolved_operations"],"unresolved",
+                x["source_parse_rejects"],"source XML rejects")
+          print("UNRESOLVED",x["unresolved"][:40])
+          PY
+      - name: Store compact source provenance evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aarch64-a32-source-links
+          path: /tmp/aarch64-a32-links.json
+          retention-days: 14
