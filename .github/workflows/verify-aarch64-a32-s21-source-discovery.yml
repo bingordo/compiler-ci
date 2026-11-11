@@ -1,0 +1,47 @@
+name: AArch64 A3.2.S2.1 discover same-release Arm type environment sources
+on:
+  push:
+    branches: [ci/aarch64-a32-s21-sources-20261110]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source-discovery:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Download release-matched architecture feature and sysreg archives
+        run: |
+          set -euo pipefail
+          for key in features sysregs; do
+            case "$key" in
+              features) path="Exploration-Tools-Arm-Architecture-Features/AARCHMRS/AARCHMRS_A_profile_FAT-2026-09.tar.gz";;
+              sysregs) path="Exploration-Tools-Arm-Architecture-System-Registers/SysReg/SysReg_xml_A_profile_FAT-2026-09.tar.gz";;
+            esac
+            url="https://developer.arm.com/-/cdn-downloads/permalink/$path"
+            echo "ARCHIVE_NAME=$key"
+            code="$(curl --retry 2 --connect-timeout 20 --max-time 150 -LsS \
+              -w '%{http_code}' -o "/tmp/$key.tgz" "$url")"
+            echo "HTTP_STATUS=$code"
+            if test "$code" != 200; then
+              echo "SOURCE_UNAVAILABLE=$key"
+              continue
+            fi
+            if ! tar tzf "/tmp/$key.tgz" > "/tmp/$key.entries"; then
+              echo "INVALID_TAR=$key"
+              continue
+            fi
+            echo "SOURCE_BYTES=$key $(stat -c%s "/tmp/$key.tgz")"
+            echo "SOURCE_SHA256=$key $(sha256sum "/tmp/$key.tgz" | cut -d' ' -f1)"
+            python3 - "$key" <<'PY'
+          import pathlib, sys
+          key=sys.argv[1]
+          entries=pathlib.Path(f"/tmp/{key}.entries").read_text().splitlines()
+          print("RELEASE",key,"ENTRY_COUNT",len(entries))
+          print("ROOTS",sorted({s.split('/')[0] for s in entries})[:15])
+          if key=="features":
+              print("FEATURES_JSON", [s for s in entries if s.endswith("/Features.json") or s=="Features.json"][:8])
+          else:
+              print("SYSREG_XML_EXAMPLES", [s for s in entries if s.lower().endswith((".xml",))][:8])
+          PY
+          done
