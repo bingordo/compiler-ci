@@ -1,0 +1,112 @@
+name: X7 B2 full pinned Intel iform operation-helper dependency work graph
+on:
+  push:
+    branches: [ci/x7-iform-helper-deps-20261110]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fixture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 7
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5355fbe4415b7dd990de24c3f0de36f374779ef6
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Syntax and all deterministic/dependency fixture checks
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 5355fbe4415b7dd990de24c3f0de36f374779ef6
+          python3 -m py_compile tools/x86_iform_helper_dependencies.py tools/test_x86_iform_helper_dependencies.py
+          python3 -m unittest discover -s tools -p 'test_x86_iform_helper_dependencies.py' -v
+          python3 -m unittest discover -s tools -p 'test_x86_iform_batch_worklist.py' -v
+          echo X7_B2_DEPENDENCY_FIXTURES_PASS
+  all-iforms:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5355fbe4415b7dd990de24c3f0de36f374779ef6
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin exact compiler SHA
+        run: test "$(git rev-parse HEAD)" = 5355fbe4415b7dd990de24c3f0de36f374779ef6
+      - name: Fetch complete Intel source XML at locked commit
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/x7-b2-xml /tmp/x7-b2-artifacts
+          rev=35eface1b7ee003a1cda95005ec5fd83de658a64
+          curl --fail --silent --show-error --location --retry 2 --max-time 180 \
+            "https://codeload.github.com/intel/SDM/tar.gz/${rev}" \
+            --output /tmp/x7-b2-artifacts/intel-sdm.tar.gz
+          python3 - <<'PY'
+          from pathlib import Path
+          import re,tarfile
+          src=Path("/tmp/x7-b2-artifacts/intel-sdm.tar.gz")
+          out=Path("/tmp/x7-b2-xml")
+          files=0
+          with tarfile.open(src,"r:gz") as tar:
+              for m in tar:
+                  if not m.isfile() or not re.fullmatch(
+                      r"[^/]+/data/instruction/[^/]+\.xml",m.name):
+                      continue
+                  assert 0 < m.size < 4*1024*1024
+                  content=tar.extractfile(m).read()
+                  assert len(content)==m.size
+                  (out/m.name.rsplit("/",1)[-1]).write_bytes(content)
+                  files+=1
+                  assert files<=900
+          assert files==741,files
+          print("X7_B2_SOURCE_XML_FILES",files)
+          PY
+      - name: Derive all source operation dependencies, measured
+        run: |
+          set -euo pipefail
+          /usr/bin/time -f "%e" -o /tmp/x7-b2-artifacts/elapsed.txt \
+            python3 tools/x86_iform_helper_dependencies.py \
+              --xml-dir /tmp/x7-b2-xml \
+              --out /tmp/x7-b2-artifacts/all-source-dependencies.json \
+              --shards 16
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path("/tmp/x7-b2-artifacts")
+          data=json.loads((p/"all-source-dependencies.json").read_text())
+          assert data["intel_sdm_commit"]=="35eface1b7ee003a1cda95005ec5fd83de658a64"
+          assert data["source_files_scanned"]==741
+          assert data["operations_indexed"]==1641,data["operations_indexed"]
+          assert data["source_iforms"]==10859,data["source_iforms"]
+          assert data["shard_count"]==16
+          assert data["semantic_proofs"]==0 and data["native_validations"]==0
+          assert data["selection_eligible_forms"]==0
+          ids=[r["form_id"] for r in data["forms"]]
+          assert len(ids)==len(set(ids))==10859
+          assert all(not r["production_selection_eligible"] and
+                     not r["semantic_proven"] and r["blockers"]
+                     for r in data["forms"])
+          assert sum(g["count"] for g in data["candidate_operation_body_groups"])==10859
+          assert sum(1 for r in data["forms"] if
+                     r["linked_local_operation_candidates"])>0
+          print("X7_B2_FULL_SOURCE_GRAPH_PASS",{
+              "xml":data["source_files_scanned"],
+              "operations":data["operations_indexed"],
+              "iforms":data["source_iforms"],
+              "linked_operation_units":data["locally_linked_operation_units"],
+              "groups":len(data["candidate_operation_body_groups"]),
+              "elapsed_seconds":float((p/"elapsed.txt").read_text())})
+          PY
+      - name: Archive full pinned helper/iform dependency evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-b2-full-source-dependency-graph
+          path: |
+            /tmp/x7-b2-artifacts/all-source-dependencies.json
+            /tmp/x7-b2-artifacts/elapsed.txt
+          if-no-files-found: warn
+          retention-days: 14
