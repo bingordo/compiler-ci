@@ -1,0 +1,212 @@
+name: EDG TypeId void routines C/C++ cross-object differential
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/verify-edg-typeid-void-20261110.yml
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/verify-edg-typeid-void-20261110.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: edg-typeid-void-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  direct-edg:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container:
+      image: ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8
+    defaults:
+      run:
+        shell: edg-container-exec "bash -eo pipefail {0}"
+    env:
+      EDG_SOURCE_SHA: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+      EDG_RELEASE_TAG: edgcpfe-ci-799603e0b5ab
+      EDG_RELEASE_SHA256: fa769825e70766fbefe017806816b2338acd03daa93bb5562369c293972ce64c
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUST_TOOLCHAIN_VERSION: 1.99.1
+    steps:
+      - name: Checkout private compiler pilot with scoped CI key
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: main
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+
+      - name: Check out exact EDG headers and configuration
+        uses: actions/checkout@v7
+        with:
+          repository: bingundu/edgcpp
+          ref: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+          path: edgcpp
+          persist-credentials: false
+
+      - name: Record compiler and EDG source revision
+        run: |
+          test "$(git -C edgcpp rev-parse HEAD)" = "$EDG_SOURCE_SHA"
+          git -C compiler rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Configure matching EDG native metadata only
+        env:
+          EDG_BASE: ${{ github.workspace }}/edgcpp/bases/docker/dev-env/gcc
+        working-directory: edgcpp
+        run: |
+          cmake --preset linux-gcc-release \
+            -DEDG_BUILD_LIB=OFF \
+            -DEDG_BUILD_CALLABLE_LIBRARY=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          cmake --build build/gcc-release --target error-info --parallel 2
+
+      - name: Restore exact EDG prebuilt native archive
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          url="https://github.com/bingundu/edgcpp/releases/download/$EDG_RELEASE_TAG/edgcpfe-ci-x86_64-callable-release-linux-x86_64.tar.gz"
+          mkdir -p build/gcc-release/lib build/prebuilt-edg
+          curl --fail --location --silent --show-error --retry 4 --retry-delay 2 \
+            "$url" --output build/prebuilt-edg/archive.tar.gz
+          printf '%s  %s\n' "$EDG_RELEASE_SHA256" build/prebuilt-edg/archive.tar.gz | sha256sum --check --status
+          tar -xzf build/prebuilt-edg/archive.tar.gz -C build/prebuilt-edg
+          grep -Fx "commit=$EDG_SOURCE_SHA" build/prebuilt-edg/BUILD-INFO.txt
+          grep -Fx 'platform=linux-x86_64' build/prebuilt-edg/BUILD-INFO.txt
+          test -s build/prebuilt-edg/lib/libedgcpfe.a
+          cp build/prebuilt-edg/lib/libedgcpfe.a build/gcc-release/lib/libedgcpfe.a
+
+      - name: Check out C++0 EDG linker-symbol export candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/edgcpp-rust
+          ref: cbbce8db01722b7cc72edda073990718a2350107
+          path: edg-rust
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: |
+          if ! command -v cargo >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN_VERSION"
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install "$RUST_TOOLCHAIN_VERSION" --profile minimal
+          rustup default "$RUST_TOOLCHAIN_VERSION"
+
+      - name: Test source-authoritative EDG C++ dialect and class admission wire events
+        env:
+          EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+          EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+          EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+          EDGCPP_EDG_REVISION: ${{ env.EDG_SOURCE_SHA }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test --manifest-path edg-rust/Cargo.toml --lib decodes_cpp_dialect_and_immutable_record_triviality_proofs
+
+      - name: Verify TypeId-native SysV GP variadic ABI acceptance and rejection
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          # Isolate the dependency-free IR crate from the compiler workspace:
+          # Cargo otherwise resolves the private Mini-C Git dependency of
+          # the unrelated driver even when testing compiler-ir alone.
+          temp="$(mktemp -d)"
+          cp -a crates/ir "$temp/ir"
+          cargo test --manifest-path "$temp/ir/Cargo.toml" sysv_gp_variadic_tests --lib
+
+
+      - name: Run shared TypeId optimizer and inliner unit tests (isolated crates)
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          # Cargo otherwise resolves unrelated private frontend Git dependencies.
+          # Preserve all local path/dev dependencies in a standalone crate tree.
+          temp="$(mktemp -d)"
+          mkdir -p "$temp/crates"
+          cp -a crates/ir crates/opt crates/backend crates/backend-x86 "$temp/crates/"
+          cargo test --manifest-path "$temp/crates/opt/Cargo.toml" --lib
+
+      - name: Build direct EDG to compiler-ir and x86 backend adapter
+        working-directory: compiler
+        env:
+          EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+          EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+          EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+          EDGCPP_EDG_REVISION: ${{ env.EDG_SOURCE_SHA }}
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test --manifest-path tools/edg-driver/Cargo.toml
+          cargo build --manifest-path tools/edg-driver/Cargo.toml
+
+
+      - name: Native source-verified void calls and returns, C and C++ GCC differential
+        working-directory: edgcpp/build/gcc-release
+        env:
+          VOID_ARTIFACTS: ${{ runner.temp }}/edg-typeid-void
+        run: |
+          set -euo pipefail
+          source ./environment.sh
+          compiler="${GITHUB_WORKSPACE}/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          fixtures="${GITHUB_WORKSPACE}/compiler/tools/edg-driver/tests/fixtures"
+          mkdir -p "$VOID_ARTIFACTS"
+          cp "$fixtures"/edg_native_void*.c "$VOID_ARTIFACTS/"
+          cp "$fixtures"/edg_native_cxx1_void_method*.cpp "$VOID_ARTIFACTS/"
+          cp "$fixtures"/edg_native_cxx1_mutating_bad_ctor.cpp "$VOID_ARTIFACTS/"
+          cd "$VOID_ARTIFACTS"
+          git -C "$GITHUB_WORKSPACE/compiler" rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
+
+          gcc -std=c11 -O2 -Wall -Wextra -Werror -c edg_native_void.c -o gcc-void.o
+          gcc -std=c11 -O2 -Wall -Wextra -Werror -c edg_native_void_driver.c -o gcc-void-driver.o
+          "$compiler" native-void.o --typeid-native --c11 edg_native_void.c >native-void.log 2>&1 || {
+            cat native-void.log; exit 1;
+          }
+          test "$(od -An -tx1 -N4 native-void.o | tr -d '[:space:]')" = 7f454c46
+          nm -g --defined-only native-void.o | grep -Fq native_void_store
+          nm -g --defined-only native-void.o | grep -Fq native_void_noop
+          gcc gcc-void-driver.o gcc-void.o -o gcc-void-reference
+          gcc gcc-void-driver.o native-void.o -o gcc-void-native
+          timeout 15s ./gcc-void-reference >c-reference.out 2>c-reference.err
+          timeout 15s ./gcc-void-native >c-native.out 2>c-native.err
+          test "$(sha256sum c-reference.out | cut -d' ' -f1)" = "$(sha256sum c-native.out | cut -d' ' -f1)"
+          test "$(sha256sum c-reference.err | cut -d' ' -f1)" = "$(sha256sum c-native.err | cut -d' ' -f1)"
+          echo "EDG_VOID gate=native_C_void_calls_and_returns result=pass"
+
+          g++ -std=c++17 -O2 -Wall -Wextra -Werror -c edg_native_cxx1_void_method.cpp -o gxx-void.o
+          g++ -std=c++17 -O2 -Wall -Wextra -Werror -c edg_native_cxx1_void_method_driver.cpp -o gxx-void-driver.o
+          "$compiler" native-cxx-void.o --typeid-native edg_native_cxx1_void_method.cpp >native-cxx-void.log 2>&1 || {
+            cat native-cxx-void.log; exit 1;
+          }
+          test "$(od -An -tx1 -N4 native-cxx-void.o | tr -d '[:space:]')" = 7f454c46
+          nm -g --defined-only native-cxx-void.o | c++filt | grep -Fq 'VoidCounter::set(int)'
+          g++ gxx-void-driver.o gxx-void.o -o gxx-void-reference
+          g++ gxx-void-driver.o native-cxx-void.o -o gxx-void-native
+          timeout 15s ./gxx-void-reference >cpp-reference.out 2>cpp-reference.err
+          timeout 15s ./gxx-void-native >cpp-native.out 2>cpp-native.err
+          test "$(sha256sum cpp-reference.out | cut -d' ' -f1)" = "$(sha256sum cpp-native.out | cut -d' ' -f1)"
+          test "$(sha256sum cpp-reference.err | cut -d' ' -f1)" = "$(sha256sum cpp-native.err | cut -d' ' -f1)"
+          echo "EDG_VOID gate=native_CPP_void_method result=pass"
+
+          g++ -std=c++17 -fsyntax-only edg_native_cxx1_mutating_bad_ctor.cpp
+          if "$compiler" bad-special.o --typeid-native edg_native_cxx1_mutating_bad_ctor.cpp >bad-special.log 2>&1; then
+            echo "unsupported C++ ctor unexpectedly accepted" >&2; exit 1
+          fi
+          test ! -e bad-special.o
+          echo "EDG_VOID gate=unsupported_special_member_no_partial_ELF result=pass"
+
+      - name: Retain native C and C++ void cross-object differential artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: edg-typeid-void-oracle
+          path: ${{ runner.temp }}/edg-typeid-void/
+          if-no-files-found: ignore
