@@ -1,0 +1,128 @@
+name: X7 full 10859 iform deterministic proof worklist
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/x7-full-iform-worklist-20261110]
+permissions:
+  contents: read
+jobs:
+  fixture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - name: Checkout exact compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 8a69cbcfe2e80594ad9b2d032e29579a08551c71
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check exact source and exhaustive shard fixture tests
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 8a69cbcfe2e80594ad9b2d032e29579a08551c71
+          python3 -m py_compile tools/x86_iform_batch_worklist.py
+          python3 -m unittest discover -s tools -p 'test_x86_iform_batch_worklist.py' -v
+          echo X7_IFORM_SHARD_FIXTURE_PASS
+  catalog-census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Checkout pinned compiler catalog candidate scanner
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 8a69cbcfe2e80594ad9b2d032e29579a08551c71
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned repository and compile worklist tool
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 8a69cbcfe2e80594ad9b2d032e29579a08551c71
+          python3 -m py_compile tools/x86_iform_batch_worklist.py tools/x86_g10_catalog_census.py
+      - name: Retrieve complete commit-pinned Intel instruction XML corpus
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/x7-g10-full-xml /tmp/x7-g10-census
+          rev=35eface1b7ee003a1cda95005ec5fd83de658a64
+          curl --fail --silent --show-error --location --retry 2 --max-time 180 \
+            "https://codeload.github.com/intel/SDM/tar.gz/${rev}" \
+            --output /tmp/x7-g10-census/intel-sdm.tar.gz
+          python3 - <<'PY'
+          from pathlib import Path
+          import re,tarfile
+          archive=Path('/tmp/x7-g10-census/intel-sdm.tar.gz')
+          target=Path('/tmp/x7-g10-full-xml')
+          total=0
+          with tarfile.open(archive,'r:gz') as tar:
+              for member in tar:
+                  if not (member.isfile() and
+                          re.fullmatch(r'[^/]+/data/instruction/[^/]+\.xml',member.name)):
+                      continue
+                  assert 0 < member.size < 4 * 1024 * 1024, member.name
+                  data=tar.extractfile(member).read()
+                  assert len(data)==member.size
+                  (target/member.name.rsplit('/',1)[-1]).write_bytes(data)
+                  total+=1
+                  assert total <= 900
+          assert 700 <= total <= 900, total
+          print('PINNED_INTEL_XML_FILES',total)
+          PY
+      - name: Partition all pinned Intel source iforms in one scan
+        run: |
+          set -euo pipefail
+          /usr/bin/time -f '%e' -o /tmp/x7-g10-census/full-iform-seconds.txt \
+            python3 tools/x86_iform_batch_worklist.py \
+              --xml-dir /tmp/x7-g10-full-xml \
+              --out /tmp/x7-g10-census/all-iform-worklist.json \
+              --split-dir /tmp/x7-g10-census/shards --shards 16 \
+              --intel-revision 35eface1b7ee003a1cda95005ec5fd83de658a64
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          root=Path('/tmp/x7-g10-census')
+          all_forms=json.loads((root/'all-iform-worklist.json').read_text())
+          forms=all_forms['forms']
+          assert all_forms['source_files_scanned']==741,all_forms['source_files_scanned']
+          assert all_forms['total_source_iforms']==10859,all_forms['total_source_iforms']
+          assert len(forms)==10859
+          assert len({f['form_id'] for f in forms})==10859
+          assert all_forms['semantically_proven']==0
+          assert all_forms['production_selection_eligible']==0
+          assert all(not f['production_selection_eligible'] and f['blockers']
+                     for f in forms)
+          assert sum(g['iform_count'] for g in
+                     all_forms['family_shape_groups'])==10859
+          shards=sorted((root/'shards').glob('iform-shard-*.json'))
+          assert len(shards)==16,len(shards)
+          all_shard_rows=[]
+          for i,p in enumerate(shards):
+              part=json.loads(p.read_text())
+              assert part['shard_index']==i
+              assert part['status']=='unproved_worklist_only'
+              assert part['source_corpus_sha256']==all_forms['source_corpus_sha256']
+              all_shard_rows.extend(part['forms'])
+          assert sorted(x['form_id'] for x in all_shard_rows)==[
+              x['form_id'] for x in forms]
+          assert all_shard_rows and all(not x['semantic_proven']
+              for x in all_shard_rows)
+          print('X7_FULL_IFORM_WORKLIST_PASS', {
+              'files':all_forms['source_files_scanned'],
+              'source_iforms':all_forms['total_source_iforms'],
+              'shards':len(shards),
+              'families':len(all_forms['family_shape_groups']),
+              'seconds':float((root/'full-iform-seconds.txt').read_text())})
+          print('X7_TOP_FAMILY_COUNTS',[
+              x['iform_count'] for x in all_forms['family_shape_groups'][:8]])
+          PY
+      - name: Archive every source form and all deterministic shard outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-full-10859-iform-worklist
+          path: |
+            /tmp/x7-g10-census/all-iform-worklist.json
+            /tmp/x7-g10-census/shards/
+            /tmp/x7-g10-census/full-iform-seconds.txt
+          retention-days: 14
+          if-no-files-found: warn
