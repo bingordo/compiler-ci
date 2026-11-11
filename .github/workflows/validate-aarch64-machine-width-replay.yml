@@ -1,0 +1,50 @@
+name: Validate AArch64 machine SSA width-preserving ELF replay
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/validate-aarch64-machine-width-replay.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  aarch64-width-replay:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a0362a4df5e7d89b25ca2b86511747a389d167df
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned source and isolate native backend crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "a0362a4df5e7d89b25ca2b86511747a389d167df"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo "Source SHA: a0362a4df5e7d89b25ca2b86511747a389d167df" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: aarch64-machine-width-replay
+      - name: Selected machine v1/v2 codecs and byte-equivalent ELF and GAS emit
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --offline -p compiler-backend-aarch64 --test machine_text_v2 -- --nocapture
+          cargo test --offline -p compiler-backend-aarch64 --test machine_text_v1
+          cargo test --offline -p compiler-backend-aarch64 --lib real_native_typeid_aarch64_selection_is_machine_text_replayable
+      - name: Strict backend Clippy
+        working-directory: compiler
+        run: |
+          cargo clippy --offline -p compiler-backend-aarch64 --all-targets -- -D warnings
