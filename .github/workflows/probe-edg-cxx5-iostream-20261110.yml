@@ -30,7 +30,7 @@ jobs:
       EDG_SOURCE_SHA: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
       EDG_RELEASE_TAG: edgcpfe-ci-799603e0b5ab
       EDG_RELEASE_SHA256: fa769825e70766fbefe017806816b2338acd03daa93bb5562369c293972ce64c
-      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '1'
       CARGO_PROFILE_TEST_DEBUG: '0'
       RUST_TOOLCHAIN_VERSION: 1.99.1
     steps:
@@ -183,6 +183,28 @@ jobs:
           set -e
           echo "exit_status=$native_status elapsed_seconds=$SECONDS" | tee native-status.log
           cat /sys/fs/cgroup/memory.events >>native-resource.log 2>/dev/null || true
+          if test "$native_status" -eq 139; then
+            echo "EDG_CXX5 native compiler segfault; collecting debugger evidence" >&2
+            if ! command -v gdb >/dev/null 2>&1; then
+              if command -v dnf >/dev/null 2>&1; then
+                dnf -y install gdb >gdb-install.log 2>&1 || true
+              elif command -v apt-get >/dev/null 2>&1; then
+                apt-get update -qq >gdb-install.log 2>&1 &&
+                  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gdb >>gdb-install.log 2>&1 || true
+              fi
+            fi
+            if command -v gdb >/dev/null 2>&1; then
+              timeout 50s gdb -batch -quiet \
+                -ex 'set pagination off' \
+                -ex 'set print frame-arguments none' \
+                -ex run -ex 'thread apply all bt 28' \
+                --args "$compiler" native.o --typeid-native "${edg_options[@]}" "${include_flags[@]}" iostream.cpp \
+                >native-gdb.log 2>&1 || true
+              grep -A35 -m1 'Program received signal' native-gdb.log | head -n 50 >&2 || true
+            else
+              echo 'GDB_UNAVAILABLE' >native-gdb.log
+            fi
+          fi
           if test "$native_status" -ne 0; then
             echo "EDG_CXX5 gate=native_typeid_codegen result=blocked exit_status=$native_status" >&2
             tail -n 25 native-compile.log >&2
