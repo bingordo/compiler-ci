@@ -1,0 +1,102 @@
+name: F6 source CLI x86 AArch64 runtime differential PR909
+on:
+  push:
+    branches: [ci/verify-f6-source-matrix-909-20261111]
+    paths:
+      - '.github/workflows/verify-f6-source-matrix-909.yml'
+permissions:
+  contents: read
+jobs:
+  source-c11-cross-architecture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      COMPILER_F6_AARCH64_QEMU: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c4ba0a334e30bc4138ef1b3f6947bbed713f51fd
+          path: compiler
+          ssh-key: \${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin exact source, resolve frontends and install actual QEMU cross tools
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = c4ba0a334e30bc4138ef1b3f6947bbed713f51fd
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user gdb
+          command -v aarch64-linux-gnu-gcc
+          command -v qemu-aarch64
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: f6-source-matrix-909-compiler
+      - name: Run exact source CLI differential (84 independent linked native executions)
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test f6_source_runtime_parity -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/f6-source.log"
+          test "$(grep -c 'F6_SOURCE_EXEC target=' "$RUNNER_TEMP/f6-source.log")" -eq 84
+          grep -F 'test f6_x86_source_default_typeid_and_rollback_execute_same_c11_oracle ... ok' "$RUNNER_TEMP/f6-source.log"
+          grep -F 'test f6_aarch64_source_default_typeid_and_rollback_execute_under_qemu ... ok' "$RUNNER_TEMP/f6-source.log"
+          grep -F 'test f6_source_fail_closed_never_creates_partial_artifacts_or_falls_back ... ok' "$RUNNER_TEMP/f6-source.log"
+          ! grep -F 'F6_SOURCE_AARCH64_SKIPPED' "$RUNNER_TEMP/f6-source.log"
+      - name: Existing default TypeId/explicit rollback source and real Mini-C integration
+        working-directory: compiler
+        run: |
+          cargo test -p compiler --test ir_default_cli --test mini_c_cli --test typeid_elf_linker_matrix -- --test-threads=2
+          cargo test -p compiler-backend-aarch64
+      - name: Strict frontend and target source lint
+        working-directory: compiler
+        run: cargo clippy -p compiler -p compiler-backend-aarch64 --all-targets -- -D warnings
+      - name: Capture failed source oracle
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: f6-source-matrix-909-failure
+          path: \${{ runner.temp }}/f6-source.log
+          if-no-files-found: ignore
+          retention-days: 14
+  standalone-mini-c:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c4ba0a334e30bc4138ef1b3f6947bbed713f51fd
+          path: compiler
+          ssh-key: \${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin exact source for standalone producer and rollback
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = c4ba0a334e30bc4138ef1b3f6947bbed713f51fd
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: f6-source-matrix-909-standalone
+      - name: Standalone checked Mini-C TypeId default and explicit legacy rollback
+        working-directory: compiler
+        run: |
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib -- --test-threads=2
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --test typeid_cli -- --test-threads=2
+      - name: Standalone original C differential against GCC
+        working-directory: compiler
+        run: |
+          cargo build --manifest-path tools/mini-c-driver/Cargo.toml --bin compiler-mini-c
+          python3 tools/mini-c-driver/tests/differential.py \
+            --compiler tools/mini-c-driver/target/debug/compiler-mini-c \
+            --seed-count 2 --steps 60 --ct04-seed-count 1 --m10-compound-seed-count 1 \
+            --artifacts target/f6-source-matrix-909-repro
+      - name: Strict standalone Mini-C lint
+        working-directory: compiler
+        run: cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml --all-targets -- -D warnings
