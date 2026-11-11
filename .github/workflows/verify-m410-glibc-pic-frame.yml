@@ -1,0 +1,71 @@
+name: M4.10 checked glibc PIC/RBP ELF-GAS ABI matrix
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-m410-glibc-pic-frame.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  acceptance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      COMPILER_ELF_REQUIRE_LLVM: '1'
+    steps:
+      - name: Checkout exact compiler ELF ABI candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1f63730f4fd396ee1a9cd983fae54c391327b42d
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify immutable candidate and new matrix
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "1f63730f4fd396ee1a9cd983fae54c391327b42d"
+          test -s crates/driver/tests/typeid_pic_frame_glibc.rs
+          echo "M4.10 glibc PIC+RBP candidate: 1f63730f4fd396ee1a9cd983fae54c391327b42d" >> "$GITHUB_STEP_SUMMARY"
+      - name: Resolve pinned public frontend dependencies
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - name: Ensure native GNU and LLVM linkers
+        run: |
+          set -euo pipefail
+          if ! command -v ld.lld >/dev/null || ! command -v gdb >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y lld gdb
+          fi
+          command -v gcc
+          command -v clang
+          command -v ld.lld
+          command -v readelf
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m410-glibc-pic-frame-v1
+      - name: Unmodified glibc PIC plus RBP source and linker matrix
+        working-directory: compiler
+        run: cargo test -p compiler --test typeid_pic_frame_glibc -- --nocapture
+      - name: Previous TypeId glibc and ELF linker matrix
+        working-directory: compiler
+        run: |
+          cargo test -p compiler --test mini_c_cli cli_unmodified_glibc_stdin_printf_and_stack_varargs_match_gcc -- --nocapture
+          cargo test -p compiler --test typeid_pic_frame_shared
+          cargo test -p compiler --test typeid_pic_shared
+          cargo test -p compiler --test typeid_elf_linker_matrix
+          cargo test -p compiler --test typeid_tls_linker_matrix
+      - name: Backend ELF and ABI regressions
+        working-directory: compiler
+        run: cargo test -p compiler-backend --all-targets --no-fail-fast
+      - name: Full IR optimizer native x86 and AArch64 regressions
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --features compiler-backend-x86/x7-native-form-validation
+      - name: Strict all-target Clippy
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --features compiler-backend-x86/x7-native-form-validation --all-targets -- -D warnings
+          cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
