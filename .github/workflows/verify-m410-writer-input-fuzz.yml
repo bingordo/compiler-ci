@@ -1,0 +1,91 @@
+name: M4.10 source-pinned replayable ELF writer input fuzz
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-m410-writer-input-fuzz.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  acceptance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler writer-input fuzz revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 3069047b842aa76b8f6fa1bee69240822eb53888
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify candidate immutable source and record range
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "3069047b842aa76b8f6fa1bee69240822eb53888"
+          grep -q 'm410_replayable_writer_input_property_fuzz' crates/backend/src/elf.rs
+          echo 'M4.10 writer input fuzz candidate: 3069047b842aa76b8f6fa1bee69240822eb53888' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Replay ranges: [0, 4096), [1000000, 1004096)' >> "$GITHUB_STEP_SUMMARY"
+      - name: Resolve public frontend Git repositories
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m410-writer-input-fuzz-v1
+      - name: First 4096 deterministic seeds plus reproducible ELF artifacts
+        working-directory: compiler
+        env:
+          M410_ELF_FUZZ_START: '0'
+          M410_ELF_FUZZ_CASES: '4096'
+          M410_ELF_FUZZ_SAMPLES_DIR: ${{ runner.temp }}/m410-writer-input-objects
+        run: cargo test -p compiler-backend --lib m410_replayable_writer_input_property_fuzz -- --nocapture
+      - name: Independent GNU readelf checks for produced x86 and AArch64 objects
+        run: |
+          set -euo pipefail
+          readelf -hWSr "$RUNNER_TEMP/m410-writer-input-objects/x86-mixed.o" | tee "$RUNNER_TEMP/m410-writer-input-objects/x86-readelf.txt"
+          readelf -hWSr "$RUNNER_TEMP/m410-writer-input-objects/aarch64-call.o" | tee "$RUNNER_TEMP/m410-writer-input-objects/aarch64-readelf.txt"
+          grep -q 'Advanced Micro Devices X86-64' "$RUNNER_TEMP/m410-writer-input-objects/x86-readelf.txt"
+          grep -q 'AArch64' "$RUNNER_TEMP/m410-writer-input-objects/aarch64-readelf.txt"
+          grep -q '.rela.text' "$RUNNER_TEMP/m410-writer-input-objects/x86-readelf.txt"
+          grep -q '.rela.text' "$RUNNER_TEMP/m410-writer-input-objects/aarch64-readelf.txt"
+      - name: Second 4096 replayable high-seed writer input corpus
+        working-directory: compiler
+        env:
+          M410_ELF_FUZZ_START: '1000000'
+          M410_ELF_FUZZ_CASES: '4096'
+        run: cargo test -p compiler-backend --lib m410_replayable_writer_input_property_fuzz -- --nocapture
+      - name: Existing serialized ELF metadata rejection and mutation suites
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend --lib m410_seeded_serialized_elf_metadata_rejection
+          cargo test -p compiler-backend --lib m410_unstructured_serialized_elf_mutation_never_panics
+          cargo test -p compiler-backend --test x86_elf_contract
+          cargo test -p compiler-backend --test aarch64_elf
+      - name: Full backend ELF and ABI regression tests
+        working-directory: compiler
+        run: |
+          if command -v gdb >/dev/null; then
+            cargo test -p compiler-backend --all-targets --no-fail-fast
+          else
+            echo 'Only existing interactive GDB breakpoint test excluded (no gdb)' >> "$GITHUB_STEP_SUMMARY"
+            cargo test -p compiler-backend --all-targets --no-fail-fast -- --skip gdb_resolves_real_line_breakpoints_and_backtraces_generated_pie
+          fi
+      - name: TypeId IR optimizer x86 and AArch64 regressions
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend-x86 -p compiler-backend-aarch64 --features compiler-backend-x86/x7-native-form-validation
+      - name: Strict all-target Clippy for compiler and backends
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --features compiler-backend-x86/x7-native-form-validation --all-targets -- -D warnings
+          cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
+      - name: Retain reproduced valid object samples
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m410-writer-input-elf-samples
+          path: ${{ runner.temp }}/m410-writer-input-objects/
+          if-no-files-found: ignore
+          retention-days: 7
