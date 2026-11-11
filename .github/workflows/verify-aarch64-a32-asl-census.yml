@@ -1,0 +1,53 @@
+name: Inspect AARCHMRS ASL operation AST for A3.2
+on:
+  push:
+    branches: [ci/aarch64-a32-asl-census-20261110]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  schema:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Read exact pinned public ASL source
+        run: |
+          set -euo pipefail
+          git clone --quiet --depth 1 --filter=blob:none https://kernel.googlesource.com/pub/scm/linux/kernel/git/maz/AARCHMRS mrs
+          test "$(git -C mrs rev-parse HEAD)" = 1346b16d47619400448f3cb6d4f22d62d3b76848
+          echo "ef75f3ec02df1b9b9c0612f4ea259d6710ac3de686b097d8f9c83d1d97aa800a  mrs/Instructions.json" | sha256sum -c -
+          python3 - <<'PY'
+          import json
+          from collections import Counter
+          from pathlib import Path
+          root=json.loads(Path('mrs/Instructions.json').read_bytes())
+          ops=root['operations']
+          print('ROOT',list(root),'OPCOUNT',len(ops))
+          print('FIRST_3_OP_KEYS',list(ops)[:3])
+          tree=[r for r in root['instructions'] if r.get('name')=='A64'][0]
+          target={'ADD_64_addsub_shift','ADD_64_addsub_imm','AND_64_log_shift',
+                  'MOVZ_64_movewide','LDR_64_ldst_pos','B_only_branch_imm',
+                  'SUBS_64_addsub_shift','CBZ_64_compbranch','LSLV_64_dp_2src'}
+          found={}
+          def visit(node):
+              if node.get('name') in target:
+                  found[node['name']]=node
+              for ch in node.get('children',[]):
+                  if isinstance(ch,dict):visit(ch)
+          visit(tree)
+          print('FOUND',sorted(found))
+          for name in sorted(found):
+              n=found[name];k=n.get('operation_id');v=ops.get(k)
+              print('\n=== '+name+' ===')
+              print('ID',repr(k),'LEAF_KEYS',list(n), 'TYPE',n.get('_type'))
+              print('OPVALUE',repr(v)[:6500])
+              print('LEAFOPCODE',repr(n.get('operation'))[:500])
+              print('CHILDREN',str(len(n.get('children',[]))))
+          typecount=Counter()
+          ops_with_code=0
+          for v in ops.values():
+              if isinstance(v,dict):
+                  typecount[v.get('_type','none')]+=1
+                  if v.get('code') is not None:ops_with_code+=1
+          print('OP_TYPES',typecount,'CODE_COUNT',ops_with_code)
+          PY
