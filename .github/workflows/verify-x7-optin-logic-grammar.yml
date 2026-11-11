@@ -1,0 +1,146 @@
+name: X7 opted-in logical DAG candidate discovery
+on:
+  push:
+    branches: [ci/x7-optin-logic-grammar-20261110]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  common-schema-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 28
+    steps:
+      - name: Checkout pinned opt-in logic grammar compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 333a9695b07ab2c982341a532903c72a0f202150
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check exact commit and generator syntax
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 333a9695b07ab2c982341a532903c72a0f202150
+          python3 -m py_compile tools/regen_x86_add_dag_patterns.py \
+            tools/regen_x86_add64_dag_patterns.py \
+            tools/regen_x86_dag_patterns.py
+          python3 -m py_compile tools/x86_pattern_discovery.py tools/test_x86_pattern_discovery.py
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("crates/backend-x86/src")
+          source=(p/"dag_match.rs").read_text()
+          assert "mod dag_add_match;" not in (p/"lib.rs").read_text()
+          assert "mod dag_ctz_match;" not in (p/"lib.rs").read_text()
+          assert not (p/"dag_add_match.rs").exists()
+          assert not (p/"dag_ctz_match.rs").exists()
+          assert "fn select_rules<" in source and "pub(crate) fn plan(" in source
+          groups=[
+             ("generated_dag_patterns.rs",7,"Ctz32"),
+             ("generated_add_dag_patterns.rs",2,"Add32"),
+             ("generated_add64_dag_patterns.rs",2,"Add64"),
+          ]
+          ids=[]
+          import re
+          for filename,count,target in groups:
+              s=(p/filename).read_text()
+              assert "DagOp::" not in s and "DagTarget::" not in s
+              assert s.count("    RuleSpec {")==count,(filename,count)
+              assert s.count("target: TargetCost::"+target)==count
+              assert s.count("bits: "+("64" if target=="Add64" else "32"))==count
+              ids+=re.findall(r'id: "([^"]+)"',s)
+          assert len(ids)==len(set(ids))==11,ids
+          print("X7_OPTIN_LOGIC_ONE_SCHEMA_PASS rules=11 groups=CTZ32,ADD32,ADD64")
+          PY
+      - name: Install source-proof dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y z3
+          z3 -version
+          python3 -m venv /tmp/x7-optin-logic-venv
+          /tmp/x7-optin-logic-venv/bin/pip install --quiet z3-solver
+          mkdir -p /tmp/x7-optin-logic-intel
+          revision=35eface1b7ee003a1cda95005ec5fd83de658a64
+          for op in ADD BSF; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 45 \
+              "https://raw.githubusercontent.com/intel/SDM/${revision}/data/instruction/${op}.xml" \
+              -o "/tmp/x7-optin-logic-intel/${op}.xml"
+          done
+      - name: Regenerate and independently reprove exact original source-linked DAG rules
+        run: |
+          set -euo pipefail
+          PYTHON=/tmp/x7-optin-logic-venv/bin/python
+          $PYTHON tools/regen_x86_add_dag_patterns.py --intel-dir /tmp/x7-optin-logic-intel --check
+          $PYTHON tools/regen_x86_add64_dag_patterns.py --intel-dir /tmp/x7-optin-logic-intel --check
+          $PYTHON tools/regen_x86_dag_patterns.py --intel-dir /tmp/x7-optin-logic-intel --check
+          INTEL_ISL_DIR=/tmp/x7-optin-logic-intel $PYTHON -m unittest discover -s tools -p 'test_x86_pattern_discovery.py' -v
+          echo X7_OPTIN_LOGIC_GENERATOR_PROOF_PARITY_PASS
+      - name: Isolate core and x86 crates and compile all original proof tests
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          """)
+          PY
+          cargo test -p compiler-backend-x86 --lib dag_match --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --offline
+          cargo test -p compiler-backend-x86 --no-default-features --offline
+      - name: Validate prior production source-linked native machine-byte census
+        run: |
+          set -euo pipefail
+          cargo test --release -p compiler-backend-x86 \
+            --features x7-c-defined-64 \
+            --test x7_g10_n20c_compile_benchmark --offline -- --nocapture \
+            | tee /tmp/x7-optin-logic-code-size.log
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          lines=[l for l in Path("/tmp/x7-optin-logic-code-size.log").read_text().splitlines()
+                 if "X7_N20C_BENCH_JSON " in l]
+          assert len(lines)==1,lines
+          d=json.loads(lines[0].split("X7_N20C_BENCH_JSON ",1)[1])
+          assert (d["selected_total"],d["selected_single"],d["selected_branch"],
+                  d["selected_pressure"],d["text_bytes_saved"])==(120,60,60,0,360),d
+          print("X7_OPTIN_LOGIC_MACHINE_CODE_PARITY_PASS forms=120 saved_bytes=360")
+          PY
+      - name: Archive rule proof and byte evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-optin-logic-rule-and-machine-evidence
+          path: /tmp/x7-optin-logic-code-size.log
+          if-no-files-found: warn
+          retention-days: 30
+  full-workspace:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout exact opt-in logic grammar compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 333a9695b07ab2c982341a532903c72a0f202150
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Private frontend dependency access
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Install gdb and trust GitHub SSH
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+          sudo apt-get update -qq
+          sudo apt-get install -y gdb
+      - name: Entire compiler, opted I64 and feature-free fallback
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 333a9695b07ab2c982341a532903c72a0f202150
+          cargo test --workspace
+          cargo test -p compiler-backend-x86 --features x7-c-defined-64
+          cargo test -p compiler-backend-x86 --no-default-features
+          echo X7_OPTIN_LOGIC_FULL_WORKSPACE_PASS
