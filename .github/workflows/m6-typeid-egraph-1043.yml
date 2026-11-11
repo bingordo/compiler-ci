@@ -1,0 +1,72 @@
+name: M6 native TypeId egraph and retired fusion benchmarks
+on:
+  push:
+    branches: [ci/m6-typeid-egraph-1043-20261111]
+    paths: ['.github/workflows/m6-typeid-egraph-1043.yml']
+permissions:
+  contents: read
+jobs:
+  native-m6:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 4f803b6bfb7d6b2776a252d897ceab0b7d7288aa
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest source pin, native TypeId adapter and retired benchmark
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 4f803b6bfb7d6b2776a252d897ceab0b7d7288aa
+          python3 - <<'PY'
+          from pathlib import Path
+          root=Path("compiler")
+          core=(root/"crates/opt/src/lib.rs").read_text()
+          native=(root/"crates/opt/src/typed_egraph_ssa.rs").read_text()
+          mini=(root/"tools/mini-c-driver/Cargo.toml").read_text()
+          assert 'pub mod typed_egraph_ssa;' in core
+          assert 'pub fn optimize_m6_typeid(' in core
+          assert 'module.validate_optimizer_abi()' in native
+          assert 'TypedSsaModule' in native
+          assert 'project_legacy_compat_function' not in native
+          assert 'Function,' not in native
+          assert 'experimental-fusion-benchmark' not in mini
+          assert not (root/"tools/mini-c-driver/examples/benchmark_generated_fusion.rs").exists()
+          assert not (root/"tools/mini-c-driver/examples/benchmark_generated_fusion").exists()
+          assert 'experimental-s14-audit' in mini
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m6-typeid-egraph
+      - name: Native M6 oracle and compile-time regression
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --features typeid-egraph --test m6_typeid_egraph -- --nocapture --test-threads=1
+          cargo test -p compiler-opt --features typeid-egraph --lib -- --test-threads=2
+          cargo check -p compiler-opt --all-targets --features typeid-egraph
+          cargo clippy -p compiler-opt --all-targets --features typeid-egraph -- -D warnings
+      - name: Prior opt-in M6 and normal unified compiler remain available
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt -p compiler --features compiler-opt/legacy-experimental-ssa --all-targets
+          cargo test -p compiler --bin compiler -- --test-threads=2
+          cargo test -p compiler-ir -p compiler-opt --lib -- --test-threads=2
+          cargo clippy -p compiler -p compiler-ir -p compiler-opt --all-targets -- -D warnings
+      - name: Standalone Mini-C builds without legacy fusion benchmark
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib -- --test-threads=2
+          cargo check --manifest-path tools/mini-c-driver/Cargo.toml --all-targets
+          cargo check --manifest-path tools/mini-c-driver/Cargo.toml --all-targets --features legacy-experimental-ssa
+          cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml --all-targets -- -D warnings
