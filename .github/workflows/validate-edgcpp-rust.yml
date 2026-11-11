@@ -48,7 +48,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/edgcpp-rust
-          ref: ${{ inputs.source_ref || '159b5e06ab83b3ebb64feb2bac7296a55f0da468' }}
+          ref: ${{ inputs.source_ref || '2be4a19bc03a4a66efcc5d0e18ed66ecd4fd0596' }}
           path: edgcpp-rust
           persist-credentials: false
       - name: Record exact revision
@@ -59,7 +59,7 @@ jobs:
           test "${#sha}" -eq 40
           echo "EDG Rust commit: $sha" | tee -a "$GITHUB_STEP_SUMMARY"
           if [[ "${{ github.event_name }}" != workflow_dispatch ]]; then
-            test "$sha" = 159b5e06ab83b3ebb64feb2bac7296a55f0da468
+            test "$sha" = 2be4a19bc03a4a66efcc5d0e18ed66ecd4fd0596
           fi
       - name: Check out source headers matching the pinned EDG library
         uses: actions/checkout@v4
@@ -133,6 +133,30 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           cargo test --features codegen --lib file_scope_init_schedule_wire_tests -- --nocapture
           python3 tools/gen_wire_schema.py --check
+      - name: Probe original C++ global constructor startup schedule
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source build/gcc-release/environment.sh
+          cat >build/gcc-release/global-init-probe.cpp <<'CPP'
+          struct Effectful {
+            int value;
+            explicit Effectful(int x) : value(x) {}
+            ~Effectful() { value = 0; }
+          };
+          Effectful global_effect(7);
+          int main() { return 0; }
+          CPP
+          cd build/gcc-release
+          version="$(g++ -dumpfullversion -dumpversion)"
+          IFS=. read -r major minor patch <<<"$version"
+          gnu_number=$((10#${major}*10000+10#${minor:-0}*100+10#${patch:-0}))
+          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" \
+            --example parse -- --g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number" \
+            global-init-probe.cpp >"$RUNNER_TEMP/edg-init-probe.log" 2>&1
+          grep -F 'file scope init scheduler available=' "$RUNNER_TEMP/edg-init-probe.log"
+          grep -F 'file scope init root position=' "$RUNNER_TEMP/edg-init-probe.log" || true
       - name: Run all Rust library tests with codegen
         working-directory: edgcpp-rust
         run: |
@@ -156,5 +180,6 @@ jobs:
           path: |
             ${{ runner.temp }}/edg-cfg-targeted.log
             ${{ runner.temp }}/edg-cfg-library.log
+            ${{ runner.temp }}/edg-init-probe.log
           if-no-files-found: ignore
           retention-days: 14
