@@ -1,0 +1,79 @@
+name: FZ-2 PR1012 calls traps alias and stage registry
+on:
+  push:
+    branches: [fuzz/fz2-call-trap-alias-pr1012-20261111]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 17
+    steps:
+      - name: Checkout immutable compiler PR source using read-only key
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 6b89c9e412dda0220ab34d030bac8d076c565d50
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check exact source and new fixtures
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "6b89c9e412dda0220ab34d030bac8d076c565d50"
+          test -s compiler/crates/opt/tests/typeid_fuzz_pass_registry.rs
+          test -s compiler/crates/opt/tests/fixtures/typeid_fuzz_call_alias_div.toml
+      - name: Use self-contained compiler core workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: fz2-trap-alias-calls
+          cache-workspace-crates: 'true'
+      - name: Run all new generator and optimizer stage registration tests
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typeid_fuzz_bias -- --nocapture
+          cargo test -p compiler-opt --test typeid_fuzz_pass_registry -- --nocapture
+          cargo test -p compiler-opt --test typed_core_native_verifier -- --nocapture
+      - name: Validate replay and actual CSE and DSE edits
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          for kind in cse dse; do
+            out="$RUNNER_TEMP/fz2-$kind"
+            cargo run -p compiler-opt --example typeid_fuzz -- \
+              "crates/opt/tests/fixtures/typeid_fuzz_$kind.toml" "$out"
+            test "$(wc -l < "$out/coverage.tsv")" -eq 25
+            awk -F '\t' 'NR>1 && $4!="true" {bad=1} END {if(bad || NR!=25) exit 1}' "$out/coverage.tsv"
+          done
+      - name: Verify every call alias division seed is represented in replay ledger
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/fz2-call-alias-div"
+          cargo run -p compiler-opt --example typeid_fuzz -- \
+            crates/opt/tests/fixtures/typeid_fuzz_call_alias_div.toml "$out"
+          test "$(wc -l < "$out/coverage.tsv")" -eq 17
+          test "$(find "$out" -name '*-before.ir' | wc -l)" -eq 16
+          awk -F '\t' 'NR>1 {
+            if(index($2,"aliased-store")==0 || index($2,"signed-division")==0 || index($2,"internal-call")==0 || index($2,"memory-roundtrip")==0) bad=1;
+            if(index($2,"duplicate-add")!=0) bad=1;
+          } END {if(bad || NR!=17) exit 1}' "$out/coverage.tsv"
+      - name: Strict Clippy on both fuzz test targets and runner
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt --test typeid_fuzz_bias --test typeid_fuzz_pass_registry --example typeid_fuzz -- -D warnings
+      - name: Retain replay artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fz2-calls-traps-aliases
+          path: ${{ runner.temp }}/fz2-*/
+          retention-days: 7
