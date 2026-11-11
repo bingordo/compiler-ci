@@ -1,0 +1,82 @@
+name: M4.10 Oberon PIC RBP DSO constructor lifecycle acceptance
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-m410-oberon-ctor-dso.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  acceptance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      COMPILER_ELF_REQUIRE_LLVM: '1'
+    steps:
+      - name: Checkout exact compiler constructor acceptance revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 8a8a42cde215c404ac2671f27a0e5f53ea993336
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify immutable checked compiler source
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "8a8a42cde215c404ac2671f27a0e5f53ea993336"
+          test -s crates/driver/tests/typeid_oberon_ctor_pic_dso.rs
+          echo "M4.10 Oberon ctor DSO candidate 8a8a42cde215c404ac2671f27a0e5f53ea993336" >> "$GITHUB_STEP_SUMMARY"
+      - name: Resolve public GitHub frontend sources
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - name: Require GNU and LLVM tools, use bundled Rust LLD if absent
+        run: |
+          set -euo pipefail
+          if ! command -v ld.lld >/dev/null; then
+            host="$(rustc -vV | sed -n 's/^host: //p')"
+            lld="$(rustc --print sysroot)/lib/rustlib/$host/bin/rust-lld"
+            test -x "$lld"
+            ln -s "$lld" "$RUNNER_TEMP/ld.lld"
+            echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+            export PATH="$RUNNER_TEMP:$PATH"
+          fi
+          command -v gcc
+          command -v clang
+          command -v readelf
+          command -v nm
+          ld.lld --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m410-oberon-ctor-pic-rbp-v1
+      - name: New checked Oberon module constructor cross-linker DSO lifecycle
+        working-directory: compiler
+        run: cargo test -p compiler --test typeid_oberon_ctor_pic_dso -- --nocapture
+      - name: Existing checked constructors, Oberon PIC RBP, TLS, and linker tests
+        working-directory: compiler
+        run: |
+          cargo test -p compiler --test m42_module_initialization_native -- --nocapture
+          cargo test -p compiler --test typeid_oberon_pic_frame_dso
+          cargo test -p compiler --test typeid_elf_linker_matrix
+          cargo test -p compiler --test typeid_tls_linker_matrix
+          cargo test -p compiler --test typeid_pic_frame_shared
+      - name: Backend ELF metadata, ABI and corruption regression suite
+        working-directory: compiler
+        run: |
+          if command -v gdb >/dev/null; then
+            cargo test -p compiler-backend --all-targets --no-fail-fast
+          else
+            echo 'Existing GDB-only breakpoint test excluded due to absent host gdb' >> "$GITHUB_STEP_SUMMARY"
+            cargo test -p compiler-backend --all-targets --no-fail-fast -- --skip gdb_resolves_real_line_breakpoints_and_backtraces_generated_pie
+          fi
+      - name: TypeId IR optimizer x86 and AArch64 shared regressions
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend-x86 -p compiler-backend-aarch64 --features compiler-backend-x86/x7-native-form-validation
+      - name: Strict Clippy all targets
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --features compiler-backend-x86/x7-native-form-validation --all-targets -- -D warnings
+          cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
