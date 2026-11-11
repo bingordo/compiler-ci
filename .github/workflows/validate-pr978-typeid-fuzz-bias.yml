@@ -14,15 +14,17 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 0819a384370884715da53fb7c0d5b03336b72907
+          ref: 52e89430524ea5c033c07869327db987cece6bcc
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - name: Verify immutable compiler source and regression fixture
         run: |
-          test "$(git -C compiler rev-parse HEAD)" = "0819a384370884715da53fb7c0d5b03336b72907"
+          test "$(git -C compiler rev-parse HEAD)" = "52e89430524ea5c033c07869327db987cece6bcc"
           test -s compiler/crates/opt/tests/typeid_fuzz_bias.rs
           test -s compiler/crates/opt/tests/support/typeid_fuzz.rs
+          test -s compiler/crates/opt/tests/support/typeid_fuzz_profile.rs
+          test -s compiler/crates/opt/examples/typeid_fuzz.rs
       - name: Restrict Cargo to credential-independent core crates
         shell: bash
         run: |
@@ -41,6 +43,30 @@ jobs:
         run: |
           cargo test -p compiler-opt --test typeid_fuzz_bias -- --nocapture
           cargo test -p compiler-opt --test typed_core_native_verifier -- --nocapture
+      - name: Execute the profile CLI and validate real CSE ledger
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/fz2-replay"
+          cargo run -p compiler-opt --example typeid_fuzz -- \
+            crates/opt/tests/fixtures/typeid_fuzz_cse.toml "$out"
+          test -s "$out/profile.toml"
+          test -s "$out/final-weights.toml"
+          test -s "$out/coverage.tsv"
+          test "$(wc -l < "$out/coverage.tsv")" -eq 25
+          test "$(find "$out" -name '*-before.ir' | wc -l)" -eq 24
+          test "$(find "$out" -name '*-after-cse.ir' | wc -l)" -eq 24
+          ! grep -q 
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt --test typeid_fuzz_bias --example typeid_fuzz -- -D warnings
+\\tfalse\\t' "$out/coverage.tsv"
+      - name: Preserve canonical TypeId replay evidence
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fz2-typeid-replay-exact-sha
+          path: ${{ runner.temp }}/fz2-replay/
+          retention-days: 7
       - name: Strict targeted Clippy
         working-directory: compiler
         run: cargo clippy -p compiler-opt --test typeid_fuzz_bias -- -D warnings
