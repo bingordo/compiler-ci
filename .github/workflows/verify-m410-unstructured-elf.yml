@@ -1,0 +1,81 @@
+name: M4.10 unstructured serialized ELF64 mutation acceptance
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-m410-unstructured-elf.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  acceptance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      COMPILER_ELF_REQUIRE_LLVM: '1'
+    steps:
+      - name: Checkout exact compiler ELF mutation source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5f48498d7db1f3879e859c73a825901328a3ef1a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify immutable candidate
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "5f48498d7db1f3879e859c73a825901328a3ef1a"
+          echo "M4.10 unstructured ELF mutation candidate 5f48498d7db1f3879e859c73a825901328a3ef1a" >> "$GITHUB_STEP_SUMMARY"
+      - name: Resolve pinned public frontend dependencies
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - name: Ensure GNU and LLVM linkers without apt dependency
+        run: |
+          set -euo pipefail
+          if ! command -v ld.lld >/dev/null; then
+            host="$(rustc -vV | sed -n 's/^host: //p')"
+            lld="$(rustc --print sysroot)/lib/rustlib/$host/bin/rust-lld"
+            test -x "$lld"
+            ln -s "$lld" "$RUNNER_TEMP/ld.lld"
+            echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+            export PATH="$RUNNER_TEMP:$PATH"
+          fi
+          gcc --version | head -1
+          clang --version | head -1
+          ld.lld --version
+          readelf --version | head -1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m410-elf-unstructured-v1
+      - name: New bounded serialized ELF mutation test
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend --lib m410_unstructured_serialized_elf_mutation_never_panics -- --nocapture
+          cargo test -p compiler-backend --lib m410_seeded_serialized_elf_metadata_rejection
+      - name: Complete backend ELF and ABI suite
+        working-directory: compiler
+        run: |
+          if command -v gdb >/dev/null; then
+            cargo test -p compiler-backend --all-targets --no-fail-fast
+          else
+            echo "Interactive GDB breakpoint test excluded: gdb not installed" >> "$GITHUB_STEP_SUMMARY"
+            cargo test -p compiler-backend --all-targets --no-fail-fast -- --skip gdb_resolves_real_line_breakpoints_and_backtraces_generated_pie
+          fi
+      - name: Actual TypeId ELF PIC RBP TLS ABI linked sources
+        working-directory: compiler
+        run: |
+          cargo test -p compiler --test typeid_pic_frame_glibc
+          cargo test -p compiler --test typeid_pic_frame_shared
+          cargo test -p compiler --test typeid_tls_linker_matrix
+          cargo test -p compiler --test typeid_elf_linker_matrix
+      - name: IR optimizer x86 and AArch64 shared regressions
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend-x86 -p compiler-backend-aarch64 --features compiler-backend-x86/x7-native-form-validation
+      - name: Strict Clippy all targets
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --features compiler-backend-x86/x7-native-form-validation --all-targets -- -D warnings
+          cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
