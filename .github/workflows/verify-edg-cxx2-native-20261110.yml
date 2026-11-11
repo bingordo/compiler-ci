@@ -1,20 +1,22 @@
-name: EDG C++2 path-sensitive constructor destructor lifetime verifier
+name: EDG C++2 native executable constructor destructor G++ differential
 
 on:
   push:
     branches: [main]
     paths:
-      - .github/workflows/probe-edg-cxx2-lifetime-20261110.yml
+      - .github/workflows/verify-edg-cxx2-native-20261110.yml
   workflow_dispatch:
+  schedule:
+    - cron: '19 11 * * 1-5'
   pull_request:
     paths:
-      - .github/workflows/verify-edg-cxx2-paths-20261110.yml
+      - .github/workflows/verify-edg-cxx2-native-20261110.yml
 
 permissions:
   contents: read
 
 concurrency:
-  group: edg-cxx2-path-${{ github.ref }}
+  group: edg-cxx2-native-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -149,7 +151,7 @@ jobs:
           cargo build --manifest-path tools/edg-driver/Cargo.toml
 
 
-      - name: Inspect real constructor destructor execution regions without unsafe native admission
+      - name: Execute real native EDG C++2 lifetime and compare independent G++ trace
         working-directory: edgcpp/build/gcc-release
         env:
           CXX2_ARTIFACTS: ${{ runner.temp }}/edg-cxx2-lifetime-probe
@@ -181,20 +183,44 @@ jobs:
           grep -E '^(object lifetime|scope lifetime|init lifetime|lifetime destruction)' probe.log >lifetime-regions.log || true
           grep -F 'routine attributes' probe.log >routine-notes.log
           rm -f native-caller.o
-          if "$compiler" native-caller.o --typeid-native edg_native_cxx2_lifetime_caller.cpp >native-rejected.log 2>&1; then
-            echo "EDG_CXX2_PROBE gate=nontrivial_lifetime_must_reject unexpected_success" >&2
+          "$compiler" native-caller.o --typeid-native edg_native_cxx2_lifetime_caller.cpp >native-compile.log 2>&1 || {
+            echo "EDG_CXX2_NATIVE native compile failed; diagnostics:" >&2
+            cat native-compile.log >&2
             exit 1
-          fi
-          test ! -e native-caller.o
-          grep -Fq "source cleanup paths verified; native ctor/dtor lowering pending" native-rejected.log
-          echo "EDG_CXX2_PROBE gate=GXX_lifetime_reference pass=1"
-          echo "EDG_CXX2_PROBE gate=explicit_source_cleanup_calls verified=1"
-          echo "EDG_CXX2_PROBE gate=nontrivial_lifetime_must_reject no_partial_elf=1"
+          }
+          test "$(od -An -tx1 -N4 native-caller.o | tr -d '[:space:]')" = 7f454c46
+          nm -u native-caller.o | c++filt | grep -Fq 'Marker::Marker(int)'
+          nm -u native-caller.o | c++filt | grep -Fq 'Marker::~Marker()'
+          g++ native-caller.o methods-gxx.o driver-gxx.o -o native
+          timeout 15s ./native | tee native.out
+          test "$(sha256sum reference.out | cut -d' ' -f1)" = "$(sha256sum native.out | cut -d' ' -f1)"
+          echo "EDG_CXX2_NATIVE gate=unmodified_source_gxx_cross_object_runtime result=pass"
+          echo "EDG_CXX2_NATIVE gate=all_five_inputs_and_dtor_order result=pass"
+          checked_negatives=0
+          for file in "$fixtures"/edg_native_cxx2_bad_*.cpp; do
+            cp "$file" .
+            name="$(basename "$file")"
+            g++ -std=c++17 -Wall -Wextra -Werror -fsyntax-only "$name"
+            rm -f negative.o
+            if "$compiler" negative.o --typeid-native "$name" >negative.log 2>&1; then
+              echo "unsafe C++2 source was incorrectly accepted: $name" >&2
+              cat negative.log >&2
+              exit 1
+            fi
+            if test -e negative.o; then
+              echo "unsafe C++2 source emitted a partial object: $name" >&2
+              exit 1
+            fi
+            checked_negatives=$((checked_negatives+1))
+            echo "EDG_CXX2_NATIVE gate=fail_closed fixture=$name result=pass"
+          done
+          test "$checked_negatives" = 6
+          echo "EDG_CXX2_NATIVE gate=all_six_unsupported_shapes_rejected result=pass"
 
       - name: Preserve EDG lifetime graph and independent G++ execution evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: edg-cxx2-lifetime-probe
+          name: edg-cxx2-native-executable
           path: ${{ runner.temp }}/edg-cxx2-lifetime-probe/
           if-no-files-found: ignore
