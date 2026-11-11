@@ -1,0 +1,65 @@
+name: Mini-C native TypeId generic allocator M4 profile PR1004
+on:
+  push:
+    branches: [ci/verify-typeid-m4-alloc-profile-1004-20261111]
+    paths: ['.github/workflows/verify-typeid-m4-alloc-profile-1004.yml']
+permissions:
+  contents: read
+jobs:
+  native-verified-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ca728c9f44ff2a7384346b67984adf1f57639704
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest source pin and physical retirement of ordinary Function tests
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = ca728c9f44ff2a7384346b67984adf1f57639704
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path('compiler/tools/mini-c-driver/tests/unit/lib.rs').read_text()
+          assert 'lower_source(' not in s, 'legacy Function source probes still present'
+          assert 'fn m4_register_allocation_profile()' in s
+          assert 'native_regalloc::stats(f)' in s
+          assert 'TYPEID_M4_ALLOC,' in s
+          assert 'profile_allocation(f,budget)' not in s
+          assert 'use compiler_backend::Backend;' not in s
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: minic-native-m4-1004
+      - name: Full standalone checked C tests and GCC/ELF/TLS/C11 acceptance
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib -- --test-threads=2
+          M4_REPETITIONS=3 cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib tests::m4_register_allocation_profile -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/typeid-m4-allocation-profile.log"
+          grep -F 'TYPEID_M4_ALLOC,pressure_16_locals' "$RUNNER_TEMP/typeid-m4-allocation-profile.log"
+          grep -F 'TYPEID_M4_ALLOC,loops_calls' "$RUNNER_TEMP/typeid-m4-allocation-profile.log"
+          grep -F 'TYPEID_M4_ALLOC,short_circuit' "$RUNNER_TEMP/typeid-m4-allocation-profile.log"
+          grep -F 'TYPEID_M4_ALLOC,division_effects' "$RUNNER_TEMP/typeid-m4-allocation-profile.log"
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --test typeid_cli -- --test-threads=2
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --test m4_8_source_native -- --test-threads=1
+          cargo build --manifest-path tools/mini-c-driver/Cargo.toml --bin compiler-mini-c
+          python3 tools/mini-c-driver/tests/differential.py --compiler tools/mini-c-driver/target/debug/compiler-mini-c --seed-count 2 --steps 60 --ct04-seed-count 1 --m10-compound-seed-count 1 --artifacts target/ir-pr1004-diff
+          cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml --all-targets -- -D warnings
+      - name: Unified TypeId x86 checked-source execution and strict lint
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test f6_source_runtime_parity f6_x86_source_default_and_explicit_typeid_execute_same_c11_oracle -- --test-threads=1
+          cargo test -p compiler --test mini_c_cli --test ir_default_cli -- --test-threads=2
+          cargo test -p compiler --bin compiler -- --test-threads=2
+          cargo test -p compiler-ir -p compiler-opt --lib -- --test-threads=2
+          cargo clippy -p compiler -p compiler-ir -p compiler-opt --all-targets -- -D warnings
