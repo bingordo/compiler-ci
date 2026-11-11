@@ -1,0 +1,147 @@
+name: X7 batch all Intel ISL operations with pinned cache and blocker triage
+on:
+  push:
+    branches: [ci/x7-full-isl-batch-20261110]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fixture-fast:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Checkout exact compiler revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7a628670abec1a09bc1340b1f32a0a3b3d8701ca
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Validate bounded parallel cache and deterministic CLI
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 7a628670abec1a09bc1340b1f32a0a3b3d8701ca
+          python3 -m py_compile tools/x86_isl_batch.py tools/x86_isl_corpus.py tools/test_x86_isl_corpus.py
+          python3 -m unittest discover -s tools -p 'test_x86_isl_corpus.py' -v
+          python3 -m unittest discover -s tools -p 'test_x86_isl_semantic_corpus_report.py' -v
+          echo X7_BATCH_FIXTURE_PASS
+  syntax:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7a628670abec1a09bc1340b1f32a0a3b3d8701ca
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require exact pinned compiler SHA
+        run: test "$(git rev-parse HEAD)" = 7a628670abec1a09bc1340b1f32a0a3b3d8701ca
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: 5.4.1
+      - name: Clone exact Intel parser and build standalone AST exporter
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libgmp-dev pkg-config cmake libz3-dev
+          git clone --filter=blob:none https://github.com/IntelLabs/isa-tools.git /tmp/isa-tools
+          git -C /tmp/isa-tools checkout 16260979137c38339743a04b7fd5d9f0fa8a6ee5
+          git -C /tmp/isa-tools submodule update --init --recursive
+          cp tools/x86_isl_ast_export.ml tools/x86_isl_ast_json.ml /tmp/isa-tools/bin/
+          cat >> /tmp/isa-tools/bin/dune <<'EOF'
+          (executable
+           (name x86_isl_ast_export)
+           (modules x86_isl_ast_export x86_isl_ast_json)
+           (libraries libISA yojson))
+          EOF
+          cd /tmp/isa-tools
+          opam install --switch="$GITHUB_WORKSPACE" . --deps-only --yes
+          opam exec --switch="$GITHUB_WORKSPACE" -- dune build bin/x86_isl_ast_export.exe
+          test -x _build/default/bin/x86_isl_ast_export.exe
+      - name: Validate parser AST protocol and failure accounting
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools -p 'test_x86_isl_corpus.py' -v
+          python3 -m unittest discover -s tools -p 'test_x86_isl_loop_inventory.py' -v
+          python3 tools/verify_x86_isl_ast_examples.py --parser /tmp/isa-tools/_build/default/bin/x86_isl_ast_export.exe
+      - name: Fetch pinned complete Intel instruction corpus
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --sparse https://github.com/intel/SDM.git /tmp/intel-sdm
+          git -C /tmp/intel-sdm fetch --depth 1 origin 35eface1b7ee003a1cda95005ec5fd83de658a64
+          git -C /tmp/intel-sdm checkout 35eface1b7ee003a1cda95005ec5fd83de658a64
+          git -C /tmp/intel-sdm sparse-checkout set data/instruction
+      - name: Benchmark serial, cold parallel, warm cached all 1641 Intel operations
+        run: |
+          set -euo pipefail
+          root=/tmp/intel-sdm/data/instruction
+          parser=/tmp/isa-tools/_build/default/bin/x86_isl_ast_export.exe
+          parser_rev=16260979137c38339743a04b7fd5d9f0fa8a6ee5
+          intel_rev=35eface1b7ee003a1cda95005ec5fd83de658a64
+          /usr/bin/time -f '%e' -o /tmp/x7-serial-seconds.txt \
+            python3 tools/x86_isl_corpus.py --xml-dir "$root" --parser "$parser" \
+              --jobs 1 --out /tmp/x7-serial.json --require-parsed 1641 \
+              --parser-revision "$parser_rev" --corpus-revision "$intel_rev"
+          /usr/bin/time -f '%e' -o /tmp/x7-parallel-seconds.txt \
+            python3 tools/x86_isl_corpus.py --xml-dir "$root" --parser "$parser" \
+              --jobs 8 --cache-dir /tmp/x7-isl-ast-cache \
+              --out /tmp/x7-parallel.json --triage-out /tmp/x7-isl-triage.json \
+              --semantic-features-report /tmp/x7-semantic-features.json \
+              --loop-report /tmp/x7-loop-inventory.json --require-parsed 1641 \
+              --parser-revision "$parser_rev" --corpus-revision "$intel_rev"
+          /usr/bin/time -f '%e' -o /tmp/x7-warm-seconds.txt \
+            python3 tools/x86_isl_corpus.py --xml-dir "$root" --parser "$parser" \
+              --jobs 8 --cache-dir /tmp/x7-isl-ast-cache \
+              --out /tmp/x7-warm.json --triage-out /tmp/x7-isl-warm-triage.json \
+              --require-parsed 1641 \
+              --parser-revision "$parser_rev" --corpus-revision "$intel_rev"
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          root=Path('/tmp')
+          serial=json.loads((root/'x7-serial.json').read_text())
+          cold=json.loads((root/'x7-parallel.json').read_text())
+          warm=json.loads((root/'x7-warm.json').read_text())
+          triage=json.loads((root/'x7-isl-triage.json').read_text())
+          warm_triage=json.loads((root/'x7-isl-warm-triage.json').read_text())
+          loops=json.loads((root/'x7-loop-inventory.json').read_text())
+          assert serial['operations'] == cold['operations'] == warm['operations']
+          assert serial['summary'] == cold['summary'] == warm['summary']
+          assert serial['summary']['status_counts'] == {'parsed': 1641}
+          assert cold['batch']['parser_invocations'] == cold['batch']['unique_bodies']
+          assert cold['batch']['cache_hits'] == 0
+          assert warm['batch']['cache_hits'] == warm['batch']['unique_bodies']
+          assert warm['batch']['parser_invocations'] == 0
+          assert cold['summary']['operations'] == 1641
+          assert triage == warm_triage
+          assert triage['summary']['operations'] == 1641
+          assert triage['summary']['semantically_proven'] == 0
+          assert triage['summary']['selection_eligible'] == 0
+          assert all(not r['production_selection_eligible'] and
+                     not r['semantic_proven'] for r in triage['operations'])
+          assert loops['operations_scanned'] == 1641
+          assert loops['total_loops'] == 1077
+          assert loops['loop_kinds'] == {'For': 1075, 'While': 2}
+          elapsed={k:float((root/f'x7-{k}-seconds.txt').read_text().strip())
+                   for k in ('serial','parallel','warm')}
+          print('X7_FULL_ISL_BATCH_PARITY_PASS',serial['summary'])
+          print('X7_FULL_ISL_BATCH_SPEED',elapsed)
+          print('X7_FULL_ISL_BATCH_ACCOUNTING',cold['batch'],warm['batch'])
+          (root/'x7-batch-benchmark.json').write_text(
+              json.dumps({'elapsed_seconds':elapsed,'cold':cold['batch'],
+                          'warm':warm['batch']},sort_keys=True,indent=2)+'\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-intel-isl-batch-cache-and-triage
+          path: |
+            /tmp/x7-serial.json
+            /tmp/x7-parallel.json
+            /tmp/x7-warm.json
+            /tmp/x7-isl-triage.json
+            /tmp/x7-semantic-features.json
+            /tmp/x7-loop-inventory.json
+            /tmp/x7-batch-benchmark.json
+          if-no-files-found: ignore
