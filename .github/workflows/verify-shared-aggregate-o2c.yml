@@ -1,0 +1,90 @@
+name: Source-pinned shared aggregate and Oberon O2c.1 validation
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-shared-aggregate-o2c.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-records:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      COMPILER_SHA: 827ad2313496dc2a1f7d9296f0ebe49a96a1735c
+      OBERON_SHA: 6d323d19aee142642e5c45fbef7fb611ca3c740e
+    steps:
+      - name: Checkout exact private compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 827ad2313496dc2a1f7d9296f0ebe49a96a1735c
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Prove exact source pins and prepare public frontends
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          grep -F "$OBERON_SHA" compiler/crates/driver/Cargo.toml
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          echo "compiler=$COMPILER_SHA frontend=$OBERON_SHA target=${{ matrix.target }}" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: shared-aggregate-o2c-v1-${{ matrix.target }}
+      - name: Test aggregate registry and native compiler frontend
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-ir --test aggregate_layout
+          cargo test -p compiler --bin compiler
+          cargo clippy -p compiler-ir -p compiler --all-targets -- -D warnings
+          cargo build -p compiler --bin compiler
+      - name: Execute checked Oberon record C oracle through GAS and ELF
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p oracle
+          cat > oracle/Records.mod <<'EOF'
+          MODULE Records;
+          TYPE Pair = RECORD a,b: INTEGER END;
+          VAR p: Pair;
+          PROCEDURE Add*(n: INTEGER): INTEGER;
+          BEGIN
+            p.a := n;
+            p.b := p.a + 1;
+            RETURN p.a + p.b
+          END Add;
+          END Records.
+          EOF
+          cat > oracle/main.c <<'EOF'
+          #include <stdint.h>
+          extern int32_t Records__Add(int32_t);
+          int main(void) {
+              return Records__Add(20) != 41 || Records__Add(5) != 11;
+          }
+          EOF
+          for format in obj asm; do
+            if [ "$format" = obj ]; then
+              suffix=o
+            else
+              suffix=s
+            fi
+            compiler/target/debug/compiler oracle/Records.mod \
+              --language oberon --target ${{ matrix.target }} --emit "$format" \
+              -o "oracle/Records.$suffix"
+            cc -O2 oracle/main.c "oracle/Records.$suffix" -o "oracle/test-$format"
+            "oracle/test-$format"
+            echo "source→TypeId→$format→C: PASS (${{ matrix.target }})" >> "$GITHUB_STEP_SUMMARY"
+          done
