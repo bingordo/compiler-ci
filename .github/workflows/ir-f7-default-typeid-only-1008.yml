@@ -1,0 +1,74 @@
+name: IR F7 Mini-C default build legacy Function cutover PR1008
+on:
+  push:
+    branches: [ci/ir-f7-default-typeid-only-1008-20261111]
+    paths: ['.github/workflows/ir-f7-default-typeid-only-1008.yml']
+permissions:
+  contents: read
+jobs:
+  native-verified-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ee9bdb09f53df08d5fe0713cea5a447b33f944fb
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest source pin and physical retirement of ordinary Function tests
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = ee9bdb09f53df08d5fe0713cea5a447b33f944fb
+          python3 - <<'PY'
+          from pathlib import Path
+          base=Path('compiler/tools/mini-c-driver')
+          lib=(base/'src/lib.rs').read_text()
+          assert 'pub fn lower_source(source: &str)' not in lib, 'public legacy Function Mini-C API remains'
+          assert 'fn typed_minic_to_legacy(' in lib
+          assert lib.count('#[cfg(any(feature = "legacy-experimental-ssa", feature = "experimental-fusion-benchmark"))]')>=9
+          assert 'pub fn lower_source_native_typeid(source: &str)' in lib
+          for filename in ['shared_select_allocation_metrics.rs','shared_select_physical_costs.rs']:
+              code=(base/'examples'/filename).read_text()
+              assert 'compiler_mini_c::lower_source(' not in code
+              assert 'compiler_mini_c::lower_source_native_typeid(' in code
+              assert 'native_typeid::select(&module)' in code or 'compiler_backend_x86::native_typeid::select(&module)' in code
+          tests=(base/'tests/unit/lib.rs').read_text()
+          assert 'lower_source(' not in tests and 'lower_source_raw_module_abi(' not in tests
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: minic-default-native-1008
+      - name: Full standalone checked C tests and GCC/ELF/TLS/C11 acceptance
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib -- --test-threads=2
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --test typeid_cli -- --test-threads=2
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --test m4_8_source_native -- --test-threads=1
+          cargo build --manifest-path tools/mini-c-driver/Cargo.toml --bin compiler-mini-c
+          python3 tools/mini-c-driver/tests/differential.py --compiler tools/mini-c-driver/target/debug/compiler-mini-c --seed-count 2 --steps 60 --ct04-seed-count 1 --m10-compound-seed-count 1 --artifacts target/ir-pr1008-diff
+          cargo run --manifest-path tools/mini-c-driver/Cargo.toml --example shared_select_allocation_metrics 2>&1 | tee "$RUNNER_TEMP/f7-native-allocation.log"
+          grep -F 'branches_144,' "$RUNNER_TEMP/f7-native-allocation.log"
+          grep -F 'loop_24,' "$RUNNER_TEMP/f7-native-allocation.log"
+          cargo run --manifest-path tools/mini-c-driver/Cargo.toml --example shared_select_physical_costs 2>&1 | tee "$RUNNER_TEMP/f7-native-physical-costs.log"
+          grep -F 'branches_144,SKL,' "$RUNNER_TEMP/f7-native-physical-costs.log"
+          grep -F 'branches_144,ZEN4,' "$RUNNER_TEMP/f7-native-physical-costs.log"
+          cargo check --manifest-path tools/mini-c-driver/Cargo.toml --all-targets --features legacy-experimental-ssa
+          cargo check --manifest-path tools/mini-c-driver/Cargo.toml --all-targets --features experimental-fusion-benchmark
+          cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml --all-targets -- -D warnings
+      - name: Unified TypeId x86 checked-source execution and strict lint
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test f6_source_runtime_parity f6_x86_source_default_and_explicit_typeid_execute_same_c11_oracle -- --test-threads=1
+          cargo test -p compiler --test mini_c_cli --test ir_default_cli -- --test-threads=2
+          cargo test -p compiler --bin compiler -- --test-threads=2
+          cargo test -p compiler-ir -p compiler-opt --lib -- --test-threads=2
+          cargo clippy -p compiler -p compiler-ir -p compiler-opt --all-targets -- -D warnings
