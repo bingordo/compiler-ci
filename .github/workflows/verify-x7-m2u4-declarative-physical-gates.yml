@@ -1,0 +1,142 @@
+name: X7 M2 U4 source-generated physical form feature gates replace opcode switches
+on:
+  push:
+    branches: [ci/x7-m2u4-generated-physical-gates-20261111]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout exact compiler N17 candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 6a0413dfe179f6666121c77ded4c3891c988f2bc
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Generate exact Intel-linked bitwise forms and exercise independent oracle
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 6a0413dfe179f6666121c77ded4c3891c988f2bc
+          mkdir -p /tmp/n17-intel /tmp/n17-native
+          revision=35eface1b7ee003a1cda95005ec5fd83de658a64
+          for name in MOV ADD SUB AND OR XOR; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 45 \
+              "https://raw.githubusercontent.com/intel/SDM/${revision}/data/instruction/${name}.xml" \
+              -o "/tmp/n17-intel/${name}.xml"
+          done
+          python3 tools/x86_g10_regen_physical_forms.py --xml-dir /tmp/n17-intel --check
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          generated=Path("crates/backend-x86/src/generated_x7_g10_physical_forms.rs").read_text()
+          selector=Path("crates/backend-x86/src/x7_late_selector.rs").read_text()
+          assert generated.count("compiler_gate: SourceFormGate::")==12
+          assert generated.count("SourceFormGate::NotApproved")==2
+          assert generated.count("SourceFormGate::Add32")==1
+          assert generated.count("SourceFormGate::Sub32")==1
+          assert generated.count("SourceFormGate::Logical32")==3
+          assert generated.count("SourceFormGate::Add64")==1
+          assert generated.count("SourceFormGate::Sub64")==1
+          assert generated.count("SourceFormGate::Logical64")==3
+          assert "fn compiler_form_enabled(" in selector
+          assert "fn reviewed_memory_read_form(" in selector
+          assert "if kind == IntBinOp::Sub" not in selector
+          print("X7_PHYSICAL_GATE_GENERATED_FORM_PARITY_PASS")
+          PY
+          python3 tools/regen_x86_forms.py --check
+          python3 -m unittest discover -s tools -p 'test_x86_g10_native_iforms.py' -v
+          python3 tools/x86_g10_native_iforms.py --xml-dir /tmp/n17-intel --out-dir /tmp/n17-native
+          cc -O2 -std=c11 -Wall -Wextra -Werror -fno-strict-aliasing \
+            tools/tests/x86_g10_native_iforms.c /tmp/n17-native/native_forms.S \
+            -o /tmp/n17-native/oracle
+          /tmp/n17-native/oracle
+          python3 tools/x86_g10_validate_native_bytes.py \
+            --binary /tmp/n17-native/oracle \
+            --evidence /tmp/n17-native/source_form_evidence.json
+      - name: All five default and explicit-feature form matrix and native tests
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          """)
+          PY
+          cargo test -p compiler-backend-x86 \
+            --test x7_g10_n17_default_five_forms --offline
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --features x7-c-defined-add \
+            --test x7_g10_n17_default_five_forms --offline
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --features x7-c-defined-sub \
+            --test x7_g10_n17_default_five_forms --offline
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --features x7-c-defined-bitwise \
+            --test x7_g10_n17_default_five_forms --offline
+          cargo test -p compiler-backend-x86 \
+            --test x7_g10_n16_bitwise_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 \
+            --test x7_g10_n14_sub_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 \
+            --lib x7_native_form_bridge --offline
+          cargo test -p compiler-backend-x86 \
+            --lib x7_late_selector --offline
+          cargo test -p compiler-backend-x86 \
+            --features x7-c-defined-64 \
+            --test x7_g10_n19_64_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 \
+            --no-default-features \
+            --lib x7_late_selector --offline
+          cargo test --release -p compiler-backend-x86 \
+            --features x7-c-defined-64 \
+            --test x7_g10_n20c_compile_benchmark --offline -- --nocapture \
+            | tee /tmp/x7-m2u4-physical-native-bench.log
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          lines=[l for l in Path('/tmp/x7-m2u4-physical-native-bench.log').read_text().splitlines()
+                 if 'X7_N20C_BENCH_JSON ' in l]
+          assert len(lines)==1
+          d=json.loads(lines[0].split('X7_N20C_BENCH_JSON ',1)[1])
+          assert (d['selected_total'],d['selected_single'],d['selected_branch'],
+                  d['selected_pressure'],d['text_bytes_saved'])==(120,60,60,0,360),d
+          print('X7_M2U4_PHYSICAL_SELECTOR_MACHINE_PARITY_PASS')
+          PY
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --test x7_g10_n15_no_default_fallback --offline
+          echo X7_N17_DEFAULT_FIVE_NATIVE_PASS
+  full-workspace:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact compiler N17 candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 6a0413dfe179f6666121c77ded4c3891c988f2bc
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Authorize private frontend git dependencies
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub host key and install debugger
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+          sudo apt-get update -qq
+          sudo apt-get install -y gdb
+      - name: Full workspace with default bitwise and strict/opt-out regressions
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 6a0413dfe179f6666121c77ded4c3891c988f2bc
+          cargo test --workspace
+          cargo test -p compiler-backend-x86 \
+            --features x7-c-defined-bitwise,x7-native-form-validation
+          cargo test -p compiler-backend-x86 --no-default-features
+          echo X7_N17_FULL_WORKSPACE_PASS
