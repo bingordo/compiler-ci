@@ -1,0 +1,81 @@
+name: CT-11 checked loop-bearing TypeId source census
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/ct11-checked-loop-source-profile.yml']
+permissions:
+  contents: read
+concurrency:
+  group: ct11-checked-source-loops-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  checked-census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 72c6d1bf41db084eeff526042f858f5393be47e7
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pinned source and diagnostic syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          test "$(git -C compiler rev-parse HEAD)" = 72c6d1bf41db084eeff526042f858f5393be47e7
+          git -C compiler rev-parse HEAD | tee results/compiler-sha.txt
+          rustc --version | tee results/toolchain.txt
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          python3 -m py_compile compiler/tools/ct11_loop_source_profile.py compiler/tools/s23_native_profile_source.py compiler/tools/source_compile_corpus.py
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ct11-checked-loop-source
+      - name: Native optimizer and checked frontend gates
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test --release -p compiler-opt --test typed_licm_native
+          cargo test --release -p compiler --test typeid_native_s2316_profile
+          cargo test --release -p compiler-opt --test native_s2316_profile
+          cargo clippy -p compiler-opt --lib -- -D warnings
+          cargo clippy -p compiler --bin compiler --test typeid_native_s2316_profile -- -D warnings
+          cargo build --release -p compiler --bin compiler
+      - name: Checked source branch, call, real loop and nested-loop census
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/ct11_loop_source_profile.py \
+            --compiler compiler/target/release/compiler \
+            --output results/ct11-loop-source.json --rounds 3 \
+            2>&1 | tee results/ct11-loop-source.log
+          test "$(grep -c '^CT11_CHECKED_LOOP ' results/ct11-loop-source.log)" -eq 8
+          python3 - <<'PY'
+          import json
+          report=json.load(open('results/ct11-loop-source.json'))
+          assert report['case_count']==8,report['case_count']
+          assert len(report['cases_with_loops_at_licm'])>=1
+          for name,row in report['cases'].items():
+              assert row['object_sha256'] and row['sha256'],name
+              assert row['gcc_typeid_oracle_input_pairs']==36,name
+              assert row['gcc_typeid_oracle_digest'],name
+              assert row['phase_profile_median']['licm_core_preheader_loop_scans']>=1,name
+          print('CT11_LOOP_ASSERTIONS cases=8 detected_loops=',
+                report['cases_with_loops_at_licm'],flush=True)
+          PY
+          grep '^CT11_CHECKED_LOOP ' results/ct11-loop-source.log | tee -a "$GITHUB_STEP_SUMMARY"
+          grep '^CT11_LOOP_CENSUS ' results/ct11-loop-source.log | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ct11-checked-loop-source
+          path: results/
+          retention-days: 30
