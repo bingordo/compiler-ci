@@ -1,0 +1,163 @@
+name: Mini-C default library emitters TypeId-only PR948
+on:
+  push:
+    branches: [ci/verify-minic-no-implicit-legacy-948-20261111]
+    paths: ['.github/workflows/verify-minic-no-implicit-legacy-948.yml']
+permissions:
+  contents: read
+jobs:
+  ir-native-verification:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 11bef837204a2b77529c949629a385a828e44a13
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest source, isolate compiler libraries, provide DWARF debugger
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 11bef837204a2b77529c949629a385a828e44a13
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86","crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gdb
+      - name: Assert retired F3 legacy importer and feature are physically absent
+        run: |
+          set -euo pipefail
+          test ! -e compiler/crates/ir/src/native_source_bridge.rs
+          test ! -e compiler/crates/ir/tests/native_source_bridge.rs
+          if rg -n 'native_source_bridge|legacy-source-import' compiler/crates compiler/tools compiler/.github compiler/Cargo.toml; then
+            echo 'Obsolete legacy source import still has code/CI consumers' >&2
+            exit 1
+          fi
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: minic-no-implicit-legacy-948
+      - name: Native IR, optimizer, x86, AArch64 complete unit and integration suites
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 -- --test-threads=2
+      - name: Strict all-targets Clippy for native and old-format compatibility tests
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --all-targets -- -D warnings
+          cargo clippy -p compiler-opt --features legacy-experimental-ssa --all-targets -- -D warnings
+  source-c11-cross-architecture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      COMPILER_F6_AARCH64_QEMU: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 11bef837204a2b77529c949629a385a828e44a13
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin exact source, resolve frontends and install actual QEMU cross tools
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 11bef837204a2b77529c949629a385a828e44a13
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user gdb
+          command -v aarch64-linux-gnu-gcc
+          command -v qemu-aarch64
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: minic-no-implicit-legacy-948-compiler
+      - name: Run exact source CLI differential (56 independent linked native executions)
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test f6_source_runtime_parity -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/f6-source.log"
+          test "$(grep -c 'F6_SOURCE_EXEC target=' "$RUNNER_TEMP/f6-source.log")" -eq 56
+          grep -F 'test result: ok. 4 passed; 0 failed' "$RUNNER_TEMP/f6-source.log"
+          test "$(grep -c 'F6_SOURCE_EXEC target=aarch64' "$RUNNER_TEMP/f6-source.log")" -eq 24
+          test "$(grep -c 'F6_SOURCE_EXEC target=x86_64' "$RUNNER_TEMP/f6-source.log")" -eq 32
+          ! grep -F 'F6_SOURCE_AARCH64_SKIPPED' "$RUNNER_TEMP/f6-source.log"
+      - name: Existing default TypeId/explicit rollback source and real Mini-C integration
+        working-directory: compiler
+        run: |
+          cargo test -p compiler --test ir_default_cli --test mini_c_cli --test typeid_elf_linker_matrix -- --test-threads=2
+          cargo test -p compiler --bin compiler -- --test-threads=2
+          cargo test -p compiler-backend-aarch64
+      - name: Strict frontend and target source lint
+        working-directory: compiler
+        run: cargo clippy -p compiler -p compiler-backend-aarch64 --all-targets -- -D warnings
+      - name: Capture failed source oracle
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: minic-no-implicit-legacy-948-failure
+          path: ${{ runner.temp }}/f6-source.log
+          if-no-files-found: ignore
+          retention-days: 14
+  standalone-mini-c:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 11bef837204a2b77529c949629a385a828e44a13
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin exact source for standalone producer and rollback
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 11bef837204a2b77529c949629a385a828e44a13
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: minic-no-implicit-legacy-948-standalone
+      - name: Standalone checked Mini-C TypeId default and explicit legacy rollback
+        working-directory: compiler
+        run: |
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib -- --test-threads=2
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --test typeid_cli -- --test-threads=2
+      - name: Standalone original C differential against GCC
+        working-directory: compiler
+        run: |
+          cargo build --manifest-path tools/mini-c-driver/Cargo.toml --bin compiler-mini-c
+          python3 tools/mini-c-driver/tests/differential.py \
+            --compiler tools/mini-c-driver/target/debug/compiler-mini-c \
+            --seed-count 2 --steps 60 --ct04-seed-count 1 --m10-compound-seed-count 1 \
+            --artifacts target/minic-no-implicit-legacy-948-repro
+      - name: Ensure public Mini-C convenience entrypoints do not reach legacy backend
+        working-directory: compiler
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          text = Path("tools/mini-c-driver/src/lib.rs").read_text()
+          for api in ("compile_object", "compile_object_with_frame_pointer",
+                      "compile_object_omitting_unreferenced_static_bodies",
+                      "compile_assembly_with_frame_pointer"):
+              if f"pub fn {api}(" not in text:
+                  raise AssertionError(api + ": public source API missing")
+          assert "compile_native_typeid(source, false, false)" in text
+          assert "compile_native_typeid(source, frame_pointer, false)" in text
+          assert "compile_native_typeid_with_body_policy(source, frame_pointer, false, true)" in text
+          assert "compile_native_typeid(source, frame_pointer, true)" in text
+          PY
+      - name: Strict standalone Mini-C lint
+        working-directory: compiler
+        run: cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml --all-targets -- -D warnings
