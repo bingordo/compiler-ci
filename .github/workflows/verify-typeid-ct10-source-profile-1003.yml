@@ -1,0 +1,66 @@
+name: Mini-C CT10 native TypeId optimizer profiling parity PR1003
+on:
+  push:
+    branches: [ci/verify-typeid-ct10-source-profile-1003-20261111]
+    paths: ['.github/workflows/verify-typeid-ct10-source-profile-1003.yml']
+permissions:
+  contents: read
+jobs:
+  native-verified-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 39200cda81f6dd5ea42458c3788da5c119aeb402
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest source pin and physical retirement of ordinary Function tests
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 39200cda81f6dd5ea42458c3788da5c119aeb402
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path('compiler/tools/mini-c-driver/tests/unit/lib.rs').read_text()
+          assert s.count('lower_source(')==1, 'unexpected old source Function test calls'
+          assert 'lower_source_raw_linked(source)' not in s
+          assert 'fn ct10_real_mini_c_typeid_source_profile()' in s
+          assert 'CT10_TYPEID_STAGE' in s
+          assert 'CT10_REAL_STAGE' not in s
+          cargo=Path('compiler/tools/mini-c-driver/Cargo.toml').read_text()
+          assert 'ct10-verifier-source-profile = []' in cargo
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: minic-native-ct10-1003
+      - name: Full standalone checked C tests and GCC/ELF/TLS/C11 acceptance
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib -- --test-threads=2
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --features ct10-verifier-source-profile --lib tests::ct10_real_mini_c_typeid_source_profile -- --exact --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/ct10-typeid-source.log"
+          grep -F 'CT10_TYPEID_SOURCE,language=mini_c,case=branches' "$RUNNER_TEMP/ct10-typeid-source.log"
+          grep -F 'CT10_TYPEID_SOURCE,language=mini_c,case=loops_calls' "$RUNNER_TEMP/ct10-typeid-source.log"
+          grep -F 'CT10_TYPEID_STAGE,language=mini_c' "$RUNNER_TEMP/ct10-typeid-source.log"
+          cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml --features ct10-verifier-source-profile --all-targets -- -D warnings
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --test typeid_cli -- --test-threads=2
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --test m4_8_source_native -- --test-threads=1
+          cargo build --manifest-path tools/mini-c-driver/Cargo.toml --bin compiler-mini-c
+          python3 tools/mini-c-driver/tests/differential.py --compiler tools/mini-c-driver/target/debug/compiler-mini-c --seed-count 2 --steps 60 --ct04-seed-count 1 --m10-compound-seed-count 1 --artifacts target/ir-pr1003-diff
+          cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml --all-targets -- -D warnings
+      - name: Unified TypeId x86 checked-source execution and strict lint
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test f6_source_runtime_parity f6_x86_source_default_and_explicit_typeid_execute_same_c11_oracle -- --test-threads=1
+          cargo test -p compiler --test mini_c_cli --test ir_default_cli -- --test-threads=2
+          cargo test -p compiler --bin compiler -- --test-threads=2
+          cargo test -p compiler-ir -p compiler-opt --lib -- --test-threads=2
+          cargo clippy -p compiler -p compiler-ir -p compiler-opt --all-targets -- -D warnings
