@@ -1,0 +1,145 @@
+name: X7 B3 source-linked real Intel operation Z3 model worker
+on:
+  push:
+    branches: [ci/x7-b3-source-model-worker-20261111]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fixture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a71226c47be6dce709767fab2c4003f800bcc636
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Install pinned independent SMT engine
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/x7-worker-venv
+          /tmp/x7-worker-venv/bin/python -m pip install --disable-pip-version-check 'z3-solver==4.13.4.0'
+      - name: Verify fixture source model and negative mutation/identity tests
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = a71226c47be6dce709767fab2c4003f800bcc636
+          python3 -m py_compile tools/x86_isl_operation_proof_worker.py tools/test_x86_isl_operation_proof_worker.py
+          /tmp/x7-worker-venv/bin/python -m unittest discover -s tools -p 'test_x86_isl_operation_proof_worker.py' -v
+          /tmp/x7-worker-venv/bin/python -m unittest discover -s tools -p 'test_x86_isl_smt_verify.py' -v
+          echo X7_SOURCE_MODEL_WORKER_FIXTURE_PASS
+  pinned-intel-mov:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a71226c47be6dce709767fab2c4003f800bcc636
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Exact compiler checkout and pinned Z3
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = a71226c47be6dce709767fab2c4003f800bcc636
+          python3 -m venv /tmp/x7-worker-venv
+          /tmp/x7-worker-venv/bin/python -m pip install --disable-pip-version-check 'z3-solver==4.13.4.0'
+          /tmp/x7-worker-venv/bin/python -c 'import z3; print("X7_B3_Z3_VERSION",z3.get_version_string())'
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: 5.4.1
+      - name: Build actual pinned upstream Intel ISL grammar AST exporter
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libgmp-dev pkg-config cmake libz3-dev
+          git clone --filter=blob:none https://github.com/IntelLabs/isa-tools.git /tmp/isa-tools
+          git -C /tmp/isa-tools checkout 16260979137c38339743a04b7fd5d9f0fa8a6ee5
+          git -C /tmp/isa-tools submodule update --init --recursive
+          cp tools/x86_isl_ast_export.ml tools/x86_isl_ast_json.ml /tmp/isa-tools/bin/
+          cat >> /tmp/isa-tools/bin/dune <<'EOF'
+          (executable
+           (name x86_isl_ast_export)
+           (modules x86_isl_ast_export x86_isl_ast_json)
+           (libraries libISA yojson))
+          EOF
+          cd /tmp/isa-tools
+          opam install --switch="$GITHUB_WORKSPACE" . --deps-only --yes
+          opam exec --switch="$GITHUB_WORKSPACE" -- dune build bin/x86_isl_ast_export.exe
+          test -x _build/default/bin/x86_isl_ast_export.exe
+      - name: Download complete exact Intel SDM 741-file source corpus
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/x7-b3-xml /tmp/x7-b3-proof
+          rev=35eface1b7ee003a1cda95005ec5fd83de658a64
+          curl --fail --silent --show-error --location --retry 2 --max-time 180 \
+            "https://codeload.github.com/intel/SDM/tar.gz/${rev}" -o /tmp/x7-b3-proof/intel.tar.gz
+          python3 - <<'PY'
+          import re,tarfile
+          from pathlib import Path
+          out=Path('/tmp/x7-b3-xml')
+          total=0
+          with tarfile.open('/tmp/x7-b3-proof/intel.tar.gz','r:gz') as tar:
+              for m in tar:
+                  if not m.isfile() or not re.fullmatch(
+                          r'[^/]+/data/instruction/[^/]+\.xml',m.name):
+                      continue
+                  assert 0<m.size<4*1024*1024
+                  data=tar.extractfile(m).read()
+                  assert len(data)==m.size
+                  (out/m.name.rsplit('/',1)[-1]).write_bytes(data)
+                  total+=1
+                  assert total<=900
+          assert total==741,total
+          PY
+      - name: Build exact source/queue and verify Intel MOV operation with independent Z3
+        run: |
+          set -euo pipefail
+          /usr/bin/time -f 'B2 index wall seconds %e' \
+            python3 tools/x86_iform_helper_dependencies.py \
+              --xml-dir /tmp/x7-b3-xml --out /tmp/x7-b3-proof/deps.json
+          /usr/bin/time -f 'B3 queue wall seconds %e' \
+            python3 tools/x86_iform_proof_work_dag.py \
+              --dependency-index /tmp/x7-b3-proof/deps.json \
+              --out /tmp/x7-b3-proof/work-queue.json
+          /usr/bin/time -f 'B3 MOV proof wall seconds %e' \
+            /tmp/x7-worker-venv/bin/python tools/x86_isl_operation_proof_worker.py \
+              --dependency-index /tmp/x7-b3-proof/deps.json \
+              --proof-work-queue /tmp/x7-b3-proof/work-queue.json \
+              --xml-dir /tmp/x7-b3-xml \
+              --parser /tmp/isa-tools/_build/default/bin/x86_isl_ast_export.exe \
+              --operation-name MOV --source-file MOV.xml \
+              --width 32 --jobs 4 --max-checks 1 --timeout-ms 2000 \
+              --cache-dir /tmp/x7-b3-proof/syntax-cache \
+              --out /tmp/x7-b3-proof/mov-proof.json
+          python3 - <<'PY'
+          import json
+          p='/tmp/x7-b3-proof/mov-proof.json'
+          r=json.load(open(p))
+          assert r['intel_sdm_commit']=='35eface1b7ee003a1cda95005ec5fd83de658a64'
+          assert r['operations_indexed']==1641,r['operations_indexed']
+          assert r['operations_reported']==1,r['operations_reported']
+          assert r['summary']['supported_source_model_equivalences']==1,r['summary']
+          assert r['summary']['full_architectural_semantic_proofs']==0
+          assert r['summary']['selection_eligible_forms']==0
+          row=r['operations'][0]
+          assert row['source_file']=='MOV.xml'
+          assert row['operation']=='MOV'
+          assert row['status']=='supported_model_equivalent',row
+          assert 'result' in row['checked_outputs']
+          assert row['model_proof_status']=='equivalent_to_supported_isl_model'
+          assert row['machine_semantics_proven'] is False
+          assert row['production_selection_eligible'] is False
+          assert r['parser_batch']['parser_invocations']==1
+          print('X7_B3_REAL_INTEL_MOV_MODEL_PROOF_PASS',row)
+          PY
+      - name: Archive source-linked actual Intel MOV operation proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-b3-real-intel-mov-source-model-proof
+          path: |
+            /tmp/x7-b3-proof/mov-proof.json
+          if-no-files-found: warn
+          retention-days: 14
