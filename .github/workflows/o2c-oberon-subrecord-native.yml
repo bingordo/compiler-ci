@@ -42,3 +42,65 @@ jobs:
             checked_oberon_inherited_record_layout_prefix_copies_execute_typeid -- --nocapture
       - name: Strict all-target driver Clippy
         run: cargo clippy --manifest-path compiler/Cargo.toml -p compiler --all-targets -- -D warnings
+
+  arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 3741b2748bc929c1ac5424342462fd18e5af3f8b
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and native architecture
+        run: |
+          test "$(uname -m)" = aarch64
+          test "$(git -C compiler rev-parse HEAD)" = 3741b2748bc929c1ac5424342462fd18e5af3f8b
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: oberon-subrecord-aarch64
+      - name: Execute real selected subrecord copies via AArch64 ELF and GAS
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo build -p compiler --bin compiler
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          cat > "$tmp/ArmSub.mod" <<'EOF'
+          MODULE ArmSub;
+          TYPE Pair=RECORD x,y:INTEGER END;
+               Outer=RECORD left,right:Pair END;
+          VAR state:Outer;
+          PROCEDURE Eval*(n:INTEGER):INTEGER;
+          VAR local:Outer; part:Pair;
+          BEGIN
+              part.x:=n; part.y:=n+1;
+              local.left:=part; local.right:=local.left;
+              state:=local;
+              RETURN state.left.x+10*state.right.y
+          END Eval;
+          END ArmSub.
+          EOF
+          cat > "$tmp/oracle.c" <<'EOF'
+          extern int ArmSub__Eval(int);
+          int main(void) {
+              return ArmSub__Eval(2)!=32 || ArmSub__Eval(7)!=87;
+          }
+          EOF
+          for fmt in obj asm; do
+            ext=o
+            if [ "$fmt" = asm ]; then ext=s; fi
+            ./target/debug/compiler "$tmp/ArmSub.mod" --language oberon \
+              --target aarch64 --ir typeid --emit "$fmt" -o "$tmp/native.$ext"
+            cc -std=c11 -O2 -no-pie "$tmp/oracle.c" "$tmp/native.$ext" -o "$tmp/test-$fmt"
+            "$tmp/test-$fmt"
+            echo "O2C_AARCH64_SUBRECORD_PASS format=$fmt" >> "$GITHUB_STEP_SUMMARY"
+          done
