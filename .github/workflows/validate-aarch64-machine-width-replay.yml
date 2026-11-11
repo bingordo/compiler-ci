@@ -10,13 +10,13 @@ permissions:
 
 jobs:
   aarch64-width-replay:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 3f40cbb2930ba61fc26669a3417854c7de745284
+          ref: 44593fd75e8cbec663dbcb741fa1ad1d3230468c
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -24,14 +24,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C compiler rev-parse HEAD)" = "3f40cbb2930ba61fc26669a3417854c7de745284"
+          test "$(git -C compiler rev-parse HEAD)" = "44593fd75e8cbec663dbcb741fa1ad1d3230468c"
           cat > compiler/Cargo.toml <<'EOF'
           [workspace]
           resolver = "2"
           members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
           EOF
           rm -f compiler/Cargo.lock
-          echo "Source SHA: 3f40cbb2930ba61fc26669a3417854c7de745284" >> "$GITHUB_STEP_SUMMARY"
+          echo "Source SHA: 44593fd75e8cbec663dbcb741fa1ad1d3230468c" >> "$GITHUB_STEP_SUMMARY"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: compiler -> target
@@ -44,13 +44,14 @@ jobs:
           cargo test --offline -p compiler-backend-aarch64 --test machine_text_v2 -- --nocapture
           cargo test --offline -p compiler-backend-aarch64 --test machine_text_v1
           cargo test --offline -p compiler-backend-aarch64 --lib real_native_typeid_aarch64_selection_is_machine_text_replayable
-      - name: Execute decoded AArch64 machine objects against independent C oracles under QEMU
+      - name: Execute decoded AArch64 machine objects against independent native ARM64 C oracles
         working-directory: compiler
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends gcc-aarch64-linux-gnu qemu-user
+          test "$(uname -m)" = aarch64
+          command -v cc
+          echo 'Native ARM64 runner: no QEMU or network-dependent package installation' >> "$GITHUB_STEP_SUMMARY"
           tmp="$(mktemp -d)"
           trap 'rm -rf "$tmp"' EXIT
           cat > "$tmp/answer32.ir" <<'EOF'
@@ -123,10 +124,10 @@ jobs:
               emit-object "$tmp/answer$bits.mir" "$tmp/answer$bits.o"
             cargo run --offline -p compiler-backend-aarch64 --bin aarch64-machine-ir -- \
               emit-asm "$tmp/answer$bits.mir" "$tmp/answer$bits.s"
-            aarch64-linux-gnu-gcc -static -O2 -fno-pie -no-pie -Wall -Wextra -Werror \
+            cc -O2 -Wall -Wextra -Werror \
               "$tmp/oracle$bits.c" "$tmp/answer$bits.o" -o "$tmp/answer$bits"
-            timeout 30 qemu-aarch64 "$tmp/answer$bits"
-            echo "PASS: native TypeId > selected v2 width-carrying machine SSA > AArch64 ELF > C$bits QEMU oracle"
+            timeout 30 "$tmp/answer$bits"
+            echo "PASS: native TypeId > selected v2 width-carrying machine SSA > AArch64 ELF > native ARM64 C$bits oracle"
           done
       - name: Strict backend Clippy
         working-directory: compiler
