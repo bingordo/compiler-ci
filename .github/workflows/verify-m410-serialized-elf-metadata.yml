@@ -1,0 +1,77 @@
+name: M4.10 seeded serialized ELF metadata acceptance
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-m410-serialized-elf-metadata.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  acceptance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      COMPILER_ELF_REQUIRE_LLVM: '1'
+    steps:
+      - name: Checkout exact ELF implementation
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: fdf79407e9caf75e6fc77f9eda6ade36da57fe5d
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned source and new mutation test
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "fdf79407e9caf75e6fc77f9eda6ade36da57fe5d"
+          grep -q m410_seeded_serialized_elf_metadata_rejection crates/backend/src/elf.rs
+          grep -q m410_init_array_rejects_zero_extent_constructor crates/backend/src/elf.rs
+          echo "ELF M4.10 pinned candidate: fdf79407e9caf75e6fc77f9eda6ade36da57fe5d" >> "$GITHUB_STEP_SUMMARY"
+      - name: Resolve pinned public frontend dependencies
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - name: Verify GNU/LLVM toolchains
+        run: |
+          set -euo pipefail
+          if ! command -v ld.lld >/dev/null || ! command -v gdb >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y lld gdb
+          fi
+          command -v gcc
+          command -v clang
+          command -v ld.lld
+          command -v gdb
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m410-elf-serialized-meta-v1
+      - name: Focused 256-seed serialized corruption acceptance
+        working-directory: compiler
+        run: cargo test -p compiler-backend --lib m410_seeded_serialized_elf_metadata_rejection -- --nocapture
+      - name: Empty constructor rejection and existing ELF writer mutation gate
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend --lib m410_init_array_rejects_zero_extent_constructor -- --nocapture
+          cargo test -p compiler-backend --lib m410_elf_section_symbol_relocation_mutation_matrix -- --nocapture
+          cargo test -p compiler-backend --test x86_elf_contract
+      - name: Complete backend ELF and ABI regressions
+        working-directory: compiler
+        run: cargo test -p compiler-backend --all-targets --no-fail-fast
+      - name: Real checked C TypeId ELF PIC RBP and native linkers
+        working-directory: compiler
+        run: |
+          cargo test -p compiler --test typeid_pic_frame_shared
+          cargo test -p compiler --test typeid_pic_shared
+          cargo test -p compiler --test typeid_frame_pointer
+          cargo test -p compiler --test typeid_elf_linker_matrix
+      - name: Full IR optimizer x86 and AArch64 regression
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --features compiler-backend-x86/x7-native-form-validation
+      - name: Strict all-target Clippy
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --features compiler-backend-x86/x7-native-form-validation --all-targets -- -D warnings
+          cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
