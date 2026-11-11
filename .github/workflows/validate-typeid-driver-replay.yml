@@ -1,0 +1,56 @@
+name: Validate TypeId production driver dump and replay
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/validate-typeid-driver-replay.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  driver-replay:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Configure read-only SSH for private source and pinned frontends
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub SSH host
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 6f05c218dc9cd569da2a862866e3b44c045fce14
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check source SHA and toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 6f05c218dc9cd569da2a862866e3b44c045fce14
+          echo 'Compiler source: 6f05c218dc9cd569da2a862866e3b44c045fce14' >> "$GITHUB_STEP_SUMMARY"
+          rustc --version
+          cargo --version
+          cc --version | head -n1
+      - name: Reuse compiler build objects
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-driver-ir-replay
+      - name: Production CLI TypeId text/binary dump and reloaded backend tests
+        working-directory: compiler
+        run: cargo test -p compiler --test typeid_ir_dump_replay -- --nocapture
+      - name: Existing TypeId CLI and optimizer pass replay regression suites
+        working-directory: compiler
+        run: |
+          cargo test -p compiler --test ir_default_cli -- --nocapture
+          cargo test -p compiler-opt --test native_ir_pass_replay -- --nocapture
+      - name: Strict driver Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler --all-targets -- -D warnings
