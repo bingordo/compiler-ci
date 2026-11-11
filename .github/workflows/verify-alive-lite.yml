@@ -38,7 +38,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ inputs.source_ref || 'main' }}
+          ref: ${{ inputs.source_ref || '78b736b1953f5680c87ab69d8c14e69e4541c49b' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -117,6 +117,8 @@ jobs:
           ):
               if not re.search(r'test alive_lite_codec::'+test+r' \.\.\. ok', log):
                   raise SystemExit(f'Missing passing replay regression: {test}')
+          if not re.search(r'test alive_lite_typeid::al02_source_pipeline_compositions_changed_and_replayable \.\.\. ok', log):
+              raise SystemExit('AL-02 composed default TypeId source non-Z3 replay missing')
           if not re.search(r'test alive_lite_typeid::al02_typeid_witnesses_are_changed_replayable_and_catalogued \.\.\. ok', log):
               raise SystemExit('AL-02 changed TypeId/replay controls missing')
           if not re.search(r'test seeded_select_corpus_is_replayable_and_distinct \.\.\. ok', log):
@@ -339,6 +341,25 @@ jobs:
                   evidence.write(json.dumps(row, sort_keys=True)+'\n')
           if not all(row.get('policy') == ('select_capable' if row['stage'] == 'if_conversion' else 'default') for row in proven):
               raise SystemExit('AL-02 proof stage policy is not recorded accurately')
+          composed = [
+              json.loads(line.split('AL02_TYPEID_SOURCE_LEDGER ',1)[1])
+              for line in log.splitlines() if 'AL02_TYPEID_SOURCE_LEDGER ' in line
+          ]
+          if {row['fixture'] for row in composed} != {
+              'arithmetic_trap_cse', 'guarded_phi_constant'
+          } or len(composed) != 2:
+              raise SystemExit('Missing distinct whole TypeId source-composition proofs')
+          if not all(row['path'] == 'optimize_typeid_source'
+                     and row['changed'] is True and row['changes'] > 0
+                     and row['verdict'] == 'PROVEN' for row in composed):
+              raise SystemExit('Whole production TypeId transaction not changed and SMT-proven')
+          if 'AL02_TYPEID_SOURCE_SUMMARY transactions=2 changed_proven=2 policy=default_select_disabled verdict=PROVEN' not in log:
+              raise SystemExit('AL-02 source-pipeline composition summary missing')
+          with open('../alive-lite-typeid-source-proofs.jsonl','w') as evidence:
+              for row in composed:
+                  row['source_sha'] = '${{ steps.source.outputs.sha }}'
+                  evidence.write(json.dumps(row, sort_keys=True)+'\n')
+          print('Validated two actual default TypeId source optimizer transactions')
           print('Validated 21 TypeId production stages: 12 changed+proven, 9 unknown')
           if not re.search(r'AL01_DIRECT_TYPEID_SMT changed_passes=1 changed_operations=[1-9][0-9]* proofs=1 sat_mutants=2 unknown_controls=3 status=PROVEN', log):
               raise SystemExit('Missing changed TypeId-native AL-01 Z3 proof and negative controls')
@@ -382,6 +403,7 @@ jobs:
             alive-lite-memory.jsonl
             alive-lite-memory-proofs.jsonl
             alive-lite-typeid-stage-proofs.jsonl
+            alive-lite-typeid-source-proofs.jsonl
           retention-days: 14
       - name: Cache exact passing source revision
         if: success() && steps.verified.outputs.cache-hit != 'true'
