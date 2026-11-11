@@ -1,0 +1,129 @@
+name: X7 B3a full Intel operation and iform proof-work DAG
+on:
+  push:
+    branches: [ci/x7-proof-dag-20261110]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fixture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 7
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9982a5d4f7a4ad90743380838fb4e8fac232f242
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Syntax and incremental proof-work graph invariants
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 9982a5d4f7a4ad90743380838fb4e8fac232f242
+          python3 -m py_compile tools/x86_iform_proof_work_dag.py tools/test_x86_iform_proof_work_dag.py
+          python3 -m unittest discover -s tools -p 'test_x86_iform_proof_work_dag.py' -v
+          python3 -m unittest discover -s tools -p 'test_x86_iform_helper_dependencies.py' -v
+          echo X7_B3_PROOF_DAG_FIXTURE_PASS
+  all-work:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 16
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9982a5d4f7a4ad90743380838fb4e8fac232f242
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin compiler source revision
+        run: test "$(git rev-parse HEAD)" = 9982a5d4f7a4ad90743380838fb4e8fac232f242
+      - name: Fetch 741 Intel XML files at exact upstream revision
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/x7-b3-xml /tmp/x7-b3
+          rev=35eface1b7ee003a1cda95005ec5fd83de658a64
+          curl --fail --silent --show-error --location --retry 2 --max-time 180 \
+            "https://codeload.github.com/intel/SDM/tar.gz/${rev}" -o /tmp/x7-b3/intel.tar.gz
+          python3 - <<'PY'
+          from pathlib import Path
+          import re, tarfile
+          root=Path('/tmp/x7-b3-xml')
+          seen=0
+          with tarfile.open('/tmp/x7-b3/intel.tar.gz','r:gz') as tar:
+              for m in tar:
+                  if not m.isfile() or not re.fullmatch(
+                      r'[^/]+/data/instruction/[^/]+\.xml',m.name):
+                      continue
+                  assert 0<m.size<4*1024*1024
+                  b=tar.extractfile(m).read()
+                  assert len(b)==m.size
+                  (root/m.name.rsplit('/',1)[-1]).write_bytes(b)
+                  seen+=1
+                  assert seen<=900
+          assert seen==741,seen
+          PY
+      - name: Produce and validate all source operation dependencies and proof work
+        run: |
+          set -euo pipefail
+          /usr/bin/time -f '%e' -o /tmp/x7-b3/helper-seconds.txt \
+            python3 tools/x86_iform_helper_dependencies.py \
+              --xml-dir /tmp/x7-b3-xml --shards 16 \
+              --out /tmp/x7-b3/dependencies.json
+          /usr/bin/time -f '%e' -o /tmp/x7-b3/queue-seconds.txt \
+            python3 tools/x86_iform_proof_work_dag.py \
+              --dependency-index /tmp/x7-b3/dependencies.json \
+              --shards 16 --out /tmp/x7-b3/proof-tasks.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          root=Path('/tmp/x7-b3')
+          index=json.loads((root/'dependencies.json').read_text())
+          plan=json.loads((root/'proof-tasks.json').read_text())
+          assert index['operations_indexed']==1641
+          assert index['source_iforms']==10859
+          assert plan['operation_count']==1641
+          assert plan['iform_count']==10859
+          assert plan['shard_count']==16
+          assert plan['summary']['tasks']==2*1641+5*10859
+          assert len(plan['tasks'])==plan['summary']['tasks']
+          assert len(plan['form_gate_index'])==10859
+          assert plan['summary']['stages']=={
+              'operation_ast':1641,'operation_semantics':1641,
+              'form_effects':10859,'form_encoding':10859,
+              'form_native':10859,'form_cost':10859,
+              'form_admission':10859}
+          assert plan['summary']['proof_certificates']==0
+          assert plan['summary']['selection_eligible_forms']==0
+          assert all(not t['source_work_key_is_proof'] and
+                     not t['production_selection_eligible']
+                     for t in plan['tasks'])
+          ids={t['task_id'] for t in plan['tasks']}
+          assert len(ids)==plan['summary']['tasks']
+          assert all(set(t['dependencies'])<=ids for t in plan['tasks'])
+          assert sum(s['task_count'] for s in plan['summary']['shards'])==len(ids)
+          from sys import path
+          path.insert(0,'tools')
+          from x86_iform_proof_work_dag import plan as make_plan, compare
+          eight=make_plan(index,shards=8)
+          assert compare(plan,eight)=={
+              'reused_source_work_keys_only':len(ids),
+              'new_or_invalidated_tasks':0,'retired_tasks':0,
+              'reused_semantic_proofs':0,'selection_eligible_forms':0}
+          timings={
+              'helper_graph_seconds':float((root/'helper-seconds.txt').read_text()),
+              'task_dag_seconds':float((root/'queue-seconds.txt').read_text())}
+          (root/'timing.json').write_text(json.dumps(timings,indent=2)+'\n')
+          print('X7_B3_FULL_PROOF_WORK_PASS',{
+              'operation_definitions':1641,
+              'source_forms':10859,'task_gates':len(ids),
+              'shards':16,'all_unproved':True,'timings':timings})
+          PY
+      - name: Attach entire source-dependent proof task DAG
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-b3-full-intel-proof-work-dag
+          path: |
+            /tmp/x7-b3/proof-tasks.json
+            /tmp/x7-b3/timing.json
+          if-no-files-found: warn
+          retention-days: 14
