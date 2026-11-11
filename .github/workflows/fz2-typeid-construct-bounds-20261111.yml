@@ -1,0 +1,66 @@
+name: FZ-2 TypeId constructs, exclusions, CSE/DSE and native oracle
+on:
+  push:
+    branches: [fuzz/fz2-bounded-construct-validate-20261111]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fz2:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 52f9fa6af75edae5b4f72c409392e3c9e2b52596
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source revision and profiles
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "52f9fa6af75edae5b4f72c409392e3c9e2b52596"
+          test -s compiler/crates/opt/tests/fixtures/typeid_fuzz_cse.toml
+          test -s compiler/crates/opt/tests/fixtures/typeid_fuzz_dse.toml
+      - name: Restrict to public-dependency-free core crates
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: fz2-bounded-constructs
+          cache-workspace-crates: 'true'
+      - name: Exercise biased SSA tests and independent native C11 GAS/ELF
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typeid_fuzz_bias -- --nocapture
+          cargo test -p compiler-opt --test typed_core_native_verifier -- --nocapture
+      - name: Exercise exact replay and positive pass-change gates
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          for pass in cse dse; do
+            out="$RUNNER_TEMP/fz2-$pass"
+            cargo run -p compiler-opt --example typeid_fuzz -- "crates/opt/tests/fixtures/typeid_fuzz_$pass.toml" "$out"
+            test -s "$out/profile.toml"
+            test -s "$out/final-weights.toml"
+            test "$(wc -l < "$out/coverage.tsv")" -eq 25
+            test "$(find "$out" -name '*-before.ir' | wc -l)" -eq 24
+            test "$(find "$out" -name "*-after-$pass.ir" | wc -l)" -eq 24
+            awk -F '\t' 'NR>1 && $4!="true" {bad=1} END {if(bad || NR!=25) exit 1}' "$out/coverage.tsv"
+          done
+      - name: Strict Clippy on the test and runner
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt --test typeid_fuzz_bias --example typeid_fuzz -- -D warnings
+      - name: Preserve replay evidence
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fz2-bounded-replay
+          path: ${{ runner.temp }}/fz2-*/
+          retention-days: 7
