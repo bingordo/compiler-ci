@@ -1,0 +1,62 @@
+name: IR F12 native TypeId Oberon inlining and CT10 source profile
+on:
+  push:
+    branches: [ci/f12-oberon-native-inline-ct10-1017-20261111]
+    paths: ['.github/workflows/f12-oberon-native-inline-ct10-1017.yml']
+permissions:
+  contents: read
+jobs:
+  no-legacy-elf:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d3e425d472b4a103f06a5e17688758ab501305f8
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest native-only source and physical old backend deletion
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = d3e425d472b4a103f06a5e17688758ab501305f8
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path("compiler/crates/driver/src/main.rs").read_text()
+          for name in ("compile_object(", "compile_object_with_inlining(",
+                       "compile_object_with_inline_mode(", "compile_object_with_inline_policy("):
+              assert "fn "+name not in s, name
+          assert "use compiler_backend::Backend;" not in s
+          t=Path("compiler/crates/driver/tests/unit/driver_cases.rs").read_text()
+          inline=t.split("fn no_inline_keeps_small_oberon_call_and_preserves_default_output()",1)[1].split("#[test]",1)[0]
+          assert "lower_unit(" not in inline and "compile_object(" not in inline
+          assert "lower_oberon_native_typeid(src)" in inline
+          assert "emit_typeid_source_with_inline_mode(" in inline
+          assert "fn ct10_real_oberon_legacy_verifier_stage_counts" not in t
+          assert "fn ct10_real_oberon_typeid_source_profile" in t
+          assert "CT10_TYPEID_STAGE,language=oberon" in t
+          feature=Path("compiler/crates/driver/Cargo.toml").read_text()
+          assert "ct10-verifier-source-profile = []" in feature
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: oberon-inline-ct10-native-f12
+      - name: Full native compiler tests, CT10 feature source profiles and strict lint
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --bin compiler -- --test-threads=2
+          cargo test -p compiler --features ct10-verifier-source-profile --bin compiler ct10_real_oberon_typeid_source_profile -- --exact --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/f12-ct10-native.log"
+          grep -F 'CT10_TYPEID_SOURCE,language=oberon,case=branches' "$RUNNER_TEMP/f12-ct10-native.log"
+          grep -F 'CT10_TYPEID_SOURCE,language=oberon,case=loops_calls' "$RUNNER_TEMP/f12-ct10-native.log"
+          grep -F 'CT10_TYPEID_STAGE,language=oberon' "$RUNNER_TEMP/f12-ct10-native.log"
+          cargo test -p compiler --test f6_source_runtime_parity -- --test-threads=1
+          cargo test -p compiler-ir -p compiler-opt --lib -- --test-threads=2
+          cargo clippy -p compiler -p compiler-ir -p compiler-opt --all-targets -- -D warnings
+          cargo clippy -p compiler --features ct10-verifier-source-profile --all-targets -- -D warnings
