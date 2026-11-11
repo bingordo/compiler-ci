@@ -1,0 +1,72 @@
+name: M4.10 seeded mixed data ELF writer acceptance
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-m410-seeded-mixed-data-elf.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  acceptance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      COMPILER_ELF_REQUIRE_LLVM: '1'
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 422f24156509b10b269fba78210ea1172055dc58
+          path: compiler
+          ssh-key: \${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify immutable candidate
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "422f24156509b10b269fba78210ea1172055dc58"
+          test -s crates/backend/tests/x86_elf_contract.rs
+          echo "M4.10 mixed data ELF seed corpus: 422f24156509b10b269fba78210ea1172055dc58" >> "$GITHUB_STEP_SUMMARY"
+      - name: Resolve public pinned frontend dependencies
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - name: Verify native linker tools
+        run: |
+          set -euo pipefail
+          if ! command -v ld.lld >/dev/null || ! command -v gdb >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y lld gdb
+          fi
+          command -v gcc
+          command -v clang
+          command -v ld.lld
+          command -v gdb
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m410-elf-seeded-data-v1
+      - name: Focused 128-seed data layout and relocation rejection oracle
+        working-directory: compiler
+        run: cargo test -p compiler-backend --test x86_elf_contract seeded_mixed_data_relocations_and_constructor_contract -- --nocapture
+      - name: Rust formatting
+        working-directory: compiler
+        run: cargo fmt --all -- --check
+      - name: Complete backend ELF and ABI regressions
+        working-directory: compiler
+        run: cargo test -p compiler-backend --all-targets --no-fail-fast
+      - name: Existing real C TypeId ELF PIC RBP and linkers
+        working-directory: compiler
+        run: |
+          cargo test -p compiler --test typeid_pic_frame_shared
+          cargo test -p compiler --test typeid_pic_shared
+          cargo test -p compiler --test typeid_frame_pointer
+          cargo test -p compiler --test typeid_elf_linker_matrix
+      - name: Full IR optimizer backend and target regression
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --features compiler-backend-x86/x7-native-form-validation
+      - name: Strict all-target Clippy
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --features compiler-backend-x86/x7-native-form-validation --all-targets -- -D warnings
+          cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
