@@ -1,0 +1,63 @@
+name: Mini-C legacy linked Function entrypoints removal PR965
+on:
+  push:
+    branches: [ci/verify-mini-c-unlinked-deletion-965-20261111]
+    paths: ['.github/workflows/verify-mini-c-unlinked-deletion-965.yml']
+permissions:
+  contents: read
+jobs:
+  x86-source-and-library:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 302a43459e9b142779b9ce2daec3204e90101693
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest exact source without apt dependency provisioning
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 302a43459e9b142779b9ce2daec3204e90101693
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: minic-unlinked-delete-965
+      - name: Exact source full standalone unit, native CLI, independent C runtime and strict Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib -- --test-threads=2
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --test typeid_cli -- --test-threads=2
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --test m4_8_source_native -- --nocapture --test-threads=1
+          cargo build --manifest-path tools/mini-c-driver/Cargo.toml --bin compiler-mini-c
+          python3 tools/mini-c-driver/tests/differential.py --compiler tools/mini-c-driver/target/debug/compiler-mini-c --seed-count 2 --steps 60 --ct04-seed-count 1 --m10-compound-seed-count 1 --artifacts target/m4-8-pr955-repro
+          cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml --all-targets -- -D warnings
+      - name: Hard fail if legacy Mini-C backend emitters are still exported
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          if grep -E -n '(fn emit_checked_m48_source|fn lower_checked_m48_source|struct CheckedM48|pub fn compile_object_with_backend|pub fn compile_assembly_with_backend|&dyn Backend)' tools/mini-c-driver/src/lib.rs; then
+            echo 'legacy Mini-C backend survived physical deletion' >&2
+            exit 1
+          fi
+          grep -Fq 'pub fn compile_native_typeid_pic' tools/mini-c-driver/src/lib.rs
+          if grep -E -n '(pub fn lower_checked\(|fn lower_checked_with_globals\(|fn lower_checked_with_pool\(|pub fn lower_source_linked\()' tools/mini-c-driver/src/lib.rs; then
+            echo 'removed legacy Function lowering API returned' >&2
+            exit 1
+          fi
+      - name: Actual unified x86 TypeId C11 object/assembly oracle with no fallback
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test f6_source_runtime_parity f6_x86_source_default_and_explicit_typeid_execute_same_c11_oracle -- --test-threads=1
+          cargo test -p compiler --test f6_source_runtime_parity f6_legacy_ir_selection_is_rejected_for_valid_sources_without_artifacts -- --test-threads=1
+          cargo test -p compiler --test mini_c_cli --test ir_default_cli -- --test-threads=2
+          cargo test -p compiler --bin compiler -- --test-threads=2
+          cargo clippy -p compiler -p compiler-ir -p compiler-opt --all-targets -- -D warnings
