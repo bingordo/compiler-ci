@@ -1,0 +1,157 @@
+name: O2c native mixed BYTE and INTEGER records
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-o2c-byte-record-executable.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      COMPILER_SHA: 61d9ab8a1d5a088861e42b60943cdf36ce1d5f78
+      OBERON_SHA: 6369b2705636355d5abfe9c2459d40b478cb7ad0
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 61d9ab8a1d5a088861e42b60943cdf36ce1d5f78
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check immutable pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          grep -F "$OBERON_SHA" compiler/crates/driver/Cargo.toml
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: o2c-byte-executable-${{ matrix.target }}
+      - name: Build and strict TypeId checks
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test aggregate_layout
+          cargo test -p compiler-ir --test aggregate_roots
+          cargo test -p compiler-opt --test typed_aggregate_pipeline
+          if [ "${{ matrix.target }}" = x86_64 ]; then
+            cargo test -p compiler --bin compiler
+            cargo clippy -p compiler-ir -p compiler --all-targets -- -D warnings
+          else
+            cargo test -p compiler --bin compiler --no-run
+            cargo clippy -p compiler-ir --all-targets -- -D warnings
+            cargo clippy -p compiler --bin compiler -- -D warnings
+          fi
+          cargo build -p compiler --bin compiler
+      - name: Source-checked mixed BYTE/INTEGER native execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p oracle
+          cat > oracle/ByteRec.mod <<'EOF'
+          MODULE ByteRec;
+          TYPE Mixed = RECORD tag: BYTE; count: INTEGER; tail: BYTE END;
+          VAR g: Mixed;
+          PROCEDURE Sum*(n: INTEGER): INTEGER;
+          VAR l: Mixed;
+          BEGIN
+            l.tag:=n; l.count:=n+100; l.tail:=n+1;
+            g.tag:=l.tag; g.count:=l.count; g.tail:=l.tail;
+            RETURN g.tag+g.count+g.tail
+          END Sum;
+          END ByteRec.
+          EOF
+          cat > oracle/NestedByte.mod <<'EOF'
+          MODULE NestedByte;
+          TYPE Inner = RECORD b: BYTE; n: INTEGER END;
+          Outer = RECORD front: BYTE; child: Inner; tail: INTEGER END;
+          VAR g: Outer;
+          PROCEDURE F*(n: INTEGER): INTEGER;
+          BEGIN
+            g.child.b:=n; g.child.n:=n+1; g.tail:=g.child.n;
+            RETURN g.child.b+g.tail
+          END F;
+          END NestedByte.
+          EOF
+          cat > oracle/Roots.mod <<'EOF'
+          MODULE Roots;
+          TYPE Pair=RECORD a,b: INTEGER END;
+          Node=RECORD x,y: Pair END;
+          VAR g: Node;
+          PROCEDURE Go*(n: INTEGER): INTEGER;
+          VAR l: Node;
+          BEGIN
+            l.x.a:=n; l.x.b:=n+1; l.y:=l.x; g:=l;
+            RETURN g.x.a+g.x.b+g.y.a+g.y.b
+          END Go;
+          END Roots.
+          EOF
+          cat > oracle/main.c <<'EOF'
+          #include <stdint.h>
+          extern int32_t ByteRec__Sum(int32_t);
+          extern int32_t NestedByte__F(int32_t);
+          extern int32_t Roots__Go(int32_t);
+          int main(void) {
+            if (ByteRec__Sum(258)!=363 || ByteRec__Sum(5)!=116 ||
+                ByteRec__Sum(-1)!=354) return 1;
+            if (NestedByte__F(258)!=261 || NestedByte__F(5)!=11) return 2;
+            if (Roots__Go(20)!=82 || Roots__Go(5)!=22) return 3;
+            return 0;
+          }
+          EOF
+          for format in obj asm; do
+            objects=()
+            for module in ByteRec NestedByte Roots; do
+              if [ "$format" = obj ]; then suffix=o; else suffix=s; fi
+              compiler/target/debug/compiler "oracle/$module.mod" \
+                --language oberon --target ${{ matrix.target }} \
+                --emit "$format" -o "oracle/$module.$suffix"
+              objects+=("oracle/$module.$suffix")
+            done
+            cc -O2 oracle/main.c "${objects[@]}" -o "oracle/run-$format"
+            "oracle/run-$format"
+            echo "mixed BYTE/INTEGER source ${{ matrix.target }} $format PASS" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Rejected unsupported storage and copies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > oracle/ByteOnly.mod <<'EOF'
+          MODULE ByteOnly;
+          TYPE B=RECORD b: BYTE END;
+          VAR g: B;
+          END ByteOnly.
+          EOF
+          cat > oracle/BadCopy.mod <<'EOF'
+          MODULE BadCopy;
+          TYPE R=RECORD tag: BYTE; value: INTEGER END;
+          VAR g,h: R;
+          PROCEDURE F*(n: INTEGER): INTEGER;
+          BEGIN g.tag:=n; h:=g; RETURN h.tag END F;
+          END BadCopy.
+          EOF
+          for module in ByteOnly BadCopy; do
+            if compiler/target/debug/compiler "oracle/$module.mod" \
+              --language oberon --target ${{ matrix.target }} \
+              --emit obj -o "oracle/$module.o"; then
+              echo "Unexpected acceptance of $module" >&2
+              exit 1
+            fi
+          done
