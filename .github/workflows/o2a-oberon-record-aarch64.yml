@@ -1,0 +1,106 @@
+name: O2a Oberon record objects AArch64 QEMU parity candidate
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/o2a-oberon-record-aarch64.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  aarch64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Install AArch64 cross gcc and QEMU
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu qemu-user
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d9a1a60a2eb464a1bced6f9f0c1a4b74ec972efc
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin exact source
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = d9a1a60a2eb464a1bced6f9f0c1a4b74ec972efc
+          grep -Fq 'rev = "c2c7911e0e8f1c1f9c6255fd8626d2e92aa7eb66"' compiler/crates/driver/Cargo.toml
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: o2a-oberon-aarch64-qemu
+      - name: Build checked TypeId compiler and run AArch64 ELF/GAS native oracles
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo build -p compiler --bin compiler
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          cat > "$tmp/A64Record.mod" <<'EOF'
+          MODULE A64Record;
+          TYPE Duo = RECORD left,right: INTEGER END;
+          VAR state: Duo;
+          PROCEDURE Read*(): INTEGER;
+          BEGIN RETURN state.left+10*state.right END Read;
+          PROCEDURE Eval*(n: INTEGER): INTEGER;
+          VAR local: Duo;
+          BEGIN
+              local.left:=n; local.right:=n+1;
+              state:=local;
+              RETURN Read()
+          END Eval;
+          BEGIN state.left:=4; state.right:=5 END A64Record.
+          EOF
+          cat > "$tmp/oracle.c" <<'EOF'
+          extern int A64Record__Read(void);
+          extern int A64Record__Eval(int);
+          int main(void) {
+              if (A64Record__Read()!=54) return 1;
+              if (A64Record__Eval(1)!=21) return 2;
+              if (A64Record__Read()!=21) return 3;
+              if (A64Record__Eval(7)!=87) return 4;
+              return A64Record__Read()!=87;
+          }
+          EOF
+          cat > "$tmp/start.S" <<'EOF'
+          .text
+          .global _start
+          .type _start,%function
+          _start:
+            bl __run_constructors
+            bl main
+            mov x8,#93
+            svc #0
+          __run_constructors:
+            stp x19,x30,[sp,#-16]!
+            stp x20,x21,[sp,#-16]!
+            adrp x19,__init_array_start
+            add x19,x19,:lo12:__init_array_start
+            adrp x20,__init_array_end
+            add x20,x20,:lo12:__init_array_end
+          1:
+            cmp x19,x20
+            b.hs 2f
+            ldr x16,[x19],#8
+            blr x16
+            b 1b
+          2:
+            ldp x20,x21,[sp],#16
+            ldp x19,x30,[sp],#16
+            ret
+          EOF
+          for fmt in obj asm; do
+            ext=o
+            if [ "$fmt" = asm ]; then ext=s; fi
+            ./target/debug/compiler "$tmp/A64Record.mod" --language oberon \
+              --target aarch64 --ir typeid --emit "$fmt" -o "$tmp/record.$ext"
+            aarch64-linux-gnu-gcc -nostdlib -static -no-pie -fno-pie \
+              -fno-stack-protector -O0 "$tmp/start.S" "$tmp/oracle.c" \
+              "$tmp/record.$ext" -o "$tmp/$fmt.elf"
+            timeout 30 qemu-aarch64 "$tmp/$fmt.elf"
+            echo "O2A_AARCH64_PASS format=$fmt" >> "$GITHUB_STEP_SUMMARY"
+          done
