@@ -1,0 +1,65 @@
+name: IR F9 delete old Mini-C legacy module wrappers
+on:
+  push:
+    branches: [ci/f9-minic-single-legacy-oracle-20261111]
+    paths: ['.github/workflows/f9-minic-single-legacy-oracle.yml']
+permissions:
+  contents: read
+jobs:
+  native-default-and-legacy-opt-in:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 69520f0b53a548931437394d65d4877fbe156a4a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest source pin and physical legacy wrapper deletion
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 69520f0b53a548931437394d65d4877fbe156a4a
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path("compiler/tools/mini-c-driver/src/lib.rs").read_text()
+          for name in ("CheckedNativeModule", "lower_source_raw_module(", "lower_source_raw_module_abi",
+                       "lower_source_raw_module_abi_checked_externals"):
+              assert name not in s, name
+          assert s.count("fn lower_source_raw_linked(")==1
+          assert s.count("typed_minic_to_legacy(f,ids)")==1
+          assert "fn raw_benchmark_oracle_keeps_checked_unoptimized_function" in s
+          assert "fn linked_oracle_keeps_private_function_linkage" in s
+          assert "fn function_only_oracle_rejects_globals_and_gp_variadics" in s
+          assert "pub fn lower_source(source:" not in s
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: minic-one-legacy-oracle-f9
+      - name: Native Mini-C unit, CLI and real GCC differential
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib -- --test-threads=2
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --features experimental-fusion-benchmark --lib legacy_cutover_guards -- --test-threads=1
+          cargo check --manifest-path tools/mini-c-driver/Cargo.toml --all-targets --features legacy-experimental-ssa
+          cargo check --manifest-path tools/mini-c-driver/Cargo.toml --all-targets --features experimental-fusion-benchmark
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --test typeid_cli --test m4_8_source_native -- --test-threads=2
+          cargo build --manifest-path tools/mini-c-driver/Cargo.toml --bin compiler-mini-c
+          python3 tools/mini-c-driver/tests/differential.py --compiler tools/mini-c-driver/target/debug/compiler-mini-c --seed-count 2 --steps 60 --ct04-seed-count 1 --m10-compound-seed-count 1 --artifacts target/ir-f9-mini-c-diff
+          cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml --all-targets -- -D warnings
+      - name: Unified TypeId C and Oberon source runtime plus strict lint
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --bin compiler -- --test-threads=2
+          cargo test -p compiler --test f6_source_runtime_parity -- --test-threads=1
+          cargo test -p compiler --test mini_c_cli --test ir_default_cli -- --test-threads=2
+          cargo test -p compiler-ir -p compiler-opt --lib -- --test-threads=2
+          cargo clippy -p compiler -p compiler-ir -p compiler-opt --all-targets -- -D warnings
