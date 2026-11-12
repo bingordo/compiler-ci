@@ -1,0 +1,79 @@
+name: CT-11 exact-source TypeId PRE transaction and trial profile
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/ct11-pre-transaction-phase-profile.yml']
+permissions:
+  contents: read
+concurrency:
+  group: ct11-pre-phase-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  checked-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 3117691859b91a663418a227afeb06b0c931ccf0
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pinned source and toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          test "$(git -C compiler rev-parse HEAD)" = dc2503e124a9e636a76dbe54d1717d17ccaaca5a
+          git -C compiler rev-parse HEAD | tee results/sha.txt
+          rustc --version | tee results/toolchain.txt
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          python3 -m py_compile compiler/tools/s23_native_profile_source.py
+          python3 -m py_compile compiler/tools/ct11_loop_source_profile.py
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ct11-pre-transaction-phase-profile
+      - name: Opt-in PRE parity and error rollback
+        shell: bash
+        working-directory: compiler
+        run: |
+          cargo test --release -p compiler-opt --test typed_pre_native -- --nocapture
+      - name: Opt-in CLI phase records and exact ELF and GAS parity
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test --release -p compiler --test typeid_native_s2316_profile -- --nocapture
+          cargo test --release -p compiler-opt --test native_s2316_profile -- --nocapture
+          cargo clippy -p compiler-opt --lib -- -D warnings
+          cargo clippy -p compiler --bin compiler --test typeid_native_s2316_profile -- -D warnings
+          cargo build --release -p compiler --bin compiler
+      - name: Pinned C source phase census and ELF/GAS checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/s23_native_profile_source.py \
+            --root compiler --compiler compiler/target/release/compiler \
+            --output results/ct11-typed-licm-phase-profile.json --rounds 3 \
+            2>&1 | tee results/corpus.log
+          test "$(grep -c '^S2316_SOURCE_PROFILE ' results/corpus.log)" -eq 14
+          test "$(grep -c '^CT11_PASS_SUMMARY ' results/corpus.log)" -eq 294
+          test "$(grep -c '^CT11_LICM_SUMMARY ' results/corpus.log)" -eq 28
+          test "$(grep -c '^CT11_LICM_INNER_SUMMARY ' results/corpus.log)" -eq 28
+          test "$(grep -c '^CT11_PRE_SUMMARY ' results/corpus.log)" -eq 28
+          grep '^CT11_PRE_SUMMARY name=combined_12_extracted ' results/corpus.log | tee -a "$GITHUB_STEP_SUMMARY"
+          grep '^CT11_PRE_SUMMARY name=controlled_five_boolean ' results/corpus.log | tee -a "$GITHUB_STEP_SUMMARY"
+          grep '^CT11_PASS_SUMMARY name=combined_12_extracted ' results/corpus.log | tee -a "$GITHUB_STEP_SUMMARY"
+          grep '^S2316_SOURCE_SUMMARY ' results/corpus.log | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ct11-typed-licm-phase-profile
+          path: results/
+          retention-days: 30
