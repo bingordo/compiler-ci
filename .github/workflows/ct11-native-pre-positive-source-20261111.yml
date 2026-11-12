@@ -1,0 +1,140 @@
+name: CT-11 native fixed-width PRE positive source and C ABI parity
+'on':
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct11-native-pre-positive-source-20261111.yml'
+permissions:
+  contents: read
+jobs:
+  native-pre-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [a, b]
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 15af9ed039945ae2eae62f2e9997ccc175a62ba0
+          path: parent
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 579e443f123b78f5fabf37792e32f3c150d150f
+          path: candidate
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: ifduyue/musl
+          ref: 7813e9119eb5fe681b6750b8a033a0490bca0941
+          path: musl
+          persist-credentials: false
+      - name: Verify exact source revisions and tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          test "$(git -C parent rev-parse HEAD)" = 15af9ed039945ae2eae62f2e9997ccc175a62ba0
+          test "$(git -C candidate rev-parse HEAD)" = 579e443f123b78f5fabf37792e32f3c150d150f
+          test "$(git -C musl rev-parse HEAD)" = 7813e9119eb5fe681b6750b8a033a0490bca0941
+          echo '15af9ed039945ae2eae62f2e9997ccc175a62ba0' > results/parent.txt
+          echo '579e443f123b78f5fabf37792e32f3c150d150f' > results/candidate.txt
+          rustc --version | tee results/toolchain.txt
+          lscpu | grep 'Model name' | tee results/cpu.txt || true
+          python3 -m py_compile candidate/tools/ct11_native_pre_positive_source.py
+          python3 -m py_compile candidate/tools/s23_full_upstream_tu_census.py
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            parent -> target
+            candidate -> target
+          key: ct11-native-pre-abi-${{ matrix.runner }}
+      - name: Native PRE optimizer, width-canonicalization and strict Clippy
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release --manifest-path candidate/Cargo.toml -p compiler-opt --test typed_pre_native -- --nocapture
+          cargo test --release --manifest-path candidate/Cargo.toml -p compiler-opt --lib canonical_native_intbin_and_intcmp
+          cargo test --release --manifest-path candidate/Cargo.toml -p compiler-opt --test native_s2316_profile
+          cargo clippy --manifest-path candidate/Cargo.toml -p compiler-opt --lib -- -D warnings
+          cargo clippy --manifest-path candidate/Cargo.toml -p compiler --bin compiler -- -D warnings
+      - name: Build two exact-source complete release C compilers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path parent/Cargo.toml -p compiler --bin compiler
+          cargo build --release --manifest-path candidate/Cargo.toml -p compiler --bin compiler
+      - name: Authored non-upstream source canaries, profiled native PRE and GCC oracles
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -u candidate/tools/ct11_native_pre_positive_source.py \
+            --compiler parent/target/release/compiler \
+            --output results/parent-authored-pre.json --rounds 3 \
+            2>&1 | tee results/parent-authored.log
+          python3 -u candidate/tools/ct11_native_pre_positive_source.py \
+            --compiler candidate/target/release/compiler \
+            --output results/candidate-authored-pre.json --rounds 3 --require-positive \
+            2>&1 | tee results/candidate-authored.log
+          python3 - <<'PY'
+          import json
+          a=json.load(open("results/parent-authored-pre.json"))
+          b=json.load(open("results/candidate-authored-pre.json"))
+          assert len(a['cases'])==len(b['cases'])==3
+          for name in sorted(a['cases']):
+              x,y=a['cases'][name],b['cases'][name]
+              assert x['source_sha256']==y['source_sha256'],name
+              assert x['gcc_oracle_digest']==y['gcc_oracle_digest'],name
+              assert x['gcc_runtime_oracle_pairs']==y['gcc_runtime_oracle_pairs']==36,name
+              print('CT11_REAL_C_PRE_DIFF name='+name+
+                    ' parent_edits='+str(x['pre_core_edits'])+
+                    ' candidate_edits='+str(y['pre_core_edits'])+
+                    ' source_sha256='+x['source_sha256'],flush=True)
+          assert b['positive_cases']>=1
+          PY
+          grep '^CT11_REAL_C_PRE_DIFF ' results/candidate-authored.log || true
+          grep '^CT11_PRE_SOURCE_CONTROL_SUMMARY ' results/candidate-authored.log | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Current native PRE on all 27 unmodified upstream musl sources
+        if: matrix.runner == 'a'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -u candidate/tools/s23_full_upstream_tu_census.py \
+            --musl-root musl \
+            --compiler candidate/target/release/compiler \
+            --compiler-sha '579e443f123b78f5fabf37792e32f3c150d150f' \
+            --output results/current-original-musl-census.json \
+            --rounds 3 2>&1 | tee results/original-musl.log
+          python3 - <<'PY'
+          import json
+          d=json.load(open("results/current-original-musl-census.json"))
+          assert d['attempted']==27 and d['accepted']+d['rejected']==27
+          for name,r in sorted(d['cases'].items()):
+              if r['status']=='accepted':
+                  p=r['profile_median']
+                  print('CT11_UPSTREAM_C_PRE name='+name+
+                        ' edits='+str(p['pre_core_edits'])+
+                        ' trials='+str(p['pre_core_trials'])+
+                        ' bytes='+str(r['bytes']),flush=True)
+          PY
+          grep '^S2339_SUMMARY ' results/original-musl.log | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ct11-native-pre-source-${{ matrix.runner }}
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
