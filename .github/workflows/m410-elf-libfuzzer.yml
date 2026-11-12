@@ -29,7 +29,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ github.event_name == 'pull_request' && '87a1c3dad38480896f9b9ac94723142386725b0e' || inputs.source_ref || 'main' }}
+          ref: ${{ github.event_name == 'pull_request' && 'fcd789418f58cff65aa615c08f2db4eb14a0ac39' || inputs.source_ref || 'main' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -39,7 +39,7 @@ jobs:
           set -euo pipefail
           source_sha="$(git rev-parse HEAD)"
           if [ "${{ github.event_name }}" = pull_request ]; then
-            test "$source_sha" = '87a1c3dad38480896f9b9ac94723142386725b0e'
+            test "$source_sha" = 'fcd789418f58cff65aa615c08f2db4eb14a0ac39'
           fi
           test -s fuzz/fuzz_targets/elf_writer_input.rs
           test -s fuzz/fuzz_targets/elf_serialized_metadata.rs
@@ -99,6 +99,31 @@ jobs:
           readelf -hWr "$RUNNER_TEMP/m410-reference-elf-objects/aarch64-call.o" > "$RUNNER_TEMP/m410-arm-readelf.txt"
           grep -q 'Advanced Micro Devices X86-64' "$RUNNER_TEMP/m410-x86-readelf.txt"
           grep -q 'AArch64' "$RUNNER_TEMP/m410-arm-readelf.txt"
+      - name: Install independent LLVM reader and cross-linker if needed
+        run: |
+          set -euo pipefail
+          if ! (command -v llvm-readobj || command -v llvm-readobj-18 || command -v llvm-readobj-19); then
+            sudo apt-get update -qq
+            sudo apt-get install -y llvm-18 lld-18 clang-18
+          fi
+          command -v readelf
+          (command -v llvm-readobj || command -v llvm-readobj-18 || command -v llvm-readobj-19)
+          (command -v ld.lld || command -v ld.lld-18 || command -v ld.lld-19)
+          (command -v clang || command -v clang-18 || command -v clang-19)
+      - name: Independently inspect randomized ELF and link fixed x86/AArch64 oracles
+        working-directory: compiler
+        env:
+          M410_ELF_LINK_ORACLE_DIR: ${{ runner.temp }}/m410-fixed-oracle-objects
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools -p 'test_m410_elf_cross_tool_oracle.py' -v
+          cargo test -p compiler-backend --lib m410_independent_linker_oracle_fixture
+          python3 tools/m410_elf_cross_tool_oracle.py \
+            --objects "$RUNNER_TEMP/m410-fixed-oracle-objects" \
+            --seeded "$RUNNER_TEMP/m410-reference-elf-objects" \
+            --out "$RUNNER_TEMP/m410-cross-tool-oracles" \
+            | tee "$RUNNER_TEMP/m410-cross-tool-summary.txt"
+          echo 'GNU readelf and LLVM agree on fixed and seeded x86/AArch64 ELF; GCC/Clang x86 PIE/non-PIE constructor+call oracles and AArch64 LLD relocatable link pass.' >> "$GITHUB_STEP_SUMMARY"
       - name: Check isolated fuzz workspace on stable
         working-directory: compiler
         run: cargo check --manifest-path fuzz/Cargo.toml --bins
@@ -168,6 +193,13 @@ jobs:
               cp "$RUNNER_TEMP/$name" "$RUNNER_TEMP/m410-elf-corpus-bundle/logs/"
             fi
           done
+          if [ -d "$RUNNER_TEMP/m410-cross-tool-oracles/logs" ]; then
+            mkdir -p "$RUNNER_TEMP/m410-elf-corpus-bundle/logs/cross-tool"
+            cp -a "$RUNNER_TEMP/m410-cross-tool-oracles/logs/." "$RUNNER_TEMP/m410-elf-corpus-bundle/logs/cross-tool/"
+            if [ -f "$RUNNER_TEMP/m410-cross-tool-oracles/summary.json" ]; then
+              cp "$RUNNER_TEMP/m410-cross-tool-oracles/summary.json" "$RUNNER_TEMP/m410-elf-corpus-bundle/logs/cross-tool/summary.json"
+            fi
+          fi
       - name: Persist versioned and checksummed corpus for the next trusted run
         if: always()
         uses: actions/upload-artifact@v4
