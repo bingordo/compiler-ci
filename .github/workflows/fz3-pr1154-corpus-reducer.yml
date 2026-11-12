@@ -1,0 +1,55 @@
+name: FZ-3 PR1154 observed-edit corpus and bounded reducer
+on:
+  push:
+    branches: [fuzz/fz3-corpus-reducer-pr1154]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fz3:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 539fcf40170cebcf74fe8d50d6a7de7312924d8f
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify immutable TypeId fuzzer source
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "539fcf40170cebcf74fe8d50d6a7de7312924d8f"
+          test -s compiler/crates/opt/tests/typeid_fuzz_corpus_reduce.rs
+          test -s compiler/crates/opt/tests/support/typeid_fuzz_corpus.rs
+      - name: Isolate self-contained compiler core crates
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: fz3-corpus-reducer
+          cache-workspace-crates: 'true'
+      - name: Bounded greedy pass reachability and CSE DSE reduction controls
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typeid_fuzz_corpus_reduce -- --nocapture
+      - name: FZ-2.5 stage interactions and previous native oracle regressions
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typeid_fuzz_interactions
+          cargo test -p compiler-opt --test typeid_fuzz_pre_induction_targeted
+          cargo test -p compiler-opt --test typeid_fuzz_promotion_stages
+          cargo test -p compiler-opt --test typeid_fuzz_licm_identical_targeted
+          cargo test -p compiler-opt --test typeid_fuzz_memory_cfg_targeted
+          cargo test -p compiler-opt --test typeid_fuzz_local_cfg_targeted
+          cargo test -p compiler-opt --test typeid_fuzz_targeted
+          cargo test -p compiler-opt --test typeid_fuzz_bias
+          cargo test -p compiler-opt --test typeid_fuzz_pass_registry
+          cargo test -p compiler-opt --test typed_core_native_verifier
+      - name: Strict Clippy on FZ3 and existing generator suites
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt --test typeid_fuzz_corpus_reduce --test typeid_fuzz_interactions --test typeid_fuzz_bias -- -D warnings
