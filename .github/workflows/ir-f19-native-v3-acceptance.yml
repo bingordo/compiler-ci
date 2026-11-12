@@ -1,0 +1,96 @@
+# One-off exact-source acceptance for compiler PR 1122.
+# Close this workflow PR unmerged after evidence is recorded.
+name: IR F19 native TypeId SSA replay cutover (compiler PR 1122)
+on:
+  pull_request:
+    paths: ['.github/workflows/ir-f19-native-v3-acceptance.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-wire:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 91592b63efcf294ce7cfb87b8391c4da097d2df8
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm exact compiler source and core-only workspace
+        run: |
+          set -euxo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "91592b63efcf294ce7cfb87b8391c4da097d2df8"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-f19-native-ssa-wire
+      - name: Native TypeId body, legacy rejection and ir-tool CLI
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-ir --test typed_ssa_body -- --nocapture
+          cargo test -p compiler-ir --test native_module_text_v3 -- --nocapture
+          cargo test -p compiler-ir --test native_module_cli -- --nocapture
+      - name: Full IR library and independent native text/binary regression suite
+        working-directory: compiler
+        run: cargo test -p compiler-ir
+      - name: Strict IR all-target Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir --all-targets -- -D warnings
+
+  native-opt-replay:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 91592b63efcf294ce7cfb87b8391c4da097d2df8
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm exact source and select independent core workspace
+        run: |
+          set -euxo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "91592b63efcf294ce7cfb87b8391c4da097d2df8"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-f19-opt-replay
+      - name: Install debugger needed by existing DWARF backend test
+        run: |
+          if ! command -v gdb >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq gdb
+          fi
+      - name: Explicit TypeId replay compatibility smoke and source pipeline
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test ir_replay_cli -- --nocapture
+          cargo test -p compiler-opt --test typed_core_pipeline -- --nocapture
+          cargo test -p compiler-opt --test typed_algebra -- --nocapture
+      - name: Broad IR optimizer backend regression (known unrelated S23 1058 excluded)
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 -- --skip generated_comparison_dag_all_widths_with_cfg_and_negative_guards
+      - name: Strict optimizer and generic backend all-target Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt -p compiler-backend --all-targets -- -D warnings
