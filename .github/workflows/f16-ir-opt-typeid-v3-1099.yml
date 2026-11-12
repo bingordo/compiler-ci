@@ -1,0 +1,66 @@
+name: F16 native TypeId v3 ir-opt replay without legacy Function
+on:
+  push:
+    branches: [ci/f16-ir-opt-typeid-v3-1099-20261111]
+    paths: ['.github/workflows/f16-ir-opt-typeid-v3-1099.yml']
+permissions:
+  contents: read
+jobs:
+  native-ir-replay:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f16fe300abcb995af744a0f0497eeabc28c0837d
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest exact source and native ir-opt no Function adapter
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = f16fe300abcb995af744a0f0497eeabc28c0837d
+          python3 - <<'PY'
+          from pathlib import Path
+          root=Path("compiler")
+          code=(root/"crates/opt/src/bin/ir-opt.rs").read_text()
+          tests=(root/"crates/opt/tests/ir_replay_cli.rs").read_text()
+          fixture=(root/"crates/opt/tests/fixtures/ir_replay_diamond.ir").read_text()
+          for forbidden in ("compiler_ir::Function", "read_and_verify_function",
+                            "write_function(", "fn pass_apply(", "save_failed_input(",
+                            "fn snapshot("):
+              assert forbidden not in code,forbidden
+          assert 'read_native_module_text_v3' in code
+          assert 'write_native_module_text_v3' in code
+          assert '"pipeline"|"typed-core"=>optimize_typed_core' in code
+          assert 'legacy_function_ir_is_explicitly_rejected_by_native_replay' in tests
+          assert fixture.startswith("compiler-ir-native-module 3\n")
+          assert fixture.endswith("endmodule\n")
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: f16-ir-opt-typeid-v3
+      - name: Native TypeId replay CLI tests, serialization and strict lints
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test ir_replay_cli -- --nocapture --test-threads=1
+          cargo test -p compiler-ir --test native_module_text_v3 -- --test-threads=2
+          cargo test -p compiler-opt --lib -- --test-threads=2
+          cargo check -p compiler-opt --all-targets
+          cargo clippy -p compiler-opt --all-targets -- -D warnings
+      - name: Production compiler and independent Mini-C unaffected by replay cutover
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --bin compiler -- --test-threads=2
+          cargo test -p compiler --test f6_source_runtime_parity -- --test-threads=1
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib -- --test-threads=2
+          cargo clippy -p compiler -p compiler-ir -p compiler-opt --all-targets -- -D warnings
+          cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml --all-targets -- -D warnings
