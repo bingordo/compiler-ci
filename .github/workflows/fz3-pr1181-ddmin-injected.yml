@@ -1,0 +1,82 @@
+name: FZ-3 PR1181 TypeId ddmin operand and constants injected fault
+on:
+  push:
+    branches: [fuzz/fz3-ddmin-operand-constant-pr1181]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  ddmin:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 16f626cb90978eb6f1e8385989c1f1f68651280c
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check exact TypeId ddmin source revision
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "16f626cb90978eb6f1e8385989c1f1f68651280c"
+          test -s compiler/crates/opt/tests/support/typeid_injected_wrongcode.rs
+          test -s compiler/crates/opt/examples/typeid_wrongcode_repro.rs
+      - name: Isolate self-contained compiler core workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: fz3-ddmin-operand-constant
+          cache-workspace-crates: 'true'
+      - name: Strict Clippy for new reducer and injected fault examples
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt --lib --test delta_reduce_ir --example delta_reduce --example typeid_wrongcode_repro -- -D warnings -A dead_code
+      - name: Generic and TypeId ddmin with independent wrong-code signatures
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --lib delta_reduce::tests -- --nocapture
+          cargo test -p compiler-opt --test delta_reduce_ir -- --nocapture
+      - name: End-to-end TypeId IR file wrong-code minimization and replay
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          temp="$RUNNER_TEMP/fz3-wrongcode"
+          mkdir -p "$temp"
+          cargo run -p compiler-opt --example typeid_fuzz -- \
+            crates/opt/tests/fixtures/typeid_ddmin_wrongcode.toml "$temp/generated"
+          cargo build -p compiler-opt --example delta_reduce --example typeid_wrongcode_repro
+          oracle="./target/debug/examples/typeid_wrongcode_repro"
+          reducer="./target/debug/examples/delta_reduce"
+          "$oracle" "$temp/generated/0000-before.ir" add-as-sub
+          if "$oracle" "$temp/generated/0000-before.ir" constant-bit-six; then exit 5; fi
+          "$reducer" --mode typeid \
+            --input "$temp/generated/0000-before.ir" \
+            --output "$temp/reduced.ir" --max-probes 160 \
+            --stage core.cse --seed 1777 --timeout-ms 5000 -- \
+            "$oracle" @INPUT@ add-as-sub
+          "$oracle" "$temp/reduced.ir" add-as-sub
+          if "$oracle" "$temp/reduced.ir" constant-bit-six; then exit 6; fi
+          test -s "$temp/reduced.ir.replay.txt"
+          grep -q 'simplified' "$temp/reduced.ir.replay.txt"
+      - name: Existing FZ-3 corpus and cross-pass TypeId native regression
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typeid_fuzz_corpus_reduce
+          cargo test -p compiler-opt --test typeid_fuzz_interactions
+          cargo test -p compiler-opt --test typeid_fuzz_bias
+          cargo test -p compiler-opt --test typeid_fuzz_pass_registry
+          cargo test -p compiler-opt --test typed_core_native_verifier
+      - name: Preserve injected-wrongcode minimized IR artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fz3-pr1181-ddmin-wrongcode
+          path: ${{ runner.temp }}/fz3-wrongcode/
+          retention-days: 7
