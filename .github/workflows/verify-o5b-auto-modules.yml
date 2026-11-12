@@ -1,0 +1,177 @@
+name: O5b automatic source module dependency build
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-o5b-auto-modules.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      COMPILER_SHA: 2ac9568953548cac8f1b9bdd3c5f093f7b1d3c9c
+      OBERON_SHA: 4d8e87c7f4ebbb16b0b967369988d30f51b83807
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2ac9568953548cac8f1b9bdd3c5f093f7b1d3c9c
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check immutable pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          grep -F "$OBERON_SHA" compiler/crates/driver/Cargo.toml
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: o5b-auto-modules-${{ matrix.target }}
+      - name: Build and strict TypeId checks
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test aggregate_layout
+          cargo test -p compiler-ir --test aggregate_roots
+          cargo test -p compiler-opt --test typed_aggregate_pipeline
+          if [ "${{ matrix.target }}" = x86_64 ]; then
+            cargo test -p compiler --bin compiler
+            cargo clippy -p compiler-ir -p compiler --all-targets -- -D warnings
+          else
+            cargo test -p compiler --bin compiler --no-run
+            cargo clippy -p compiler-ir --all-targets -- -D warnings
+            cargo clippy -p compiler --bin compiler -- -D warnings
+          fi
+          cargo build -p compiler --bin compiler
+      - name: Topological multi-module build and independent native oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p oracle/apps oracle/libs oracle/shared
+          cat > oracle/shared/Core.mod <<'EOF'
+          MODULE Core;
+          PROCEDURE Add*(a,b:INTEGER):INTEGER;
+          BEGIN RETURN a+b END Add;
+          PROCEDURE Inc*(VAR x:INTEGER):INTEGER;
+          BEGIN x:=x+1; RETURN x END Inc;
+          END Core.
+          EOF
+          cat > oracle/libs/Tools.mod <<'EOF'
+          MODULE Tools;
+          IMPORT C:=Core;
+          PROCEDURE Compute*(VAR n:INTEGER):INTEGER;
+          BEGIN RETURN C.Inc(n)+C.Add(n,5) END Compute;
+          END Tools.
+          EOF
+          cat > oracle/apps/Final.mod <<'EOF'
+          MODULE Final;
+          IMPORT T:=Tools, Core;
+          PROCEDURE Run*(n:INTEGER):INTEGER;
+          VAR x:INTEGER;
+          BEGIN
+            x:=n;
+            RETURN T.Compute(x)+Core.Add(x,2)
+          END Run;
+          END Final.
+          EOF
+          cat > oracle/main.c <<'EOF'
+          #include <stdint.h>
+          extern int32_t Final__Run(int32_t);
+          extern int32_t Core__Add(int32_t,int32_t);
+          int main(void) {
+            for(int32_t n=-1;n<260;n++) {
+              if(Final__Run(n)!=2*n+9) return 1;
+              if(Core__Add(n,7)!=n+7) return 2;
+            }
+            return 0;
+          }
+          EOF
+          for format in obj asm; do
+            suffix=o
+            if [ "$format" = asm ]; then suffix=s; fi
+            out="oracle/built-$format"
+            compiler/target/debug/compiler oracle/apps/Final.mod \
+              --language oberon --target ${{ matrix.target }} \
+              --build-modules "$out" \
+              --module-path oracle/libs --module-path oracle/shared --emit "$format"
+            printf 'Core.%s\nTools.%s\nFinal.%s\n' "$suffix" "$suffix" "$suffix" \
+              > oracle/expected.list
+            diff -u oracle/expected.list "$out/objects.list"
+            for module in Core Tools Final; do
+              test -s "$out/$module.$suffix"
+              test -s "$out/$module.sym"
+            done
+            grep -F 'IMPORT Core' "$out/Tools.sym"
+            grep -F 'PROC Compute(VAR INTEGER): INTEGER' "$out/Tools.sym"
+            grep -F 'IMPORT Tools, Core' "$out/Final.sym"
+            cc -std=c11 -O2 oracle/main.c \
+              "$out/Core.$suffix" "$out/Tools.$suffix" "$out/Final.$suffix" \
+              -o "oracle/run-$format"
+            "oracle/run-$format"
+            echo "O5b automatic module graph ${{ matrix.target }} $format PASS" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Dependency cycle, ambiguity, missing file, and initializer ordering fail closed
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p oracle/bad
+          cat > oracle/bad/A.mod <<'EOF'
+          MODULE A; IMPORT B; END A.
+          EOF
+          cat > oracle/bad/B.mod <<'EOF'
+          MODULE B; IMPORT A; END B.
+          EOF
+          if compiler/target/debug/compiler oracle/bad/A.mod \
+              --language oberon --target ${{ matrix.target }} \
+              --build-modules oracle/cycle; then
+            echo 'Cycle unexpectedly accepted' >&2; exit 1
+          fi
+          test ! -e oracle/cycle
+          cat > oracle/bad/Missing.mod <<'EOF'
+          MODULE Missing; IMPORT DoesNotExist; END Missing.
+          EOF
+          if compiler/target/debug/compiler oracle/bad/Missing.mod \
+              --language oberon --target ${{ matrix.target }} \
+              --build-modules oracle/missing; then
+            echo 'Missing module unexpectedly accepted' >&2; exit 1
+          fi
+          test ! -e oracle/missing
+          cp oracle/shared/Core.mod oracle/libs/Core.mod
+          if compiler/target/debug/compiler oracle/apps/Final.mod \
+              --language oberon --target ${{ matrix.target }} \
+              --module-path oracle/libs --module-path oracle/shared \
+              --build-modules oracle/ambiguous; then
+            echo 'Ambiguous module unexpectedly accepted' >&2; exit 1
+          fi
+          test ! -e oracle/ambiguous
+          rm oracle/libs/Core.mod
+          cat > oracle/apps/HasBegin.mod <<'EOF'
+          MODULE HasBegin;
+          IMPORT Core;
+          VAR x:INTEGER;
+          BEGIN x:=Core.Add(1,2)
+          END HasBegin.
+          EOF
+          if compiler/target/debug/compiler oracle/apps/HasBegin.mod \
+              --language oberon --target ${{ matrix.target }} \
+              --module-path oracle/shared --build-modules oracle/init; then
+            echo 'Unordered module BEGIN unexpectedly accepted' >&2; exit 1
+          fi
+          test ! -e oracle/init
