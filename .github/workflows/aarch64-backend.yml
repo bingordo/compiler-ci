@@ -1,11 +1,11 @@
-name: AArch64 backend (compiler-ci)
+name: AArch64 backend current main (compiler-ci)
 on:
   workflow_dispatch:
     inputs:
       compiler_ref:
         description: 'Compiler branch, tag, or commit to test'
         required: true
-        default: 'aarch64-bootstrap-20261029'
+        default: 'main'
         type: string
   push:
     paths:
@@ -36,7 +36,7 @@ jobs:
       - name: Resolve compiler revision
         id: source
         env:
-          REF: ${{ inputs.compiler_ref || 'aarch64-bootstrap-20261029' }}
+          REF: ${{ inputs.compiler_ref || 'main' }}
         run: |
           set -euo pipefail
           sha=$(git ls-remote ssh://git@github.com/bingordo/compiler.git "refs/heads/$REF" "refs/tags/$REF" | head -n1 | cut -f1)
@@ -52,7 +52,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .aarch64-verified
-          key: aarch64-verified-v1-${{ steps.source.outputs.sha }}
+          key: aarch64-main-verified-v2-${{ steps.source.outputs.sha }}
           enableCrossOsArchive: true
       - name: Decide whether to test
         id: decision
@@ -86,13 +86,6 @@ jobs:
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Checkout pinned public Mini-C frontend
-        uses: actions/checkout@v4
-        with:
-          repository: bingordo/mini-c
-          ref: 421e0b93b0b78409987e37cf9c43f8e58ed92cb3
-          path: mini-c
-          persist-credentials: false
       - name: Report exact compiler revision under test
         env:
           COMPILER_SHA: ${{ needs.detect-change.outputs.source_sha }}
@@ -108,7 +101,7 @@ jobs:
             compiler/crates/backend-x86 compiler/crates/backend-aarch64 \
             compiler/crates/driver aarch64-workspace/crates/
           cp -a compiler/examples compiler/tests aarch64-workspace/
-          cp -a compiler/tools/mini-c-driver aarch64-workspace/tools/
+          cp -a compiler/tools aarch64-workspace/
           cat > aarch64-workspace/Cargo.toml <<'EOF'
           [workspace]
           resolver = "2"
@@ -148,24 +141,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          bash tests/aarch64_frontend_integration.sh
-          echo 'Source frontend + shared SSA/optimization + native AArch64 ELF integration passed: Flow 19,551-case oracle, Math 20,402-result implicit ELF target, 16 argument calls, recursion, arrays and unsupported output diagnostics.' >> "$GITHUB_STEP_SUMMARY"
-      - name: Test checked Mini-C AArch64 emission without x86-native unit oracles
+          COMPILER_DRIVER="$PWD/target/debug/compiler" bash tests/aarch64_driver_integration.sh
+          echo 'Current-main checked Oberon/Mini-C -> AArch64 native ELF/GAS, globals, PIC and Linux GP varargs integration passed.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Run all source-pinned AArch64 offline oracle and batch tests
         working-directory: aarch64-workspace
         shell: bash
-        env:
-          MINI_C_LOCAL_REPO: ${{ github.workspace }}/mini-c
-          CARGO_TARGET_DIR: ${{ github.workspace }}/aarch64-workspace/target
         run: |
           set -euo pipefail
-          expected_mini_c=421e0b93b0b78409987e37cf9c43f8e58ed92cb3
-          actual_mini_c="$(git -C ../mini-c rev-parse HEAD)"
-          test "$actual_mini_c" = "$expected_mini_c"
-          printf 'Pinned checked Mini-C frontend: `%s`\n' "$actual_mini_c" >> "$GITHUB_STEP_SUMMARY"
-          bash tools/mini-c-driver/cargo-local.sh test -p compiler-mini-c --lib aarch64_ -- --test-threads=1
-          bash tools/mini-c-driver/cargo-local.sh build -p compiler-mini-c --bin compiler-mini-c
-          MINI_C_COMPILER="$CARGO_TARGET_DIR/debug/compiler-mini-c" bash tests/aarch64_mini_c_integration.sh
-          echo 'Checked Mini-C C source -> shared SSA/opt -> AArch64 ELF -> C oracle passed (AAPCS64, recursion, loops, pointers, byte loads, signed division/remainder); unsupported output modes rejected.' >> "$GITHUB_STEP_SUMMARY"
+          python3 -m unittest discover -s tools -p 'test_aarch64*.py' -v
+          echo 'Offline source fingerprints, encoding oracle, and scalable AArch64 batch planner passed.' >> "$GITHUB_STEP_SUMMARY"
       - name: Record successful verification
         run: |
           mkdir -p .aarch64-verified
@@ -174,5 +158,5 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .aarch64-verified
-          key: aarch64-verified-v1-${{ needs.detect-change.outputs.source_sha }}
+          key: aarch64-main-verified-v2-${{ needs.detect-change.outputs.source_sha }}
           enableCrossOsArchive: true
