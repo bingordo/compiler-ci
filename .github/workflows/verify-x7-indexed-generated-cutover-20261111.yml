@@ -1,0 +1,70 @@
+name: X7 indexed generated selection and reviewed ALU form production gate
+on:
+  push:
+    branches: [ci/x7-indexed-generated-cutover-20261111]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  focused-x86:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout exact candidate x86 compiler commit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b6210704b129b639ede577de7e534076acc7b73d
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check generated tables and provenance-sensitive tests
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = b6210704b129b639ede577de7e534076acc7b73d
+          python3 tools/regen_x86_selector_rules.py --check
+          python3 tools/regen_x86_scalar_bin_forms.py --check
+          python3 tools/regen_x86_forms.py --check
+          python3 -m unittest discover -s tools -p 'test_x86_selector_rules.py' -v
+          python3 -m unittest discover -s tools -p 'test_x86_scalar_bin_forms.py' -v
+      - name: Test real x86 selector and binary encoder
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          """)
+          PY
+          cargo test -p compiler-backend-x86 --lib --offline
+          cargo test -p compiler-backend-x86 --lib --no-default-features --offline
+          cargo test -p compiler-backend-x86 --lib --features x7-native-form-validation --offline
+          echo X7_INDEXED_SELECTOR_NATIVE_GREEN
+  full-workspace:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b6210704b129b639ede577de7e534076acc7b73d
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Authorize private frontend dependencies
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub and prepare native test tools
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+          sudo apt-get update -qq
+          sudo apt-get install -y gdb
+      - name: Full workspace with generated encoder changes
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = b6210704b129b639ede577de7e534076acc7b73d
+          cargo test --workspace
+          cargo test -p compiler-backend-x86 --features x7-c-defined-bitwise,x7-native-form-validation
+          echo X7_GENERATED_PRODUCTION_WORKSPACE_GREEN
