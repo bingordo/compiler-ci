@@ -69,3 +69,41 @@ jobs:
           cargo test --workspace
           cargo test -p compiler-backend-x86 --features x7-c-defined-bitwise,x7-native-form-validation
           echo X7_GENERATED_PRODUCTION_WORKSPACE_GREEN
+
+  opt-base-repro:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout compiler PR base without x86 changes
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 3b2f8a3aa54a28256d1dbc63ec1fcb17073b4996
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Distinguish pre-existing optimizer idempotence failure
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 3b2f8a3aa54a28256d1dbc63ec1fcb17073b4996
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          """)
+          PY
+          set +e
+          cargo test -p compiler-opt --test generated_native_compare_dag \
+            generated_comparison_dag_all_widths_with_cfg_and_negative_guards \
+            --offline -- --nocapture > /tmp/opt-base-repro.log 2>&1
+          rc=$?
+          set -e
+          tail -n 35 /tmp/opt-base-repro.log
+          if [ "$rc" = 0 ]; then
+            echo "OPT_BASE_COMPARE_DAG_PASS"
+          elif grep -q "non-idempotent comparison DAG" /tmp/opt-base-repro.log; then
+            echo "OPT_BASE_COMPARE_DAG_PREEXISTING_FAILURE"
+          else
+            echo "OPT_BASE_COMPARE_DAG_OTHER_FAILURE"
+            exit "$rc"
+          fi
