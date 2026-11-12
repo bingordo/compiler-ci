@@ -1,0 +1,105 @@
+name: CT-11 pinned TypeId mem2reg phase census
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/ct11-typed-mem2reg-phase-profile.yml']
+permissions:
+  contents: read
+concurrency:
+  group: ct11-typed-mem2reg-phase-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  checked-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a1d9433998c2c602258e71cb8b4f70b5fb7f73e9
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pinned source and toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          test "$(git -C compiler rev-parse HEAD)" = a1d9433998c2c602258e71cb8b4f70b5fb7f73e9
+          git -C compiler rev-parse HEAD | tee results/sha.txt
+          rustc --version | tee results/toolchain.txt
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          python3 -m py_compile compiler/tools/s23_native_profile_source.py compiler/tools/ct11_loop_source_profile.py compiler/tools/source_compile_corpus.py
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ct11-typed-mem2reg-phase-profile
+      - name: Opt-in native TypeId mem2reg parity and rollback
+        shell: bash
+        working-directory: compiler
+        run: |
+          cargo test --release -p compiler-opt --test typed_mem2reg ct11_typed_mem2reg_profile_preserves_promoted_and_rejected_transactions -- --nocapture
+          cargo test --release -p compiler-opt --test typed_licm_native ct11_native_licm_phase_diagnostics_preserve_exact_transaction -- --nocapture
+      - name: Opt-in CLI phase records and exact ELF and GAS parity
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test --release -p compiler --test typeid_native_s2316_profile -- --nocapture
+          cargo test --release -p compiler-opt --test native_s2316_profile -- --nocapture
+          cargo clippy -p compiler-opt --lib -- -D warnings
+          cargo clippy -p compiler --bin compiler --test typeid_native_s2316_profile -- -D warnings
+          cargo build --release -p compiler --bin compiler
+      - name: Pinned checked loop, branch and call source phase census
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/ct11_loop_source_profile.py \
+            --compiler compiler/target/release/compiler \
+            --output results/ct11-typed-mem2reg-phase-profile.json --rounds 3 \
+            2>&1 | tee results/corpus.log
+          test "$(grep -c '^CT11_CHECKED_LOOP ' results/corpus.log)" -eq 8
+          python3 - <<'PY' | tee -a results/corpus.log
+          import json
+          from pathlib import Path
+          report=json.loads(Path("results/ct11-typed-mem2reg-phase-profile.json").read_text())
+          assert report["case_count"]==8
+          assert report["cases_with_loops_at_licm"],"no actual loops reached LICM"
+          phases=("input_validation","clone","promotion","exit_validation")
+          counts=("functions_scanned","promoted")
+          for name,row in sorted(report["cases"].items()):
+              assert row["gcc_typeid_oracle_input_pairs"]==36,name
+              assert row["object_sha256"] and row["gcc_typeid_oracle_digest"],name
+              p=row["phase_profile_median"]
+              for invocation in ("core","retry"):
+                  for stage in ("pre","post"):
+                      prefix=f"mem2reg_{invocation}_{stage}_"
+                      for phase in phases:
+                          assert prefix+phase+"_ns" in p,(name,prefix,phase)
+                          assert p[prefix+phase+"_ns"]>=0
+                      for field in counts:
+                          assert prefix+field in p,(name,prefix,field)
+                          assert p[prefix+field]>=0
+              assert p["mem2reg_core_post_input_validation_ns"]>0,name
+              print("CT11_MEM2REG_CHECKED name="+name+
+                    " post_input_validation_ns="+str(p["mem2reg_core_post_input_validation_ns"])+
+                    " post_clone_ns="+str(p["mem2reg_core_post_clone_ns"])+
+                    " post_promotion_ns="+str(p["mem2reg_core_post_promotion_ns"])+
+                    " post_exit_validation_ns="+str(p["mem2reg_core_post_exit_validation_ns"])+
+                    " functions_scanned="+str(p["mem2reg_core_post_functions_scanned"])+
+                    " promoted="+str(p["mem2reg_core_post_promoted"]),flush=True)
+          print("CT11_MEM2REG_CENSUS cases=8 oracle_pairs=288 elf_gas_parity=passed",flush=True)
+          PY
+          grep '^CT11_MEM2REG_CHECKED ' results/corpus.log | tee -a "$GITHUB_STEP_SUMMARY"
+          grep '^CT11_LOOP_CENSUS ' results/corpus.log | tee -a "$GITHUB_STEP_SUMMARY"
+          grep '^CT11_MEM2REG_CENSUS ' results/corpus.log | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ct11-typed-mem2reg-phase-profile
+          path: results/
+          retention-days: 30
