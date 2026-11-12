@@ -1,0 +1,96 @@
+name: M4.10 bounded coverage-guided ELF fuzz
+on:
+  pull_request:
+    paths: ['.github/workflows/m410-elf-libfuzzer.yml']
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Compiler SHA or ref (main by default)
+        required: false
+        default: main
+        type: string
+  schedule:
+    - cron: '37 8 * * 6'
+permissions:
+  contents: read
+concurrency:
+  group: m410-elf-libfuzzer-${{ github.event_name == 'pull_request' && github.head_ref || github.ref }}
+  cancel-in-progress: true
+jobs:
+  fuzz-elf:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout source-pinned compiler or scheduled main
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ github.event_name == 'pull_request' && '327624127e4f15dbb4ba739cbbf54cc32cddea88' || inputs.source_ref || 'main' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record source and reproducible toolchains
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          source_sha="$(git rev-parse HEAD)"
+          if [ "${{ github.event_name }}" = pull_request ]; then
+            test "$source_sha" = '327624127e4f15dbb4ba739cbbf54cc32cddea88'
+          fi
+          test -s fuzz/fuzz_targets/elf_writer_input.rs
+          test -s fuzz/fuzz_targets/elf_serialized_metadata.rs
+          echo "Exact compiler source: $source_sha" | tee -a "$GITHUB_STEP_SUMMARY"
+          rustc -vV | tee "$RUNNER_TEMP/m410-fuzz-rust-version.txt"
+          printf 'source_sha=%s\n' "$source_sha" >> "$RUNNER_TEMP/m410-fuzz-rust-version.txt"
+      - name: Resolve compiler Git dependencies
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m410-libfuzzer-v1
+      - name: Ensure regular backend tests and shared oracle are unchanged
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend --lib m410_replayable_writer_input_property_fuzz
+          cargo test -p compiler-backend --lib m410_unstructured_serialized_elf_mutation_never_panics
+          cargo test -p compiler-backend --lib m410_seeded_serialized_elf_metadata_rejection
+      - name: Check isolated fuzz workspace on stable
+        working-directory: compiler
+        run: cargo check --manifest-path fuzz/Cargo.toml --bins
+      - name: Install nightly sanitizer toolchain and pinned cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal --component rust-src
+          cargo install cargo-fuzz --locked --version 0.13.2
+          cargo +nightly -V | tee -a "$RUNNER_TEMP/m410-fuzz-rust-version.txt"
+          cargo fuzz --version | tee -a "$RUNNER_TEMP/m410-fuzz-rust-version.txt"
+      - name: Coverage-guided writer-model fuzz bounded 90 seconds
+        working-directory: compiler/fuzz
+        run: |
+          set -euo pipefail
+          cargo +nightly fuzz run elf_writer_input -- -max_total_time=90 -max_len=512 -timeout=3 -rss_limit_mb=1024 -print_final_stats=1 2>&1 | tee "$RUNNER_TEMP/m410-elf-writer-fuzz.log"
+      - name: Coverage-guided serialized-metadata fuzz bounded 90 seconds
+        working-directory: compiler/fuzz
+        run: |
+          set -euo pipefail
+          cargo +nightly fuzz run elf_serialized_metadata -- -max_total_time=90 -max_len=512 -timeout=3 -rss_limit_mb=1024 -print_final_stats=1 2>&1 | tee "$RUNNER_TEMP/m410-elf-metadata-fuzz.log"
+      - name: Strict Clippy backend and oracle feature
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-backend --all-targets -- -D warnings
+          cargo clippy -p compiler-backend --features elf-fuzz --lib -- -D warnings
+      - name: Preserve corpus, crashes, coverage progression and replay tools
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m410-elf-libfuzzer-replay-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            compiler/fuzz/corpus/
+            compiler/fuzz/artifacts/
+            ${{ runner.temp }}/m410-fuzz-rust-version.txt
+            ${{ runner.temp }}/m410-elf-writer-fuzz.log
+            ${{ runner.temp }}/m410-elf-metadata-fuzz.log
+          if-no-files-found: ignore
+          retention-days: 30
