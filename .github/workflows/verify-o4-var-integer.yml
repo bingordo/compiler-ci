@@ -1,0 +1,133 @@
+name: O4 native VAR INTEGER scalar alias semantics
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-o4-var-integer.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      COMPILER_SHA: a1d71fcc5003ab0035b5f194e76d10a8de2a82cb
+      OBERON_SHA: 96c0cc982079c12435c468d3a81e828f9382c8d3
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a1d71fcc5003ab0035b5f194e76d10a8de2a82cb
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check immutable pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          grep -F "$OBERON_SHA" compiler/crates/driver/Cargo.toml
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: o4-var-integer-${{ matrix.target }}
+      - name: Build and strict TypeId checks
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test aggregate_layout
+          cargo test -p compiler-ir --test aggregate_roots
+          cargo test -p compiler-opt --test typed_aggregate_pipeline
+          if [ "${{ matrix.target }}" = x86_64 ]; then
+            cargo test -p compiler --bin compiler
+            cargo clippy -p compiler-ir -p compiler --all-targets -- -D warnings
+          else
+            cargo test -p compiler --bin compiler --no-run
+            cargo clippy -p compiler-ir --all-targets -- -D warnings
+            cargo clippy -p compiler --bin compiler -- -D warnings
+          fi
+          cargo build -p compiler --bin compiler
+      - name: Execute native scalar VAR INTEGER reference and alias semantics
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p oracle
+          cat > oracle/Ref.mod <<'EOF'
+          MODULE Ref;
+          VAR g: INTEGER;
+          PROCEDURE Bump*(VAR x: INTEGER; amount: INTEGER): INTEGER;
+          BEGIN x:=x+amount; RETURN x END Bump;
+          PROCEDURE Forward*(VAR x: INTEGER): INTEGER;
+          BEGIN RETURN Bump(x,2) END Forward;
+          PROCEDURE Work*(n: INTEGER): INTEGER;
+          VAR local: INTEGER;
+          BEGIN local:=n; g:=1;
+            RETURN Forward(local)+local+Bump(g,3)+g
+          END Work;
+          PROCEDURE Change*(n: INTEGER): INTEGER;
+          BEGIN RETURN Bump(n,5)+n END Change;
+          PROCEDURE Same*(VAR a,b: INTEGER): INTEGER;
+          BEGIN a:=a+1; b:=b+2; RETURN a+b END Same;
+          PROCEDURE Alias*(n: INTEGER): INTEGER;
+          VAR x: INTEGER;
+          BEGIN x:=n; RETURN Same(x,x)+x END Alias;
+          END Ref.
+          EOF
+          cat > oracle/main.c <<'EOF'
+          #include <stdint.h>
+          extern int32_t Ref__Work(int32_t);
+          extern int32_t Ref__Change(int32_t);
+          extern int32_t Ref__Alias(int32_t);
+          extern int32_t Ref__Bump(int32_t *,int32_t);
+          int main(void) {
+            for(int32_t n=-1;n<=258;n++) {
+              if(Ref__Work(n)!=2*n+12) return 1;
+              if(Ref__Change(n)!=2*n+10) return 2;
+              if(Ref__Alias(n)!=3*n+9) return 3;
+            }
+            int32_t x=10;
+            if(Ref__Bump(&x,7)!=17 || x!=17) return 4;
+            return 0;
+          }
+          EOF
+          for format in obj asm; do
+            suffix=o
+            if [ "$format" = asm ]; then suffix=s; fi
+            compiler/target/debug/compiler oracle/Ref.mod \
+              --language oberon --target ${{ matrix.target }} \
+              --emit "$format" -o "oracle/Ref.$suffix"
+            cc -std=c11 -O2 oracle/main.c "oracle/Ref.$suffix" -o "oracle/run-$format"
+            "oracle/run-$format"
+            echo "VAR INTEGER ${{ matrix.target }} $format PASS" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Reject non-lvalue VAR actuals
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > oracle/BadVar.mod <<'EOF'
+          MODULE BadVar;
+          PROCEDURE Mut*(VAR x:INTEGER):INTEGER;
+          BEGIN x:=x+1; RETURN x END Mut;
+          PROCEDURE Run*(n:INTEGER):INTEGER;
+          BEGIN RETURN Mut(n+1) END Run;
+          END BadVar.
+          EOF
+          if compiler/target/debug/compiler oracle/BadVar.mod \
+              --language oberon --target ${{ matrix.target }} \
+              --emit obj -o oracle/BadVar.o; then
+            echo "Expected VAR non-lvalue rejection" >&2
+            exit 1
+          fi
