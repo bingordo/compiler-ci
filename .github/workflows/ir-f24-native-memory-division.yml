@@ -1,0 +1,101 @@
+name: IR F24 TypeId memory division and native execution acceptance
+on:
+  pull_request:
+    paths: ['.github/workflows/ir-f24-native-memory-division.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  typed-effects-native-execution:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 6e82e2b49cb8331bbe5cdcd9492fdf0cd6ceb514
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - name: Check exact compiler commit and portable workspace
+        run: |
+          set -euxo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "6e82e2b49cb8331bbe5cdcd9492fdf0cd6ceb514"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-f24-memory-and-div
+      - name: No retired scalar optimizer or Function backend in migrated suites
+        working-directory: compiler
+        run: |
+          if rg -n '(compiler_opt::optimize\(|\boptimize\(&mut\b|\.emit_assembly\(|\.emit_object\()' crates/opt/tests/division_effects.rs crates/opt/tests/m4_integer_effects.rs crates/opt/tests/local_memory_native.rs crates/opt/tests/memory_native.rs; then
+            echo "Migrated test still uses legacy optimizer/backend" >&2
+            exit 1
+          fi
+      - name: Signed division and duplicate traps from TypeId pipeline
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test division_effects -- --nocapture
+      - name: Overlapping I64 and checked external effect TypeId oracle
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test m4_integer_effects -- --nocapture
+      - name: Exact slot forwarding native GAS and ELF C oracle
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test local_memory_native -- --nocapture
+      - name: Pointer PHI memory order native GAS and ELF C oracle
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test memory_native -- --nocapture
+      - name: Previous F23 native execution regression
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test cse_native
+          cargo test -p compiler-opt --test phi_native
+          cargo test -p compiler-opt --test native_cfg_differential
+          cargo test -p compiler-opt --test typed_dse
+          cargo test -p compiler-opt --features typeid-egraph,typeid-memory-ssa --test m6_typeid_egraph
+      - name: Strict all-target IR/optimizer Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt --all-targets -- -D warnings
+  full-core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 6e82e2b49cb8331bbe5cdcd9492fdf0cd6ceb514
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - name: Verify source SHA and isolate core workspace
+        run: |
+          set -euxo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "6e82e2b49cb8331bbe5cdcd9492fdf0cd6ceb514"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-f24-memory-full
+      - name: Install GDB for native DWARF tests
+        run: |
+          if ! command -v gdb >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq gdb
+          fi
+      - name: Full IR optimizer x86 and AArch64 core tests
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 -- --skip generated_comparison_dag_all_widths_with_cfg_and_negative_guards
