@@ -1,0 +1,92 @@
+name: M6 final physical Function MemorySSA retirement
+on:
+  push:
+    branches: [ci/m6-final-retirement-1092-20261111]
+    paths: ['.github/workflows/m6-final-retirement-1092.yml']
+permissions:
+  contents: read
+jobs:
+  native-m6-only:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c309e0e38e0bf6b87e78a2757b354caad588c2f5
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest exact compiler SHA and physical M6 Function removal
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = c309e0e38e0bf6b87e78a2757b354caad588c2f5
+          python3 - <<'PY'
+          from pathlib import Path
+          root=Path("compiler")
+          for p in ("crates/opt/src/egraph_ssa.rs",
+                    "crates/opt/src/memory_ssa.rs",
+                    "crates/opt/src/memory_ssa_loads.rs",
+                    "crates/opt/tests/ct03_memoryssa_invalidation_native.rs",
+                    "crates/opt/tests/indirect_call_memory_barriers.rs",
+                    "crates/opt/tests/m6_opt_in.rs",
+                    "crates/opt/tests/m6_marginal_native.rs",
+                    "crates/opt/tests/m6_native_optin.rs",
+                    "crates/opt/tests/m6_generated_factor_matrix.rs"):
+              assert not (root/p).exists(),p
+          lib=(root/"crates/opt/src/lib.rs").read_text()
+          cargo=(root/"crates/opt/Cargo.toml").read_text()
+          assert "pub mod memory_ssa;" not in lib
+          assert "pub mod memory_ssa_loads;" not in lib
+          assert "pub mod typed_memory_ssa;" in lib
+          assert "pub mod typed_memory_ssa_loads;" in lib
+          assert "optimize_m6_experimental" not in lib
+          assert "legacy-experimental-ssa = []" in cargo
+          assert "typeid-egraph = [\"typeid-memory-ssa\"]" in cargo
+          for f in ("m6_typeid_memoryssa.rs", "m6_typeid_memoryssa_cfg.rs",
+                    "m6_typeid_memoryssa_stress.rs", "m6_typeid_matrix.rs",
+                    "m6_typeid_egraph.rs"):
+              assert (root/"crates/opt/tests"/f).exists(),f
+          doc=(root/"docs/research/M6_Experimental_EGraph_MemorySSA.md").read_text()
+          assert "MemorySSA TypeId migration is complete" in doc
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m6-final-native-memoryssa-only-1092
+      - name: Native MemorySSA graph, alias, callback, stress and x86/GCC oracles
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --features typeid-memory-ssa --test m6_typeid_memoryssa -- --nocapture --test-threads=1
+          cargo test -p compiler-opt --features typeid-memory-ssa --test m6_typeid_memoryssa_cfg -- --nocapture --test-threads=1
+          cargo test -p compiler-opt --features typeid-memory-ssa --test m6_typeid_memoryssa_stress -- --nocapture --test-threads=1
+          cargo clippy -p compiler-opt --features typeid-memory-ssa --all-targets -- -D warnings
+      - name: Native egraph and CPU memory overhead plus legacy feature no-op
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --features typeid-egraph --test m6_typeid_egraph -- --test-threads=1
+          cargo test -p compiler-opt --features typeid-egraph --test m6_typeid_matrix -- --test-threads=1
+          cargo test -p compiler-opt --features typeid-egraph --test m6_overhead -- --nocapture --test-threads=1
+          cargo test -p compiler-opt --features typeid-egraph --lib -- --test-threads=2
+          cargo clippy -p compiler-opt --features typeid-egraph --all-targets -- -D warnings
+          cargo test -p compiler-opt --features legacy-experimental-ssa --lib -- --test-threads=2
+          cargo clippy -p compiler-opt --features legacy-experimental-ssa --all-targets -- -D warnings
+          cargo check -p compiler --features legacy-experimental-ssa --all-targets
+          cargo check --manifest-path tools/mini-c-driver/Cargo.toml --features legacy-experimental-ssa --all-targets
+      - name: Full checked source and default compiler TypeId regressions
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --features typeid-egraph --bin compiler m6_checked_oberon_source_vs_c_oracle -- --test-threads=1
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --features typeid-egraph --lib m6_real_checked_mini_c_source_vs_gcc -- --test-threads=1
+          cargo test -p compiler --bin compiler -- --test-threads=2
+          cargo test -p compiler --test f6_source_runtime_parity -- --test-threads=1
+          cargo test -p compiler-ir -p compiler-opt --lib -- --test-threads=2
+          cargo clippy -p compiler -p compiler-ir -p compiler-opt --all-targets -- -D warnings
+          cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml --all-targets -- -D warnings
