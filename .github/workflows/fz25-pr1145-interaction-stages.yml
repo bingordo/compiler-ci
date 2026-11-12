@@ -1,0 +1,53 @@
+name: FZ-2.5 PR1145 cross-pass stage replay and native C11 oracle
+on:
+  push:
+    branches: [fuzz/fz25-interaction-stage-pr1145]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  interaction:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 0bc05de7500b2410a4f90b33e1c4630909e5e5ac
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "0bc05de7500b2410a4f90b33e1c4630909e5e5ac"
+          test -s compiler/crates/opt/tests/typeid_fuzz_interactions.rs
+      - name: Isolate self-contained compiler crates
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: fz25-interaction-stage-replay
+          cache-workspace-crates: 'true'
+      - name: Mixed constructs stage replay rollback and native independent C11
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typeid_fuzz_interactions -- --nocapture
+      - name: Previous TypeId FZ-2.5 and FZ-2 regression
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typeid_fuzz_pre_induction_targeted
+          cargo test -p compiler-opt --test typeid_fuzz_promotion_stages
+          cargo test -p compiler-opt --test typeid_fuzz_licm_identical_targeted
+          cargo test -p compiler-opt --test typeid_fuzz_memory_cfg_targeted
+          cargo test -p compiler-opt --test typeid_fuzz_local_cfg_targeted
+          cargo test -p compiler-opt --test typeid_fuzz_targeted
+          cargo test -p compiler-opt --test typeid_fuzz_bias
+          cargo test -p compiler-opt --test typeid_fuzz_pass_registry
+          cargo test -p compiler-opt --test typed_core_native_verifier
+      - name: Strict Clippy for stage interaction suite
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt --test typeid_fuzz_interactions --test typeid_fuzz_pass_registry -- -D warnings
