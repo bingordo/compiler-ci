@@ -1,0 +1,98 @@
+name: Compiler X7 verified GP variadic full x86 candidate matrix (e3291147c053)
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/verify-x7-shared-machine-gp-varargs-full-matrix-20261112.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  all-x86-rust-tests:
+    name: x86 all targets / ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            flags: ""
+          - name: no-default-features
+            flags: "--no-default-features"
+          - name: native-form-validation
+            flags: "--features x7-native-form-validation"
+          - name: native-64bit
+            flags: "--features x7-c-defined-64"
+          - name: all-features
+            flags: "--all-features"
+    steps:
+      - name: Checkout pinned compiler GP variadic candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e3291147c053bb7ec15fd47052592c4c89389d6f
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Prove exact candidate SHA and use the dependency-independent x86 workspace
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = e3291147c053bb7ec15fd47052592c4c89389d6f
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text('''[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          ''')
+          PY
+          cc --version | head -n 1
+          rustc --version
+          cargo --version
+      - name: Run ALL x86 Rust unit, integration, binary, example and bench test targets — no skips
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --all-targets --no-fail-fast --offline ${{ matrix.flags }}
+          cargo test -p compiler-backend-x86 --doc --offline ${{ matrix.flags }}
+          echo "X86_GP_VARIADIC_FULL_MATRIX_PASS ${{ matrix.name }} source=e3291147c053bb7ec15fd47052592c4c89389d6f"
+  x86-python-and-catalog:
+    name: x86 Python source/selector/encoding tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - name: Checkout pinned compiler GP variadic candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e3291147c053bb7ec15fd47052592c4c89389d6f
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Prepare offline symbolic proof test dependency
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user 'z3-solver==4.13.4.0'
+      - name: Check x86 generated source forms and execute every x86 Python unit test
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = e3291147c053bb7ec15fd47052592c4c89389d6f
+          # The N8/N9 source regressions intentionally require real pinned
+          # upstream Intel source files, never fabricated in-repo fixtures.
+          rev=35eface1b7ee003a1cda95005ec5fd83de658a64
+          mkdir -p /tmp/x86-main-pinned-intel
+          for instruction in ADD BSF POPCNT; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 90 \
+              "https://raw.githubusercontent.com/intel/SDM/${rev}/data/instruction/${instruction}.xml" \
+              --output "/tmp/x86-main-pinned-intel/${instruction}.xml"
+          done
+          curl --fail --silent --show-error --location --retry 2 --max-time 90 \
+            "https://raw.githubusercontent.com/intel/SDM/${rev}/data/definitions.xml.gz" \
+            --output /tmp/x86-main-pinned-intel/definitions.xml.gz
+          export X7_N8_PINNED_ADD_XML=/tmp/x86-main-pinned-intel/ADD.xml
+          export X7_N9_INTEL_DEFINITIONS_GZ=/tmp/x86-main-pinned-intel/definitions.xml.gz
+          export INTEL_ISL_DIR=/tmp/x86-main-pinned-intel
+          # Verify pinned review hashes before enabling six real-source tests.
+          python3 tools/import_intel_isl_subset.py "$INTEL_ISL_DIR"
+          python3 tools/regen_x86_forms.py --check
+          python3 tools/regen_x86_selector_rules.py --check
+          python3 -m unittest discover -s tools -p 'test_x86_*.py' -v
+          echo X86_GP_VARIADIC_PINNED_PYTHON_PASS
