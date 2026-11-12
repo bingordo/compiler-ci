@@ -1,0 +1,164 @@
+name: O5 native scalar Oberon module imports
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-o5-scalar-module-imports.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      COMPILER_SHA: e113245efe35c73a684c67113931708797b83517
+      OBERON_SHA: cac6bdf673f4e7e5e280ad699d1ba7a1130c26bc
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e113245efe35c73a684c67113931708797b83517
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check immutable pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          grep -F "$OBERON_SHA" compiler/crates/driver/Cargo.toml
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: o5-scalar-imports-${{ matrix.target }}
+      - name: Build and strict TypeId checks
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test aggregate_layout
+          cargo test -p compiler-ir --test aggregate_roots
+          cargo test -p compiler-opt --test typed_aggregate_pipeline
+          if [ "${{ matrix.target }}" = x86_64 ]; then
+            cargo test -p compiler --bin compiler
+            cargo clippy -p compiler-ir -p compiler --all-targets -- -D warnings
+          else
+            cargo test -p compiler --bin compiler --no-run
+            cargo clippy -p compiler-ir --all-targets -- -D warnings
+            cargo clippy -p compiler --bin compiler -- -D warnings
+          fi
+          cargo build -p compiler --bin compiler
+      - name: Compile and link independently checked Oberon modules
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p oracle
+          cat > oracle/Arithmetic.mod <<'EOF'
+          MODULE Arithmetic;
+          PROCEDURE Add*(a,b:INTEGER):INTEGER;
+          BEGIN RETURN a+b END Add;
+          PROCEDURE Bump*(VAR x:INTEGER; n:INTEGER):INTEGER;
+          BEGIN x:=x+n; RETURN x END Bump;
+          PROCEDURE Hidden(n:INTEGER):INTEGER;
+          BEGIN RETURN n+100 END Hidden;
+          END Arithmetic.
+          EOF
+          cat > oracle/Client.mod <<'EOF'
+          MODULE Client;
+          IMPORT A:=Arithmetic;
+          VAR count:INTEGER;
+          PROCEDURE Compute*(n:INTEGER):INTEGER;
+          VAR x:INTEGER;
+          BEGIN
+            x:=A.Add(n,2);
+            count:=A.Bump(x,3);
+            RETURN x+count
+          END Compute;
+          END Client.
+          EOF
+          cat > oracle/Extra.mod <<'EOF'
+          MODULE Extra;
+          IMPORT Arithmetic;
+          PROCEDURE Run*(n:INTEGER):INTEGER;
+          BEGIN RETURN Arithmetic.Add(n,Arithmetic.Add(3,4)) END Run;
+          END Extra.
+          EOF
+          cat > oracle/main.c <<'EOF'
+          #include <stdint.h>
+          extern int32_t Arithmetic__Add(int32_t,int32_t);
+          extern int32_t Arithmetic__Bump(int32_t *,int32_t);
+          extern int32_t Client__Compute(int32_t);
+          extern int32_t Extra__Run(int32_t);
+          int main(void) {
+            for(int32_t n=-1;n<260;n++) {
+              if (Arithmetic__Add(n,2)!=n+2) return 1;
+              if (Client__Compute(n)!=2*n+10) return 2;
+              if (Extra__Run(n)!=n+7) return 3;
+            }
+            int32_t x=123;
+            if(Arithmetic__Bump(&x,7)!=130 || x!=130) return 4;
+            return 0;
+          }
+          EOF
+          compiler/target/debug/compiler oracle/Arithmetic.mod --language oberon \
+            --target ${{ matrix.target }} --emit sym -o oracle/Arithmetic.sym
+          grep -F 'PROC Add(INTEGER; INTEGER): INTEGER' oracle/Arithmetic.sym
+          grep -F 'PROC Bump(VAR INTEGER; INTEGER): INTEGER' oracle/Arithmetic.sym
+          if grep -q Hidden oracle/Arithmetic.sym; then
+            echo 'Private procedure unexpectedly exposed by .sym' >&2
+            exit 1
+          fi
+          for format in obj asm; do
+            objects=()
+            for module in Arithmetic Client Extra; do
+              suffix=o
+              if [ "$format" = asm ]; then suffix=s; fi
+              opts=()
+              if [ "$module" != Arithmetic ]; then
+                opts=(--import-interface oracle/Arithmetic.sym)
+              fi
+              compiler/target/debug/compiler "oracle/$module.mod" \
+                --language oberon --target ${{ matrix.target }} --emit "$format" \
+                "${opts[@]}" -o "oracle/$module.$suffix"
+              objects+=("oracle/$module.$suffix")
+            done
+            cc -O2 oracle/main.c "${objects[@]}" -o "oracle/run-$format"
+            "oracle/run-$format"
+            echo "O5 imported modules ${{ matrix.target }} $format PASS" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Reject hidden imports and stale missing interfaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed 's/A.Add(n,2)/A.Hidden(n)/' oracle/Client.mod > oracle/Bad.mod
+          if compiler/target/debug/compiler oracle/Bad.mod --language oberon \
+            --target ${{ matrix.target }} --import-interface oracle/Arithmetic.sym \
+            --emit obj -o oracle/Bad.o; then
+            echo 'Private import illegally compiled' >&2
+            exit 1
+          fi
+          if compiler/target/debug/compiler oracle/Client.mod --language oberon \
+            --target ${{ matrix.target }} --emit obj -o oracle/Missing.o; then
+            echo 'Missing .sym illegally accepted' >&2
+            exit 1
+          fi
+          cp oracle/Arithmetic.sym oracle/Stale.sym
+          sed -i 's/PROC Add(INTEGER; INTEGER): INTEGER/PROC Add(INTEGER): INTEGER/' oracle/Stale.sym
+          if compiler/target/debug/compiler oracle/Client.mod --language oberon \
+            --target ${{ matrix.target }} --import-interface oracle/Stale.sym \
+            --emit obj -o oracle/Stale.o; then
+            echo 'Stale prototype was accepted' >&2
+            exit 1
+          fi
