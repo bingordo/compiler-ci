@@ -1,0 +1,55 @@
+name: FZ-2.5 PR1136 PRE induction pre-post promotion
+on:
+  push:
+    branches: [fuzz/fz25-pre-induction-promotion-pr1136]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  targeted:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 0d9974b70ea51b83274963dfd8c249c78d051911
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source revision and new suites
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "0d9974b70ea51b83274963dfd8c249c78d051911"
+          test -s compiler/crates/opt/tests/typeid_fuzz_pre_induction_targeted.rs
+          test -s compiler/crates/opt/tests/typeid_fuzz_promotion_stages.rs
+      - name: Isolate self-contained compiler crates
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: fz25-last-core-pass
+          cache-workspace-crates: 'true'
+      - name: PRE and induction seeded positive negative trap native C11
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typeid_fuzz_pre_induction_targeted -- --nocapture
+      - name: Pre and post inline promotion real stage and native C11
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typeid_fuzz_promotion_stages -- --nocapture
+      - name: Existing targeted TypeId oracles and registry regression
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typeid_fuzz_licm_identical_targeted
+          cargo test -p compiler-opt --test typeid_fuzz_memory_cfg_targeted
+          cargo test -p compiler-opt --test typeid_fuzz_local_cfg_targeted
+          cargo test -p compiler-opt --test typeid_fuzz_targeted
+          cargo test -p compiler-opt --test typeid_fuzz_bias
+          cargo test -p compiler-opt --test typeid_fuzz_pass_registry
+          cargo test -p compiler-opt --test typed_core_native_verifier
+      - name: Strict Clippy for new and registry test suites
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt --test typeid_fuzz_pre_induction_targeted --test typeid_fuzz_promotion_stages --test typeid_fuzz_pass_registry -- -D warnings
