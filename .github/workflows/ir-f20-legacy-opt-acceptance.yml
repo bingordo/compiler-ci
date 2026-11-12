@@ -1,0 +1,52 @@
+name: IR F20 retire obsolete Function optimizer policy variants
+on:
+  pull_request:
+    paths: ['.github/workflows/ir-f20-legacy-opt-acceptance.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  opt-standalone:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 6791398c5e4d9a715468db56446bf268a418ec9d
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - name: Check compiler pin and select independent core packages
+        run: |
+          set -euxo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "6791398c5e4d9a715468db56446bf268a418ec9d"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: f20-old-optimizer-policy-removal
+      - name: Check all deprecated runner policy symbols are truly absent
+        working-directory: compiler
+        run: |
+          ! rg -n 'optimize_module_with_inline_mode|optimize_module_without_inlining|optimize_module_with_target_inline_policy|optimize_with_if_conversion_policy|optimize_module_with_if_conversion_policy|InlineMode' crates/opt/src crates/opt/tests
+      - name: Historical bounded inline policies, branch/select safeguards and CTFE
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test inline_cost_policy -- --nocapture
+          cargo test -p compiler-opt --test ctfe -- --nocapture
+          cargo test -p compiler-opt --lib if_conversion -- --nocapture
+          cargo test -p compiler-opt --test ct03_closeout -- --nocapture
+      - name: Strict all-target compiler-ir and compiler-opt Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt --all-targets -- -D warnings
+      - name: Broad verifier optimizer generic backend and x86 tests
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 -- --skip generated_comparison_dag_all_widths_with_cfg_and_negative_guards
