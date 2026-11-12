@@ -29,7 +29,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ github.event_name == 'pull_request' && 'c7090af2d66c57f1bfdbe248e548c66ace59d582' || inputs.source_ref || 'main' }}
+          ref: ${{ github.event_name == 'pull_request' && '87a1c3dad38480896f9b9ac94723142386725b0e' || inputs.source_ref || 'main' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -39,7 +39,7 @@ jobs:
           set -euo pipefail
           source_sha="$(git rev-parse HEAD)"
           if [ "${{ github.event_name }}" = pull_request ]; then
-            test "$source_sha" = 'c7090af2d66c57f1bfdbe248e548c66ace59d582'
+            test "$source_sha" = '87a1c3dad38480896f9b9ac94723142386725b0e'
           fi
           test -s fuzz/fuzz_targets/elf_writer_input.rs
           test -s fuzz/fuzz_targets/elf_serialized_metadata.rs
@@ -118,6 +118,32 @@ jobs:
         run: |
           set -euo pipefail
           cargo +nightly fuzz run elf_serialized_metadata -- -max_total_time=90 -max_len=512 -timeout=3 -rss_limit_mb=1024 -print_final_stats=1 2>&1 | tee "$RUNNER_TEMP/m410-elf-metadata-fuzz.log"
+      - name: Minimize both ELF corpora with native libFuzzer coverage
+        working-directory: compiler/fuzz
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/m410-cmin-originals"
+          for target in elf_writer_input elf_serialized_metadata; do
+            # Preserve a complete unminimized fallback. Never apply a
+            # partial or timed-out coverage reduction as a valid corpus.
+            cp -a "corpus/$target" "$RUNNER_TEMP/m410-cmin-originals/$target"
+            if timeout --signal=TERM --kill-after=10s 150s \
+              cargo +nightly fuzz cmin "$target" \
+              > "$RUNNER_TEMP/m410-$target-cmin.log" 2>&1; then
+              echo "Coverage-aware libFuzzer minimization succeeded for $target" >> "$GITHUB_STEP_SUMMARY"
+            else
+              code=$?
+              rm -rf "corpus/$target"
+              cp -a "$RUNNER_TEMP/m410-cmin-originals/$target" "corpus/$target"
+              echo "Coverage minimization failed for $target ($code); original corpus restored" >> "$GITHUB_STEP_SUMMARY"
+              tail -n 40 "$RUNNER_TEMP/m410-$target-cmin.log"
+              exit "$code"
+            fi
+            # The canonical snapshot further checks per-input byte limits,
+            # total size and file count before it can be uploaded.
+            test -n "$(find "corpus/$target" -type f -print -quit)"
+            tail -n 10 "$RUNNER_TEMP/m410-$target-cmin.log"
+          done
       - name: Strict Clippy backend and oracle feature
         working-directory: compiler
         run: |
@@ -137,7 +163,7 @@ jobs:
             --log-writer "$RUNNER_TEMP/m410-elf-writer-fuzz.log" \
             --log-metadata "$RUNNER_TEMP/m410-elf-metadata-fuzz.log" | tee -a "$GITHUB_STEP_SUMMARY"
           mkdir -p "$RUNNER_TEMP/m410-elf-corpus-bundle/logs"
-          for name in m410-fuzz-rust-version.txt m410-elf-writer-fuzz.log m410-elf-metadata-fuzz.log m410-x86-readelf.txt m410-arm-readelf.txt; do
+          for name in m410-fuzz-rust-version.txt m410-elf-writer-fuzz.log m410-elf-metadata-fuzz.log m410-elf_writer_input-cmin.log m410-elf_serialized_metadata-cmin.log m410-x86-readelf.txt m410-arm-readelf.txt; do
             if [ -f "$RUNNER_TEMP/$name" ]; then
               cp "$RUNNER_TEMP/$name" "$RUNNER_TEMP/m410-elf-corpus-bundle/logs/"
             fi
