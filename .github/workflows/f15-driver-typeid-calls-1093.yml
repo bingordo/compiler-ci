@@ -1,0 +1,61 @@
+name: F15 driver final Function signature scan removal
+on:
+  push:
+    branches: [ci/f15-driver-typeid-call-verifier-1093-20261111]
+    paths: ['.github/workflows/f15-driver-typeid-calls-1093.yml']
+permissions:
+  contents: read
+jobs:
+  driver-typeid-only:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7a64b9265d22c57037d88a95859532e9499c9f0d
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest exact source, no driver Function scan and native ABI test
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 7a64b9265d22c57037d88a95859532e9499c9f0d
+          python3 - <<'PY'
+          from pathlib import Path
+          m=Path("compiler/crates/driver/src/main.rs").read_text()
+          s=Path("compiler/crates/driver/tests/unit/driver_cases.rs").read_text()
+          assert "fn verify_defined_call_signatures(" not in m
+          assert "use compiler_ir::{verify, Function}" not in m
+          assert "use compiler_ir::{Block, Instruction, Parameter}" not in m
+          assert "typeid_defined_and_external_call_signatures_are_checked_before_linking" in s
+          assert "module.validate_optimizer_abi()" in s
+          assert "undeclared foreign C call" in s
+          assert "duplicate definitions" in s
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: f15-driver-typeid-calls
+      - name: Native ABI negative/positive direct call tests and feature variants
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --bin compiler typeid_defined_and_external_call_signatures_are_checked_before_linking -- --exact --nocapture --test-threads=1
+          cargo test -p compiler --bin compiler -- --test-threads=2
+          cargo test -p compiler --features typeid-egraph --bin compiler m6_checked_oberon_source_vs_c_oracle -- --test-threads=1
+          cargo test -p compiler --features ct10-verifier-source-profile --bin compiler tests::ct10_real_oberon_typeid_source_profile -- --exact --nocapture --test-threads=1
+          cargo clippy -p compiler --all-targets -- -D warnings
+          cargo clippy -p compiler --features typeid-egraph --all-targets -- -D warnings
+      - name: Independent native source runtime, IR and Mini-C regression
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test f6_source_runtime_parity -- --test-threads=1
+          cargo test -p compiler-ir -p compiler-opt --lib -- --test-threads=2
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib -- --test-threads=2
+          cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml --all-targets -- -D warnings
