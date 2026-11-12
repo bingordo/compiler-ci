@@ -1,0 +1,308 @@
+name: AArch64 source-linked eight-instruction AST batch cohort (real Arm)
+on:
+  push:
+    branches: [ci/aarch64-a32-real-eight-cohort-20261112]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  pinned-evidence:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a268533906456ea6b4c4de36031952b55a03b4f0
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: herd/herdtools7
+          ref: cfc4f56c522ec0d701acaf5a23139b47e8711299
+          path: herd-bundler
+          sparse-checkout: |
+            herd/libdir/asl-pseudocode/bundler.py
+            herd/libdir/asl-pseudocode/type-checking-implementations.asl
+          persist-credentials: false
+      - name: Validate exact compiler source and offline tests
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = a268533906456ea6b4c4de36031952b55a03b4f0
+          python3 -m unittest discover -s compiler/tools -p 'test_aarch64*.py' -v
+          python3 -m py_compile compiler/tools/aarch64_a32_asl_typeenv.py compiler/tools/aarch64_a32_asl_diagnostics.py
+          clang --version | head -1
+      - name: Reproduce source-linked A3.1 witnesses without apt installs
+        run: |
+          set -euo pipefail
+          git clone -q --depth 1 --filter=blob:none https://kernel.googlesource.com/pub/scm/linux/kernel/git/maz/AARCHMRS mrs
+          test "$(git -C mrs rev-parse HEAD)" = 1346b16d47619400448f3cb6d4f22d62d3b76848
+          echo "ef75f3ec02df1b9b9c0612f4ea259d6710ac3de686b097d8f9c83d1d97aa800a  mrs/Instructions.json" | sha256sum -c -
+          curl -fLsS --retry 3 --connect-timeout 20 --max-time 240 --max-filesize 200000000 \
+            -o /tmp/ISA_A64_xml_A_profile-2026-09.tar.gz \
+            https://developer.arm.com/-/cdn-downloads/permalink/Exploration-Tools-A64-ISA/ISA_A64/ISA_A64_xml_A_profile-2026-09.tar.gz
+          echo "44cfb89c763c7eea8e59de0ad2221e3c012e6aa77899bd7f1c3e1f24537191d7  /tmp/ISA_A64_xml_A_profile-2026-09.tar.gz" | sha256sum -c -
+          python3 compiler/tools/aarch64_mrs_catalog.py --instructions mrs/Instructions.json \
+            --expect-sha256 ef75f3ec02df1b9b9c0612f4ea259d6710ac3de686b097d8f9c83d1d97aa800a \
+            --out /tmp/aarch64-catalog.json
+          python3 compiler/tools/aarch64_a31_encoding_oracle.py \
+            --catalog /tmp/aarch64-catalog.json --out /tmp/aarch64-evidence.json
+          python3 compiler/tools/aarch64_a32_asl_source_links.py \
+            --isa-xml-archive /tmp/ISA_A64_xml_A_profile-2026-09.tar.gz \
+            --a31-evidence /tmp/aarch64-evidence.json --out /tmp/aarch64-source-links.json
+          python3 compiler/tools/aarch64_a32_batch_plan.py \
+            --source-links /tmp/aarch64-source-links.json \
+            --batch-size 8 --out /tmp/aarch64-cohorts.json
+          python3 - <<'PY'
+          import json
+          a=json.load(open('/tmp/aarch64-source-links.json'))
+          assert (a['requested_operations'],a['linked_operations'],a['unresolved_operations']) == (23,23,0)
+          assert a['selection_eligible'] is False
+          e=json.load(open('/tmp/aarch64-evidence.json'))
+          assert e['cases_verified'] == 26 and e['selection_eligible'] is False
+          print("A32_MATCHED_PINNED_LINKS",a['linked_operations'],"A31_WITNESSES",e['cases_verified'])
+          PY
+      - name: Classify published ImpDefMemoryAttributes declarations without exposing ASL
+        run: |
+          set -euo pipefail
+          test "$(git -C herd-bundler rev-parse HEAD)" = cfc4f56c522ec0d701acaf5a23139b47e8711299
+          python3 - <<'PY'
+          import json, sys, tarfile, tempfile, hashlib
+          from pathlib import Path
+          from argparse import Namespace
+          sys.path.insert(0, 'compiler/tools')
+          from aarch64_a32_aslref_compat import load_bundler
+          from aarch64_a32_asl_type_collision import source_symbol_census
+          from aarch64_a32_sysreg_source import copy_typing_only_implementations
+          sharedxml="ISA_A64_xml_A_profile-2026-09/shared_pseudocode.xml"
+          with tempfile.TemporaryDirectory() as d:
+              folder=Path(d)
+              with tarfile.open('/tmp/ISA_A64_xml_A_profile-2026-09.tar.gz','r:gz') as archive:
+                  item=archive.getmember(sharedxml)
+                  assert item.isfile() and 0 < item.size < 60000000
+                  (folder/'shared_pseudocode.xml').write_bytes(archive.extractfile(item).read())
+              b=load_bundler(Path('herd-bundler/herd/libdir/asl-pseudocode/bundler.py'))
+              shared=folder/'shared_pseudocode.asl'
+              b.make_shared_pseudocode(Namespace(i_files=[folder/'shared_pseudocode.xml'],o_dir=shared))
+              copy_typing_only_implementations(
+                  Path('herd-bundler/herd/libdir/asl-pseudocode/type-checking-implementations.asl'),
+                  folder)
+              d=source_symbol_census(shared,folder/'type_checking_implementations.asl')
+              assert d['by_source']['typing_stub']['identifier_line_count'] == 1
+              assert d['published_impdef_declarations'] == 1, d
+              assert any(row['kind'] == 'impdef_func' and
+                         row['memory_attributes_return_marker']
+                         for row in d['by_source']['shared']['occurrences'])
+              assert d['selection_eligible'] is False and d['semantic_equivalence_proven'] is False
+              print('MATCHED_A32_DECLARATION_CENSUS',json.dumps(d,sort_keys=True))
+              from aarch64_a32_asl_type_collision import reconcile
+              from aarch64_a32_asl_type_collision import _OPTIONAL_FUNCTIONS, _published_function
+              for name, (_, form, result_type) in _OPTIONAL_FUNCTIONS.items():
+                  matches=_published_function(shared.read_text(), name, form, result_type)
+                  print('A32_PINNED_HELPER_SOURCE',name,len(matches),
+                        [hashlib.sha256(x.encode()).hexdigest() for x in matches])
+              omission = reconcile(shared, folder/'type_checking_implementations.asl')
+              # Verify published variants without exporting Arm source text.
+              import re, hashlib
+              for name in ('ImpDefBool','ImpDefInt','ImpDefBits','ImpDefBit'):
+                  lines=[x.strip() for x in shared.read_text().splitlines()
+                         if re.search(r'\b'+name+r'\b',x)]
+                  entries=[{
+                      'kind': 'impdef_func' if re.match(r'^impdef\s+func\b',x)
+                          else 'readonly_func' if re.match(r'^readonly\s+func\b',x)
+                          else 'other',
+                      'line_sha256': hashlib.sha256(x.encode()).hexdigest(),
+                      'line_bytes': len(x.encode()),
+                      'returns_boolean': bool(re.search(r'=>\s*boolean\b',x)),
+                      'returns_integer': bool(re.search(r'=>\s*integer\b',x)),
+                      'returns_bits': bool(re.search(r'=>\s*bits\s*\(',x)),
+                      'has_impdef': 'impdef' in x,
+                      'has_string_parameter': bool(re.search(r':\s*string\b',x)),
+                      'has_generic': '{N}' in x,
+                  } for x in lines]
+                  print('A32_PINNED_IMPDEF_VARIANT',name,json.dumps([x for x in entries if x['has_impdef']],sort_keys=True))
+              print('A32_PINNED_IMPDEF_OMISSIONS',omission['omitted_identifiers'])
+              assert {'ImpDefMemoryAttributes','ImpDefBool','ImpDefInt','ImpDefBits'} <= set(
+                  omission['omitted_identifiers'])
+              assert omission['upstream_typing_stub_omissions'] >= 4
+              assert omission['typing_only'] and not omission['semantic_equivalence_proven']
+              print('A32_PINNED_IMPDEF_RECONCILIATION',json.dumps(omission,sort_keys=True))
+          PY
+      - name: Bind exact tool sources to previous validated commit
+        run: git -C compiler rev-parse HEAD > /tmp/compiler-source-sha.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aarch64-a32-cohort8-pinned-compiler-tools
+          path: compiler/tools
+          retention-days: 3
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aarch64-a32-cohort8-source-links-only
+          path: /tmp/aarch64-source-links.json
+          retention-days: 3
+
+  matched-aslref:
+    needs: pinned-evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    container:
+      image: ocaml/opam:alpine-3.21-ocaml-5.2
+      options: --user root
+    env:
+      OPAMROOT: /home/opam/.opam
+      OPAMROOTISOK: "1"
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: aarch64-a32-cohort8-pinned-compiler-tools
+          path: compiler/tools
+      - uses: actions/checkout@v4
+        with:
+          repository: herd/herdtools7
+          ref: cfc4f56c522ec0d701acaf5a23139b47e8711299
+          path: herd
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: aarch64-a32-cohort8-source-links-only
+          path: evidence
+      - name: Build ASLRef from exact upstream Arm source (no Ubuntu apt)
+        shell: sh
+        run: |
+          set -eu
+          apk add --no-cache bash python3 curl coreutils git gmp-dev pkgconf
+          test -f compiler/tools/aarch64_a32_asl_typeenv.py
+          test "$(git -C herd rev-parse HEAD)" = cfc4f56c522ec0d701acaf5a23139b47e8711299
+          opam --version
+          opam list --installed --short
+          opam install -y dune menhir zarith
+          (cd herd && opam exec -- dune build -p aslref --profile release)
+          mkdir -p herd/asllib/offline_slicer
+          cp compiler/tools/aarch64_a32_ast_slice.ml herd/asllib/offline_slicer/aarch64_ast_slice.ml
+          echo '(executable (name aarch64_ast_slice) (libraries aslref) (flags (:standard -w -40-42)))' > herd/asllib/offline_slicer/dune
+          (cd herd && opam exec -- dune build asllib/offline_slicer/aarch64_ast_slice.exe)
+          test -x herd/_build/default/asllib/offline_slicer/aarch64_ast_slice.exe
+          test -x herd/_build/default/asllib/aslref.exe
+          ./herd/_build/default/asllib/aslref.exe --version | tee /tmp/aslref-version.txt
+          grep -Fx "aslref version 1.0-EAC2" /tmp/aslref-version.txt
+          opam list --installed --short > /tmp/matched-aslref-ocaml-deps.txt
+          cp evidence/aarch64-source-links.json /tmp/aarch64-source-links.json
+      - name: Fetch and pin exact 2026-09 Arm XML/feature/SysReg archives
+        shell: sh
+        run: |
+          set -eu
+          curl -fLsS --retry 3 --connect-timeout 20 --max-time 240 --max-filesize 200000000 \
+            -o /tmp/ISA_A64_xml_A_profile-2026-09.tar.gz \
+            https://developer.arm.com/-/cdn-downloads/permalink/Exploration-Tools-A64-ISA/ISA_A64/ISA_A64_xml_A_profile-2026-09.tar.gz
+          echo "44cfb89c763c7eea8e59de0ad2221e3c012e6aa77899bd7f1c3e1f24537191d7  /tmp/ISA_A64_xml_A_profile-2026-09.tar.gz" | sha256sum -c -
+          curl -fLsS --retry 3 --connect-timeout 20 --max-time 180 --max-filesize 2000000 \
+            -o /tmp/Arm_AARCHMRS_Features_2026-09.tar.gz \
+            https://developer.arm.com/-/cdn-downloads/permalink/Exploration-Tools-Arm-Architecture-Features/AARCHMRS/AARCHMRS_A_profile_FAT-2026-09.tar.gz
+          echo "f7b1a960e81dc32d657599f0a83a3f22054198df4133320bfbdd1d8b6a9f1982  /tmp/Arm_AARCHMRS_Features_2026-09.tar.gz" | sha256sum -c -
+          curl -fLsS --retry 3 --connect-timeout 20 --max-time 240 --max-filesize 175000000 \
+            -o /tmp/SysReg_xml_A_profile_FAT-2026-09.tar.gz \
+            https://developer.arm.com/-/cdn-downloads/permalink/Exploration-Tools-Arm-Architecture-System-Registers/SysReg/SysReg_xml_A_profile_FAT-2026-09.tar.gz
+          echo "8a2b57cf02f83e4a98fa68bf3e3d6f536f31d137e21ff2becbb967945e7b8920  /tmp/SysReg_xml_A_profile_FAT-2026-09.tar.gz" | sha256sum -c -
+      - name: Matched-source EAC1 strict typing, register closure and collision matrix
+        shell: sh
+        run: |
+          set -eu
+          python3 compiler/tools/aarch64_a32_asl_typeenv.py \
+            --source-links /tmp/aarch64-source-links.json \
+            --archive /tmp/ISA_A64_xml_A_profile-2026-09.tar.gz \
+            --bundler herd/herd/libdir/asl-pseudocode/bundler.py \
+            --aslref "$(pwd)/herd/_build/default/asllib/aslref.exe" \
+            --aslref-mode matching-source-eac1 \
+            --features-archive /tmp/Arm_AARCHMRS_Features_2026-09.tar.gz \
+            --feature-generator herd/herd/libdir/asl-pseudocode/build_features.py \
+            --sysreg-archive /tmp/SysReg_xml_A_profile_FAT-2026-09.tar.gz \
+            --type-implementations herd/herd/libdir/asl-pseudocode/type-checking-implementations.asl \
+            --closure-steps 32 --reconcile-published-stub --slice-shared --batch-shared \
+            --batch-plan /tmp/aarch64-cohorts.json --batch-index 0 \
+            --ast-slice-tool "$(pwd)/herd/_build/default/asllib/offline_slicer/aarch64_ast_slice.exe" --out /tmp/aarch64-a32-matched-typeenv.json
+          python3 - <<'PY'
+          import json
+          r=json.load(open("/tmp/aarch64-a32-matched-typeenv.json"))
+          recon=r["source_backed_typing_stub_reconciliation"]
+          assert recon["collision_identifier"] == "ImpDefMemoryAttributes"
+          assert recon["published_declarations"] == 1
+          assert recon["upstream_typing_stub_omissions"] >= 4
+          assert {"ImpDefMemoryAttributes","ImpDefBool"} <= set(recon["omitted_identifiers"])
+          assert set(recon["omitted_identifiers"]) <= {
+              "ImpDefMemoryAttributes", "ImpDefBool", "ImpDefInt",
+              "ImpDefBits", "ImpDefBit", "Unimplemented", "ReservedEncoding",
+              "See", "ImpDef", "IsFeatureImplemented"}
+          assert recon["typing_only"] is True
+          assert not recon["selection_eligible"] and not recon["semantic_equivalence_proven"]
+          print("MATCHED_ASLREF_RECONCILIATION",recon)
+          assert r["aslref_typecheck_mode"] == "matching-source-eac1"
+          assert r["aslref_cli_version"] == "aslref version 1.0-EAC2"
+          assert len(r["instruction_types"]) == 8
+          plan=json.load(open('/tmp/aarch64-cohorts.json'))
+          assert plan["operation_count"] == 23
+          assert plan["batch_count"] >= 3
+          assert set(x["operation_id"] for x in r["instruction_types"]) == set(
+              x["operation_id"] for x in plan["batches"][0]["operations"])
+          assert plan["selection_eligible"] is False
+          print("REAL_A32_COHORT",plan["operation_count"],plan["batch_count"],
+                [x["operation_id"] for x in plan["batches"][0]["operations"]])
+          assert r["sysreg_source"]["archive_sha256"] == "8a2b57cf02f83e4a98fa68bf3e3d6f536f31d137e21ff2becbb967945e7b8920"
+          assert r["feature_source"]["archive_sha256"] == "f7b1a960e81dc32d657599f0a83a3f22054198df4133320bfbdd1d8b6a9f1982"
+          assert not r["full_architectural_typechecked"]
+          assert not r["semantic_equivalence_proven"] and not r["selection_eligible"]
+          census=r["residual_source_census"]
+          assert census["format"] == "aarch64-a32-residual-source-census-v1"
+          assert census["classification_only"] is True
+          assert census["selection_eligible"] is False
+          assert census["semantic_equivalence_proven"] is False
+          assert census["reported_identifier_count"] >= 0
+          assert len(census["identifiers"]) <= 8
+          print("A32_RESIDUAL_IDENTIFIERS", [
+              (name, {source: (v["token_count"], v["declaration_shaped_line_tokens"])
+                       for source, v in sources.items()})
+              for name, sources in sorted(census["identifiers"].items())])
+          slices=r["instruction_source_slices"]
+          assert len(slices) == 8, slices
+          assert len({x["operation_id"] for x in slices}) == 8
+          assert all(x["selection_eligible"] is False
+                     and x["semantic_equivalence_proven"] is False for x in slices)
+          assert all(x["source_slice"]["parsed_declarations_selected"] > 0 for x in slices)
+          print("A32_SLICED_SOURCE_OUTCOME", [
+              (x["operation_id"],
+               x["source_slice"]["parsed_declarations_selected"],
+               x["source_slice"]["total_sections"],
+               x["slice_mentions_edscr"],
+               x["strict_typing"]["typechecked"],
+               x["strict_typing"]["diagnostics"]["category"],
+               x["strict_typing"]["diagnostics"]["identifiers"],
+               x["strict_typing"]["diagnostics"].get("conflicting_identifiers",[]),
+               x["source_slice"]["synthetic_ast_nodes_without_source"],
+               x["source_backed_slice_register_closure"],
+               x["slice_typing_stub_reconciliation"]["omitted_source_owned_helpers"],
+               x["slice_typing_stub_demand"]["retained_declaration_count"],
+               x["slice_typing_stub_demand"]["omitted_declarations"])
+
+              for x in slices])
+          cl=r["source_backed_register_closure"]
+          print("MATCHED_ASLREF_SUMMARY",[(x["operation_id"],x["with_bounded_sysregs_and_typing_implementations"]["diagnostics"]["category"]) for x in r["instruction_types"]])
+          print("MATCHED_ASLREF_CLOSURE",[(x["step"],x["registers_added"],x["aarch32_registers_added"],
+                [(d["family"],d.get("conflicting_identifiers",[])) for d in x["diagnostic_families"]][:1])
+                for x in cl["steps"][-12:]], "total",len(cl["steps"]))
+          print("MATCHED_ASLREF_FINAL",cl["stop_reason"],cl["final_strict_passes"],cl.get("source_boundary_matrix"))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: aarch64-a32-cohort8-source-matched-aslref-cli
+          path: herd/_build/default/asllib/aslref.exe
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: aarch64-a32-cohort8-source-matched-typeenv
+          path: |
+            /tmp/aarch64-a32-matched-typeenv.json
+            /tmp/matched-aslref-ocaml-deps.txt
+            /tmp/aslref-version.txt
+          retention-days: 7
