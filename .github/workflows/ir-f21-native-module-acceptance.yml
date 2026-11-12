@@ -1,0 +1,100 @@
+# Temporary exact-head compiler acceptance. Do not merge into compiler-ci.
+name: IR F21 physical Function module optimizer deletion
+on:
+  pull_request:
+    paths: ['.github/workflows/ir-f21-native-module-acceptance.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  old-callers-and-native-opt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 32
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 0e615f11bf0c753a76a5a936ad45c218fe2b58be
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - name: Verify exact compiler source and independent workspace
+        run: |
+          set -euxo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "0e615f11bf0c753a76a5a936ad45c218fe2b58be"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-f21-function-module-removal-a
+      - name: Assert Function module runner and all call sites are physically gone
+        working-directory: compiler
+        run: |
+          if rg -n 'optimize_module(_profiled)?[[:space:]]*\(' crates/opt/src crates/opt/tests; then
+            echo "Legacy module optimizer callable still remains" >&2
+            exit 1
+          fi
+      - name: Previously dependent CTFE and inline/module oracle suites
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test ctfe -- --nocapture
+          cargo test -p compiler-opt --test inline_native -- --nocapture
+          cargo test -p compiler-opt --test inline_cost_policy -- --nocapture
+          cargo test -p compiler-opt --test module_signatures -- --nocapture
+          cargo test -p compiler-opt --test ct03_closeout -- --nocapture
+          cargo test -p compiler-opt --lib dead_functions -- --nocapture
+          cargo test -p compiler-opt --lib profile -- --nocapture
+      - name: Feature-gated historical verifier counts and TypeId MemorySSA/egraph
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --lib --features verify-counts ct03_verify_counts -- --nocapture
+          cargo test -p compiler-opt --features typeid-egraph,typeid-memory-ssa --test m6_typeid_egraph -- --nocapture
+          cargo test -p compiler-opt --features typeid-egraph,typeid-memory-ssa --test m6_typeid_memoryssa -- --nocapture
+      - name: Strict all-target IR and optimizer Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt --all-targets -- -D warnings
+
+  full-core-regressions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 0e615f11bf0c753a76a5a936ad45c218fe2b58be
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - name: Verify exact source and isolate portable workspace
+        run: |
+          set -euxo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "0e615f11bf0c753a76a5a936ad45c218fe2b58be"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-f21-function-module-removal-b
+      - name: Install debugger for native DWARF breakpoint/backtrace test
+        run: |
+          if ! command -v gdb >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq gdb
+          fi
+      - name: Broad IR, opt, x86 and AArch64 backend tests
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 -- --skip generated_comparison_dag_all_widths_with_cfg_and_negative_guards
