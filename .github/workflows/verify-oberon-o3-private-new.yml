@@ -1,0 +1,140 @@
+name: O3 native private Oberon NEW record pointers
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-oberon-o3-private-new.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      COMPILER_SHA: 6deb3e6cdc093f154259c474d7372e210f9ff24b
+      OBERON_SHA: 40f0e8a213566e02db08bc67931bd56629cd92ee
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 6deb3e6cdc093f154259c474d7372e210f9ff24b
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check immutable pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          grep -F "$OBERON_SHA" compiler/crates/driver/Cargo.toml
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: o3-private-new-${{ matrix.target }}
+      - name: Build and strict TypeId checks
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test aggregate_layout
+          cargo test -p compiler-ir --test aggregate_roots
+          cargo test -p compiler-opt --test typed_aggregate_pipeline
+          if [ "${{ matrix.target }}" = x86_64 ]; then
+            cargo test -p compiler --bin compiler
+            cargo clippy -p compiler-ir -p compiler --all-targets -- -D warnings
+          else
+            cargo test -p compiler --bin compiler --no-run
+            cargo clippy -p compiler-ir --all-targets -- -D warnings
+            cargo clippy -p compiler --bin compiler -- -D warnings
+          fi
+          cargo build -p compiler --bin compiler
+      - name: Private NEW pointer and dereferenced record execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p oracle
+          cat > oracle/HeapRecord.mod <<'EOF'
+          MODULE HeapRecord;
+          TYPE R=RECORD tag:BYTE; value:INTEGER END;
+               P=POINTER TO R;
+          VAR g: P;
+          PROCEDURE Work*(n:INTEGER):INTEGER;
+          VAR p,q:P;
+          BEGIN
+            NEW(p); p^.tag:=n; p^.value:=n+100;
+            q:=p;
+            NEW(g);
+            g^.value:=q^.value;
+            RETURN q^.tag+g^.value
+          END Work;
+          PROCEDURE Zero*(n:INTEGER):INTEGER;
+          VAR p:P;
+          BEGIN
+            NEW(p);
+            RETURN p^.tag+p^.value
+          END Zero;
+          PROCEDURE Clear*(n:INTEGER):INTEGER;
+          VAR p:P;
+          BEGIN NEW(p); p^.value:=n; p:=NIL;
+            NEW(p); RETURN p^.value
+          END Clear;
+          END HeapRecord.
+          EOF
+          cat > oracle/main.c <<'EOF'
+          #include <stdint.h>
+          extern int32_t HeapRecord__Work(int32_t);
+          extern int32_t HeapRecord__Zero(int32_t);
+          extern int32_t HeapRecord__Clear(int32_t);
+          int main(void) {
+            if (HeapRecord__Work(5)!=110 || HeapRecord__Work(258)!=360 ||
+                HeapRecord__Work(-1)!=354) return 1;
+            if (HeapRecord__Zero(1)!=0 || HeapRecord__Zero(100)!=0) return 2;
+            if (HeapRecord__Clear(8)!=0 || HeapRecord__Clear(100)!=0) return 3;
+            return 0;
+          }
+          EOF
+          for format in obj asm; do
+            suffix=o
+            if [ "$format" = asm ]; then suffix=s; fi
+            compiler/target/debug/compiler oracle/HeapRecord.mod \
+              --language oberon --target ${{ matrix.target }} \
+              --emit "$format" -o "oracle/HeapRecord.$suffix"
+            cc -O2 oracle/main.c "oracle/HeapRecord.$suffix" -o "oracle/run-$format"
+            "oracle/run-$format"
+            echo "O3 NEW ${{ matrix.target }} $format PASS" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Reject unsupported pointer ABI and invalid targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > oracle/PublicPointer.mod <<'EOF'
+          MODULE PublicPointer;
+          TYPE R=RECORD x:INTEGER END;
+          VAR p*:POINTER TO R;
+          END PublicPointer.
+          EOF
+          cat > oracle/BadPointer.mod <<'EOF'
+          MODULE BadPointer;
+          VAR p:POINTER TO INTEGER;
+          END BadPointer.
+          EOF
+          for module in PublicPointer BadPointer; do
+            if compiler/target/debug/compiler "oracle/$module.mod" \
+              --language oberon --target ${{ matrix.target }} \
+              --emit obj -o "oracle/$module.o"; then
+              echo "Unexpected acceptance of $module" >&2
+              exit 1
+            fi
+          done
