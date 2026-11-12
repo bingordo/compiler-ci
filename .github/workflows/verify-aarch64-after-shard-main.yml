@@ -1,0 +1,98 @@
+name: AArch64 main green after 2134-source ASL shard aggregator merge
+on:
+  push:
+    branches: [ci/aarch64-after-shard-summary-main-20261112]
+    paths:
+      - '.github/workflows/verify-aarch64-after-shard-main.yml'
+permissions:
+  contents: read
+concurrency:
+  group: aarch64-after-shard-main-20261112
+  cancel-in-progress: true
+jobs:
+  offline-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: dd6890ccb959c0005c7d75a6bafc37cdd061d732
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Source pin and AArch64 offline Python test suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = dd6890ccb959c0005c7d75a6bafc37cdd061d732
+          python3 -m unittest discover -s compiler/tools -p 'test_aarch64*.py' -v
+          find compiler/tools -maxdepth 1 -name 'aarch64*.py' -print0 | xargs -0 -r python3 -m py_compile
+  compile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: dd6890ccb959c0005c7d75a6bafc37cdd061d732
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin source and exclude private frontends
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = dd6890ccb959c0005c7d75a6bafc37cdd061d732
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: modern-a64-crate
+          cache-workspace-crates: 'true'
+      - name: Modern IR and AArch64 compile / all-target tests
+        working-directory: compiler
+        run: |
+          cargo check -p compiler-backend-aarch64 --all-targets
+          cargo test -p compiler-backend-aarch64 --lib
+          cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
+
+  native:
+    needs: [compile, offline-source]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: dd6890ccb959c0005c7d75a6bafc37cdd061d732
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify native ARM host and pinned compiler source
+        run: |
+          test "$(uname -m)" = aarch64
+          test "$(git -C compiler rev-parse HEAD)" = dd6890ccb959c0005c7d75a6bafc37cdd061d732
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          command -v cc
+          command -v objcopy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: modern-a64-native
+          cache-workspace-crates: 'true'
+      - name: Targeted AArch64 native ELF, unwind and C ABI tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-aarch64 --all-targets -- --test-threads=1
+          echo 'Modern IR AArch64 backend native C/ELF tests passed for dd6890ccb959c0005c7d75a6bafc37cdd061d732' >> "$GITHUB_STEP_SUMMARY"
