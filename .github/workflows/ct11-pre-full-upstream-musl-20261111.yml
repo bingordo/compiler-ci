@@ -1,0 +1,93 @@
+name: CT-11 native PRE on 27 original upstream musl C translation units
+'on':
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct11-pre-full-upstream-musl-20261111.yml'
+      - 'tools/ct11_pre_original_musl_census.py'
+permissions:
+  contents: read
+jobs:
+  full-original-c:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 15af9ed039945ae2eae62f2e9997ccc175a62ba0
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: ifduyue/musl
+          ref: 7813e9119eb5fe681b6750b8a033a0490bca0941
+          path: musl
+          persist-credentials: false
+      - name: Verify all source pins, Python scripts and tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          test "$(git -C compiler rev-parse HEAD)" = "15af9ed039945ae2eae62f2e9997ccc175a62ba0"
+          test "$(git -C musl rev-parse HEAD)" = 7813e9119eb5fe681b6750b8a033a0490bca0941
+          printf '%s\n' '15af9ed039945ae2eae62f2e9997ccc175a62ba0' > results/compiler-sha.txt
+          rustc --version | tee results/rustc.txt
+          cc --version | head -1 | tee results/cc.txt
+          lscpu | grep 'Model name' | tee results/cpu.txt || true
+          python3 -m py_compile harness/tools/ct11_pre_original_musl_census.py
+          python3 -m py_compile compiler/tools/s23_full_upstream_tu_census.py compiler/tools/s23_native_profile_source.py
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ct11-pre-unchanged-musl
+      - name: Release TypeId PRE and strict optimizer lint gates
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release -p compiler-opt --test typed_pre_native
+          cargo test --release -p compiler --test typeid_native_s2316_profile
+          cargo test --release -p compiler-opt --test native_s2316_profile
+          cargo clippy -p compiler-opt --lib -- -D warnings
+          cargo clippy -p compiler --bin compiler -- -D warnings
+      - name: Build pinned normal TypeId release C compiler
+        run: cargo build --release --manifest-path compiler/Cargo.toml -p compiler --bin compiler
+      - name: Attempt every original musl TU and profile accepted source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -u compiler/tools/s23_full_upstream_tu_census.py \
+            --musl-root musl \
+            --compiler compiler/target/release/compiler \
+            --compiler-sha '15af9ed039945ae2eae62f2e9997ccc175a62ba0' \
+            --output results/original-musl-source-census.json \
+            --rounds 3 2>&1 | tee results/census.log
+          test "$(grep -c '^S2339_REJECT ' results/census.log)" -gt 0
+          grep '^S2339_SUMMARY ' results/census.log | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Preserve original source successes, failures and PRE exact-pass counters
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -u harness/tools/ct11_pre_original_musl_census.py \
+            --census results/original-musl-source-census.json \
+            --output results/ct11-original-musl-pre-profile.json \
+            2>&1 | tee results/pre-report.log
+          grep '^CT11_REAL_PRE_SUMMARY ' results/pre-report.log | tee -a "$GITHUB_STEP_SUMMARY"
+          grep '^CT11_REAL_PRE file=' results/pre-report.log | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Preserve complete checked source/LLVM gap profile
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ct11-original-musl-typeid-pre-census
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
