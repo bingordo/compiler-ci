@@ -1,0 +1,135 @@
+name: S23.40 original musl TU coverage host vs native musl header path
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-40-musl-header-environment.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/s23-40-musl-header-environment.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare-original-upstream-header-environments:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact S23.39 native checked TypeId C compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7ef8fc8f763f0ade933e996ec3b900e85bf0dd45
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout pinned musl-host comparison harness and source contract
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: dad055e72d769c49f0e0c5b72f969079b95e5a7e
+          path: benchmark
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact original upstream musl implementation and source headers
+        uses: actions/checkout@v4
+        with:
+          repository: ifduyue/musl
+          ref: 7813e9119eb5fe681b6750b8a033a0490bca0941
+          path: musl
+          persist-credentials: false
+      - name: Verify pins and original-source comparison Python code
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 7ef8fc8f763f0ade933e996ec3b900e85bf0dd45
+          test "$(git -C benchmark rev-parse HEAD)" = dad055e72d769c49f0e0c5b72f969079b95e5a7e
+          test "$(git -C musl rev-parse HEAD)" = 7813e9119eb5fe681b6750b8a033a0490bca0941
+          python3 -m py_compile benchmark/tools/s23_full_upstream_tu_census.py benchmark/tools/s23_compare_full_tu_headers.py
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          rustc --version
+          cc --version | head -1
+      - name: Restore TypeId native source compiler Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: s2339-native-full-upstream
+      - name: Build identical release Mini-C checked-source compiler once
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path compiler/Cargo.toml -p compiler --bin compiler
+          test -x compiler/target/release/compiler
+      - name: Reproduce host glibc preprocessing results with exact original files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          python3 -u benchmark/tools/s23_full_upstream_tu_census.py \
+            --musl-root musl \
+            --compiler compiler/target/release/compiler \
+            --compiler-sha 7ef8fc8f763f0ade933e996ec3b900e85bf0dd45 \
+            --output results/s2340-host-header-census.json \
+            --rounds 3 2>&1 | tee results/s2340-host-header-census.log
+          grep '^S2339_SUMMARY ' results/s2340-host-header-census.log | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Generate pinned musl x86-64 public and private header dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -C musl ARCH=x86_64 obj/include/bits/alltypes.h obj/include/bits/syscall.h
+          test -s musl/obj/include/bits/alltypes.h
+          test -s musl/obj/include/bits/syscall.h
+          git -C musl diff --exit-code
+          mkdir -p cc-musl-wrapper
+          cat > cc-musl-wrapper/cc <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          exec /usr/bin/cc -nostdinc -D_XOPEN_SOURCE=700 \
+            -I"${MUSL_HEADERS_ROOT}/arch/x86_64" \
+            -I"${MUSL_HEADERS_ROOT}/arch/generic" \
+            -I"${MUSL_HEADERS_ROOT}/obj/src/internal" \
+            -I"${MUSL_HEADERS_ROOT}/src/include" \
+            -I"${MUSL_HEADERS_ROOT}/src/internal" \
+            -I"${MUSL_HEADERS_ROOT}/obj/include" \
+            -I"${MUSL_HEADERS_ROOT}/include" \
+            "$@"
+          EOF
+          chmod +x cc-musl-wrapper/cc
+      - name: Compile identical complete original sources with native musl header paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          export MUSL_HEADERS_ROOT="$PWD/musl"
+          export PATH="$PWD/cc-musl-wrapper:$PATH"
+          python3 -u benchmark/tools/s23_full_upstream_tu_census.py \
+            --musl-root musl \
+            --compiler compiler/target/release/compiler \
+            --compiler-sha 7ef8fc8f763f0ade933e996ec3b900e85bf0dd45 \
+            --output results/s2340-musl-native-header-census.json \
+            --rounds 3 2>&1 | tee results/s2340-musl-native-header-census.log
+          grep '^S2339_SUMMARY ' results/s2340-musl-native-header-census.log | tee -a "$GITHUB_STEP_SUMMARY"
+          git -C musl diff --exit-code
+      - name: Strict original blob and source equality comparison and manifest summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -u benchmark/tools/s23_compare_full_tu_headers.py \
+            --host results/s2340-host-header-census.json \
+            --musl-headers results/s2340-musl-native-header-census.json \
+            --out results/s2340-header-coverage-comparison.json \
+            2>&1 | tee results/s2340-header-coverage-comparison.log
+          test "$(grep -c '^S2340_FILE ' results/s2340-header-coverage-comparison.log)" -eq 27
+          grep '^S2340_SUMMARY ' results/s2340-header-coverage-comparison.log | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Preserve both untouched-original source capability matrices and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2340-original-musl-header-comparison
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
