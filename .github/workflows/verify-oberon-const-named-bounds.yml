@@ -1,0 +1,146 @@
+name: O6 native Oberon constants and named array bounds
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-oberon-const-named-bounds.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      COMPILER_SHA: 4f1954f9f852f17a176967bc5c5f83c4b362509b
+      OBERON_SHA: 955c1a4e61438b004c8570710f596be49ce9668e
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 4f1954f9f852f17a176967bc5c5f83c4b362509b
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check immutable pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          grep -F "$OBERON_SHA" compiler/crates/driver/Cargo.toml
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: o6-constants-${{ matrix.target }}
+      - name: Build and strict TypeId checks
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test aggregate_layout
+          cargo test -p compiler-ir --test aggregate_roots
+          cargo test -p compiler-opt --test typed_aggregate_pipeline
+          if [ "${{ matrix.target }}" = x86_64 ]; then
+            cargo test -p compiler --bin compiler
+            cargo clippy -p compiler-ir -p compiler --all-targets -- -D warnings
+          else
+            cargo test -p compiler --bin compiler --no-run
+            cargo clippy -p compiler-ir --all-targets -- -D warnings
+            cargo clippy -p compiler --bin compiler -- -D warnings
+          fi
+          cargo build -p compiler --bin compiler
+      - name: Executable checked CONST and named array bounds (GAS and ELF)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p oracle
+          cat > oracle/Constants.mod <<'EOF'
+          MODULE Constants;
+          CONST Size=2+3; Double=Size*2; Enabled=TRUE;
+          VAR data: ARRAY Double OF INTEGER; flag*: INTEGER;
+          PROCEDURE Work*(n: INTEGER): INTEGER;
+          CONST Size=2; LocalSize=Size+2;
+          VAR local: ARRAY LocalSize OF INTEGER;
+          BEGIN
+            local[Size]:=n+Double;
+            IF Enabled THEN data[Size]:=local[Size] END;
+            RETURN data[Size]+LocalSize
+          END Work;
+          BEGIN flag:=Double; data[1]:=flag
+          END Constants.
+          EOF
+          cat > oracle/Chained.mod <<'EOF'
+          MODULE Chained;
+          CONST Max=2*3; Half=Max DIV 2; Off=Half+1;
+          VAR a: ARRAY Max OF INTEGER;
+          PROCEDURE Compute*(n: INTEGER): INTEGER;
+          CONST Max=5; Last=Max-1;
+          VAR l: ARRAY Max OF INTEGER;
+          BEGIN l[Last]:=n; a[Off]:=l[Last];
+            RETURN a[Off]+Last
+          END Compute;
+          END Chained.
+          EOF
+          cat > oracle/main.c <<'EOF'
+          #include <stdint.h>
+          extern int32_t Constants__Work(int32_t);
+          extern int32_t Constants__flag;
+          extern int32_t Chained__Compute(int32_t);
+          int main(void) {
+            if (Constants__flag!=10) return 1;
+            if (Constants__Work(5)!=19 || Constants__Work(258)!=272 ||
+                Constants__Work(-1)!=13) return 2;
+            if (Chained__Compute(5)!=9 || Chained__Compute(258)!=262)
+              return 3;
+            return 0;
+          }
+          EOF
+          for format in obj asm; do
+            objects=()
+            for module in Constants Chained; do
+              if [ "$format" = obj ]; then suffix=o; else suffix=s; fi
+              compiler/target/debug/compiler "oracle/$module.mod" \
+                --language oberon --target ${{ matrix.target }} \
+                --emit "$format" -o "oracle/$module.$suffix"
+              objects+=("oracle/$module.$suffix")
+            done
+            cc -O2 oracle/main.c "${objects[@]}" -o "oracle/run-$format"
+            "oracle/run-$format"
+            echo "O6 CONST native ${{ matrix.target }} $format PASS" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Reject unsupported constants and bounds
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > oracle/RealConstant.mod <<'EOF'
+          MODULE RealConstant;
+          CONST Pi=3.5;
+          PROCEDURE Work*(): INTEGER;
+          BEGIN RETURN 1 END Work;
+          END RealConstant.
+          EOF
+          cat > oracle/BadBound.mod <<'EOF'
+          MODULE BadBound;
+          CONST N=0;
+          VAR a: ARRAY N OF INTEGER;
+          END BadBound.
+          EOF
+          for module in RealConstant BadBound; do
+            if compiler/target/debug/compiler "oracle/$module.mod" \
+              --language oberon --target ${{ matrix.target }} \
+              --emit obj -o "oracle/$module.o"; then
+              echo "Unexpected native acceptance: $module" >&2
+              exit 1
+            fi
+          done
