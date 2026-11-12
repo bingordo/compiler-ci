@@ -1,0 +1,56 @@
+# One-off exact-source acceptance; close this PR unmerged after validation.
+name: IR P0 TypeId LICM canonical integer parity (PR 1114)
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ir-typeid-licm-1114.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+concurrency:
+  group: ir-licm-1114-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  typeid-licm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler PR
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ffb0774bcd7d0d49823d6ece9e4d1ecb6545047c
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check SHA and select credential-independent core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "ffb0774bcd7d0d49823d6ece9e4d1ecb6545047c"
+          git -C compiler rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
+          rustc --version | tee -a "$GITHUB_STEP_SUMMARY"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-typeid-licm-native-parity
+      - name: Canonical LICM regression, rollback, C11 ELF/GAS x86 oracle
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typed_licm_native -- --nocapture
+      - name: Full affected IR, optimizer, generic backend and x86 tests
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+      - name: All-target strict Clippy for touched core
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt --all-targets -- -D warnings
