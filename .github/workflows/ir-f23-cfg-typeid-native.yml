@@ -1,0 +1,90 @@
+name: IR F23 TypeId CSE phi CFG native executable oracles
+on:
+  pull_request:
+    paths: ['.github/workflows/ir-f23-cfg-typeid-native.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-execution:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 13b527aa72c4ca00e7d3e47b3c2cd7a60a000e30
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - name: Verify exact source and isolate portable workspace
+        run: |
+          set -euxo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "13b527aa72c4ca00e7d3e47b3c2cd7a60a000e30"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: f23-typeid-executable
+      - name: Verify migrated test suites have zero Function optimize or legacy backend callers
+        working-directory: compiler
+        run: |
+          if rg -n 'compiler_opt::optimize\(|\.emit_assembly\(|\.emit_object\(' crates/opt/tests/cse_native.rs crates/opt/tests/phi_native.rs crates/opt/tests/native_cfg_differential.rs; then
+            echo "Found legacy optimizer/backend in migrated native executable suite" >&2
+            exit 1
+          fi
+      - name: Run CSE native TypeId GAS/C oracle
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test cse_native -- --nocapture
+      - name: Run loop phi native TypeId GAS/C oracle
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test phi_native -- --nocapture
+      - name: Run guarded traps and pointer phi native TypeId GAS/ELF/C oracle
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test native_cfg_differential -- --nocapture
+      - name: Strict compiler IR/opt Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt --all-targets -- -D warnings
+  full-core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 13b527aa72c4ca00e7d3e47b3c2cd7a60a000e30
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - name: Pin source and portable core workspace
+        run: |
+          set -euxo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "13b527aa72c4ca00e7d3e47b3c2cd7a60a000e30"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: f23-typeid-executable-full
+      - name: Install GDB for existing DWARF test
+        run: |
+          if ! command -v gdb >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq gdb
+          fi
+      - name: Full IR and optimizer, native x86 and AArch64 core tests
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 -- --skip generated_comparison_dag_all_widths_with_cfg_and_negative_guards
