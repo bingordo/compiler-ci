@@ -1,0 +1,90 @@
+name: S23.39 complete unchanged upstream musl TU native matcher census
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-39-whole-musl-tu-census.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/s23-39-whole-musl-tu-census.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pinned-whole-upstream-c-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact fully-validated TypeId source compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7ef8fc8f763f0ade933e996ec3b900e85bf0dd45
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout immutable S23.39 full-TU census and documentation
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9552b017275d3bd3dd51fc166e66e9e3790d99b7
+          path: benchmark
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout original, entirely unchanged musl upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: ifduyue/musl
+          ref: 7813e9119eb5fe681b6750b8a033a0490bca0941
+          path: musl
+          persist-credentials: false
+      - name: Validate three source revisions, original git objects and script
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 7ef8fc8f763f0ade933e996ec3b900e85bf0dd45
+          test "$(git -C benchmark rev-parse HEAD)" = 9552b017275d3bd3dd51fc166e66e9e3790d99b7
+          test "$(git -C musl rev-parse HEAD)" = 7813e9119eb5fe681b6750b8a033a0490bca0941
+          python3 -m py_compile benchmark/tools/s23_full_upstream_tu_census.py
+          python3 -m py_compile benchmark/tools/s23_native_profile_source.py
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          rustc --version
+          cc --version | head -1
+      - name: Reuse actual production source compiler Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: s2339-native-full-upstream
+      - name: Build the full native TypeId Mini-C source compiler in release mode
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path compiler/Cargo.toml -p compiler --bin compiler
+          test -x compiler/target/release/compiler
+      - name: Attempt all 27 unchanged musl TUs and profile every accepted original source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          python3 -u benchmark/tools/s23_full_upstream_tu_census.py \
+            --musl-root musl \
+            --compiler compiler/target/release/compiler \
+            --compiler-sha 7ef8fc8f763f0ade933e996ec3b900e85bf0dd45 \
+            --output results/s2339-full-musl-tu-census.json \
+            --rounds 3 \
+            2>&1 | tee results/s2339-full-musl-tu-census.log
+          python3 -c 'import json; r=json.load(open("results/s2339-full-musl-tu-census.json")); assert r["attempted"] == 27 and r["accepted"] + r["rejected"] == 27'
+          grep '^S2339_SUMMARY ' results/s2339-full-musl-tu-census.log | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Preserve complete upstream source capability matrix, errors and timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2339-unchanged-musl-complete-tu-census
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
