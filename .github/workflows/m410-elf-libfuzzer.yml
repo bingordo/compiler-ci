@@ -13,6 +13,7 @@ on:
     - cron: '37 8 * * 6'
 permissions:
   contents: read
+  actions: read
 concurrency:
   group: m410-elf-libfuzzer-${{ github.event_name == 'pull_request' && github.head_ref || github.ref }}
   cancel-in-progress: true
@@ -28,7 +29,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ github.event_name == 'pull_request' && '327624127e4f15dbb4ba739cbbf54cc32cddea88' || inputs.source_ref || 'main' }}
+          ref: ${{ github.event_name == 'pull_request' && 'c7090af2d66c57f1bfdbe248e548c66ace59d582' || inputs.source_ref || 'main' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -38,7 +39,7 @@ jobs:
           set -euo pipefail
           source_sha="$(git rev-parse HEAD)"
           if [ "${{ github.event_name }}" = pull_request ]; then
-            test "$source_sha" = '327624127e4f15dbb4ba739cbbf54cc32cddea88'
+            test "$source_sha" = 'c7090af2d66c57f1bfdbe248e548c66ace59d582'
           fi
           test -s fuzz/fuzz_targets/elf_writer_input.rs
           test -s fuzz/fuzz_targets/elf_serialized_metadata.rs
@@ -51,12 +52,53 @@ jobs:
         with:
           workspaces: compiler -> target
           key: m410-libfuzzer-v1
-      - name: Ensure regular backend tests and shared oracle are unchanged
+      - name: Validate bounded corpus rollover and trusted artifact semantics
         working-directory: compiler
         run: |
+          python3 -m unittest discover -s tools -p 'test_m410_elf_fuzz_corpus.py' -v
+          python3 -m py_compile tools/m410_elf_fuzz_corpus.py
+      - name: Restore latest successful trusted main-branch fuzz corpus
+        working-directory: compiler
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo="bingordo/compiler-ci"
+          mapfile -t previous_runs < <(
+            gh api "repos/$repo/actions/workflows/m410-elf-libfuzzer.yml/runs?branch=main&status=success&per_page=30" \
+              --jq '.workflow_runs[] | select(.event == "schedule" or .event == "workflow_dispatch") | .id'
+          )
+          restored=0
+          for run_id in "${previous_runs[@]}"; do
+            artifact_name="$(gh api "repos/$repo/actions/runs/$run_id/artifacts?per_page=100" \
+              --jq '.artifacts[] | select(.expired == false and (.name | startswith("m410-elf-corpus-v1-"))) | .name' | head -n 1)"
+            if [ -z "$artifact_name" ]; then continue; fi
+            mkdir -p "$RUNNER_TEMP/m410-prior-bundle"
+            gh run download "$run_id" --repo "$repo" --name "$artifact_name" --dir "$RUNNER_TEMP/m410-prior-bundle"
+            python3 tools/m410_elf_fuzz_corpus.py restore \
+              --bundle "$RUNNER_TEMP/m410-prior-bundle" \
+              --corpus fuzz/corpus \
+              --receipt "$RUNNER_TEMP/m410-prior-receipt.json"
+            echo "Reused SHA-verified ELF corpus from trusted successful run $run_id" >> "$GITHUB_STEP_SUMMARY"
+            restored=1
+            break
+          done
+          if [ "$restored" -eq 0 ]; then
+            echo "No prior compatible trusted corpus: using checked-in version-1 seeds" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Ensure backend tests and independent ELF metadata oracle are unchanged
+        working-directory: compiler
+        env:
+          M410_ELF_FUZZ_SAMPLES_DIR: ${{ runner.temp }}/m410-reference-elf-objects
+        run: |
+          set -euo pipefail
           cargo test -p compiler-backend --lib m410_replayable_writer_input_property_fuzz
           cargo test -p compiler-backend --lib m410_unstructured_serialized_elf_mutation_never_panics
           cargo test -p compiler-backend --lib m410_seeded_serialized_elf_metadata_rejection
+          readelf -hWr "$RUNNER_TEMP/m410-reference-elf-objects/x86-mixed.o" > "$RUNNER_TEMP/m410-x86-readelf.txt"
+          readelf -hWr "$RUNNER_TEMP/m410-reference-elf-objects/aarch64-call.o" > "$RUNNER_TEMP/m410-arm-readelf.txt"
+          grep -q 'Advanced Micro Devices X86-64' "$RUNNER_TEMP/m410-x86-readelf.txt"
+          grep -q 'AArch64' "$RUNNER_TEMP/m410-arm-readelf.txt"
       - name: Check isolated fuzz workspace on stable
         working-directory: compiler
         run: cargo check --manifest-path fuzz/Cargo.toml --bins
@@ -81,16 +123,38 @@ jobs:
         run: |
           cargo clippy -p compiler-backend --all-targets -- -D warnings
           cargo clippy -p compiler-backend --features elf-fuzz --lib -- -D warnings
-      - name: Preserve corpus, crashes, coverage progression and replay tools
+      - name: Snapshot canonical corpus, coverage and history even on crashes
+        if: always()
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          if [ ! -f tools/m410_elf_fuzz_corpus.py ]; then exit 1; fi
+          python3 tools/m410_elf_fuzz_corpus.py snapshot \
+            --corpus fuzz/corpus \
+            --out "$RUNNER_TEMP/m410-elf-corpus-bundle" \
+            --source-sha "$(git rev-parse HEAD)" \
+            --prior-receipt "$RUNNER_TEMP/m410-prior-receipt.json" \
+            --log-writer "$RUNNER_TEMP/m410-elf-writer-fuzz.log" \
+            --log-metadata "$RUNNER_TEMP/m410-elf-metadata-fuzz.log" | tee -a "$GITHUB_STEP_SUMMARY"
+          mkdir -p "$RUNNER_TEMP/m410-elf-corpus-bundle/logs"
+          for name in m410-fuzz-rust-version.txt m410-elf-writer-fuzz.log m410-elf-metadata-fuzz.log m410-x86-readelf.txt m410-arm-readelf.txt; do
+            if [ -f "$RUNNER_TEMP/$name" ]; then
+              cp "$RUNNER_TEMP/$name" "$RUNNER_TEMP/m410-elf-corpus-bundle/logs/"
+            fi
+          done
+      - name: Persist versioned and checksummed corpus for the next trusted run
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: m410-elf-libfuzzer-replay-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            compiler/fuzz/corpus/
-            compiler/fuzz/artifacts/
-            ${{ runner.temp }}/m410-fuzz-rust-version.txt
-            ${{ runner.temp }}/m410-elf-writer-fuzz.log
-            ${{ runner.temp }}/m410-elf-metadata-fuzz.log
+          name: m410-elf-corpus-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/m410-elf-corpus-bundle/
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Preserve crash artifacts separately for investigation
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m410-elf-fuzz-crashes-${{ github.run_id }}-${{ github.run_attempt }}
+          path: compiler/fuzz/artifacts/
           if-no-files-found: ignore
-          retention-days: 30
+          retention-days: 90
