@@ -1,0 +1,63 @@
+name: M4.10 verify real previously uploaded corpus can roll forward
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-m410-real-corpus-import.yml']
+permissions:
+  contents: read
+  actions: read
+jobs:
+  acceptance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c7090af2d66c57f1bfdbe248e548c66ace59d582
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Download actual preceding M4.10 fuzz run's uploaded artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download 43168269919 --repo bingordo/compiler-ci \
+            --name m410-elf-corpus-v1-43168269919-1 \
+            --dir "$RUNNER_TEMP/real-prior-corpus"
+          test -s "$RUNNER_TEMP/real-prior-corpus/manifest.json"
+      - name: Import actual archived inputs and re-snapshot same-source coverage
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 'c7090af2d66c57f1bfdbe248e548c66ace59d582'
+          python3 tools/m410_elf_fuzz_corpus.py restore \
+            --bundle "$RUNNER_TEMP/real-prior-corpus" \
+            --corpus fuzz/corpus \
+            --receipt "$RUNNER_TEMP/restored.json"
+          python3 tools/m410_elf_fuzz_corpus.py snapshot \
+            --corpus fuzz/corpus \
+            --out "$RUNNER_TEMP/rollover-check" \
+            --source-sha 'c7090af2d66c57f1bfdbe248e548c66ace59d582' \
+            --prior-receipt "$RUNNER_TEMP/restored.json" \
+            --log-writer "$RUNNER_TEMP/real-prior-corpus/logs/m410-elf-writer-fuzz.log" \
+            --log-metadata "$RUNNER_TEMP/real-prior-corpus/logs/m410-elf-metadata-fuzz.log"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])
+          before = json.loads((root/'real-prior-corpus/manifest.json').read_text())
+          after = json.loads((root/'rollover-check/manifest.json').read_text())
+          receipt = json.loads((root/'restored.json').read_text())
+          assert before['source_sha'] == after['source_sha'] == 'c7090af2d66c57f1bfdbe248e548c66ace59d582'
+          assert len(before['targets']['elf_writer_input']) >= 250
+          assert len(before['targets']['elf_serialized_metadata']) >= 200
+          for target in ['elf_writer_input', 'elf_serialized_metadata']:
+              assert receipt['artifact_files'][target] == len(before['targets'][target])
+              assert len(after['targets'][target]) >= len(before['targets'][target])
+              assert after['same_source_edge_deltas'][target] == 0
+          assert len(after['history']) == 2
+          print('M410_REAL_ARTIFACT_ROLLOVER_OK: imported all prior cases, verified hashes, retained history and same-source metrics')
+          PY
+          echo 'Imported real source-pinned fuzz archive, verified SHA-256 and re-exported its full corpus with same-source metric parity' >> "$GITHUB_STEP_SUMMARY"
