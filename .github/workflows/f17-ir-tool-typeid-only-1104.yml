@@ -1,0 +1,68 @@
+name: F17 ir-tool TypeId-only input, legacy Function CLI retirement
+on:
+  push:
+    branches: [ci/f17-ir-tool-typeid-only-1104-20261111]
+    paths: ['.github/workflows/f17-ir-tool-typeid-only-1104.yml']
+permissions:
+  contents: read
+jobs:
+  native-ir-tool:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5bf26be39e2693753323433bfdf6e3f9eaf0b67c
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest exact source, no Function parser and native CLI v3 regression
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 5bf26be39e2693753323433bfdf6e3f9eaf0b67c
+          python3 - <<'PY'
+          from pathlib import Path
+          root=Path("compiler")
+          s=(root/"crates/ir/src/bin/ir-tool.rs").read_text()
+          for old in ("read_and_verify_function", "write_function(",
+                      "read_typed_module(", "write_typed_module(",
+                      "read_module(", "write_module("):
+              assert old not in s,old
+          for native in ("read_native_module_text_v3", "read_native_binary_v1",
+                         "read_native_integer_v2", "read_typed_ssa"):
+              assert native in s,native
+          assert "legacy Function-based" in s
+          assert not (root/"crates/ir/tests/typed_module_cli.rs").exists()
+          new=(root/"crates/ir/tests/native_module_cli.rs").read_text()
+          assert "ir_tool_rejects_removed_function_based_text_format_families" in new
+          assert "ir_tool_verifies_normalizes_and_replays_native_typeid_v3_module" in new
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: f17-ir-tool-native-v3-only
+      - name: Native v3 ir-tool CLI, typed envelope, binary replay and strict IR lint
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test native_module_cli -- --nocapture --test-threads=1
+          cargo test -p compiler-ir --test ssa_typeids -- --test-threads=2
+          cargo test -p compiler-ir --test typed_ssa_body -- --test-threads=2
+          cargo test -p compiler-ir --test native_module_text_v3 -- --test-threads=2
+          cargo test -p compiler-ir --test native_binary_v1 -- --test-threads=2
+          cargo test -p compiler-ir --lib -- --test-threads=2
+          cargo clippy -p compiler-ir --all-targets -- -D warnings
+      - name: Native optimizer replay and default source compiler unaffected
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test ir_replay_cli -- --test-threads=1
+          cargo test -p compiler --bin compiler -- --test-threads=2
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib -- --test-threads=2
+          cargo clippy -p compiler -p compiler-opt -p compiler-ir --all-targets -- -D warnings
+          cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml --all-targets -- -D warnings
