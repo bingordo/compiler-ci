@@ -1,0 +1,71 @@
+name: M6 native MemorySSA width/alias and 128-predecessor join stress
+on:
+  push:
+    branches: [ci/m6-memoryssa-stress-1091-20261111]
+    paths: ['.github/workflows/m6-memoryssa-stress-1091.yml']
+permissions:
+  contents: read
+jobs:
+  native-mssa-stress:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 82cd0eaa4f46735d42be9e0cd82cddeaf480535f
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest exact SHA and typed-only stress vectors
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 82cd0eaa4f46735d42be9e0cd82cddeaf480535f
+          python3 - <<'PY'
+          from pathlib import Path
+          root=Path("compiler")
+          s=(root/"crates/opt/tests/m6_typeid_memoryssa_stress.rs").read_text()
+          for token in ("m6_typeid_memoryssa_stress", "native_memoryssa_large_join_parallel_edges_and_mutation_reanalysis",
+                        "native_memoryssa_wide_store_and_unknown_pointer_are_conservative_clobbers",
+                        "native_memoryssa_load_key_respects_width_address_and_signedness",
+                        "8,24,48,96,128", "Op::StorePtr64", "Op::LoadNarrow",
+                        "Op::LoadI64", "TypedSsaModule", "MemorySsa::build"):
+              assert token in s,token
+          assert "project_legacy_compat_function" not in s
+          assert "from_legacy" not in s
+          assert 'name = "m6_typeid_memoryssa_stress"' in (root/"crates/opt/Cargo.toml").read_text()
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m6-memoryssa-native-width-stress-1091
+      - name: Execute native TypeId stress and all native MemorySSA controls
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --features typeid-memory-ssa --test m6_typeid_memoryssa_stress -- --nocapture --test-threads=1
+          cargo test -p compiler-opt --features typeid-memory-ssa --test m6_typeid_memoryssa_cfg -- --nocapture --test-threads=1
+          cargo test -p compiler-opt --features typeid-memory-ssa --test m6_typeid_memoryssa -- --nocapture --test-threads=1
+          cargo clippy -p compiler-opt --features typeid-memory-ssa --all-targets -- -D warnings
+      - name: Preserve old independent MemorySSA and new M6 native egraph
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --features legacy-experimental-ssa --lib -- --test-threads=2
+          cargo test -p compiler-opt --features legacy-experimental-ssa --test ct03_memoryssa_invalidation_native -- --test-threads=1
+          cargo test -p compiler-opt --features legacy-experimental-ssa --test indirect_call_memory_barriers -- --test-threads=1
+          cargo test -p compiler-opt --features typeid-egraph --test m6_typeid_matrix -- --test-threads=1
+          cargo test -p compiler-opt --features typeid-egraph --test m6_typeid_egraph -- --test-threads=1
+          cargo clippy -p compiler-opt --features typeid-egraph --all-targets -- -D warnings
+      - name: Checked source and compiler baseline remain unchanged
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --features typeid-egraph --bin compiler m6_checked_oberon_source_vs_c_oracle -- --test-threads=1
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --features typeid-egraph --lib m6_real_checked_mini_c_source_vs_gcc -- --test-threads=1
+          cargo test -p compiler --bin compiler -- --test-threads=2
+          cargo clippy -p compiler -p compiler-opt --all-targets -- -D warnings
