@@ -1,0 +1,90 @@
+# One-shot source-pinned physical TypeId cutover acceptance.
+# Close unmerged after recording accepted evidence in compiler #1109/#1111.
+name: IR F17/F18 physical TypeId cutover acceptance
+on:
+  pull_request:
+    paths: ['.github/workflows/ir-f17-f18-source-pins.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  f17-native-m6:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7d206b0d70f28ed33401ab149d1c8dbb569e21fb
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm exact source and retired helper absence
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "7d206b0d70f28ed33401ab149d1c8dbb569e21fb"
+          test ! -e compiler/tools/m6_compile_metrics.rs
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-f17-native-m6
+      - name: Native TypeId egraph, MemorySSA, operand matrix, overhead
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --features typeid-egraph \
+            --test m6_typeid_egraph --test m6_typeid_matrix \
+            --test m6_typeid_memoryssa --test m6_overhead
+      - name: Native M6 strict Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt --features typeid-egraph --all-targets -- -D warnings
+
+  f18-real-oberon-abi:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub SSH host
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 306c1fda312dc13ba0d998178831c57f8866c78b
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm exact source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "306c1fda312dc13ba0d998178831c57f8866c78b"
+          git -C compiler rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
+          rustc --version | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-f18-real-oberon-abi
+      - name: Checked source TypeId signature, external and duplicate rejection
+        working-directory: compiler
+        run: cargo test -p compiler --bin compiler checked_oberon_source_call_signatures_use_native_typeid_abi -- --nocapture
+      - name: Complete compiler binary unit regressions
+        working-directory: compiler
+        run: cargo test -p compiler --bin compiler -- --test-threads=2
+      - name: Strict compiler driver Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler --bin compiler -- -D warnings
