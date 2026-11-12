@@ -1,0 +1,114 @@
+name: X7 B1 full pinned Intel iform source-shape normalization
+on:
+  pull_request:
+    branches: [main]
+    paths: [.github/workflows/verify-x7-b1-full-iform-source-shapes-20261112.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  synthetic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a9d5bd9bafeed47b7044ee49241ae12e85353b5a
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source and fail-closed XML shape tests
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = a9d5bd9bafeed47b7044ee49241ae12e85353b5a
+          python3 -m py_compile tools/x86_iform_batch_worklist.py tools/x86_g10_source_operand_shapes.py
+          python3 -m unittest discover -s tools -p 'test_x86_iform_batch_worklist.py' -v
+          python3 -m unittest discover -s tools -p 'test_x86_g10_source_operand_shapes.py' -v
+          echo X7_FULL_IFORM_SHAPES_SYNTHETIC_GREEN
+  pinned-full:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 28
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a9d5bd9bafeed47b7044ee49241ae12e85353b5a
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Retrieve complete commit-pinned Intel instruction corpus
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = a9d5bd9bafeed47b7044ee49241ae12e85353b5a
+          mkdir -p /tmp/x7-b1-full-xml /tmp/x7-b1-evidence
+          revision=35eface1b7ee003a1cda95005ec5fd83de658a64
+          curl --fail --silent --show-error --location --retry 2 --max-time 180 \
+            "https://codeload.github.com/intel/SDM/tar.gz/${revision}" \
+            --output /tmp/x7-b1-evidence/intel-sdm.tar.gz
+          python3 - <<'PY'
+          from pathlib import Path
+          import re,tarfile
+          archive=Path('/tmp/x7-b1-evidence/intel-sdm.tar.gz')
+          target=Path('/tmp/x7-b1-full-xml')
+          total=0
+          with tarfile.open(archive,'r:gz') as tar:
+              for member in tar:
+                  if not (member.isfile() and
+                          re.fullmatch(r'[^/]+/data/instruction/[^/]+\.xml',member.name)):
+                      continue
+                  assert 0 < member.size < 4 * 1024 * 1024,member.name
+                  data=tar.extractfile(member).read()
+                  assert len(data)==member.size
+                  (target/member.name.rsplit('/',1)[-1]).write_bytes(data)
+                  total+=1
+                  assert total<=900
+          assert 700<=total<=900,total
+          print('X7_FULL_SOURCE_XML_FILES',total)
+          PY
+      - name: Normalize every source iform with one and eight stable shards
+        run: |
+          set -euo pipefail
+          python3 tools/x86_iform_batch_worklist.py \
+            --xml-dir /tmp/x7-b1-full-xml \
+            --out /tmp/x7-b1-evidence/worklist-8.json \
+            --normalize-out /tmp/x7-b1-evidence/shape-8.json \
+            --shards 8
+          python3 tools/x86_iform_batch_worklist.py \
+            --xml-dir /tmp/x7-b1-full-xml \
+            --out /tmp/x7-b1-evidence/worklist-1.json \
+            --normalize-out /tmp/x7-b1-evidence/shape-1.json \
+            --shards 1
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          a=json.loads(Path('/tmp/x7-b1-evidence/shape-8.json').read_text())
+          b=json.loads(Path('/tmp/x7-b1-evidence/shape-1.json').read_text())
+          for x in (a,b):
+              assert x['kind']=='full_intel_source_operand_shapes_unproved'
+              assert x['total_source_iforms']==10859
+              assert x['source_operand_shapes_parsed']+x['source_operand_shapes_blocked']==10859
+              assert x['semantic_proven']==x['encoding_proven']==x['production_selection_eligible']==0
+              assert len(x['forms'])==10859
+              assert all(not r['semantic_proven'] and not r['encoding_proven']
+                         and not r['production_selection_eligible'] and r['blockers']
+                         for r in x['forms'])
+          def shape_map(x):
+              return {r['form_id']:(r['source_iform_sha256'],r['source_shape_sha256'],
+                                   r['normalization_status'],r['blockers'])
+                      for r in x['forms']}
+          assert shape_map(a)==shape_map(b),'parallel shard source shape drift'
+          summary={k:a[k] for k in ('total_source_iforms',
+                  'source_operand_shapes_parsed','source_operand_shapes_blocked',
+                  'observed_operand_roles','blocker_counts')}
+          Path('/tmp/x7-b1-evidence/summary.json').write_text(
+              json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          print('X7_B1_FULL_SOURCE_SHAPE_SUMMARY',summary)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-b1-10859-iform-source-shapes
+          path: |
+            /tmp/x7-b1-evidence/shape-8.json
+            /tmp/x7-b1-evidence/summary.json
+          if-no-files-found: ignore
+          retention-days: 7
