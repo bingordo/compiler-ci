@@ -1,0 +1,94 @@
+name: FZ-3 PR1166 generic ddmin and TypeId IR file reducer
+on:
+  push:
+    branches: [fuzz/fz3-generic-ddmin-ir-pr1166]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  ddmin:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9603abc0b130119862a3cce9729dd959d188753b
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler source and tool
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "9603abc0b130119862a3cce9729dd959d188753b"
+          test -s compiler/crates/opt/src/delta_reduce.rs
+          test -s compiler/crates/opt/src/typeid_delta.rs
+          test -s compiler/crates/opt/examples/delta_reduce.rs
+      - name: Isolate standalone compiler core
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: fz3-generic-ddmin
+          cache-workspace-crates: 'true'
+      - name: Generic ddmin unit tests and verifier-gated TypeId CFG/instruction reduction
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --lib delta_reduce::tests -- --nocapture
+          cargo test -p compiler-opt --test delta_reduce_ir -- --nocapture
+      - name: End-to-end generic lines and TypeId IR CLI with external reproducer
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          temp="$RUNNER_TEMP/ddmin"
+          mkdir -p "$temp"
+          printf 'alpha\nbeta\nTARGET\nomega\n' > "$temp/input.txt"
+          cat > "$temp/matches-target.sh" <<'EOF'
+          #!/bin/sh
+          grep -q '^TARGET$' "$1"
+          EOF
+          chmod +x "$temp/matches-target.sh"
+          cargo run -p compiler-opt --example delta_reduce -- \
+            --mode lines --input "$temp/input.txt" --output "$temp/minimized.txt" \
+            --max-probes 150 --stage core.cse --seed 41 --timeout-ms 5000 -- \
+            "$temp/matches-target.sh" @INPUT@
+          test "$(cat "$temp/minimized.txt")" = TARGET
+          test -s "$temp/minimized.txt.replay.txt"
+          cargo run -p compiler-opt --example typeid_fuzz -- \
+            crates/opt/tests/fixtures/typeid_fuzz_cse.toml "$temp/generated"
+          test -s "$temp/generated/0000-before.ir"
+          cat > "$temp/has-add.sh" <<'EOF'
+          #!/bin/sh
+          grep -qi 'add' "$1"
+          EOF
+          chmod +x "$temp/has-add.sh"
+          cargo run -p compiler-opt --example delta_reduce -- \
+            --mode typeid --input "$temp/generated/0000-before.ir" \
+            --output "$temp/reduced.ir" --max-probes 120 \
+            --stage core.cse --seed 1 --timeout-ms 5000 -- \
+            "$temp/has-add.sh" @INPUT@
+          test -s "$temp/reduced.ir"
+          test -s "$temp/reduced.ir.replay.txt"
+          "$temp/has-add.sh" "$temp/reduced.ir"
+      - name: Previous TypeId FZ3 and cross-pass regression
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typeid_fuzz_corpus_reduce
+          cargo test -p compiler-opt --test typeid_fuzz_interactions
+          cargo test -p compiler-opt --test typeid_fuzz_bias
+          cargo test -p compiler-opt --test typeid_fuzz_pass_registry
+      - name: Clippy deny warnings except known unrelated x86 selector dead code
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt --lib --test delta_reduce_ir --example delta_reduce -- -D warnings -A dead_code
+      - name: Preserve minimized example and replay report
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ddmin-file-and-typeid-ir-example
+          path: ${{ runner.temp }}/ddmin/
+          retention-days: 7
