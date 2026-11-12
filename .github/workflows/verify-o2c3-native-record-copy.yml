@@ -1,0 +1,250 @@
+name: O2c.3 native checked record byte copies
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-o2c3-native-record-copy.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      COMPILER_SHA: ac9f5d097646c87b4c9ae5298975cf313ff8fd10
+      OBERON_SHA: c9b940203d72151a5e6149cae8f97a363f38c715
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ac9f5d097646c87b4c9ae5298975cf313ff8fd10
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check immutable pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          grep -F "$OBERON_SHA" compiler/crates/driver/Cargo.toml
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: o2c-byte-executable-${{ matrix.target }}
+      - name: Build and strict TypeId checks
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test aggregate_layout
+          cargo test -p compiler-ir --test aggregate_roots
+          cargo test -p compiler-opt --test typed_aggregate_pipeline
+          if [ "${{ matrix.target }}" = x86_64 ]; then
+            cargo test -p compiler --bin compiler
+            cargo clippy -p compiler-ir -p compiler --all-targets -- -D warnings
+          else
+            cargo test -p compiler --bin compiler --no-run
+            cargo clippy -p compiler-ir --all-targets -- -D warnings
+            cargo clippy -p compiler --bin compiler -- -D warnings
+          fi
+          cargo build -p compiler --bin compiler
+      - name: Source-checked mixed BYTE/INTEGER native execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p oracle
+          cat > oracle/ByteRec.mod <<'EOF'
+          MODULE ByteRec;
+          TYPE Mixed = RECORD tag: BYTE; count: INTEGER; tail: BYTE END;
+          VAR g: Mixed;
+          PROCEDURE Sum*(n: INTEGER): INTEGER;
+          VAR l: Mixed;
+          BEGIN
+            l.tag:=n; l.count:=n+100; l.tail:=n+1;
+            g.tag:=l.tag; g.count:=l.count; g.tail:=l.tail;
+            RETURN g.tag+g.count+g.tail
+          END Sum;
+          END ByteRec.
+          EOF
+          cat > oracle/NestedByte.mod <<'EOF'
+          MODULE NestedByte;
+          TYPE Inner = RECORD b: BYTE; n: INTEGER END;
+          Outer = RECORD front: BYTE; child: Inner; tail: INTEGER END;
+          VAR g: Outer;
+          PROCEDURE F*(n: INTEGER): INTEGER;
+          BEGIN
+            g.child.b:=n; g.child.n:=n+1; g.tail:=g.child.n;
+            RETURN g.child.b+g.tail
+          END F;
+          END NestedByte.
+          EOF
+          cat > oracle/Roots.mod <<'EOF'
+          MODULE Roots;
+          TYPE Pair=RECORD a,b: INTEGER END;
+          Node=RECORD x,y: Pair END;
+          VAR g: Node;
+          PROCEDURE Go*(n: INTEGER): INTEGER;
+          VAR l: Node;
+          BEGIN
+            l.x.a:=n; l.x.b:=n+1; l.y:=l.x; g:=l;
+            RETURN g.x.a+g.x.b+g.y.a+g.y.b
+          END Go;
+          END Roots.
+          EOF
+          cat > oracle/Tiny.mod <<'EOF'
+          MODULE Tiny;
+          TYPE One = RECORD b: BYTE END;
+          Three = RECORD a,b,c: BYTE END;
+          Five = RECORD a,b,c,d,e: BYTE END;
+          Four = RECORD a,b,c,d: BYTE END;
+          VAR g: Three; h: One; f: Four;
+          PROCEDURE Sum*(n: INTEGER): INTEGER;
+          VAR x: Five; y: One; z: Four;
+          BEGIN
+            x.a:=n; x.e:=n+4; y.b:=x.e;
+            z.a:=n; z.d:=n+3;
+            g.b:=y.b; h.b:=n; f.a:=z.a; f.d:=z.d;
+            RETURN g.a+g.b+x.a+x.b+x.e+h.b+f.a+f.d
+          END Sum;
+          END Tiny.
+          EOF
+          cat > oracle/CopyMem.mod <<'EOF'
+          MODULE CopyMem;
+          TYPE Byte3=RECORD a,b,c: BYTE END;
+          Pair=RECORD left,right: Byte3; count: INTEGER END;
+          VAR global: Pair;
+          PROCEDURE Go*(n: INTEGER): INTEGER;
+          VAR local: Pair; child: Byte3;
+          BEGIN
+            child.a:=n; child.b:=n+1; child.c:=n+2;
+            local.left:=child;
+            local.right:=local.left;
+            local.left:=local.right;
+            local.count:=n+100;
+            global:=local;
+            RETURN global.left.a+global.right.c+global.count
+          END Go;
+          END CopyMem.
+          EOF
+          cat > oracle/Prefix.mod <<'EOF'
+          MODULE Prefix;
+          TYPE Base=RECORD tag: BYTE END;
+          Derived=RECORD (Base) value: INTEGER END;
+          VAR b: Base; d: Derived;
+          PROCEDURE Go*(n: INTEGER): INTEGER;
+          BEGIN
+            d.tag:=n; d.value:=n+1; b:=d;
+            RETURN b.tag+d.value
+          END Go;
+          END Prefix.
+          EOF
+          cat > oracle/ByteCopy.mod <<'EOF'
+          MODULE ByteCopy;
+          TYPE Pair=RECORD b: BYTE; x: INTEGER; t: BYTE END;
+          VAR g,h: Pair;
+          PROCEDURE F*(n: INTEGER): INTEGER;
+          VAR l: Pair;
+          BEGIN
+            l.b:=n; l.x:=n+17; l.t:=n+1;
+            g:=l; h:=g;
+            RETURN h.b+h.x+h.t
+          END F;
+          END ByteCopy.
+          EOF
+          cat > oracle/ZeroCopy.mod <<'EOF'
+          MODULE ZeroCopy;
+          TYPE R=RECORD a: BYTE; b: INTEGER; c: BYTE END;
+          VAR g: R;
+          PROCEDURE Run*(n: INTEGER): INTEGER;
+          VAR l: R;
+          BEGIN
+            g.a:=n; g.b:=n; g.c:=n;
+            g:=l;
+            RETURN g.a+g.b+g.c
+          END Run;
+          END ZeroCopy.
+          EOF
+          cat > oracle/main.c <<'EOF'
+          #include <stdint.h>
+          extern int32_t ByteRec__Sum(int32_t);
+          extern int32_t NestedByte__F(int32_t);
+          extern int32_t Roots__Go(int32_t);
+          extern int32_t Tiny__Sum(int32_t);
+          extern int32_t CopyMem__Go(int32_t);
+          extern int32_t Prefix__Go(int32_t);
+          extern int32_t ByteCopy__F(int32_t);
+          extern int32_t ZeroCopy__Run(int32_t);
+          int main(void) {
+            if (ByteRec__Sum(258)!=363 || ByteRec__Sum(5)!=116 ||
+                ByteRec__Sum(-1)!=354) return 1;
+            if (NestedByte__F(258)!=261 || NestedByte__F(5)!=11) return 2;
+            if (Roots__Go(20)!=82 || Roots__Go(5)!=22) return 3;
+            if (Tiny__Sum(5)!=41 || Tiny__Sum(258)!=23 ||
+                Tiny__Sum(-1)!=773 || Tiny__Sum(254)!=767) return 4;
+            if (CopyMem__Go(5)!=117 || CopyMem__Go(258)!=364 ||
+                CopyMem__Go(-1)!=355) return 5;
+            if (Prefix__Go(5)!=11 || Prefix__Go(258)!=261 ||
+                Prefix__Go(-1)!=255) return 6;
+            if (ByteCopy__F(5)!=33 || ByteCopy__F(258)!=280 ||
+                ByteCopy__F(-1)!=271) return 7;
+            if (ZeroCopy__Run(5)!=0 || ZeroCopy__Run(258)!=0) return 8;
+            return 0;
+          }
+          EOF
+          for format in obj asm; do
+            objects=()
+            for module in ByteRec NestedByte Roots Tiny CopyMem Prefix ByteCopy ZeroCopy; do
+              if [ "$format" = obj ]; then suffix=o; else suffix=s; fi
+              compiler/target/debug/compiler "oracle/$module.mod" \
+                --language oberon --target ${{ matrix.target }} \
+                --emit "$format" -o "oracle/$module.$suffix"
+              objects+=("oracle/$module.$suffix")
+            done
+            # Both the direct ELF object and the assembled .s must
+            # contain exact source bytes, not the padded frame reservation.
+            if [ "$format" = asm ]; then
+              cc -c oracle/Tiny.s -o oracle/Tiny-from-asm.o
+              inspect=oracle/Tiny-from-asm.o
+            else
+              inspect=oracle/Tiny.o
+            fi
+            readelf -Ws "$inspect" | awk '
+              $NF=="Tiny__g" { if ($3!=3) exit 1; found_g=1 }
+              $NF=="Tiny__h" { if ($3!=1) exit 1; found_h=1 }
+              $NF=="Tiny__f" { if ($3!=4) exit 1; found_f=1 }
+              END {if (!found_g || !found_h || !found_f) exit 1}'
+            cc -O2 oracle/main.c "${objects[@]}" -o "oracle/run-$format"
+            "oracle/run-$format"
+            echo "mixed BYTE/INTEGER source ${{ matrix.target }} $format PASS" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Reject invalid base-to-derived record copy
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > oracle/BadCopy.mod <<'EOF'
+          MODULE BadCopy;
+          TYPE Base=RECORD tag: BYTE END;
+          Derived=RECORD (Base) value: INTEGER END;
+          VAR b: Base; d: Derived;
+          BEGIN d:=b END BadCopy.
+          EOF
+          for module in BadCopy; do
+            if compiler/target/debug/compiler "oracle/$module.mod" \
+              --language oberon --target ${{ matrix.target }} \
+              --emit obj -o "oracle/$module.o"; then
+              echo "Unexpected acceptance of $module" >&2
+              exit 1
+            fi
+          done
