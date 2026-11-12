@@ -1,0 +1,89 @@
+name: CT-11 native PRE lazy transaction exact-parent source ABBA
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/ct11-pre-lazy-transaction-abba.yml']
+permissions:
+  contents: read
+concurrency:
+  group: ct11-pre-lazy-transaction-abba-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  paired-native:
+    strategy:
+      fail-fast: false
+      matrix:
+        independent_runner: [a, b]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 3b2f8a3aa54a28256d1dbc63ec1fcb17073b4996
+          path: parent
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 10b92a17e018cdc543aefc50eead982378a1fd16
+          path: candidate
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Exact pins, toolchains and script syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          test "$(git -C parent rev-parse HEAD)" = 3b2f8a3aa54a28256d1dbc63ec1fcb17073b4996
+          test "$(git -C candidate rev-parse HEAD)" = 10b92a17e018cdc543aefc50eead982378a1fd16
+          git -C parent rev-parse HEAD | tee results/parent-sha.txt
+          git -C candidate rev-parse HEAD | tee results/candidate-sha.txt
+          rustc --version | tee results/toolchain.txt
+          cc --version | head -1 | tee results/gcc.txt
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          python3 -m py_compile candidate/tools/ct11_source_compile_abba.py candidate/tools/ct11_loop_source_profile.py
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            parent -> target
+            candidate -> target
+          key: ct11-pre-lazy-transaction-abba-${{ matrix.independent_runner }}
+      - name: Compile two exact-source release compilers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path parent/Cargo.toml -p compiler --bin compiler
+          cargo build --release --manifest-path candidate/Cargo.toml -p compiler --bin compiler
+      - name: Candidate PRE trial, native output, no-op rollback and strict Clippy
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release --manifest-path candidate/Cargo.toml -p compiler-opt --test typed_pre_native -- --nocapture
+          cargo test --release --manifest-path candidate/Cargo.toml -p compiler-opt --test native_s2316_profile
+          cargo test --release --manifest-path candidate/Cargo.toml -p compiler --test typeid_native_s2316_profile
+          cargo clippy --manifest-path candidate/Cargo.toml -p compiler-opt --lib -- -D warnings
+          cargo clippy --manifest-path candidate/Cargo.toml -p compiler --bin compiler --test typeid_native_s2316_profile -- -D warnings
+      - name: Independent exact-parent whole-source native ABBA with RSS and C runtime oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 candidate/tools/ct11_source_compile_abba.py \
+            --baseline parent/target/release/compiler \
+            --candidate candidate/target/release/compiler \
+            --output results/abba.json --rounds 7 \
+            2>&1 | tee results/abba.log
+          test "$(grep -c '^CT11_ABBA name=' results/abba.log)" -eq 8
+          grep '^CT11_ABBA ' results/abba.log | tee -a "$GITHUB_STEP_SUMMARY"
+          grep '^CT11_ABBA_SUMMARY ' results/abba.log | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ct11-pre-lazy-transaction-abba-${{ matrix.independent_runner }}
+          path: results/
+          retention-days: 30
