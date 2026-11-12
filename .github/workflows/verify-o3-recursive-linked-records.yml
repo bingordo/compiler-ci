@@ -1,0 +1,156 @@
+name: O3 recursive linked records with NEW and NIL
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-o3-recursive-linked-records.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      COMPILER_SHA: 1abbce2732d8632026a930b630a9ef6ade4287d8
+      OBERON_SHA: 47bda1f3a1b44bccefd56c2ecc2fe93edd1fd887
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1abbce2732d8632026a930b630a9ef6ade4287d8
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check immutable pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          grep -F "$OBERON_SHA" compiler/crates/driver/Cargo.toml
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: o3-linked-${{ matrix.target }}
+      - name: Build and strict TypeId checks
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test aggregate_layout
+          cargo test -p compiler-ir --test aggregate_roots
+          cargo test -p compiler-opt --test typed_aggregate_pipeline
+          if [ "${{ matrix.target }}" = x86_64 ]; then
+            cargo test -p compiler --bin compiler
+            cargo clippy -p compiler-ir -p compiler --all-targets -- -D warnings
+          else
+            cargo test -p compiler --bin compiler --no-run
+            cargo clippy -p compiler-ir --all-targets -- -D warnings
+            cargo clippy -p compiler --bin compiler -- -D warnings
+          fi
+          cargo build -p compiler --bin compiler
+      - name: Native recursive linked-node execution via C oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p oracle
+          cat > oracle/Linked.mod <<'EOF'
+          MODULE Linked;
+          TYPE Link=POINTER TO Node;
+               Node=RECORD value:INTEGER; next:Link END;
+          VAR head:Link;
+          PROCEDURE Run*(n:INTEGER):INTEGER;
+          VAR p,q:Link; total:INTEGER;
+          BEGIN
+            NEW(p); p^.value:=n;
+            NEW(p^.next);
+            p^.next^.value:=n+1;
+            p^.next^.next:=NIL;
+            head:=p;
+            q:=head;
+            total:=0;
+            WHILE q#NIL DO
+              total:=total+q^.value;
+              q:=q^.next
+            END;
+            RETURN total
+          END Run;
+          END Linked.
+          EOF
+          cat > oracle/LinkAssign.mod <<'EOF'
+          MODULE LinkAssign;
+          TYPE Link=POINTER TO Node;
+               Node=RECORD data:INTEGER; next:Link END;
+          VAR global:Link;
+          PROCEDURE Check*(n:INTEGER):INTEGER;
+          VAR p,q:Link;
+          BEGIN
+            NEW(p); NEW(q);
+            p^.next:=q; q^.data:=n+9;
+            q^.next:=NIL;
+            global:=p^.next;
+            IF global#NIL THEN RETURN global^.data ELSE RETURN -1 END
+          END Check;
+          END LinkAssign.
+          EOF
+          cat > oracle/main.c <<'EOF'
+          #include <stdint.h>
+          extern int32_t Linked__Run(int32_t);
+          extern int32_t LinkAssign__Check(int32_t);
+          int main(void) {
+            if (Linked__Run(5)!=11 || Linked__Run(258)!=517 ||
+                Linked__Run(-1)!=-1) return 1;
+            if (LinkAssign__Check(5)!=14 || LinkAssign__Check(-1)!=8 ||
+                LinkAssign__Check(258)!=267) return 2;
+            return 0;
+          }
+          EOF
+          for format in obj asm; do
+            objects=()
+            for module in Linked LinkAssign; do
+              suffix=o
+              if [ "$format" = asm ]; then suffix=s; fi
+              compiler/target/debug/compiler "oracle/$module.mod" \
+                --language oberon --target ${{ matrix.target }} \
+                --emit "$format" -o "oracle/$module.$suffix"
+              objects+=("oracle/$module.$suffix")
+            done
+            cc -O2 oracle/main.c "${objects[@]}" -o "oracle/run-$format"
+            "oracle/run-$format"
+            echo "recursive linked records ${{ matrix.target }} $format PASS" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Reject unsupported pointer targets and invalid linked fields
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > oracle/BadPtr.mod <<'EOF'
+          MODULE BadPtr; VAR p:POINTER TO INTEGER; END BadPtr.
+          EOF
+          cat > oracle/BadField.mod <<'EOF'
+          MODULE BadField;
+          TYPE Link=POINTER TO Node;
+               Node=RECORD value:INTEGER; next:Link END;
+          VAR p:Link;
+          PROCEDURE F*(n:INTEGER):INTEGER;
+          BEGIN NEW(p); RETURN p^.next^.absent END F;
+          END BadField.
+          EOF
+          for module in BadPtr BadField; do
+            if compiler/target/debug/compiler "oracle/$module.mod" \
+              --language oberon --target ${{ matrix.target }} \
+              --emit obj -o "oracle/$module.o"; then
+              echo "Unexpected acceptance of $module" >&2
+              exit 1
+            fi
+          done
