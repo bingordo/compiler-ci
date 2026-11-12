@@ -295,6 +295,12 @@ jobs:
           assert all(x["source_slice"]["shared_ast_parsed_once_per_batch"] is True
                      and x["source_slice"]["source_batch_operation_count"] == 4
                      for x in slices)
+          assert {x["operation_id"]: x["source_slice"]["parsed_declarations_selected"]
+                  for x in slices} == {
+              "ADD_addsub_imm":13, "ADD_addsub_shift":305,
+              "AND_log_shift":304, "MOVZ":301}
+          assert {x["operation_id"] for x in slices if x["strict_typing"]["typechecked"]} == {
+              "ADD_addsub_imm"}
           print("A32_SLICED_SOURCE_OUTCOME", [
               (x["operation_id"],
                x["source_slice"]["parsed_declarations_selected"],
@@ -318,6 +324,49 @@ jobs:
                 for x in cl["steps"][-12:]], "total",len(cl["steps"]))
           print("MATCHED_ASLREF_FINAL",cl["stop_reason"],cl["final_strict_passes"],cl.get("source_boundary_matrix"))
           PY
+      - name: Execute first eight-operation source cohort with one shared ASLRef parse
+        shell: sh
+        run: |
+          set -eu
+          python3 compiler/tools/aarch64_a32_batch_plan.py \
+            --source-links /tmp/aarch64-source-links.json \
+            --batch-size 8 --max-source-bytes 2000000 \
+            --out /tmp/aarch64-source-batches.json
+          python3 compiler/tools/aarch64_a32_asl_typeenv.py \
+            --source-links /tmp/aarch64-source-links.json \
+            --archive /tmp/ISA_A64_xml_A_profile-2026-09.tar.gz \
+            --bundler herd/herd/libdir/asl-pseudocode/bundler.py \
+            --aslref "$(pwd)/herd/_build/default/asllib/aslref.exe" \
+            --aslref-mode matching-source-eac1 \
+            --features-archive /tmp/Arm_AARCHMRS_Features_2026-09.tar.gz \
+            --feature-generator herd/herd/libdir/asl-pseudocode/build_features.py \
+            --sysreg-archive /tmp/SysReg_xml_A_profile_FAT-2026-09.tar.gz \
+            --type-implementations herd/herd/libdir/asl-pseudocode/type-checking-implementations.asl \
+            --closure-steps 64 --reconcile-published-stub --slice-shared --batch-shared \
+            --batch-plan /tmp/aarch64-source-batches.json --batch-index 0 \
+            --ast-slice-tool "$(pwd)/herd/_build/default/asllib/offline_slicer/aarch64_ast_slice.exe" \
+            --out /tmp/aarch64-a32-first-cohort.json
+          python3 - <<'PY'
+          import json
+          plan=json.load(open("/tmp/aarch64-source-batches.json"))
+          expected=[v["operation_id"] for v in plan["batches"][0]["operations"]]
+          r=json.load(open("/tmp/aarch64-a32-first-cohort.json"))
+          actual=[v["operation_id"] for v in r["instruction_source_slices"]]
+          assert actual == expected, (actual,expected)
+          assert len(actual)==8
+          assert all(v["source_slice"]["shared_ast_parsed_once_per_batch"] is True
+                     and v["source_slice"]["source_batch_operation_count"] == 8
+                     and v["selection_eligible"] is False
+                     and v["semantic_equivalence_proven"] is False
+                     for v in r["instruction_source_slices"])
+          print("A32_FIRST_EIGHT_OPERATION_AST_COHORT",
+                [(v["operation_id"],
+                  v["source_slice"]["parsed_declarations_selected"],
+                  v["strict_typing"]["typechecked"],
+                  v["strict_typing"]["diagnostics"]["category"])
+                 for v in r["instruction_source_slices"]])
+          PY
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
