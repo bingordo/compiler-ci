@@ -1,0 +1,77 @@
+name: AArch64 source-only full 2026-09 Arm XML catalog
+on:
+  push:
+    branches: [ci/aarch64-full-source-catalog-20261112]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  official-source-catalog:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 61cb1d33cdcade0da20181b063d7fedf7bc9a038
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Exact source pin and complete AArch64 Python suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 61cb1d33cdcade0da20181b063d7fedf7bc9a038
+          python3 -m unittest discover -s compiler/tools -p 'test_aarch64*.py' -v
+      - name: Download and verify original Arm 2026-09 A64 XML
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fLsS --retry 3 --connect-timeout 20 --max-time 240 --max-filesize 200000000 \
+            -o /tmp/ISA_A64_xml_A_profile-2026-09.tar.gz \
+            https://developer.arm.com/-/cdn-downloads/permalink/Exploration-Tools-A64-ISA/ISA_A64/ISA_A64_xml_A_profile-2026-09.tar.gz
+          echo "44cfb89c763c7eea8e59de0ad2221e3c012e6aa77899bd7f1c3e1f24537191d7  /tmp/ISA_A64_xml_A_profile-2026-09.tar.gz" | sha256sum -c -
+      - name: Inventory every unique executable Arm XML source and bound its batches
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/aarch64_a32_full_source_catalog.py \
+            --isa-xml-archive /tmp/ISA_A64_xml_A_profile-2026-09.tar.gz \
+            --out /tmp/aarch64-full-source.json
+          python3 compiler/tools/aarch64_a32_full_source_catalog.py \
+            --isa-xml-archive /tmp/ISA_A64_xml_A_profile-2026-09.tar.gz \
+            --out /tmp/aarch64-full-source.json --check
+          python3 compiler/tools/aarch64_a32_batch_plan.py \
+            --source-links /tmp/aarch64-full-source.json \
+            --batch-size 64 --max-source-bytes 4000000 \
+            --out /tmp/aarch64-full-source-batches.json
+          python3 compiler/tools/aarch64_a32_batch_plan.py \
+            --source-links /tmp/aarch64-full-source.json \
+            --batch-size 64 --max-source-bytes 4000000 \
+            --out /tmp/aarch64-full-source-batches.json --check
+          python3 - <<'PY'
+          import json
+          c=json.load(open('/tmp/aarch64-full-source.json'))
+          b=json.load(open('/tmp/aarch64-full-source-batches.json'))
+          assert c['format']=='aarch64-a32-official-xml-source-catalog-v1'
+          assert c['operation_count'] > 23
+          assert b['source_only'] is True
+          assert b['operation_count'] == c['operation_count']
+          assert sum(x['operation_count'] for x in b['batches']) == c['operation_count']
+          assert all(x['operation_count'] <= 64 and
+                     x['source_section_bytes'] <= 4000000
+                     for x in b['batches'])
+          assert not b['selection_eligible'] and not c['selection_eligible']
+          assert not b['semantic_equivalence_proven']
+          print('AARCH64_FULL_XML_SOURCE_CENSUS',c['operation_count'],
+                c['ambiguous_operation_count'],c['rejected_source_count'],
+                'batches',b['batch_count'])
+          PY
+      - name: Upload source-only fingerprints and bounded cohort plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: aarch64-full-source-inventory-pinned
+          path: |
+            /tmp/aarch64-full-source.json
+            /tmp/aarch64-full-source-batches.json
+          retention-days: 7
