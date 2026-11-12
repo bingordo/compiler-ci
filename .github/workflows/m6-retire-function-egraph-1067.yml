@@ -1,0 +1,89 @@
+name: M6 retire Function egraph and preserve native plus MemorySSA gates
+on:
+  push:
+    branches: [ci/m6-retire-function-egraph-1067-20261111]
+    paths: ['.github/workflows/m6-retire-function-egraph-1067.yml']
+permissions:
+  contents: read
+jobs:
+  retire-legacy-egraph:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 4b76028bf0b98a98179f18cb41ce3f4065668c8d
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest exact source and physical removal without erasing MemorySSA
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 4b76028bf0b98a98179f18cb41ce3f4065668c8d
+          python3 - <<'PY'
+          from pathlib import Path
+          root=Path("compiler")
+          for p in [
+              "crates/opt/src/egraph_ssa.rs",
+              "crates/opt/tests/m6_generated_factor_matrix.rs",
+              "crates/opt/tests/m6_marginal_native.rs",
+              "crates/opt/tests/m6_native_optin.rs",
+              "crates/opt/tests/m6_opt_in.rs",
+          ]:
+              assert not (root/p).exists(),p
+          lib=(root/"crates/opt/src/lib.rs").read_text()
+          cargo=(root/"crates/opt/Cargo.toml").read_text()
+          native=(root/"crates/opt/src/typed_egraph_ssa.rs").read_text()
+          assert "optimize_m6_experimental" not in lib
+          assert "pub mod egraph_ssa" not in lib
+          assert 'pub mod memory_ssa;' in lib and 'pub mod memory_ssa_loads;' in lib
+          assert 'name = "m6_overhead"' in cargo
+          assert 'required-features = ["typeid-egraph"]' in cargo
+          for name in ("equal_live_savings_prefer_shorter_paths_and_fewer_temporaries",
+                       "sibling_alternatives_can_reduce_shared_dag_cost",
+                       "child_choices_are_strictly_bounded_and_deterministic"):
+              assert "fn "+name in native,name
+          overhead=(root/"crates/opt/tests/m6_overhead.rs").read_text()
+          assert "optimize_m6_typeid(" in overhead and "TypedSsaModule" in overhead
+          workflow=(root/".github/workflows/m6-overhead-profile.yml").read_text()
+          assert "--features typeid-egraph --test m6_overhead" in workflow
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m6-retire-egraph-1067
+      - name: Run native M6, extracted DAG choice invariants and overhead diagnostic
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --features typeid-egraph --test m6_typeid_matrix -- --nocapture --test-threads=1
+          cargo test -p compiler-opt --features typeid-egraph --test m6_typeid_egraph -- --nocapture --test-threads=1
+          cargo test -p compiler-opt --features typeid-egraph --test m6_overhead -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/m6-native-overhead.log"
+          grep -F 'M6_TYPEID_OVERHEAD,arithmetic,24,' "$RUNNER_TEMP/m6-native-overhead.log"
+          grep -F 'M6_TYPEID_OVERHEAD,memory,24,' "$RUNNER_TEMP/m6-native-overhead.log"
+          cargo test -p compiler-opt --features typeid-egraph --lib -- --test-threads=2
+          cargo clippy -p compiler-opt --features typeid-egraph --all-targets -- -D warnings
+      - name: Preserve independent MemorySSA version, alias and callback tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --features legacy-experimental-ssa --lib -- --test-threads=2
+          cargo test -p compiler-opt --features legacy-experimental-ssa --test ct03_memoryssa_invalidation_native -- --nocapture --test-threads=1
+          cargo test -p compiler-opt --features legacy-experimental-ssa --test indirect_call_memory_barriers -- --nocapture --test-threads=1
+          cargo clippy -p compiler-opt --features legacy-experimental-ssa --all-targets -- -D warnings
+      - name: Checked source native M6 differential and default driver compiler
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --features typeid-egraph --bin compiler m6_checked_oberon_source_vs_c_oracle -- --test-threads=1
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --features typeid-egraph --lib m6_real_checked_mini_c_source_vs_gcc -- --test-threads=1
+          cargo test -p compiler --bin compiler -- --test-threads=2
+          cargo test -p compiler-ir -p compiler-opt --lib -- --test-threads=2
+          cargo clippy -p compiler -p compiler-ir -p compiler-opt --all-targets -- -D warnings
+          cargo check -p compiler --features legacy-experimental-ssa --all-targets
+          cargo check --manifest-path tools/mini-c-driver/Cargo.toml --features legacy-experimental-ssa --all-targets
