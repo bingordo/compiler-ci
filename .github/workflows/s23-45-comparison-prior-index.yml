@@ -212,6 +212,78 @@ jobs:
           set -euo pipefail
           python3 after/tools/s23_45_compare_stage_abba.py             --results results --rounds 4 --output results/s23-45-abba.json             | tee results/s23-45-abba.log
           cat results/s23-45-abba.log >> "$GITHUB_STEP_SUMMARY"
+      - name: ABBA mixed-width 240-function practical cost control
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmp before/crates/opt/tests/native_s2314_cost.rs after/crates/opt/tests/native_s2314_cost.rs
+          for round in 1 2 3 4; do
+            if (( round % 2 == 1 )); then order=(before after); else order=(after before); fi
+            for side in "${order[@]}"; do
+              echo "S2345_MIXED_START round=$round side=$side"
+              (
+                cd "$side"
+                CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-$side" \
+                  cargo test --release -p compiler-opt --test native_s2314_cost -- --nocapture
+              ) 2>&1 | tee "results/mixed-round${round}-${side}.log"
+            done
+          done
+      - name: Enforce mixed SSA parity and report 240-function median cost
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee results/s23-45-mixed-abba.log
+          from pathlib import Path
+          import json, statistics
+          root = Path("results")
+          cases = ("boolean", "compare", "matching")
+          data = {}
+          for round_ in range(1, 5):
+              data[round_] = {}
+              for side in ("before", "after"):
+                  rows = {}
+                  path = root / f"mixed-round{round_}-{side}.log"
+                  for line in path.read_text().splitlines():
+                      if "S2314_LARGE_COST workload=" not in line:
+                          continue
+                      fields = dict(part.split("=", 1) for part in
+                                    line.split("S2314_LARGE_COST ", 1)[1].split())
+                      if fields["workload"] in rows:
+                          raise RuntimeError(f"duplicate workload in {path}")
+                      rows[fields["workload"]] = fields
+                  if set(rows) != set(cases):
+                      raise RuntimeError(f"missing mixed corpus: {path}: {rows.keys()}")
+                  data[round_][side] = rows
+          output = []
+          for case in cases:
+              ref = data[1]["before"][case]
+              keys = ("functions", "source_bytes", "output_bytes", "fingerprint",
+                      "rewrites", "dead")
+              for round_ in data:
+                  for side in ("before", "after"):
+                      row = data[round_][side][case]
+                      for key in keys:
+                          if row[key] != ref[key]:
+                              raise RuntimeError(
+                                  f"mixed output differs case={case} round={round_} "
+                                  f"side={side} key={key} {row[key]} != {ref[key]}"
+                              )
+              def median(side):
+                  return int(statistics.median(int(data[r][side][case]["optimize_ns_median"])
+                                               for r in data))
+              before, after = median("before"), median("after")
+              result = dict(workload=case, functions=int(ref["functions"]),
+                            source_bytes=int(ref["source_bytes"]),
+                            rewrites=int(ref["rewrites"]), fingerprint=ref["fingerprint"],
+                            before_ns=before, after_ns=after,
+                            ratio_after_before=round(after / before, 3))
+              output.append(result)
+              print("S2345_MIXED_ABBA " +
+                    " ".join(f"{k}={v}" for k, v in result.items()))
+          (root / "s23-45-mixed-abba.json").write_text(
+              json.dumps(output, indent=2, sort_keys=True) + "\n")
+          PY
+          cat results/s23-45-mixed-abba.log >> "$GITHUB_STEP_SUMMARY"
       - name: Preserve exact per-round logs and validated ABBA JSON
         if: always()
         uses: actions/upload-artifact@v4
