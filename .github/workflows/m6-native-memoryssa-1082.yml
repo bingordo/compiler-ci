@@ -1,0 +1,80 @@
+name: M6 native TypeId MemorySSA graph and alias-aware load reuse
+on:
+  push:
+    branches: [ci/m6-native-memoryssa-1082-20261111]
+    paths: ['.github/workflows/m6-native-memoryssa-1082.yml']
+permissions:
+  contents: read
+jobs:
+  memoryssa-typeid:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 117c9bfab4272ce4986195c442ebf20ec565ee98
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest exact source, native graph, native load planner and old MemorySSA preservation
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 117c9bfab4272ce4986195c442ebf20ec565ee98
+          python3 - <<'PY'
+          from pathlib import Path
+          root=Path("compiler")
+          graph=(root/"crates/opt/src/typed_memory_ssa.rs").read_text()
+          loads=(root/"crates/opt/src/typed_memory_ssa_loads.rs").read_text()
+          lib=(root/"crates/opt/src/lib.rs").read_text()
+          cargo=(root/"crates/opt/Cargo.toml").read_text()
+          test=(root/"crates/opt/tests/m6_typeid_memoryssa.rs").read_text()
+          assert "TypedSsaModule" in graph and "TypedFunction" in graph
+          assert "module.validate_optimizer_abi()" in graph
+          assert "nearest_clobber_for_local_slot" in graph
+          assert "TypedSsaModule" in loads and "rewrite_uses_typed" in loads
+          assert "work.validate_optimizer_abi()" in loads
+          assert "typed_memory_ssa_loads::eliminate_redundant_loads_typed" in lib
+          assert 'typeid-memory-ssa = []' in cargo
+          assert 'typeid-egraph = ["typeid-memory-ssa"]' in cargo
+          assert (root/"crates/opt/src/memory_ssa.rs").exists()
+          assert (root/"crates/opt/src/memory_ssa_loads.rs").exists()
+          assert "native_memoryssa_gcc_oracle_elf_and_assembly" in test
+          assert "project_legacy_compat_function" not in graph+loads+test
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m6-native-memoryssa-1082
+      - name: Run new native MemorySSA versioning, mutation and GNU/x86 differential
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --features typeid-memory-ssa --test m6_typeid_memoryssa -- --nocapture --test-threads=1
+          cargo clippy -p compiler-opt --features typeid-memory-ssa --all-targets -- -D warnings
+      - name: Check composed native M6 egraph and old independent MemorySSA
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --features typeid-egraph --test m6_typeid_egraph -- --nocapture --test-threads=1
+          cargo test -p compiler-opt --features typeid-egraph --test m6_typeid_matrix -- --nocapture --test-threads=1
+          cargo test -p compiler-opt --features typeid-egraph --test m6_overhead -- --nocapture --test-threads=1
+          cargo test -p compiler-opt --features typeid-egraph --lib -- --test-threads=2
+          cargo clippy -p compiler-opt --features typeid-egraph --all-targets -- -D warnings
+          cargo test -p compiler-opt --features legacy-experimental-ssa --test ct03_memoryssa_invalidation_native -- --nocapture --test-threads=1
+          cargo test -p compiler-opt --features legacy-experimental-ssa --test indirect_call_memory_barriers -- --test-threads=1
+          cargo test -p compiler-opt --features legacy-experimental-ssa --lib -- --test-threads=2
+          cargo clippy -p compiler-opt --features legacy-experimental-ssa --all-targets -- -D warnings
+      - name: Real checked Oberon and Mini-C native source M6 differential and default regression
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --features typeid-egraph --bin compiler m6_checked_oberon_source_vs_c_oracle -- --test-threads=1
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --features typeid-egraph --lib m6_real_checked_mini_c_source_vs_gcc -- --test-threads=1
+          cargo test -p compiler --bin compiler -- --test-threads=2
+          cargo test -p compiler-ir -p compiler-opt --lib -- --test-threads=2
+          cargo clippy -p compiler -p compiler-ir -p compiler-opt --all-targets -- -D warnings
