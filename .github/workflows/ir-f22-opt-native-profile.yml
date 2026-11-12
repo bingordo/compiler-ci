@@ -1,0 +1,91 @@
+name: IR F22 Function profiler deletion and TypeId profile parity
+on:
+  pull_request:
+    paths: ['.github/workflows/ir-f22-opt-native-profile.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  typeid-profile-and-old-reference:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 32
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7e30d3316a724c0f2dbc198e3417d5585b5e290e
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - name: Check exact compiler commit and isolate core crates
+        run: |
+          set -euxo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "7e30d3316a724c0f2dbc198e3417d5585b5e290e"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: f22-profile-retirement
+      - name: No obsolete Function scalar profiler entrypoint/callers
+        working-directory: compiler
+        run: |
+          if rg -n 'optimize_profiled|scalar_optimizer_calls' crates/opt/src crates/opt/tests; then
+            echo "Obsolete Function scalar profile is still reachable" >&2
+            exit 1
+          fi
+      - name: Production TypeId diagnostic profile/rollback and legacy scalar checks
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typeid_source_profile_parity -- --nocapture
+          cargo test -p compiler-opt --test ct03_closeout -- --nocapture
+          cargo test -p compiler-opt --lib profile -- --nocapture
+          cargo test -p compiler-opt --lib --features verify-counts ct03_verify_counts -- --nocapture
+          cargo test -p compiler-opt --test typed_core_pipeline -- --nocapture
+          cargo test -p compiler-opt --test typed_aggregate_pipeline -- --nocapture
+          cargo test -p compiler-opt --features typeid-egraph,typeid-memory-ssa --test m6_typeid_egraph -- --nocapture
+      - name: Strict all-target IR/opt Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt --all-targets -- -D warnings
+  full-regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7e30d3316a724c0f2dbc198e3417d5585b5e290e
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - name: Check source pin and isolate portable workspace
+        run: |
+          set -euxo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "7e30d3316a724c0f2dbc198e3417d5585b5e290e"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: f22-profile-retirement-backends
+      - name: Install GDB for existing native DWARF tests
+        run: |
+          if ! command -v gdb >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq gdb
+          fi
+      - name: Complete core native x86 and AArch64 regressions
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 -- --skip generated_comparison_dag_all_widths_with_cfg_and_negative_guards
