@@ -1,0 +1,158 @@
+name: O2 native Oberon multidimensional INTEGER arrays
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-oberon-multidim-array.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      COMPILER_SHA: 2bc5ec32eaa35ccea2e33c00e5bacb5d7cf956c1
+      OBERON_SHA: 981886868cb0d867c2cb059d9e36340aa673e947
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2bc5ec32eaa35ccea2e33c00e5bacb5d7cf956c1
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check immutable pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          grep -F "$OBERON_SHA" compiler/crates/driver/Cargo.toml
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: o2-multidim-${{ matrix.target }}
+      - name: Build and strict TypeId checks
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test aggregate_layout
+          cargo test -p compiler-ir --test aggregate_roots
+          cargo test -p compiler-opt --test typed_aggregate_pipeline
+          if [ "${{ matrix.target }}" = x86_64 ]; then
+            cargo test -p compiler --bin compiler
+            cargo clippy -p compiler-ir -p compiler --all-targets -- -D warnings
+          else
+            cargo test -p compiler --bin compiler --no-run
+            cargo clippy -p compiler-ir --all-targets -- -D warnings
+            cargo clippy -p compiler --bin compiler -- -D warnings
+          fi
+          cargo build -p compiler --bin compiler
+      - name: Execute checked multidimensional array programs with C oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p oracle
+          cat > oracle/Matrix.mod <<'EOF'
+          MODULE Matrix;
+          CONST Rows=2; Cols=3;
+          VAR global: ARRAY Rows,Cols OF INTEGER;
+          PROCEDURE Work*(n:INTEGER):INTEGER;
+          VAR local: ARRAY Rows,Cols OF INTEGER;
+          BEGIN
+            local[1,2]:=n;
+            local[0,0]:=n+3;
+            global[1,2]:=local[0,0];
+            global[0,1]:=local[1,2];
+            RETURN global[1,2]+global[0,1]+local[0,0]
+          END Work;
+          PROCEDURE Read*(r,c:INTEGER):INTEGER;
+          BEGIN RETURN global[r,c] END Read;
+          END Matrix.
+          EOF
+          cat > oracle/Cube.mod <<'EOF'
+          MODULE Cube;
+          VAR global: ARRAY 2,3,4 OF INTEGER;
+          PROCEDURE Work*(n:INTEGER):INTEGER;
+          VAR local: ARRAY 2,3,4 OF INTEGER;
+          BEGIN
+            local[1,2,3]:=n;
+            local[0,0,0]:=n+7;
+            global[1,2,3]:=local[1,2,3];
+            global[0,0,0]:=local[0,0,0];
+            RETURN global[1,2,3]+global[0,0,0]
+          END Work;
+          END Cube.
+          EOF
+          cat > oracle/main.c <<'EOF'
+          #include <stdint.h>
+          #include <signal.h>
+          #include <unistd.h>
+          #include <sys/wait.h>
+          extern int32_t Matrix__Work(int32_t);
+          extern int32_t Matrix__Read(int32_t,int32_t);
+          extern int32_t Cube__Work(int32_t);
+          static int check_oob(int32_t row,int32_t col) {
+            pid_t child=fork();
+            if (child<0) return 0;
+            if (child==0) {
+              (void)Matrix__Read(row,col);
+              _exit(0);
+            }
+            int status=0;
+            if (waitpid(child,&status,0)!=child) return 0;
+            return WIFSIGNALED(status);
+          }
+          int main(void) {
+            if (Matrix__Work(5)!=21 || Matrix__Work(258)!=780 ||
+                Matrix__Work(-1)!=3) return 1;
+            if (Cube__Work(5)!=17 || Cube__Work(258)!=523 ||
+                Cube__Work(-1)!=5) return 2;
+            /* (0,3) gives flat offset 3, which is inside the allocation:
+               each source dimension must independently trap. */
+            if (!check_oob(0,3) || !check_oob(-1,2) ||
+                !check_oob(2,0)) return 3;
+            return 0;
+          }
+          EOF
+          ulimit -c 0
+          for format in obj asm; do
+            objects=()
+            for module in Matrix Cube; do
+              if [ "$format" = obj ]; then suffix=o; else suffix=s; fi
+              compiler/target/debug/compiler "oracle/$module.mod" \
+                --language oberon --target ${{ matrix.target }} \
+                --emit "$format" -o "oracle/$module.$suffix"
+              objects+=("oracle/$module.$suffix")
+            done
+            cc -O2 oracle/main.c "${objects[@]}" -o "oracle/run-$format"
+            "oracle/run-$format"
+            echo "O2 multidim ${{ matrix.target }} $format PASS" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Reject unverified multidimensional array declarations
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > oracle/Oversized.mod <<'EOF'
+          MODULE Oversized;
+          VAR a: ARRAY 1024,2 OF INTEGER;
+          END Oversized.
+          EOF
+          if compiler/target/debug/compiler oracle/Oversized.mod \
+              --language oberon --target ${{ matrix.target }} \
+              --emit obj -o oracle/Oversized.o; then
+            echo "Invalid native aggregate size was accepted" >&2
+            exit 1
+          fi
