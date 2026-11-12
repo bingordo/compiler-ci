@@ -1,0 +1,61 @@
+# Temporary source-pinned migration inventory. Close PR unmerged.
+name: IR F19 legacy Function caller inventory (source pinned)
+on:
+  pull_request:
+    paths: ['.github/workflows/ir-f19-legacy-inventory.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inventory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 4325705c299482f89b084b12e1d5ebcdb2ba2a7e
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - name: Report all legacy production and test consumers
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "4325705c299482f89b084b12e1d5ebcdb2ba2a7e"
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          root=Path('compiler')
+          pats={
+            'compat_project':r'project_legacy_compat_function',
+            'to_legacy':r'\.to_legacy\s*\(',
+            'from_legacy':r'\bfrom_legacy\s*\(',
+            'to_annotated':r'\bto_annotated\s*\(',
+            'from_annotated':r'\bfrom_annotated\s*\(',
+            'old_optimize_module':r'\boptimize_module(?:_with_inline_mode|_without_inlining|_with_target_inline_policy|_profiled|_with_if_conversion_policy)?\s*\(',
+            'old_optimize_single':r'\bcompiler_opt::optimize\s*\(|\boptimize\s*\(',
+            'old_backend_trait':r'(?:compiler_backend::Backend|\bimpl\s+Backend\s+for|\buse\s+compiler_backend::\{[^\n]*\bBackend)',
+            'old_backend_calls':r'\.emit_(?:assembly|object)(?:_linked|_with_globals)?\s*\(',
+            'old_function_text':r'\b(?:read_and_verify_function|write_function|read_typed_module|write_typed_module)\s*\(',
+          }
+          rows={p:[] for p in pats}
+          for file in sorted(root.rglob('*.rs')):
+            if '/target/' in str(file) or '/generated/' in str(file):continue
+            rel=file.relative_to(root).as_posix()
+            s=file.read_text(errors='replace')
+            for kind,pat in pats.items():
+              for line,text in enumerate(s.splitlines(),1):
+                if re.search(pat,text):
+                  rows[kind].append((rel,line,text.strip()[:150]))
+          for kind,matched in rows.items():
+            from collections import Counter
+            freq=Counter(p for p,_,_ in matched)
+            print(f'== {kind} total={len(matched)} files={len(freq)} ==',flush=True)
+            for path,count in sorted(freq.items(),key=lambda x:(x[0].count('/tests/'),-x[1],x[0])):
+              print(f'  {count:3} {path}')
+            print('PRODUCTION DETAILS:')
+            for path,line,fragment in matched:
+              if '/tests/' not in path and '/examples/' not in path:
+                print(f'  {path}:{line}: {fragment}')
+          print('Inventory complete')
+          PY
