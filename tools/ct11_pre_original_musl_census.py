@@ -107,7 +107,7 @@ def analyze(path: Path, output: Path) -> dict:
         cases_with_pre_edits=sum(x["pre_core_edits"] > 0 for x in accepted.values()),
         total_pre_edits=sum(x["pre_core_edits"] for x in accepted.values()),
         total_pre_trials=sum(x["pre_core_trials"] for x in accepted.values()),
-        accepted=accepted, rejected=rejected,
+        accepted_cases=accepted, rejected_cases=rejected,
         source_fidelity="all 27 original git-blob-verified, all accepted ELF profile/ordinary byte parity",
         limitation="only accepted source files have PRE timings; counts for rejected sources are unknown, not zero",
     )
