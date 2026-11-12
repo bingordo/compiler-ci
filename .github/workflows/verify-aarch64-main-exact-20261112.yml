@@ -1,0 +1,126 @@
+name: AArch64 main exact-commit acceptance 2bdfc42b9
+on:
+  push:
+    branches: [ci/aarch64-current-main-gate-20261112]
+permissions:
+  contents: read
+jobs:
+  python-aarch64-tools:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2bdfc42b95e77a32d7b8001e4ca8d1e4415b5756
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned main source and execute all AArch64 Python tests
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "2bdfc42b95e77a32d7b8001e4ca8d1e4415b5756"
+          python3 -m unittest discover -s compiler/tools -p 'test_aarch64*.py' -v
+          echo 'AArch64 offline source/encoding/ASL tests passed for `2bdfc42b95e77a32d7b8001e4ca8d1e4415b5756`' >> "$GITHUB_STEP_SUMMARY"
+  native-aarch64-full:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - name: Configure SSH for compiler checkout
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub SSH host
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - name: Checkout compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2bdfc42b95e77a32d7b8001e4ca8d1e4415b5756
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout pinned public Mini-C frontend
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: 421e0b93b0b78409987e37cf9c43f8e58ed92cb3
+          path: mini-c
+          persist-credentials: false
+      - name: Verify current main compiler SHA
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "2bdfc42b95e77a32d7b8001e4ca8d1e4415b5756"
+      - name: Report exact compiler revision under test
+        env:
+          COMPILER_SHA: 2bdfc42b95e77a32d7b8001e4ca8d1e4415b5756
+        run: |
+          printf 'Native AArch64 verification of bingordo/compiler at `%s`\n' "$COMPILER_SHA" >> "$GITHUB_STEP_SUMMARY"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Prepare isolated AArch64 workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p aarch64-workspace/crates aarch64-workspace/tools
+          cp -a compiler/crates/ir compiler/crates/opt compiler/crates/backend \
+            compiler/crates/backend-x86 compiler/crates/backend-aarch64 \
+            compiler/crates/driver aarch64-workspace/crates/
+          cp -a compiler/examples compiler/tests aarch64-workspace/
+          cp -a compiler/tools/mini-c-driver aarch64-workspace/tools/
+          cat > aarch64-workspace/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend",
+                     "crates/backend-x86", "crates/backend-aarch64", "crates/driver"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aarch64-workspace
+          key: aarch64-main-2bdfc42b95e7
+      - name: Check AArch64 backend (warnings are errors)
+        working-directory: aarch64-workspace
+        run: RUSTFLAGS="-D warnings" cargo check -p compiler-backend-aarch64 --all-targets
+      - name: Test shared IR and register allocator
+        working-directory: aarch64-workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir -p compiler-backend -- --test-threads=1
+      - name: Test AArch64 backend natively
+        working-directory: aarch64-workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v cc
+          command -v objcopy
+          cargo test -p compiler-backend-aarch64 --all-targets -- --test-threads=1
+          echo 'Native AArch64 checks passed, including .eh_frame DWARF CFI, frame-pointer-free C backtrace across generated calls, near-16KB frames and independent assembler differential tests.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Build actual Oberon compiler frontend with AArch64 object target
+        working-directory: aarch64-workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUSTFLAGS="-D warnings" cargo build -p compiler --bin compiler
+      - name: Compile checked Oberon to AArch64 ELF, link and run native C oracle
+        working-directory: aarch64-workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash tests/aarch64_frontend_integration.sh
+          echo 'Source frontend + shared SSA/optimization + native AArch64 ELF integration passed: Flow 19,551-case oracle, Math 20,402-result implicit ELF target, 16 argument calls, recursion, arrays and unsupported output diagnostics.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Test checked Mini-C AArch64 emission without x86-native unit oracles
+        working-directory: aarch64-workspace
+        shell: bash
+        env:
+          MINI_C_LOCAL_REPO: ${{ github.workspace }}/mini-c
+          CARGO_TARGET_DIR: ${{ github.workspace }}/aarch64-workspace/target
+        run: |
+          set -euo pipefail
+          expected_mini_c=421e0b93b0b78409987e37cf9c43f8e58ed92cb3
+          actual_mini_c="$(git -C ../mini-c rev-parse HEAD)"
+          test "$actual_mini_c" = "$expected_mini_c"
+          printf 'Pinned checked Mini-C frontend: `%s`\n' "$actual_mini_c" >> "$GITHUB_STEP_SUMMARY"
+          bash tools/mini-c-driver/cargo-local.sh test -p compiler-mini-c --lib aarch64_ -- --test-threads=1
+          bash tools/mini-c-driver/cargo-local.sh build -p compiler-mini-c --bin compiler-mini-c
+          MINI_C_COMPILER="$CARGO_TARGET_DIR/debug/compiler-mini-c" bash tests/aarch64_mini_c_integration.sh
+          echo 'Checked Mini-C C source -> shared SSA/opt -> AArch64 ELF -> C oracle passed (AAPCS64, recursion, loops, pointers, byte loads, signed division/remainder); unsupported output modes rejected.' >> "$GITHUB_STEP_SUMMARY"
