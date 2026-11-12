@@ -13,7 +13,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 95645cc759771f052d9e6c59cab11faec29020be
+          ref: a357eee87ca3616fe7c10bbadd789d4d6da13da7
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -29,7 +29,7 @@ jobs:
       - name: Validate exact compiler source and offline tests
         run: |
           set -euo pipefail
-          test "$(git -C compiler rev-parse HEAD)" = 95645cc759771f052d9e6c59cab11faec29020be
+          test "$(git -C compiler rev-parse HEAD)" = a357eee87ca3616fe7c10bbadd789d4d6da13da7
           python3 -m unittest discover -s compiler/tools -p 'test_aarch64*.py' -v
           python3 -m py_compile compiler/tools/aarch64_a32_asl_typeenv.py compiler/tools/aarch64_a32_asl_diagnostics.py
           clang --version | head -1
@@ -268,4 +268,54 @@ jobs:
             /tmp/aarch64-a32-matched-typeenv.json
             /tmp/matched-aslref-ocaml-deps.txt
             /tmp/aslref-version.txt
+          retention-days: 7
+
+  aggregate-batch-metadata:
+    needs: matched-aslref
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: aarch64-a32-full-sample-pinned-compiler-tools
+          path: compiler/tools
+      - uses: actions/download-artifact@v4
+        with:
+          name: aarch64-a32-full-sample-source-links-only
+          path: sources
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: aarch64-a32-full-sample-typeenv-*
+          path: reports
+          merge-multiple: false
+      - name: Validate source-pinned full-catalog cohort aggregation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s compiler/tools -p 'test_aarch64_a32_batch_summary.py' -v
+          python3 compiler/tools/aarch64_a32_batch_summary.py \
+            --source-links sources/aarch64-source-links.json \
+            --batch-plan sources/aarch64-cohorts.json \
+            --report 0:reports/aarch64-a32-full-sample-typeenv-0/aarch64-a32-matched-typeenv.json \
+            --report 130:reports/aarch64-a32-full-sample-typeenv-130/aarch64-a32-matched-typeenv.json \
+            --report 266:reports/aarch64-a32-full-sample-typeenv-266/aarch64-a32-matched-typeenv.json \
+            --out /tmp/aarch64-full-sample-summary.json
+          python3 - <<'PY'
+          import json
+          r=json.load(open('/tmp/aarch64-full-sample-summary.json'))
+          assert r['total_source_operations'] == 2134
+          assert r['covered_operations'] == 22
+          assert r['completed_batches'] == 3
+          assert r['source_batch_count'] == 267
+          assert not r['complete_census']
+          assert not r['semantic_equivalence_proven']
+          assert not r['selection_eligible']
+          print('FULL_XML_COHORT_AGGREGATE',r['covered_operations'],
+                r['strict_typechecked_count'],r['diagnostic_categories'],
+                sorted(r['dependency_blockers'].items(),key=lambda x:-x[1])[:10])
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aarch64-full-sample-bounded-diagnostic-summary
+          path: /tmp/aarch64-full-sample-summary.json
           retention-days: 7
