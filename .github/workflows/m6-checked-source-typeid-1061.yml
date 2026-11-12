@@ -1,0 +1,79 @@
+name: M6 TypeId checked Oberon and Mini-C source differential
+on:
+  push:
+    branches: [ci/m6-checked-source-typeid-1061-20261111]
+    paths: ['.github/workflows/m6-checked-source-typeid-1061.yml']
+permissions:
+  contents: read
+jobs:
+  native-source-oracles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 48666db76f938134cd4dde3195d1f3e3929d0dab
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest exact source, both native corpora and no Function projection
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 48666db76f938134cd4dde3195d1f3e3929d0dab
+          python3 - <<'PY'
+          from pathlib import Path
+          root=Path("compiler")
+          driver=(root/"crates/driver/src/main.rs").read_text()
+          mini=(root/"tools/mini-c-driver/src/lib.rs").read_text()
+          oberon=(root/"crates/driver/tests/unit/m6_oberon_source.rs").read_text()
+          ctests=(root/"tools/mini-c-driver/tests/unit/m6_source.rs").read_text()
+          for needle in ("typed_oberon_to_legacy(", "fn lower(module_name: &str, front: &FrontFunction)"):
+              assert needle not in driver,needle
+          for needle in ("typed_minic_to_legacy(", "fn lower_source_raw_linked(",
+                         "fn lower_source_raw("):
+              assert needle not in mini,needle
+          for section in (oberon,ctests):
+              assert "optimize_m6_typeid(" in section
+              assert "emit_typeid_object(" in section
+              assert "emit_typeid_assembly(" in section
+              assert "optimize_m6_experimental(" not in section
+              assert "Function" not in section or "Function" in "TypedFunction"
+          assert 'feature = "typeid-egraph"' in (root/"crates/driver/tests/unit/driver_cases.rs").read_text()
+          assert 'feature = "typeid-egraph"' in (root/"tools/mini-c-driver/tests/unit/lib.rs").read_text()
+          assert 'typeid-egraph = ["compiler-opt/typeid-egraph"]' in (root/"crates/driver/Cargo.toml").read_text()
+          assert 'typeid-egraph = ["compiler-opt/typeid-egraph"]' in (root/"tools/mini-c-driver/Cargo.toml").read_text()
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m6-source-checked-typeid-1061
+      - name: Run native Oberon full 12-case checked-source differential
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --features typeid-egraph --bin compiler m6_checked_oberon_source_vs_c_oracle -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/m6-oberon-typeid.log"
+          grep -F 'M6_OBERON_SUMMARY,' "$RUNNER_TEMP/m6-oberon-typeid.log"
+          grep -F 'M6_NATIVE,oberon,ArrayBranch,' "$RUNNER_TEMP/m6-oberon-typeid.log"
+          cargo clippy -p compiler --features typeid-egraph --all-targets -- -D warnings
+      - name: Run native Mini-C full checked/musl source differential
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --features typeid-egraph --lib m6_real_checked_mini_c_source_vs_gcc -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/m6-minic-typeid.log"
+          grep -F 'M6_MINIC_SUMMARY,' "$RUNNER_TEMP/m6-minic-typeid.log"
+          grep -F 'M6_NATIVE,mini-c,isspace,' "$RUNNER_TEMP/m6-minic-typeid.log"
+          cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml --features typeid-egraph --all-targets -- -D warnings
+      - name: Normal and old opt-in dependency builds without frontend Function
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --bin compiler -- --test-threads=2
+          cargo clippy -p compiler --all-targets -- -D warnings
+          cargo check -p compiler --features legacy-experimental-ssa --all-targets
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib -- --test-threads=2
+          cargo check --manifest-path tools/mini-c-driver/Cargo.toml --features legacy-experimental-ssa --all-targets
