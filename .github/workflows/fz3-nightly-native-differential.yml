@@ -1,0 +1,58 @@
+name: FZ-3 nightly TypeId native differential campaign
+on:
+  schedule:
+    - cron: '17 10 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: fz3-native-differential-nightly
+  cancel-in-progress: false
+jobs:
+  native-campaign:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: main
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Isolate self-contained TypeId optimizer workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: fz3-native-differential-nightly
+          cache-workspace-crates: 'true'
+      - name: Bound and execute deterministic native GAS and ELF campaign
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_sha="$(git rev-parse HEAD)"
+          # Two disjoint deterministic case seeds per UTC day. Always record
+          # the exact immutable source and seeds in summary.txt for replay.
+          first_seed="$(( ($(date -u +%s) / 86400) * 2 ))"
+          printf 'source_sha=%s\nfirst_seed=%s\n' "$source_sha" "$first_seed"
+          cargo run -p compiler-opt --example typeid_native_campaign -- \
+            --out "$RUNNER_TEMP/fz3-native-differential" \
+            --source-sha "$source_sha" --first-seed "$first_seed" \
+            --seeds 2 --max-evaluations 240 --max-unique 4 --max-probes 32
+          grep -q '^unique_failures=0$' "$RUNNER_TEMP/fz3-native-differential/summary.txt"
+          grep -q '^stopped_at_budget=false$' "$RUNNER_TEMP/fz3-native-differential/summary.txt"
+      - name: Always retain exact-source report and minimized IR failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fz3-nightly-native-differential-replay
+          path: ${{ runner.temp }}/fz3-native-differential/
+          if-no-files-found: warn
+          retention-days: 14
