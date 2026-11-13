@@ -1,0 +1,81 @@
+name: IR F35 linkage PRE LICM traps TypeId acceptance
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ir-f35-linkage-pre-typeid-20261113.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ir-f35-typeid:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact F35 compiler revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c4075a1f213aa22bb128d82389bfe940a391563b
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned source and isolated Cargo workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = c4075a1f213aa22bb128d82389bfe940a391563b
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo "Compiler source SHA c4075a1f213aa22bb128d82389bfe940a391563b" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-f35-typeid-linkage-pre-loop-v1
+      - name: F35 native linkage ELF symbol and multi-unit GAS/ELF C11 oracles
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test linkage_native -- --nocapture
+      - name: F35 PRE LICM owned-TypeId matrix against independent arithmetic oracle
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test pre_licm_semantic_matrix -- --nocapture
+      - name: F35 TypeId path-sensitive loop trap semantics and fail-closed mutants
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test loop_trap_semantics -- --nocapture
+      - name: Adjacent TypeId optimizer, linkage and previous cutover controls
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_pre_native -- --nocapture
+          cargo test -p compiler-opt --test typed_licm_native -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_cfg_native -- --nocapture
+          cargo test -p compiler-opt --test typed_core_pipeline -- --nocapture
+          cargo test -p compiler-opt --test inline_decision_oracle -- --nocapture
+          cargo test -p compiler-opt --test inline_private_decision_oracle -- --nocapture
+          cargo test -p compiler-opt --test inline_interaction_corpus -- --nocapture
+          cargo test -p compiler-opt --test inline_native -- --nocapture
+          cargo test -p compiler-opt --test inline_memory_native -- --nocapture
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-ir --lib
+      - name: Strict all-target Clippy for TypeId optimizer and x86 backend
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
