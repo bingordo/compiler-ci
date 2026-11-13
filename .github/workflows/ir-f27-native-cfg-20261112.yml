@@ -1,0 +1,64 @@
+name: IR F27 native TypeId SCCP and CT05 runtime
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ir-f27-native-cfg-20261112.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-cfg:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler F27 candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c7fa154280aef087cd533cf4dfd0a9490f095dfd
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact tested source and isolated build scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = c7fa154280aef087cd533cf4dfd0a9490f095dfd
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo "Compiler source: c7fa154280aef087cd533cf4dfd0a9490f095dfd" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-f27-native-cfg-v1
+      - name: Execute new TypeId SCCP and CT05 GCC C11 oracles on GAS and ELF
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test sccp_sparse_native -- --nocapture
+          cargo test -p compiler-opt --test ct05_identical_native -- --nocapture
+      - name: Run existing TypeId branch, CFG and optimizer regression controls
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_identical_merges -- --nocapture
+          cargo test -p compiler-opt --test typed_sccp -- --nocapture
+          cargo test -p compiler-opt --test native_cfg_differential -- --nocapture
+          cargo test -p compiler-backend-x86 --lib
+      - name: Strict Clippy for migrated oracles and native backend
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --test sccp_sparse_native --test ct05_identical_native -- -D warnings
+          cargo clippy -p compiler-backend-x86 --lib -- -D warnings
