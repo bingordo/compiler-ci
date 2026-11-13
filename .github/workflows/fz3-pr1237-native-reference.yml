@@ -1,0 +1,90 @@
+name: FZ-3 PR1237 native independent-reference wrong-value fingerprint
+on:
+  push:
+    branches: [fuzz/fz3-native-reference-pr1237]
+  workflow_dispatch:
+permissions: { contents: read }
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 22
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d236fd6add6fa681f81b8508ec0644ebe64356b8
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact source and independent reference
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "d236fd6add6fa681f81b8508ec0644ebe64356b8"
+          test -s compiler/crates/opt/examples/typeid_native_diff_repro.rs
+          test -s compiler/crates/opt/tests/support/typeid_scalar_reference.rs
+      - name: Isolate public-dependency-free compiler core
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: fz3-independent-native-reference
+          cache-workspace-crates: 'true'
+      - name: Strict Clippy new native oracle and existing reducer
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt --test typeid_native_reference_ddmin --test delta_reduce_ir --example typeid_native_diff_repro --example delta_reduce -- -D warnings -A dead_code
+      - name: Native GAS and direct ELF against independent CFG reference
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typeid_native_reference_ddmin -- --nocapture
+      - name: Exact wrong-value fingerprint through generic IR file ddmin
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/fz3-reference"
+          mkdir -p "$root"
+          cargo run -p compiler-opt --example typeid_fuzz -- \
+            crates/opt/tests/fixtures/typeid_ddmin_wrongcode.toml "$root/generated"
+          cargo build -p compiler-opt --example delta_reduce --example typeid_native_diff_repro
+          candidate="$root/generated/0000-before.ir"
+          oracle="./target/debug/examples/typeid_native_diff_repro"
+          reducer="./target/debug/examples/delta_reduce"
+          set +e
+          "$oracle" "$candidate" --a 5 --b 7 --sink both
+          status=$?
+          set -e
+          test "$status" -eq 1
+          "$oracle" "$candidate" --a 5 --b 7 --sink both \
+            --inject-add-as-sub --expected 12 --observed 4294967294
+          set +e
+          "$oracle" "$candidate" --a 5 --b 7 --sink both \
+            --inject-add-as-sub --expected 12 --observed 100
+          status=$?
+          set -e
+          test "$status" -eq 1
+          "$reducer" --mode typeid --input "$candidate" --output "$root/minimized.ir" \
+            --max-probes 30 --stage core.cse --seed 1777 --timeout-ms 10000 -- \
+            "$oracle" @INPUT@ --a 5 --b 7 --sink both \
+              --inject-add-as-sub --expected 12 --observed 4294967294
+          "$oracle" "$root/minimized.ir" --a 5 --b 7 --sink both \
+            --inject-add-as-sub --expected 12 --observed 4294967294
+          test -s "$root/minimized.ir.replay.txt"
+      - name: Existing FZ3 and FZ25 native regression tests
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typeid_delta_dominance
+          cargo test -p compiler-opt --test delta_reduce_ir
+          cargo test -p compiler-opt --test typeid_fuzz_corpus_reduce
+          cargo test -p compiler-opt --test typeid_fuzz_interactions
+          cargo test -p compiler-opt --test typeid_fuzz_pass_registry
+          cargo test -p compiler-opt --test typed_core_native_verifier
+      - name: Retain minimized native wrong-value reproducer
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fz3-native-reference-pinned-replay
+          path: ${{ runner.temp }}/fz3-reference/
+          retention-days: 7
