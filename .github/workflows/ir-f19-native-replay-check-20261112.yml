@@ -1,0 +1,53 @@
+name: One-off IR F19 TypeId v3 replay (exact compiler SHA)
+on:
+  push:
+    branches: [ci/ir-f19-native-replay-check-20261112]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  f19-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Fetch exact compiler branch merge SHA
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c0b8d337fadde456706e1f2c5b6ba2fcd866a5a9
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert tested source revision and F19 migration files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "c0b8d337fadde456706e1f2c5b6ba2fcd866a5a9"
+          grep -Fq 'write_native_module_text_v3(module)' compiler/crates/ir/src/typed_ssa_text.rs
+          ! grep -Fq 'pub fn to_annotated(' compiler/crates/ir/src/typed_ssa.rs
+          echo 'Tested compiler SHA: c0b8d337fadde456706e1f2c5b6ba2fcd866a5a9' >> "$GITHUB_STEP_SUMMARY"
+      - name: Restrict workspace to independently buildable core
+        shell: bash
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: f19-exact-native-replay-20261112
+      - name: Full IR and optimizer / backend regression
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+      - name: Strict core and x86 Clippy
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
