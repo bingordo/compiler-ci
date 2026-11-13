@@ -99,7 +99,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/edgcpp-rust
-          ref: 25be03238f65b602cb51380f848adf8a863330c7
+          ref: 1866f10a108088a9f1dd947fbe16653486e1594f
           path: edg-rust-call-target
           persist-credentials: false
 
@@ -126,6 +126,41 @@ jobs:
           cargo test --manifest-path edg-rust/Cargo.toml --lib decodes_cpp_dialect_and_immutable_record_triviality_proofs
           cargo test --manifest-path edg-rust-call-target/Cargo.toml --lib cxx5_call_target_wire_tests -- --nocapture
           cargo test --manifest-path edg-rust-call-target/Cargo.toml --lib cxx5_native_call_dispatch_wire_tests -- --nocapture
+          cargo test --manifest-path edg-rust-call-target/Cargo.toml --lib cxx5_virtual_member_info_wire_tests -- --nocapture
+          cargo test --manifest-path edg-rust-call-target/Cargo.toml --lib audit_complete_wire_field_tags_tests -- --nocapture
+
+      - name: Probe native EDG logical virtual member and vptr metadata
+        working-directory: edgcpp
+        env:
+          EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+          EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+          EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+          EDGCPP_EDG_REVISION: ${{ env.EDG_SOURCE_SHA }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source build/gcc-release/environment.sh
+          cat >build/gcc-release/virtual-member-source.cpp <<'CPP'
+          struct Base { virtual int f(); };
+          int Base::f() { return 3; }
+          struct Derived : Base { int f() override; };
+          int Derived::f() { return 5; }
+          int main() { Derived d; Base *b = &d; return b->f() != 5; }
+          CPP
+          cd build/gcc-release
+          version="$(g++ -dumpfullversion -dumpversion)"
+          IFS=. read -r major minor patch <<<"$version"
+          gnu_number=$((10#${major}*10000+10#${minor:-0}*100+10#${patch:-0}))
+          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edg-rust-call-target/Cargo.toml" \
+            --example parse -- --g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number" \
+            virtual-member-source.cpp >"$RUNNER_TEMP/edg-virtual-member.log" 2>&1
+          grep -F 'EDG_VIRTUAL_MEMBER ' "$RUNNER_TEMP/edg-virtual-member.log" | head -n 20
+          grep -F 'EDG_VIRTUAL_MEMBER ' "$RUNNER_TEMP/edg-virtual-member.log" | grep -F 'Base::f'
+          grep -F 'EDG_VIRTUAL_MEMBER ' "$RUNNER_TEMP/edg-virtual-member.log" | grep -F 'Derived::f'
+          grep -F 'EDG_VIRTUAL_MEMBER ' "$RUNNER_TEMP/edg-virtual-member.log" | grep -Fq 'executable_abi_proven=false'
+          g++ -std=c++17 -O0 -o "$RUNNER_TEMP/virtual-member-gcc" virtual-member-source.cpp
+          "$RUNNER_TEMP/virtual-member-gcc"
+          echo "Native EDG virtual metadata fixture parsed; independent G++ executable passed; no EDG virtual codegen admitted" >>"$GITHUB_STEP_SUMMARY"
 
       - name: Verify TypeId-native SysV GP variadic ABI acceptance and rejection
         working-directory: compiler
