@@ -1,0 +1,86 @@
+name: IR F32 batch TypeId optimizer x86 acceptance
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ir-f32-batch-typeid-20261113.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ir-f32-batch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exactly the compiler F32 candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 117ad6e4b64f609fdf85edee40d20da363204d6e
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert pinned SHA and create dependency-isolated Cargo workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 117ad6e4b64f609fdf85edee40d20da363204d6e
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo "Compiler source: 117ad6e4b64f609fdf85edee40d20da363204d6e" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-f32-four-suite-typeid-v1
+      - name: F32 mixed-width native inline GAS and ELF C oracle
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test inline_modern_scalar_native -- --nocapture
+      - name: F32 seventeen-case TypeId counted induction GAS and ELF C oracle
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test induction_native -- --nocapture
+      - name: F32 TypeId preheaders and LICM GAS and ELF C oracle
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test licm_preheaders -- --nocapture
+      - name: F32 TypeId DSE, alias, bulk-zero and GAS ELF C oracle
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test dse -- --nocapture
+      - name: Adjacent native TypeId optimizer and prior cutover controls
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_inline_cfg_native -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_wide_void_native -- --nocapture
+          cargo test -p compiler-opt --test typed_induction_native -- --nocapture
+          cargo test -p compiler-opt --test typed_licm_native -- --nocapture
+          cargo test -p compiler-opt --test typed_dse -- --nocapture
+          cargo test -p compiler-opt --test mem2reg_native -- --nocapture
+          cargo test -p compiler-opt --test ctfe -- --nocapture
+          cargo test -p compiler-opt --test inline_practical_native -- --nocapture
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-ir --lib
+      - name: Strict all-target TypeId IR optimizer and x86 backend Clippy
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
