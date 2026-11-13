@@ -1,0 +1,53 @@
+name: Validate target-selected machine SSA text replay
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/validate-machine-ssa-text-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selected-machine-ssa:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact private compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 6da883e21edc2a4b2d474224d36d87d7cdfb3f2a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact SHA and isolate backend crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "6da883e21edc2a4b2d474224d36d87d7cdfb3f2a"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo "Selected machine text compiler SHA: 6da883e21edc2a4b2d474224d36d87d7cdfb3f2a" >> "$GITHUB_STEP_SUMMARY"
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: machine-ssa-text-v1
+      - name: Execute human-editable machine SSA codecs and malformed fixtures
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --offline -p compiler-backend --test machine_text_v1 -- --nocapture
+          cargo test --offline -p compiler-backend-x86 --test machine_text_v1 -- --nocapture
+          cargo test --offline -p compiler-backend-aarch64 --test machine_text_v1 -- --nocapture
+          cargo test --offline -p compiler-backend-aarch64 --lib real_native_typeid_aarch64_selection_is_machine_text_replayable -- --nocapture
+      - name: Strict shared/x86/AArch64 machine codec Clippy
+        working-directory: compiler
+        run: |
+          cargo clippy --offline -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --all-targets -- -D warnings
