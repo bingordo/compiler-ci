@@ -29,7 +29,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ github.event_name == 'pull_request' && 'fcd789418f58cff65aa615c08f2db4eb14a0ac39' || inputs.source_ref || 'main' }}
+          ref: ${{ github.event_name == 'pull_request' && '2a473b25b0ee3b3948802f1d3190ffe725a31f73' || inputs.source_ref || 'main' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -39,7 +39,7 @@ jobs:
           set -euo pipefail
           source_sha="$(git rev-parse HEAD)"
           if [ "${{ github.event_name }}" = pull_request ]; then
-            test "$source_sha" = 'fcd789418f58cff65aa615c08f2db4eb14a0ac39'
+            test "$source_sha" = '2a473b25b0ee3b3948802f1d3190ffe725a31f73'
           fi
           test -s fuzz/fuzz_targets/elf_writer_input.rs
           test -s fuzz/fuzz_targets/elf_serialized_metadata.rs
@@ -64,22 +64,33 @@ jobs:
         run: |
           set -euo pipefail
           repo="bingordo/compiler-ci"
-          mapfile -t previous_runs < <(
-            gh api "repos/$repo/actions/workflows/m410-elf-libfuzzer.yml/runs?branch=main&status=success&per_page=30" \
-              --jq '.workflow_runs[] | select(.event == "schedule" or .event == "workflow_dispatch") | .id'
-          )
+          # The GitHub API call must run *directly*: process substitution
+          # masks its exit code and previously allowed silent corpus resets.
+          gh api "repos/$repo/actions/workflows/m410-elf-libfuzzer.yml/runs?branch=main&status=success&per_page=30" \
+            > "$RUNNER_TEMP/m410-prior-runs.json"
+          python3 tools/m410_elf_fuzz_corpus.py trusted-runs \
+            --api-json "$RUNNER_TEMP/m410-prior-runs.json" \
+            --out "$RUNNER_TEMP/m410-trusted-run-ids.txt"
+          mapfile -t previous_runs < "$RUNNER_TEMP/m410-trusted-run-ids.txt"
           restored=0
           for run_id in "${previous_runs[@]}"; do
-            artifact_name="$(gh api "repos/$repo/actions/runs/$run_id/artifacts?per_page=100" \
-              --jq '.artifacts[] | select(.expired == false and (.name | startswith("m410-elf-corpus-v1-"))) | .name' | head -n 1)"
+            gh api "repos/$repo/actions/runs/$run_id/artifacts?per_page=100" \
+              > "$RUNNER_TEMP/m410-candidate-artifacts.json"
+            python3 tools/m410_elf_fuzz_corpus.py trusted-artifact \
+              --api-json "$RUNNER_TEMP/m410-candidate-artifacts.json" \
+              --run-id "$run_id" \
+              --out "$RUNNER_TEMP/m410-artifact-name.txt"
+            artifact_name="$(cat "$RUNNER_TEMP/m410-artifact-name.txt")"
             if [ -z "$artifact_name" ]; then continue; fi
             mkdir -p "$RUNNER_TEMP/m410-prior-bundle"
             gh run download "$run_id" --repo "$repo" --name "$artifact_name" --dir "$RUNNER_TEMP/m410-prior-bundle"
             python3 tools/m410_elf_fuzz_corpus.py restore \
               --bundle "$RUNNER_TEMP/m410-prior-bundle" \
               --corpus fuzz/corpus \
-              --receipt "$RUNNER_TEMP/m410-prior-receipt.json"
-            echo "Reused SHA-verified ELF corpus from trusted successful run $run_id" >> "$GITHUB_STEP_SUMMARY"
+              --receipt "$RUNNER_TEMP/m410-prior-receipt.json" \
+              --origin-run-id "$run_id" \
+              --origin-artifact-name "$artifact_name"
+            echo "Reused verified corpus from main run $run_id, artifact $artifact_name" >> "$GITHUB_STEP_SUMMARY"
             restored=1
             break
           done
@@ -188,7 +199,7 @@ jobs:
             --log-writer "$RUNNER_TEMP/m410-elf-writer-fuzz.log" \
             --log-metadata "$RUNNER_TEMP/m410-elf-metadata-fuzz.log" | tee -a "$GITHUB_STEP_SUMMARY"
           mkdir -p "$RUNNER_TEMP/m410-elf-corpus-bundle/logs"
-          for name in m410-fuzz-rust-version.txt m410-elf-writer-fuzz.log m410-elf-metadata-fuzz.log m410-elf_writer_input-cmin.log m410-elf_serialized_metadata-cmin.log m410-x86-readelf.txt m410-arm-readelf.txt; do
+          for name in m410-prior-receipt.json m410-fuzz-rust-version.txt m410-elf-writer-fuzz.log m410-elf-metadata-fuzz.log m410-elf_writer_input-cmin.log m410-elf_serialized_metadata-cmin.log m410-x86-readelf.txt m410-arm-readelf.txt; do
             if [ -f "$RUNNER_TEMP/$name" ]; then
               cp "$RUNNER_TEMP/$name" "$RUNNER_TEMP/m410-elf-corpus-bundle/logs/"
             fi
