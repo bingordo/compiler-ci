@@ -1,0 +1,99 @@
+name: IR F25 TypeId array bounds and global memory native
+on:
+  pull_request:
+    paths: ['.github/workflows/ir-f25-native-array-global-memory.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  migrated-native-oracles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1174d3d36b1770d450cfad5808a35e139f26c91c
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - name: Verify exact commit and isolate core workspace
+        run: |
+          set -euxo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "1174d3d36b1770d450cfad5808a35e139f26c91c"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-f25-array-global-memory
+      - name: Assert migrated sites use no legacy optimizer or x86 emitter
+        working-directory: compiler
+        run: |
+          if rg -n '(compiler_opt::optimize\(|\.emit_assembly\(|\.emit_object\()' crates/opt/tests/array_fold_native.rs crates/opt/tests/global_memory.rs; then
+            echo "Found legacy optimizer or backend in migrated executable suites" >&2
+            exit 1
+          fi
+      - name: Array folding GAS direct ELF and SIGILL native C oracles
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test array_fold_native -- --nocapture
+      - name: TypeId global memory must-value and GAS direct ELF native C oracles
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test global_memory -- --nocapture
+      - name: Native TypeId historical C differential smoke
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test division_effects
+          cargo test -p compiler-opt --test m4_integer_effects
+          cargo test -p compiler-opt --test memory_native
+          cargo test -p compiler-opt --test local_memory_native
+          cargo test -p compiler-opt --test cse_native
+          cargo test -p compiler-opt --test phi_native
+          cargo test -p compiler-opt --test native_cfg_differential
+          cargo test -p compiler-opt --test typed_array_fold
+          cargo test -p compiler-opt --test typed_dse
+      - name: Strict full IR and opt Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt --all-targets -- -D warnings
+  broad-core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1174d3d36b1770d450cfad5808a35e139f26c91c
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - name: Check exact SHA and portable workspace
+        run: |
+          set -euxo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "1174d3d36b1770d450cfad5808a35e139f26c91c"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-f25-full-core
+      - name: Install GDB for existing DWARF tests
+        run: |
+          if ! command -v gdb >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq gdb
+          fi
+      - name: All IR optimizer x86 AArch64 core regressions
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 -- --skip generated_comparison_dag_all_widths_with_cfg_and_negative_guards
