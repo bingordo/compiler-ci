@@ -1,0 +1,71 @@
+name: IR F28 CT03 LICM TypeId migration acceptance
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ir-f28-ct03-licm-20261112.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-cutover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler F28 candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 223c55a1ba97fc030aeadee61ed62f9fa58bb447
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned compiler source and dependency-isolated workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 223c55a1ba97fc030aeadee61ed62f9fa58bb447
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo "Compiler source: 223c55a1ba97fc030aeadee61ed62f9fa58bb447" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-f28-native-cutover-v1
+      - name: F28 CT03 TypeId transactional proof and independent standalone references
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test ct03_closeout -- --nocapture
+          cargo test -p compiler-opt --test typeid_source_profile_parity -- --nocapture
+      - name: F28 native TypeId LICM execution and existing loop proof controls
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test licm_native -- --nocapture
+          cargo test -p compiler-opt --test typed_licm_native -- --nocapture
+          cargo test -p compiler-opt --test pre_native -- --nocapture
+      - name: Existing native CFG, SCCP, x86 and IR baseline controls
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test ct05_identical_native -- --nocapture
+          cargo test -p compiler-opt --test sccp_sparse_native -- --nocapture
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-ir --lib
+      - name: Strict Clippy on all core and backend package targets
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
