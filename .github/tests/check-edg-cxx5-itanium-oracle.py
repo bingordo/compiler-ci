@@ -79,7 +79,7 @@ def check(dump_path: pathlib.Path, object_path: pathlib.Path) -> None:
         ("VRight", 32, 104),
     ):
         line = re.search(r"^" + obj + r" \([^\n]+\) " +
-                         str(delta) + r"\s*$", cls, re.MULTILINE)
+                         str(delta) + r"[ \t]*$", cls, re.MULTILINE)
         require(line is not None, f"GCC {obj} base offset must be {delta}")
         if vptr is not None:
             tail = cls[line.end():]
