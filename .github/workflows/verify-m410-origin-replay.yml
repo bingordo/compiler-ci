@@ -1,0 +1,62 @@
+name: M4.10 real prior artifact lineage replay smoke
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-m410-origin-replay.yml']
+permissions:
+  contents: read
+  actions: read
+jobs:
+  origin-replay:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2a473b25b0ee3b3948802f1d3190ffe725a31f73
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Download real prior PR artifact for provenance-format acceptance only
+        working-directory: compiler
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = '2a473b25b0ee3b3948802f1d3190ffe725a31f73'
+          gh api 'repos/bingordo/compiler-ci/actions/runs/43207837994/artifacts?per_page=100' > "$RUNNER_TEMP/m410-artifacts.json"
+          python3 tools/m410_elf_fuzz_corpus.py trusted-artifact \
+            --api-json "$RUNNER_TEMP/m410-artifacts.json" \
+            --run-id 43207837994 --out "$RUNNER_TEMP/m410-selected.txt"
+          test "$(cat "$RUNNER_TEMP/m410-selected.txt")" = 'm410-elf-corpus-v1-43207837994-1'
+          gh run download 43207837994 --repo bingordo/compiler-ci \
+            --name m410-elf-corpus-v1-43207837994-1 --dir "$RUNNER_TEMP/prior"
+          python3 tools/m410_elf_fuzz_corpus.py restore \
+            --bundle "$RUNNER_TEMP/prior" --corpus fuzz/corpus \
+            --receipt "$RUNNER_TEMP/receipt.json" \
+            --origin-run-id 43207837994 \
+            --origin-artifact-name m410-elf-corpus-v1-43207837994-1
+          python3 tools/m410_elf_fuzz_corpus.py snapshot \
+            --corpus fuzz/corpus --out "$RUNNER_TEMP/next" \
+            --source-sha 2a473b25b0ee3b3948802f1d3190ffe725a31f73 --prior-receipt "$RUNNER_TEMP/receipt.json"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          p=Path(os.environ['RUNNER_TEMP'])
+          previous=json.loads((p/'prior/manifest.json').read_text())
+          receipt=json.loads((p/'receipt.json').read_text())
+          nxt=json.loads((p/'next/manifest.json').read_text())
+          source='2a473b25b0ee3b3948802f1d3190ffe725a31f73'
+          assert nxt['source_sha'] == source
+          assert nxt['previous_source_sha'] == previous['source_sha']
+          assert previous['source_sha'] != source
+          assert nxt['previous_origin'] == receipt['origin']
+          assert nxt['history'][-1]['previous_origin']['run_id'] == 43207837994
+          assert nxt['history'][-1]['same_source_edge_deltas'] == {
+              'elf_writer_input': None, 'elf_serialized_metadata': None}
+          for target in ('elf_writer_input','elf_serialized_metadata'):
+              assert len(nxt['targets'][target]) >= len(previous['targets'][target])
+              assert receipt['artifact_files'][target] == len(previous['targets'][target])
+          print('REAL_ORIGIN_ROLLOVER_REPLAY_OK: SHA-verified previous artifact, exact run provenance and bounded cross-source history')
+          PY
+          echo 'Real PR-artifact provenance format accepted (NOT a claim that a PR artifact is a trusted scheduled baseline)' >> "$GITHUB_STEP_SUMMARY"
