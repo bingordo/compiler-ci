@@ -1,0 +1,63 @@
+name: IR F30 native CTFE TypeId acceptance
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ir-f30-ctfe-typeid-20261112.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ctfe-typeid:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact F30 compiler revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c266b9bcb2d5384fb000cccfae999a420882198f
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned source and isolated workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = c266b9bcb2d5384fb000cccfae999a420882198f
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo "Compiler: c266b9bcb2d5384fb000cccfae999a420882198f" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-f30-ctfe-typeid-v1
+      - name: Execute migrated CTFE TypeId, reference and GAS/direct ELF C oracles
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test ctfe -- --nocapture
+      - name: Run existing native CTFE pipeline and prior IR cutover controls
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_ctfe -- --nocapture
+          cargo test -p compiler-opt --test typeid_source_profile_parity -- --nocapture
+          cargo test -p compiler-opt --test inline_modern_scalar_native -- --nocapture
+          cargo test -p compiler-opt --test mem2reg_native -- --nocapture
+          cargo test -p compiler-backend-x86 --lib
+      - name: Strict Clippy on IR optimizer and x86 core
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
