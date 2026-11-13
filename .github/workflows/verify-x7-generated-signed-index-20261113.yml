@@ -1,0 +1,100 @@
+name: X7 signed indexed physical form descriptors exact-source
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-x7-generated-signed-index-20261113.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: x7-index-enc-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  source-forms:
+    name: Exact encoding forms, mutation tests, signed-index ELF/GAS and Clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 0e7a9da5b84f99ea4b1d0f9f43a8fcf63ec5f429
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned candidate source
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "0e7a9da5b84f99ea4b1d0f9f43a8fcf63ec5f429"
+      - name: Verify generated forms match reviewed manifests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/regen_x86_forms.py --check
+          python3 tools/regen_x86_scalar_misc_forms.py --check
+          python3 -m unittest discover -s tools -p test_x86_scalar_misc_forms.py -v
+      - name: Isolated public compiler Rust workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: x7-signed-index-encodings
+      - name: Exact REX SIB native encoder and independent C11 TypeId ELF/GAS
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib generated_scalar_misc_tests -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-shared-machine-cutover --test x7_shared_signed_index_native -- --nocapture --test-threads=1
+          cargo test -p compiler-backend-x86 --features x7-shared-machine-cutover --lib machine_typeid::legalized_cutover_tests -- --test-threads=1
+      - name: Strict all-targets x86 Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-x86 --all-targets --all-features -- -D warnings
+  regressions:
+    name: Complete default, all-features x86 and core TypeId
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 0e7a9da5b84f99ea4b1d0f9f43a8fcf63ec5f429
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned candidate source
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "0e7a9da5b84f99ea4b1d0f9f43a8fcf63ec5f429"
+      - name: Isolated public compiler Rust workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: x7-signed-index-full
+      - name: Full default x86 backend regression
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 -- --test-threads=2
+      - name: Full all-features x86 backend regression
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --all-features -- --test-threads=2
+      - name: Debugger required by existing DWARF oracle
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gdb
+      - name: Full core TypeId regressions
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -- --test-threads=2
