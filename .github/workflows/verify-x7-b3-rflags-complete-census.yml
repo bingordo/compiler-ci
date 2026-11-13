@@ -1,0 +1,193 @@
+name: X7 B3 source RFLAGS and pure Std Bits complete model census
+on:
+  push:
+    branches: [ci/x7-rflags-full-source-census-20261111]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fixture-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 7
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5072396aed3a6bb2e7c61cc64b00f19abc5bd55e
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact census source and fail-closed negative fixtures
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 5072396aed3a6bb2e7c61cc64b00f19abc5bd55e
+          python3 -m py_compile tools/x86_isl_operation_model_census.py
+          python3 -m unittest discover -s tools -p 'test_x86_isl_operation_model_census.py' -v
+          python3 -m unittest discover -s tools -p 'test_x86_iform_proof_work_dag.py' -v
+          python3 -m py_compile tools/x86_isl_operation_proof_worker.py
+          python3 -m unittest discover -s tools -p 'test_x86_iform_helper_dependencies.py' -v
+          echo X7_B3_CENSUS_FIXTURE_GATE_PASS
+  full-intel-model-census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5072396aed3a6bb2e7c61cc64b00f19abc5bd55e
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require exact source and install pinned independent Z3
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 5072396aed3a6bb2e7c61cc64b00f19abc5bd55e
+          python3 -m venv /tmp/x7-full-model-z3
+          /tmp/x7-full-model-z3/bin/python -m pip install --disable-pip-version-check 'z3-solver==4.13.4.0'
+          /tmp/x7-full-model-z3/bin/python -c 'import z3; print("X7_B3_Z3_VERSION",z3.get_version_string())'
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: 5.4.1
+      - name: Build actual pinned IntelLabs ISA parser
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libgmp-dev pkg-config cmake libz3-dev
+          git clone --filter=blob:none https://github.com/IntelLabs/isa-tools.git /tmp/isa-tools
+          git -C /tmp/isa-tools checkout 16260979137c38339743a04b7fd5d9f0fa8a6ee5
+          git -C /tmp/isa-tools submodule update --init --recursive
+          cp tools/x86_isl_ast_export.ml tools/x86_isl_ast_json.ml /tmp/isa-tools/bin/
+          cat >> /tmp/isa-tools/bin/dune <<'EOF'
+          (executable
+           (name x86_isl_ast_export)
+           (modules x86_isl_ast_export x86_isl_ast_json)
+           (libraries libISA yojson))
+          EOF
+          cd /tmp/isa-tools
+          opam install --switch="$GITHUB_WORKSPACE" . --deps-only --yes
+          opam exec --switch="$GITHUB_WORKSPACE" -- dune build bin/x86_isl_ast_export.exe
+          test -x _build/default/bin/x86_isl_ast_export.exe
+      - name: Fetch 741 Intel source XML files at exact SDM revision
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/x7-b3-xml /tmp/x7-b3-complete /tmp/x7-b3-complete/shards
+          rev=35eface1b7ee003a1cda95005ec5fd83de658a64
+          curl --fail --silent --show-error --location --retry 2 --max-time 180 \
+            "https://codeload.github.com/intel/SDM/tar.gz/${rev}" \
+            -o /tmp/x7-b3-complete/intel-sdm.tar.gz
+          python3 - <<'PY'
+          from pathlib import Path
+          import re,tarfile
+          out=Path('/tmp/x7-b3-xml')
+          total=0
+          with tarfile.open('/tmp/x7-b3-complete/intel-sdm.tar.gz','r:gz') as tar:
+              for m in tar:
+                  if not m.isfile() or not re.fullmatch(
+                      r'[^/]+/data/instruction/[^/]+\.xml',m.name):
+                      continue
+                  assert 0 < m.size < 4*1024*1024
+                  content=tar.extractfile(m).read()
+                  assert len(content)==m.size
+                  (out/m.name.rsplit('/',1)[-1]).write_bytes(content)
+                  total+=1
+                  assert total<=900
+          assert total==741,total
+          PY
+      - name: Build full B2 source index and B3 task DAG
+        run: |
+          set -euo pipefail
+          python3 tools/x86_iform_helper_dependencies.py \
+            --xml-dir /tmp/x7-b3-xml --shards 16 \
+            --out /tmp/x7-b3-complete/source-index.json
+          python3 tools/x86_iform_proof_work_dag.py \
+            --dependency-index /tmp/x7-b3-complete/source-index.json \
+            --shards 16 --out /tmp/x7-b3-complete/task-queue.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path('/tmp/x7-b3-complete/task-queue.json').read_text())
+          assert data['operation_count']==1641
+          assert data['iform_count']==10859
+          assert data['summary']['tasks']==57577
+          assert data['shard_count']==16
+          PY
+      - name: Execute all 16 source-model proof shards with real Intel/Z3
+        run: |
+          set -euo pipefail
+          root=/tmp/x7-b3-complete
+          parser=/tmp/isa-tools/_build/default/bin/x86_isl_ast_export.exe
+          /usr/bin/time -f '%e' -o "$root/all-model-seconds.txt" bash -euo pipefail -c '
+            for i in $(seq 0 15); do
+              file=$(printf "%02d" "$i")
+              /tmp/x7-full-model-z3/bin/python tools/x86_isl_operation_proof_worker.py \
+                --dependency-index /tmp/x7-b3-complete/source-index.json \
+                --proof-work-queue /tmp/x7-b3-complete/task-queue.json \
+                --xml-dir /tmp/x7-b3-xml \
+                --parser /tmp/isa-tools/_build/default/bin/x86_isl_ast_export.exe \
+                --width 32 --jobs 8 --model-jobs 4 --max-checks 256 \
+                --shard-index "$i" --timeout-ms 2000 \
+                --cache-dir /tmp/x7-b3-complete/ast-cache \
+                --out "/tmp/x7-b3-complete/shards/op-shard-${file}.json"
+            done
+          '
+      - name: Audit all 1641 source operation statuses and blockers
+        run: |
+          set -euo pipefail
+          /tmp/x7-full-model-z3/bin/python tools/x86_isl_operation_model_census.py \
+            --dependency-index /tmp/x7-b3-complete/source-index.json \
+            --proof-work-queue /tmp/x7-b3-complete/task-queue.json \
+            --reports-dir /tmp/x7-b3-complete/shards \
+            --out /tmp/x7-b3-complete/full-source-model-census.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          root=Path('/tmp/x7-b3-complete')
+          r=json.loads((root/'full-source-model-census.json').read_text())
+          s=r['summary']
+          assert r['intel_sdm_commit']=='35eface1b7ee003a1cda95005ec5fd83de658a64'
+          assert r['shard_count']==16
+          assert s['operations_indexed']==1641
+          assert s['operations_accounted_for']==1641
+          assert s['complete_source_operation_accounting'] is True
+          assert s['operations_with_supported_model_equivalence']>=11,s
+          assert sum(x['operation_count']
+                     for x in s['unsupported_source_contract_reasons_top']) + s['unsupported_source_contract_reasons_other']==s['source_models_reported_by_status'].get('unsupported_source_contract',0)
+          assert sum(s['source_operations_by_declared_helper_shape'].values())==1641
+          assert s['fully_verified_x86_instruction_forms']==0
+          assert s['production_selection_eligible_forms']==0
+          assert sum(q['operations'] for q in r['shards'])==1641
+          assert len({x['operation_id'] for x in r['operations']})==1641
+          mov=[x for x in r['operations']
+               if x['source_file']=='MOV.xml' and x['operation']=='MOV']
+          assert len(mov)==1,mov
+          assert mov[0]['status']=='supported_model_equivalent',mov[0]
+          assert 'result' in mov[0]['checked_outputs']
+          for op in ('NOT','CLC','CMC'):
+              matches=[x for x in r['operations'] if
+                       x['source_file']==op+'.xml' and x['operation']==op]
+              assert len(matches)==1,(op,matches)
+              row=matches[0]
+              assert row['status']=='supported_model_equivalent',(op,row)
+              assert row['machine_semantics_proven'] is False
+              assert row['production_selection_eligible'] is False
+              if op=='NOT':
+                  assert 'result' in row['checked_outputs']
+                  assert row['reviewed_builtin_ast_witnesses']==['Std::Bits::Not']
+              else:
+                  assert row['reviewed_source_record']=='RFLAGS'
+                  assert 'RFLAGS.CF' in row['checked_outputs']
+                  assert len(row['checked_outputs'])==17
+              print('X7_B3_PINNED_OPERATION_MODEL_PASS',op,row['model_source_sha256'])
+          print('X7_B3_FULL_INTEL_MODEL_CENSUS_PASS',s)
+          print('X7_B3_FULL_INTEL_MODEL_CHECK_WALL_SECONDS',
+                float((root/'all-model-seconds.txt').read_text().strip()))
+          PY
+      - name: Archive all source-model evidence and shard reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-full-intel-source-model-proofs-and-blockers
+          path: |
+            /tmp/x7-b3-complete/full-source-model-census.json
+            /tmp/x7-b3-complete/shards/
+            /tmp/x7-b3-complete/all-model-seconds.txt
+          if-no-files-found: warn
+          retention-days: 14
