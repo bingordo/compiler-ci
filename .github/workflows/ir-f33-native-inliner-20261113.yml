@@ -1,0 +1,84 @@
+name: IR F33 CFG memory native TypeId batch acceptance
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ir-f33-native-inliner-20261113.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ir-f33-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler candidate F33
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9bda772cbc7a917b741eb2cafd5f2c111b3d6177
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source identity and isolate Cargo scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 9bda772cbc7a917b741eb2cafd5f2c111b3d6177
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo "Compiler candidate: 9bda772cbc7a917b741eb2cafd5f2c111b3d6177" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-f33-cfg-memory-cutover-v1
+      - name: F33 native CFG and pointer PHI GAS/ELF oracles
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test inline_native -- --nocapture
+      - name: F33 native memory, byte and caller-frame GAS/ELF oracles
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test inline_memory_native -- --nocapture
+      - name: Typed CFG, memory, scalar leaf and wide/void inliner regressions
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_inline_cfg_native -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_memory_native -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_leaf_native -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_wide_void_native -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_postopt_native_trial -- --nocapture
+          cargo test -p compiler-opt --test typed_core_inline_integration -- --nocapture
+      - name: Previous F26-F32 migration and x86 backend regression controls
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test inline_modern_scalar_native -- --nocapture
+          cargo test -p compiler-opt --test inline_practical_native -- --nocapture
+          cargo test -p compiler-opt --test licm_preheaders -- --nocapture
+          cargo test -p compiler-opt --test induction_native -- --nocapture
+          cargo test -p compiler-opt --test ctfe -- --nocapture
+          cargo test -p compiler-opt --test dse -- --nocapture
+          cargo test -p compiler-opt --test mem2reg_native -- --nocapture
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-ir --lib
+      - name: Strict all-target Clippy on TypeId optimizer and native x86 backend
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
