@@ -1,0 +1,79 @@
+name: IR F34 native TypeId offline inline size acceptance
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ir-f34-native-inline-size-20261113.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-typeid:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler F34 source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2fcae74625ce697134c7e978f5c14069889e5baa
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source pin and isolate Cargo workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 2fcae74625ce697134c7e978f5c14069889e5baa
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo "Compiler source: 2fcae74625ce697134c7e978f5c14069889e5baa" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-f34-native-size-v1
+      - name: F34 public helper exhaustive masks 2 and 4 and native GAS/direct ELF C oracle
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test inline_decision_oracle -- --nocapture
+      - name: F34 private helper exact target-size and joint-pruning masks
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test inline_private_decision_oracle -- --nocapture
+      - name: F34 five-shape callgraph corpus exact target-size mask search
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test inline_interaction_corpus -- --nocapture
+      - name: Retain native TypeId inliner/linkage and earlier cutover controls
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_inline_postopt_native_trial -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_cfg_native -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_leaf_native -- --nocapture
+          cargo test -p compiler-opt --test inline_native -- --nocapture
+          cargo test -p compiler-opt --test inline_memory_native -- --nocapture
+          cargo test -p compiler-opt --test inline_practical_native -- --nocapture
+          cargo test -p compiler-opt --test linkage_native -- --nocapture
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-ir --lib
+      - name: Strict all-target Clippy on TypeId compiler and x86 backend
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
