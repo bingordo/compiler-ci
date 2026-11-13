@@ -1,0 +1,97 @@
+name: X7 shared TypeId external-global PIC parity (exact source)
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-x7-shared-pic-global-20261112.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: x7-typeid-pic-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  focused:
+    name: PIC GOT C11 ELF/GAS x RBP and strict Clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 60747a2f328c51f03482058061375ad5d380de62
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Enforce source SHA
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "60747a2f328c51f03482058061375ad5d380de62"
+      - name: Select credential-independent Rust workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: x7-pic-typeid-focused
+      - name: PIC dynamic-loader C11 external global oracle
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --features x7-shared-machine-cutover \
+            --test x7_shared_pic_global_native -- --test-threads=1 --nocapture
+          cargo test -p compiler-backend-x86 --features x7-shared-machine-cutover \
+            --test x7_shared_machine_native_parity -- --test-threads=1
+          cargo test -p compiler-backend-x86 --features x7-shared-machine-cutover \
+            --lib machine_typeid::legalized_cutover_tests -- --test-threads=1
+      - name: Strict x86 all-target Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-x86 --all-targets --features x7-shared-machine-cutover -- -D warnings
+  full:
+    name: x86 full default/all-feature and core TypeId
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 60747a2f328c51f03482058061375ad5d380de62
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Enforce source SHA
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "60747a2f328c51f03482058061375ad5d380de62"
+      - name: Select credential-independent Rust workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: x7-pic-typeid-full
+      - name: Full default x86 regression
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 -- --test-threads=2
+      - name: Full all-features x86 regression
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --all-features -- --test-threads=2
+      - name: Install debugger required by existing backend DWARF oracle
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gdb
+          gdb --version
+      - name: Core TypeId parity regressions
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -- --test-threads=2
