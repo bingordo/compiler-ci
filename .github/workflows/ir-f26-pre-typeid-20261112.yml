@@ -1,0 +1,64 @@
+name: IR F26 native TypeId PRE migration
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ir-f26-pre-typeid-20261112.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pre-typeid:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler F26 candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 843b3271c0987fab29cd5b606772d3c7c4666216
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm pinned source and limit workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 843b3271c0987fab29cd5b606772d3c7c4666216
+          test -s compiler/crates/opt/tests/pre_native.rs
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo "Compiler source: 843b3271c0987fab29cd5b606772d3c7c4666216" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-f26-pre-typeid-v1
+      - name: Execute F26 PRE legacy-reference and native runtime GAS/ELF cases
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test pre_native -- --nocapture
+      - name: Execute existing native PRE and independent memory/CFG controls
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_pre_native -- --nocapture
+          cargo test -p compiler-opt --test memory_native -- --nocapture
+          cargo test -p compiler-opt --test typed_core_pipeline -- --nocapture
+          cargo test -p compiler-backend-x86 --lib
+      - name: Strict Clippy on migrated suite and native backend
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --test pre_native --test typed_pre_native -- -D warnings
+          cargo clippy -p compiler-backend-x86 --lib -- -D warnings
