@@ -1,0 +1,54 @@
+name: FZ-3 PR1208 dominator-safe operand and PHI ddmin native differential
+on:
+  push:
+    branches: [fuzz/fz3-dominance-phi-pr1208]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  targeted:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 39d18d0276338be00499aa3f9e7e4f09bdd4b141
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact source and FZ3 test
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "39d18d0276338be00499aa3f9e7e4f09bdd4b141"
+          test -s compiler/crates/opt/tests/typeid_delta_dominance.rs
+      - name: Build self-contained TypeId core workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: fz3-dominator-phi-ddmin
+          cache-workspace-crates: 'true'
+      - name: Clippy deny all except unrelated x86 selector dead code
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt --lib --test typeid_delta_dominance --test delta_reduce_ir --example delta_reduce -- -D warnings -A dead_code
+      - name: Domination and PHI edge reduction with native executable mismatch
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typeid_delta_dominance -- --nocapture
+      - name: Generic and TypeId ddmin previous regression
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --lib delta_reduce::tests
+          cargo test -p compiler-opt --test delta_reduce_ir
+          cargo test -p compiler-opt --test typeid_fuzz_corpus_reduce
+      - name: Cross-pass native oracles and core coverage
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typeid_fuzz_interactions
+          cargo test -p compiler-opt --test typeid_fuzz_bias
+          cargo test -p compiler-opt --test typeid_fuzz_pass_registry
+          cargo test -p compiler-opt --test typed_core_native_verifier
