@@ -1,0 +1,96 @@
+name: X7 signed indexed TypeId shared-machine parity (exact source)
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-x7-shared-signed-index-20261112.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: x7-shared-indexed-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  focused:
+    name: Signed index ELF/GAS C11 and strict Clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7b4416f7337744b5c09d78c3f5704124570cce2a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Enforce exact source SHA
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "7b4416f7337744b5c09d78c3f5704124570cce2a"
+      - name: Avoid private frontend workspace resolution
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: x7-signed-index-focused
+      - name: Native signed i32 indexing against C11, ELF, GAS, with/without frame
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --features x7-shared-machine-cutover \
+            --test x7_shared_signed_index_native -- --nocapture --test-threads=1
+          cargo test -p compiler-backend-x86 --features x7-shared-machine-cutover \
+            --lib machine_typeid::legalized_cutover_tests -- --nocapture --test-threads=1
+          cargo test -p compiler-backend-x86 --features x7-shared-machine-cutover \
+            --test x7_shared_machine_native_parity -- --nocapture --test-threads=1
+      - name: Strict Clippy on x86 backend
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-x86 --all-targets --features x7-shared-machine-cutover -- -D warnings
+  full:
+    name: Full x86 default and all-features plus TypeId core
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7b4416f7337744b5c09d78c3f5704124570cce2a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Enforce exact source SHA
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "7b4416f7337744b5c09d78c3f5704124570cce2a"
+      - name: Avoid private frontend workspace resolution
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: x7-signed-index-full
+      - name: Complete default x86 backend regression
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 -- --test-threads=2
+      - name: Complete all-features x86 backend regression
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --all-features -- --test-threads=2
+      - name: Install debugger required by existing DWARF C11 oracle
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gdb
+      - name: Complete core TypeId regressions
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -- --test-threads=2
