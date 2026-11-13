@@ -1,0 +1,85 @@
+name: IR F36 TypeId if-conversion memory semantic acceptance
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ir-f36-typeid-ifconv-memory-20261113.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ir-f36-typeid:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exactly compiler F36 source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a6c2d3aceb86d41ce53383a531d32aad2424d7e6
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert source identity and isolate Cargo workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = a6c2d3aceb86d41ce53383a531d32aad2424d7e6
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo "Compiler F36 a6c2d3aceb86d41ce53383a531d32aad2424d7e6" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-f36-typeid-ifconv-memory-v1
+      - name: F36 native if-conversion GAS ELF target and C runtime oracle
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test if_conversion_native -- --nocapture
+      - name: F36 TypeId memory side effects pointer PHI trap and bounded oracle
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test memory_execution_oracle -- --nocapture
+      - name: Adjacent TypeId if-conversion and native memory suites
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_if_conversion_native -- --nocapture
+          cargo test -p compiler-opt --test typed_if_conversion_pure -- --nocapture
+          cargo test -p compiler-opt --test typed_local_memory -- --nocapture
+          cargo test -p compiler-opt --test typed_global_memory -- --nocapture
+          cargo test -p compiler-opt --test memory_native -- --nocapture
+          cargo test -p compiler-opt --test typeid_native_memory_call -- --nocapture
+          cargo test -p compiler-opt --test m6_typeid_memoryssa -- --nocapture
+      - name: F29-F35 prior native cutover and backend regression controls
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test loop_trap_semantics -- --nocapture
+          cargo test -p compiler-opt --test pre_licm_semantic_matrix -- --nocapture
+          cargo test -p compiler-opt --test linkage_native -- --nocapture
+          cargo test -p compiler-opt --test inline_native -- --nocapture
+          cargo test -p compiler-opt --test inline_memory_native -- --nocapture
+          cargo test -p compiler-opt --test dse -- --nocapture
+          cargo test -p compiler-opt --test mem2reg_native -- --nocapture
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-ir --lib
+      - name: Strict TypeId IR optimizer and native backend all-target Clippy
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
