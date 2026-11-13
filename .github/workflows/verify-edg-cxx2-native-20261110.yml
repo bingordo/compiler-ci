@@ -29,7 +29,7 @@ jobs:
       run:
         shell: edg-container-exec "bash -eo pipefail {0}"
     env:
-      EDG_SOURCE_SHA: c0e202d9aacaea55b91746f1bc67a8f2b06301b5
+      EDG_SOURCE_SHA: 7360d26fd3730e0a6758b7602a77416d5fca8496
       EDG_RELEASE_TAG: edgcpfe-ci-799603e0b5ab
       EDG_RELEASE_SHA256: fa769825e70766fbefe017806816b2338acd03daa93bb5562369c293972ce64c
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -49,7 +49,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: bingundu/edgcpp
-          ref: c0e202d9aacaea55b91746f1bc67a8f2b06301b5
+          ref: 7360d26fd3730e0a6758b7602a77416d5fca8496
           path: edgcpp
           persist-credentials: false
 
@@ -93,8 +93,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/edgcpp-rust
-          ref: 0c787a04783809ada9ab51f9e8318032384ff2a7
+          ref: c365ee4347cad179051355b6267ba02d58616370
           path: edg-rust-call-target
+          persist-credentials: false
+
+      - name: Check out independent GCC Itanium vtable ABI oracle
+        uses: actions/checkout@v4
+        with:
+          path: gcc-itanium-oracle
           persist-credentials: false
 
       - name: Install pinned Rust toolchain
@@ -124,7 +130,28 @@ jobs:
           cargo test --manifest-path edg-rust-call-target/Cargo.toml --lib callee_vptr_field_tests -- --nocapture
           cargo test --manifest-path edg-rust-call-target/Cargo.toml --lib cxx5_prelower_virtual_call_origin_tests -- --nocapture
           cargo test --manifest-path edg-rust-call-target/Cargo.toml --lib cxx5_virtual_receiver_reuse_tests -- --nocapture
+          cargo test --manifest-path edg-rust-call-target/Cargo.toml --lib cxx5_virtual_entry_index_selection_tests -- --nocapture
           cargo test --manifest-path edg-rust-call-target/Cargo.toml --lib audit_complete_wire_field_tags_tests -- --nocapture
+
+      # A fully independent GCC x86-64 Itanium ABI oracle: verify physical
+      # primary/secondary vptr address points and two negative this-adjustment
+      # thunks before comparing to EDG's diagnostic source index. Crucially
+      # this does not authorize a runtime dereference by the compiler backend.
+      - name: Compare G++ Itanium vtable address points and secondary thunks
+        run: |
+          set -euo pipefail
+          fixture="$GITHUB_WORKSPACE/gcc-itanium-oracle/.github/tests/edg-cxx5-itanium-oracle.cpp"
+          checker="$GITHUB_WORKSPACE/gcc-itanium-oracle/.github/tests/check-edg-cxx5-itanium-oracle.py"
+          test -s "$fixture" && test -s "$checker"
+          outdir="$RUNNER_TEMP/edg-cxx5-gcc-itanium"
+          mkdir -p "$outdir"
+          g++ -std=c++17 -O0 -fdump-lang-class -c "$fixture" -o "$outdir/oracle.o"
+          mapfile -t dumps < <(find "$outdir" -maxdepth 1 -type f -name '*.class')
+          test "${#dumps[@]}" -eq 1
+          python3 "$checker" "${dumps[0]}" "$outdir/oracle.o"
+          g++ -std=c++17 -O0 "$fixture" -o "$outdir/oracle"
+          "$outdir/oracle"
+          echo "Independent GCC Itanium primary/secondary address point, -16/-32 adjustment thunk, and native virtual-runtime oracle passed; never substitute its indices for EDG proof" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Probe native EDG logical virtual member and vptr metadata
         working-directory: edgcpp
@@ -187,6 +214,19 @@ jobs:
                /executable_abi_proven=false/ {found=1; n++}
                END {exit (!found || n != 1)}' "$RUNNER_TEMP/edg-virtual-member.log"
           grep -F 'EDG_VIRTUAL_RECEIVER_REUSE ' "$RUNNER_TEMP/edg-virtual-member.log" | sed -n '1,12p'
+          # This is EDG's exact source-generated eok_padd index; the
+          # independent GCC oracle above proves its own physical primary
+          # vptr and secondary thunks, NOT a mapping for arbitrary objects.
+          awk '/EDG_NATIVE_VIRTUAL_INDEX / &&
+               /function=main / &&
+               /source_index=0 / &&
+               /native_entry_bytes=8 / &&
+               /source_byte_displacement=0 / &&
+               /exact_index_node_proven=true/ &&
+               /machine_slot_proven=false/ &&
+               /executable_abi_proven=false/ {n++}
+               END {exit n != 1}' "$RUNNER_TEMP/edg-virtual-member.log"
+          grep -F 'EDG_NATIVE_VIRTUAL_INDEX ' "$RUNNER_TEMP/edg-virtual-member.log" | sed -n '1,12p'
           grep -F 'EDG_VIRTUAL_MEMBER ' "$RUNNER_TEMP/edg-virtual-member.log" | grep -Fq 'executable_abi_proven=false'
           g++ -std=c++17 -O0 -o "$RUNNER_TEMP/virtual-member-gcc" virtual-member-source.cpp
           "$RUNNER_TEMP/virtual-member-gcc"
@@ -240,6 +280,16 @@ jobs:
                /executable_abi_proven=false/ {found=1}
                END {exit !found}' "$RUNNER_TEMP/edg-virtual-iostream.log"
           grep -F 'EDG_VIRTUAL_RECEIVER_REUSE ' "$RUNNER_TEMP/edg-virtual-iostream.log" | sed -n '1,12p'
+          awk '/EDG_NATIVE_VIRTUAL_INDEX / &&
+               /function=std::ctype<char>::widen/ &&
+               /statement=0.block.2 path=0 / &&
+               /native_entry_bytes=8 / &&
+               /exact_index_node_proven=true/ &&
+               /machine_address_point_proven=false/ &&
+               /machine_slot_proven=false/ &&
+               /executable_abi_proven=false/ {found=1}
+               END {exit !found}' "$RUNNER_TEMP/edg-virtual-iostream.log"
+          grep -F 'EDG_NATIVE_VIRTUAL_INDEX ' "$RUNNER_TEMP/edg-virtual-iostream.log" | sed -n '1,12p'
           grep -F 'EDG_PRELOWER_VIRTUAL_ORIGIN ' "$RUNNER_TEMP/edg-virtual-iostream.log" | sed -n '1,12p'
           grep -F 'EDG_INDIRECT_CALLEE_VPTR ' "$RUNNER_TEMP/edg-virtual-iostream.log" | sed -n '1,12p'
           # Ordinary C++ function pointers have no EDG vptr field witness.
@@ -250,6 +300,10 @@ jobs:
           cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edg-rust-call-target/Cargo.toml" \
             --example parse -- --g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number" \
             ordinary-function-pointer.cpp >"$RUNNER_TEMP/edg-ordinary-pointer.log" 2>&1
+          if grep -Fq 'EDG_NATIVE_VIRTUAL_INDEX ' "$RUNNER_TEMP/edg-ordinary-pointer.log"; then
+            echo "ordinary function pointer incorrectly claimed EDG Itanium entry index" >&2
+            exit 1
+          fi
           if grep -Fq 'EDG_VIRTUAL_RECEIVER_REUSE ' "$RUNNER_TEMP/edg-ordinary-pointer.log"; then
             echo "ordinary function pointer incorrectly claimed virtual receiver reuse" >&2
             exit 1
@@ -264,7 +318,7 @@ jobs:
           fi
           g++ -std=c++17 -O0 -o "$RUNNER_TEMP/ordinary-pointer-gcc" ordinary-function-pointer.cpp
           "$RUNNER_TEMP/ordinary-pointer-gcc"
-          echo "Source-rebuilt native EDG receiver reuse trace confirmed at exact Base::f and unmodified libstdc++ do_widen virtual call; qualified/nonvirtual/function-pointer controls and TypeId/G++/C++2 negative differential green; no machine subobject ABI or virtual codegen admitted" >>"$GITHUB_STEP_SUMMARY"
+          echo "Source-rebuilt EDG exact virtual table index subtree witnessed for Base::f and original libstdc++ do_widen; independent GCC primary/secondary address point and thunk oracle passed; no executable machine slot/this adjustment or virtual codegen admitted" >>"$GITHUB_STEP_SUMMARY"
 
       - name: Verify TypeId-native SysV GP variadic ABI acceptance and rejection
         working-directory: compiler
