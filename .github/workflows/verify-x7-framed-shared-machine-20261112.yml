@@ -1,0 +1,99 @@
+name: X7 framed shared-machine exact-source parity
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-x7-framed-shared-machine-20261112.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: x7-framed-shared-machine-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  focused:
+    name: Framed TypeId and strict x86 build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 92513921aa4f71d7eee212481ab6df3b67303477
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler candidate
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "92513921aa4f71d7eee212481ab6df3b67303477"
+      - name: Use credential-independent compiler workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: x7-framed-cutover-focused
+      - name: Native GCC ELF and GAS parity with explicit framed feature
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --features x7-shared-machine-cutover \
+            --test x7_shared_machine_native_parity -- --test-threads=1 --nocapture
+          cargo test -p compiler-backend-x86 --features x7-shared-machine-cutover \
+            --lib machine_typeid::legalized_cutover_tests -- --test-threads=1
+      - name: Strict x86 Clippy
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-backend-x86 --all-targets \
+            --features x7-shared-machine-cutover -- -D warnings
+  full:
+    name: Complete x86 backend and all-features regression
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 92513921aa4f71d7eee212481ab6df3b67303477
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler candidate
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "92513921aa4f71d7eee212481ab6df3b67303477"
+      - name: Restrict workspace to core and x86
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: x7-framed-cutover-full
+      - name: Full x86 backend default feature regression
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend-x86 -- --test-threads=2
+      - name: Full x86 backend all-features regression
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend-x86 --all-features -- --test-threads=2
+      - name: Core TypeId compatibility
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-ir -p compiler-opt -p compiler-backend -- --test-threads=2
