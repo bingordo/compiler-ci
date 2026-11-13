@@ -160,7 +160,27 @@ jobs:
           grep -F 'EDG_VIRTUAL_MEMBER ' "$RUNNER_TEMP/edg-virtual-member.log" | grep -Fq 'executable_abi_proven=false'
           g++ -std=c++17 -O0 -o "$RUNNER_TEMP/virtual-member-gcc" virtual-member-source.cpp
           "$RUNNER_TEMP/virtual-member-gcc"
-          echo "Native EDG virtual metadata fixture parsed; independent G++ executable passed; no EDG virtual codegen admitted" >>"$GITHUB_STEP_SUMMARY"
+          # Also exercise the original system libstdc++ header chain with the
+          # *new* bridge; the older TypeId negative matrix uses its own pin.
+          cat >virtual-iostream-source.cpp <<'CPP'
+          #include <iostream>
+          int main() { std::cout << "Hello, world!" << std::endl; }
+          CPP
+          g++ -std=c++17 -v -E -x c++ /dev/null >"$RUNNER_TEMP/edg-virtual-includes.log" 2>&1
+          mapfile -t include_dirs < <(awk '/#include <\.\.\.> search starts here:/{active=1;next} /^End of search list/{active=0} active && /^ /{sub(/^[[:space:]]+/,"");print}' "$RUNNER_TEMP/edg-virtual-includes.log")
+          test "${#include_dirs[@]}" -ge 3
+          include_flags=()
+          for dir in "${include_dirs[@]}"; do
+            test -d "$dir" && include_flags+=("-I$dir")
+          done
+          timeout --signal=TERM --kill-after=10s 10m \
+            cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edg-rust-call-target/Cargo.toml" \
+              --example parse -- --g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number" \
+              "${include_flags[@]}" virtual-iostream-source.cpp \
+              >"$RUNNER_TEMP/edg-virtual-iostream.log" 2>&1
+          grep -F 'EDG_VIRTUAL_MEMBER ' "$RUNNER_TEMP/edg-virtual-iostream.log" | head -n 12
+          grep -F 'EDG_VIRTUAL_MEMBER ' "$RUNNER_TEMP/edg-virtual-iostream.log" | grep -Fq 'executable_abi_proven=false'
+          echo "Native EDG base/override plus real libstdc++ iostream virtual metadata parsed; independent G++ control passed; no virtual codegen admitted" >>"$GITHUB_STEP_SUMMARY"
 
       - name: Verify TypeId-native SysV GP variadic ABI acceptance and rejection
         working-directory: compiler
