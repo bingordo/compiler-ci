@@ -1,0 +1,64 @@
+name: IR F29 native TypeId mem2reg acceptance
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ir-f29-mem2reg-native-20261112.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mem2reg-typeid:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler F29 source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5069fca0eb74d6c1231ad42f70ddb86fa6742de5
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm source identity and isolated Cargo scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 5069fca0eb74d6c1231ad42f70ddb86fa6742de5
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo "Compiler source: 5069fca0eb74d6c1231ad42f70ddb86fa6742de5" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-f29-mem2reg-native-v1
+      - name: Execute F29 native mem2reg GAS and direct ELF C oracles
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test mem2reg_native -- --nocapture
+      - name: Run existing TypeId promotion, pipeline and memory safety controls
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_mem2reg -- --nocapture
+          cargo test -p compiler-opt --test typed_core_pipeline -- --nocapture
+          cargo test -p compiler-opt --test memory_native -- --nocapture
+          cargo test -p compiler-opt --test array_fold_native -- --nocapture
+          cargo test -p compiler-opt --test ct03_closeout -- --nocapture
+          cargo test -p compiler-backend-x86 --lib
+      - name: Strict Clippy on TypeId optimizer and both native backends
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
