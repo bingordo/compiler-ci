@@ -150,4 +150,46 @@ jobs:
               echo "PASS AAPCS64 10-argument entry and outbound calls, pic=$pic, fmt=$fmt"
             done
           done
-          echo "Passed 10 real glibc/AArch64 QEMU executions: four puts cases, two dlopen constructor cases and four 10-GP entry/outbound AAPCS64 calls." >> "$GITHUB_STEP_SUMMARY"
+          # O2a/O2b Oberon: contiguous private INTEGER records, inherited
+          # field offsets and derived-to-base whole-record prefix copies.
+          # The real source frontend, TypeId optimizer, PIC target lowering,
+          # direct ELF and GNU GAS must agree with the independent C oracle.
+          cat > "$tmp/RecordLayout.mod" <<'EOF'
+          MODULE RecordLayout;
+          TYPE Parent = RECORD left,right: INTEGER END;
+               Child = RECORD (Parent) tail: INTEGER END;
+          VAR parent: Parent; child: Child;
+          PROCEDURE Read*(): INTEGER;
+          BEGIN RETURN parent.left+10*parent.right+100*child.tail END Read;
+          PROCEDURE Eval*(n: INTEGER): INTEGER;
+          VAR local: Child;
+          BEGIN
+              local.left:=n; local.right:=n+1; local.tail:=n+2;
+              child:=local; parent:=child;
+              RETURN Read()
+          END Eval;
+          BEGIN parent.left:=3; parent.right:=4; child.tail:=5 END RecordLayout.
+          EOF
+          cat > "$tmp/record-oracle.c" <<'EOF'
+          extern int RecordLayout__Read(void);
+          extern int RecordLayout__Eval(int);
+          int main(void) {
+              if (RecordLayout__Read()!=543) return 1;
+              if (RecordLayout__Eval(1)!=321) return 2;
+              if (RecordLayout__Read()!=321) return 3;
+              if (RecordLayout__Eval(7)!=987) return 4;
+              return RecordLayout__Read()!=987;
+          }
+          EOF
+          for fmt in obj asm; do
+            ext=o
+            if [ "$fmt" = asm ]; then ext=s; fi
+            file="$tmp/record-pic.$ext"
+            ./target/debug/compiler "$tmp/RecordLayout.mod" --language oberon \
+              --target aarch64 --ir typeid --pic --emit "$fmt" -o "$file"
+            exe="$tmp/record-pic-$fmt"
+            aarch64-linux-gnu-gcc -fPIE -pie -O0 "$tmp/record-oracle.c" "$file" -o "$exe"
+            timeout 30 qemu-aarch64 -L /usr/aarch64-linux-gnu "$exe"
+            echo "PASS Oberon contiguous inherited records, PIC, fmt=$fmt"
+          done
+          echo "Passed 12 real glibc/AArch64 QEMU executions: four puts, two dlopen constructors, four 10-GP ABI and two Oberon inherited-record PIC cases." >> "$GITHUB_STEP_SUMMARY"
