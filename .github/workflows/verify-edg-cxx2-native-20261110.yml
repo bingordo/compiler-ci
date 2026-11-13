@@ -29,7 +29,7 @@ jobs:
       run:
         shell: edg-container-exec "bash -eo pipefail {0}"
     env:
-      EDG_SOURCE_SHA: 2a6f3808ca29a1129e67450429a16e7f862b92a6
+      EDG_SOURCE_SHA: 1001ab4b6178c650863f3221b5dc64b4b3eff218
       EDG_RELEASE_TAG: edgcpfe-ci-799603e0b5ab
       EDG_RELEASE_SHA256: fa769825e70766fbefe017806816b2338acd03daa93bb5562369c293972ce64c
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -49,7 +49,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: bingundu/edgcpp
-          ref: 2a6f3808ca29a1129e67450429a16e7f862b92a6
+          ref: 1001ab4b6178c650863f3221b5dc64b4b3eff218
           path: edgcpp
           persist-credentials: false
 
@@ -93,7 +93,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/edgcpp-rust
-          ref: c2a8cdf2cb246919c2c960df3adaebd600df8ba5
+          ref: 76758a5f4e060ae33652f9ee4e2e371ec159147e
           path: edg-rust-call-target
           persist-credentials: false
 
@@ -137,11 +137,17 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           source build/gcc-release/environment.sh
           cat >build/gcc-release/virtual-member-source.cpp <<'CPP'
-          struct Base { virtual int f(); };
+          struct Base { virtual int f(); int direct(); };
           int Base::f() { return 3; }
+          int Base::direct() { return 11; }
           struct Derived : Base { int f() override; };
           int Derived::f() { return 5; }
-          int main() { Derived d; Base *b = &d; return b->f() != 5; }
+          int main() {
+            Derived d; Base *b = &d;
+            // Explicit virtual dispatch, qualified nonvirtual call of a
+            // virtual member, and ordinary nonvirtual member call.
+            return b->f() != 5 || b->Base::f() != 3 || b->direct() != 11;
+          }
           CPP
           cd build/gcc-release
           version="$(g++ -dumpfullversion -dumpversion)"
@@ -158,10 +164,17 @@ jobs:
           # text spelling is diagnostic, not a source admission test.
           grep -F 'EDG_PRELOWER_VIRTUAL_ORIGIN ' "$RUNNER_TEMP/edg-virtual-member.log" | sed -n '1,12p' || true
           awk '/EDG_PRELOWER_VIRTUAL_ORIGIN / &&
+               /function=main/ &&
                /original_name=Some\("Base::f/ &&
+               /postlower_rewrite_proven=true/ &&
+               /callee_pointer_stable=true/ &&
                /machine_slot_proven=false/ &&
                /executable_abi_proven=false/ {found=1}
                END {exit !found}' "$RUNNER_TEMP/edg-virtual-member.log"
+          # Qualified Base::f and nonvirtual Base::direct MUST NOT
+          # manufacture source-virtual origin events.
+          awk '/EDG_PRELOWER_VIRTUAL_ORIGIN / && /function=main/ {n++}
+               END {exit n != 1}' "$RUNNER_TEMP/edg-virtual-member.log"
           grep -F 'EDG_VIRTUAL_MEMBER ' "$RUNNER_TEMP/edg-virtual-member.log" | grep -Fq 'executable_abi_proven=false'
           g++ -std=c++17 -O0 -o "$RUNNER_TEMP/virtual-member-gcc" virtual-member-source.cpp
           "$RUNNER_TEMP/virtual-member-gcc"
@@ -195,6 +208,17 @@ jobs:
                /machine_slot_proven=false/ &&
                /executable_abi_proven=false/ {found=1}
                END {exit !found}' "$RUNNER_TEMP/edg-virtual-iostream.log"
+          # Both halves of the EDG-owned rewrite must survive at the
+          # same original std::ctype<char>::widen call site.
+          awk '/EDG_PRELOWER_VIRTUAL_ORIGIN / &&
+               /function=std::ctype<char>::widen/ &&
+               /statement=0.block.2 path=0 / &&
+               /original_name=Some\("std::ctype<char>::do_widen/ &&
+               /postlower_rewrite_proven=true/ &&
+               /callee_pointer_stable=true/ &&
+               /machine_slot_proven=false/ &&
+               /executable_abi_proven=false/ {found=1}
+               END {exit !found}' "$RUNNER_TEMP/edg-virtual-iostream.log"
           grep -F 'EDG_PRELOWER_VIRTUAL_ORIGIN ' "$RUNNER_TEMP/edg-virtual-iostream.log" | sed -n '1,12p'
           grep -F 'EDG_INDIRECT_CALLEE_VPTR ' "$RUNNER_TEMP/edg-virtual-iostream.log" | sed -n '1,12p'
           # Ordinary C++ function pointers have no EDG vptr field witness.
@@ -215,7 +239,7 @@ jobs:
           fi
           g++ -std=c++17 -O0 -o "$RUNNER_TEMP/ordinary-pointer-gcc" ordinary-function-pointer.cpp
           "$RUNNER_TEMP/ordinary-pointer-gcc"
-          echo "Native source-rebuilt EDG prelower virtual routine origin plus unmodified libstdc++ widen vptr field trace verified; independent function-pointer negatives and G++ controls green; no virtual ABI/codegen admitted" >>"$GITHUB_STEP_SUMMARY"
+          echo "Native source-rebuilt EDG paired pre/post virtual rewrite identity with exact stable callee pointer, unmodified libstdc++ widen vptr field trace, negative qualified/nonvirtual/function-pointer controls, and G++ differential all verified; no virtual ABI/codegen admitted" >>"$GITHUB_STEP_SUMMARY"
 
       - name: Verify TypeId-native SysV GP variadic ABI acceptance and rejection
         working-directory: compiler
