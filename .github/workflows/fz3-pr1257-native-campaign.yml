@@ -1,0 +1,81 @@
+name: FZ-3 PR1257 bounded native campaign and deduplicated IR artifacts
+on:
+  push:
+    branches: [fuzz/fz3-native-campaign-pr1257]
+  workflow_dispatch:
+permissions: { contents: read }
+jobs:
+  campaign:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 24
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d7e2f7161ff4b95d6a945033eba31d6789702744
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Exact immutable compiler source
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "d7e2f7161ff4b95d6a945033eba31d6789702744"
+          test -s compiler/crates/opt/examples/typeid_native_campaign.rs
+          test -s compiler/crates/opt/tests/typeid_native_campaign.rs
+      - name: Isolate self-contained TypeId core workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: fz3-native-campaign
+          cache-workspace-crates: 'true'
+      - name: Clippy deny warnings except existing backend selector dead code
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt --test typeid_native_campaign --example typeid_native_campaign --example typeid_native_diff_repro -- -D warnings -A dead_code
+      - name: Campaign fingerprint logic and injected end-to-end IR reduction
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --example typeid_native_campaign -- --nocapture
+          cargo test -p compiler-opt --test typeid_native_campaign -- --nocapture
+      - name: Real bounded original-reference native GAS ELF campaign
+        working-directory: compiler
+        run: |
+          cargo run -p compiler-opt --example typeid_native_campaign -- \
+            --out "$RUNNER_TEMP/fz3-native/real" \
+            --source-sha d7e2f7161ff4b95d6a945033eba31d6789702744 --first-seed 0 --seeds 1 \
+            --max-evaluations 120 --max-unique 4 --max-probes 32
+          grep -q '^unique_failures=0$' "$RUNNER_TEMP/fz3-native/real/summary.txt"
+          test "$(wc -l < "$RUNNER_TEMP/fz3-native/real/fingerprints.tsv")" -eq 1
+      - name: Injected wrong-code dedup and minimized artifact self-test
+        working-directory: compiler
+        run: |
+          cargo run -p compiler-opt --example typeid_native_campaign -- \
+            --out "$RUNNER_TEMP/fz3-native/injected" \
+            --source-sha d7e2f7161ff4b95d6a945033eba31d6789702744 --first-seed 1 --seeds 2 \
+            --max-evaluations 8 --max-unique 2 --max-probes 32 --self-test
+          grep -q '^unique_failures=2$' "$RUNNER_TEMP/fz3-native/injected/summary.txt"
+          grep -q '^duplicate_observations=2$' "$RUNNER_TEMP/fz3-native/injected/summary.txt"
+          test "$(wc -l < "$RUNNER_TEMP/fz3-native/injected/fingerprints.tsv")" -eq 3
+          test -s "$RUNNER_TEMP/fz3-native/injected/failure-000/minimized.ir"
+          test -s "$RUNNER_TEMP/fz3-native/injected/failure-001/replay.txt"
+      - name: Previous TypeId native memory call and delta regression
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typeid_native_memory_call
+          cargo test -p compiler-opt --test typeid_native_reference_ddmin
+          cargo test -p compiler-opt --test typeid_delta_dominance
+          cargo test -p compiler-opt --test delta_reduce_ir
+          cargo test -p compiler-opt --test typeid_fuzz_corpus_reduce
+          cargo test -p compiler-opt --test typeid_fuzz_pass_registry
+      - name: Always preserve campaign reports and minimized IR
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fz3-pr1257-native-campaign-artifacts
+          path: ${{ runner.temp }}/fz3-native/
+          if-no-files-found: warn
+          retention-days: 7
