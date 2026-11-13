@@ -99,7 +99,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/edgcpp-rust
-          ref: 1ec71dc6f5e34996de11aa32b56d5834cfb0ea30
+          ref: 8d163cc08553295c41504185dbb65f37d81eb524
           path: edg-rust-call-target
           persist-credentials: false
 
@@ -127,6 +127,7 @@ jobs:
           cargo test --manifest-path edg-rust-call-target/Cargo.toml --lib cxx5_call_target_wire_tests -- --nocapture
           cargo test --manifest-path edg-rust-call-target/Cargo.toml --lib cxx5_native_call_dispatch_wire_tests -- --nocapture
           cargo test --manifest-path edg-rust-call-target/Cargo.toml --lib cxx5_virtual_member_info_wire_tests -- --nocapture
+          cargo test --manifest-path edg-rust-call-target/Cargo.toml --lib callee_vptr_field_tests -- --nocapture
           cargo test --manifest-path edg-rust-call-target/Cargo.toml --lib audit_complete_wire_field_tags_tests -- --nocapture
 
       - name: Probe native EDG logical virtual member and vptr metadata
@@ -180,7 +181,32 @@ jobs:
               >"$RUNNER_TEMP/edg-virtual-iostream.log" 2>&1
           grep -F 'EDG_VIRTUAL_MEMBER ' "$RUNNER_TEMP/edg-virtual-iostream.log" | sed -n '1,12p'
           awk '/EDG_VIRTUAL_MEMBER / && /executable_abi_proven=false/ {found=1} END {exit !found}' "$RUNNER_TEMP/edg-virtual-iostream.log"
-          echo "Native EDG base/override plus real libstdc++ iostream virtual metadata parsed; independent G++ control passed; no virtual codegen admitted" >>"$GITHUB_STEP_SUMMARY"
+          # The original std::ctype<char>::widen fallback contains a
+          # lowered ordinary call whose *callee* references the EDG-owned
+          # __vptr record field. Its raw integer constant is NOT a slot.
+          awk '/EDG_INDIRECT_CALLEE_VPTR / &&
+               /function=std::ctype<char>::widen/ &&
+               /field_name=__vptr/ &&
+               /source_virtual_proven=false/ &&
+               /machine_slot_proven=false/ &&
+               /executable_abi_proven=false/ {found=1}
+               END {exit !found}' "$RUNNER_TEMP/edg-virtual-iostream.log"
+          grep -F 'EDG_INDIRECT_CALLEE_VPTR ' "$RUNNER_TEMP/edg-virtual-iostream.log" | sed -n '1,12p'
+          # Ordinary C++ function pointers have no EDG vptr field witness.
+          cat >ordinary-function-pointer.cpp <<'CPP'
+          int seven() { return 7; }
+          int main() { int (*fn)() = seven; return fn() != 7; }
+          CPP
+          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edg-rust-call-target/Cargo.toml" \
+            --example parse -- --g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number" \
+            ordinary-function-pointer.cpp >"$RUNNER_TEMP/edg-ordinary-pointer.log" 2>&1
+          if grep -Fq 'EDG_INDIRECT_CALLEE_VPTR ' "$RUNNER_TEMP/edg-ordinary-pointer.log"; then
+            echo "ordinary function pointer was incorrectly classified as vptr-derived" >&2
+            exit 1
+          fi
+          g++ -std=c++17 -O0 -o "$RUNNER_TEMP/ordinary-pointer-gcc" ordinary-function-pointer.cpp
+          "$RUNNER_TEMP/ordinary-pointer-gcc"
+          echo "Native EDG vptr-callee field structure proven in unmodified libstdc++ widen, independent function-pointer negative and G++ controls green; no virtual ABI/codegen admitted" >>"$GITHUB_STEP_SUMMARY"
 
       - name: Verify TypeId-native SysV GP variadic ABI acceptance and rejection
         working-directory: compiler
