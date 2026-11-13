@@ -1,0 +1,69 @@
+name: AArch64 source-backed ImpDefBit declaration signature probe
+on:
+  push:
+    branches: [ci/aarch64-impdefbit-signature-probe-20261112]
+permissions:
+  contents: read
+jobs:
+  pinned-shape:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d86fe01787c5b9dc0d8eab8a146309c84dea975b
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: herd/herdtools7
+          ref: cfc4f56c522ec0d701acaf5a23139b47e8711299
+          path: herd
+          sparse-checkout: |
+            herd/libdir/asl-pseudocode/bundler.py
+          persist-credentials: false
+      - name: Verify published source and fingerprint ImpDefBit declaration shape only
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = d86fe01787c5b9dc0d8eab8a146309c84dea975b
+          test "$(git -C herd rev-parse HEAD)" = cfc4f56c522ec0d701acaf5a23139b47e8711299
+          curl -fLsS --retry 3 --connect-timeout 20 --max-time 240 --max-filesize 200000000 -o /tmp/arm-2026-09.tar.gz https://developer.arm.com/-/cdn-downloads/permalink/Exploration-Tools-A64-ISA/ISA_A64/ISA_A64_xml_A_profile-2026-09.tar.gz
+          echo "44cfb89c763c7eea8e59de0ad2221e3c012e6aa77899bd7f1c3e1f24537191d7  /tmp/arm-2026-09.tar.gz" | sha256sum -c -
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, re, sys, tarfile, tempfile
+          from argparse import Namespace
+          sys.path.insert(0,"compiler/tools")
+          from aarch64_a32_aslref_compat import load_bundler
+          from aarch64_a32_asl_type_collision import _published_function, _published_signature
+          with tempfile.TemporaryDirectory() as temp:
+              root=Path(temp)
+              with tarfile.open("/tmp/arm-2026-09.tar.gz","r:gz") as tar:
+                  item=tar.getmember("ISA_A64_xml_A_profile-2026-09/shared_pseudocode.xml")
+                  assert item.isfile() and item.size < 60000000
+                  (root/"shared.xml").write_bytes(tar.extractfile(item).read())
+              bundler=load_bundler(Path("herd/herd/libdir/asl-pseudocode/bundler.py"))
+              out=root/"shared.asl"
+              bundler.make_shared_pseudocode(Namespace(i_files=[root/"shared.xml"],o_dir=out))
+              source=out.read_text()
+              lines=[x for x in source.splitlines() if re.match(
+                  r"^\s*(?:(?:impdef|readonly|pure|noreturn)\s+)*func\s+ImpDefBit\b",x)]
+              assert len(lines)==1, len(lines)
+              line=lines[0]
+              permitted=["impdef","readonly","pure","noreturn"]
+              qualifier={s: bool(re.search(r"\b"+s+r"\b",line.split("func",1)[0])) for s in permitted}
+              assert re.search(r"\bfunc\s+ImpDefBit\b",line)
+              print("SAFE_IMPDEFBIT_SIGNATURE",{
+                  "sha256":hashlib.sha256(line.strip().encode()).hexdigest(),
+                  "length":len(line),
+                  "qualifier":qualifier,
+                  "returns_bits1":bool(re.search(r"=>\s*bits\s*\(\s*1\s*\)",line)),
+                  "has_string_formal":bool(re.search(r":\s*string\b",line)),
+                  "has_generic":bool(re.search(r"\bImpDefBit\{",line)),
+                  "has_multiline_header":not "=>" in line,
+                  "current_published_signature_matches":len(_published_signature(source,"ImpDefBit","bits(1)")),
+                  "current_published_function_matches":len(_published_function(source,"ImpDefBit","string","bits(1)"))
+              })
+          PY
