@@ -36,10 +36,11 @@ jobs:
       - name: Build exact compiler source
         working-directory: compiler
         run: |
-          echo "Compiler main commit: $(git rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "Current compiler commit: $(git rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
           RUSTFLAGS="-D warnings" cargo check -p compiler -p compiler-backend-aarch64 -p compiler-backend --all-targets
           cargo test -p compiler-backend --lib
           cargo test -p compiler --bin compiler -- --test-threads=2
+          cargo test -p compiler --test ir_default_cli -- --test-threads=2
           cargo build -p compiler --bin compiler
           cargo clippy -p compiler -p compiler-backend-aarch64 -p compiler-backend --all-targets -- -D warnings
       - name: Execute legacy and native TypeId objects against C oracles
@@ -212,9 +213,11 @@ jobs:
             # full-width Mini-C wide fixture. Do not make old-IR feature gaps
             # block new-IR C-oracle validation. The first seven fixtures still
             # compare both IR pipelines for real executions.
-            modes=(legacy typeid)
+            # Independent GCC runtime gate now also runs the production
+            # implicit AArch64 default, not only --ir typeid.
+            modes=(legacy typeid default)
             case "$example" in
-              wide|division|memory) modes=(typeid) ;;
+              wide|division|memory) modes=(typeid default) ;;
             esac
             for mode in "${modes[@]}"; do
               for pic in none pic; do
@@ -224,8 +227,13 @@ jobs:
                 ext=o
                 if [ "$fmt" = asm ]; then ext=s; fi
                 artifact="$tmp/$example-$mode-$pic.$ext"
+                mode_args=()
+                if [ "$mode" != default ]; then mode_args=(--ir "$mode"); fi
                 "$PWD/target/debug/compiler" "$src" --language "$lang" \
-                  --target aarch64 --ir "$mode" --emit "$fmt" "${pic_opts[@]}" -o "$artifact"
+                  --target aarch64 "${mode_args[@]}" --emit "$fmt" "${pic_opts[@]}" -o "$artifact"
+                if [ "$mode" = default ]; then
+                  cmp "$artifact" "$tmp/$example-typeid-$pic.$ext"
+                fi
                 exe="$tmp/$example-$mode-$pic-$fmt"
                 aarch64-linux-gnu-gcc -nostdlib -static -no-pie -fno-pie \
                   -fno-stack-protector -O0 "$tmp/start.S" "$oracle" "$artifact" -o "$exe"
@@ -235,4 +243,4 @@ jobs:
               done
             done
           done
-          echo "Passed 68 AArch64 QEMU runtime oracle cases (56 legacy/TypeId parity, 12 native TypeId only)." >> "$GITHUB_STEP_SUMMARY"
+          echo "Passed 108 AArch64 QEMU runtime oracle cases (28 legacy, 40 explicit TypeId, 40 default TypeId), including byte-identical implicit-vs-explicit TypeId ELF/GAS." >> "$GITHUB_STEP_SUMMARY"
