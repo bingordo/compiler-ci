@@ -1,0 +1,80 @@
+name: Test P5d2 checked Mini-C TypeId indirect GP variadics
+on:
+  push:
+    branches: [test/p5d2-minic-checked-c-typeid-20261111]
+  pull_request:
+    paths: ['.github/workflows/verify-p5d2-source-indirect.yml']
+permissions:
+  contents: read
+jobs:
+  frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2824a395f332b7960de99d38f461b24a45672c79
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin verified compiler commit and public Mini-C dependency
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "2824a395f332b7960de99d38f461b24a45672c79"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: p5d2-minic-source
+      - name: Strict checked Mini-C source ELF/GAS GCC execution
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --bin compiler m47_p5d2_checked_c_indirect_gp_variadics -- --nocapture 2>&1 | tee "$RUNNER_TEMP/p5d2-source.log"
+          grep -F 'm47_p5d2_checked_c_indirect_gp_variadics_run_elf_gas_and_pie_against_gcc ... ok' "$RUNNER_TEMP/p5d2-source.log"
+          cargo test -p compiler --bin compiler
+          cargo clippy -p compiler --bin compiler -- -D warnings
+      - name: Retain source failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p5d2-source-logs
+          path: ${{ runner.temp }}/p5d2-source.log
+          if-no-files-found: ignore
+  core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2824a395f332b7960de99d38f461b24a45672c79
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm revision and isolate core crates
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "2824a395f332b7960de99d38f461b24a45672c79"
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text('''[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          ''')
+          PY
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: p5d2-ir-check
+      - name: Validate TypeId IR verifier and x86 GP call regressions
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend-x86 --test native_typeid_indirect_gp_varargs -- --nocapture
+          cargo clippy -p compiler-ir --lib -- -D warnings
