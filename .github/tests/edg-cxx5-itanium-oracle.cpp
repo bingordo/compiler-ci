@@ -2,8 +2,6 @@
 // Independent GCC/Itanium ABI oracle. EDG may parse this exact source,
 // but its source-owned logical index must never be mistaken for a
 // physical address point or a secondary-vtable thunk without proof.
-#include <cstddef>
-#include <cstdint>
 struct VRoot {
     virtual int root();
     virtual ~VRoot();
