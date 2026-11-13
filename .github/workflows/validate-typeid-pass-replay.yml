@@ -1,0 +1,59 @@
+name: Validate TypeId native pass dump and reload
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/validate-typeid-pass-replay.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  replay:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: da0a59fd647e97755e619d0c8cf93f5a239aee89
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and isolate dependency-independent core
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "da0a59fd647e97755e619d0c8cf93f5a239aee89"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo 'Source: da0a59fd647e97755e619d0c8cf93f5a239aee89' >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-pass-replay
+      - name: Execute native stage and replay integration tests
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test native_ir_pass_replay -- --nocapture
+          cargo test -p compiler-ir --test native_binary_v1 --test native_module_text_v3
+          cargo clippy -p compiler-opt --all-targets -- -D warnings
+      - name: Existing TypeId optimizer regression suites
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typed_core_pipeline
+          cargo test -p compiler-opt --test typed_ctfe
+          cargo test -p compiler-opt --test typed_sccp
+      - name: Upload failing evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: typeid-pass-replay-failures
+          path: compiler/target/debug/deps/*
+          if-no-files-found: ignore
+          retention-days: 5
