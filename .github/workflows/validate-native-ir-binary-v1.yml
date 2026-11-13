@@ -1,0 +1,93 @@
+name: Validate compiler native TypeId binary v1 reader/writer
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/validate-native-ir-binary-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-ir-v3:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout CI workflow
+        uses: actions/checkout@v4
+      - name: Checkout exact private compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f584600b9a0fa5b5770f7bf684e62191ad7a03e8
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact PR source and isolate core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "f584600b9a0fa5b5770f7bf684e62191ad7a03e8"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          printf 'Compiler PR #928 source SHA: %s\n' "f584600b9a0fa5b5770f7bf684e62191ad7a03e8" >> "$GITHUB_STEP_SUMMARY"
+          rustc --version
+          cargo --version
+      - name: Reuse Rust core build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: native-ir-v3-binary-v1
+      - name: Compile and run TypeId v3 codec and fixture tests
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --offline -p compiler-ir --test native_module_text_v3 --test native_binary_v1 -- --nocapture 2>&1 | tee "$RUNNER_TEMP/ir-v3-focused.log"
+          grep -F 'test result: ok.' "$RUNNER_TEMP/ir-v3-focused.log"
+          cargo run --offline -p compiler-ir --bin ir-tool -- verify crates/ir/tests/fixtures/native_cfg_v3.ir
+          cargo run --offline -p compiler-ir --bin ir-tool -- roundtrip crates/ir/tests/fixtures/native_cfg_v3.ir
+          cargo run --offline -p compiler-ir --bin ir-tool -- normalize crates/ir/tests/fixtures/native_cfg_v3.ir > "$RUNNER_TEMP/native_cfg_v3.normalized.ir"
+          cmp crates/ir/tests/fixtures/native_cfg_v3.ir "$RUNNER_TEMP/native_cfg_v3.normalized.ir"
+          cargo run --offline -p compiler-ir --bin ir-tool -- convert binary crates/ir/tests/fixtures/native_cfg_v3.ir "$RUNNER_TEMP/native_cfg_v1.bin"
+          cargo run --offline -p compiler-ir --bin ir-tool -- verify "$RUNNER_TEMP/native_cfg_v1.bin"
+          cargo run --offline -p compiler-ir --bin ir-tool -- roundtrip "$RUNNER_TEMP/native_cfg_v1.bin"
+          cargo run --offline -p compiler-ir --bin ir-tool -- convert text "$RUNNER_TEMP/native_cfg_v1.bin" "$RUNNER_TEMP/native_cfg_v1_text.ir"
+          cmp crates/ir/tests/fixtures/native_cfg_v3.ir "$RUNNER_TEMP/native_cfg_v1_text.ir"
+      - name: Run all IR tests and strict lint
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --offline -p compiler-ir 2>&1 | tee "$RUNNER_TEMP/ir-full.log"
+          cargo clippy --offline -p compiler-ir --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/ir-clippy.log"
+      - name: Install GDB required by backend debug-object oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v gdb >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq gdb
+          fi
+      - name: Validate dependent optimizer and x86 backend crates
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --offline -p compiler-opt -p compiler-backend -p compiler-backend-x86
+          cargo clippy --offline -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
+      - name: Preserve failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-v1-native-ir-v3-failures
+          path: |
+            ${{ runner.temp }}/ir-v3-focused.log
+            ${{ runner.temp }}/ir-full.log
+            ${{ runner.temp }}/ir-clippy.log
+          if-no-files-found: ignore
+          retention-days: 14
