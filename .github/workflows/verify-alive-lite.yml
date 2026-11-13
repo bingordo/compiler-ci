@@ -15,10 +15,19 @@ on:
         type: boolean
   schedule:
     - cron: '12,27,42,57 * * * *'
+  pull_request:
+    paths:
+      - '.github/workflows/verify-alive-lite.yml'
+      - 'tools/al03_proof_manifest.json'
+      - 'tools/validate_al03_manifest.py'
+      - 'tools/test_validate_al03_manifest.py'
   push:
     branches: [main]
     paths:
       - '.github/workflows/verify-alive-lite.yml'
+      - 'tools/al03_proof_manifest.json'
+      - 'tools/validate_al03_manifest.py'
+      - 'tools/test_validate_al03_manifest.py'
 
 permissions:
   contents: read
@@ -57,7 +66,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .alive-lite-verified
-          key: alive-lite-source-v1-${{ hashFiles('.github/workflows/verify-alive-lite.yml') }}-${{ steps.source.outputs.sha }}
+          key: alive-lite-source-v1-${{ hashFiles('.github/workflows/verify-alive-lite.yml', 'tools/al03_proof_manifest.json', 'tools/validate_al03_manifest.py', 'tools/test_validate_al03_manifest.py') }}-${{ steps.source.outputs.sha }}
           lookup-only: true
       - name: Restrict workspace to compiler core
         if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
@@ -387,6 +396,21 @@ jobs:
           cp "$GITHUB_WORKSPACE/alive-lite-coverage.jsonl" "$GITHUB_WORKSPACE/alive-lite-proofs.jsonl" "$GITHUB_WORKSPACE/.alive-lite-verified/"
           printf '%s\n' "${{ steps.source.outputs.sha }}" > "$GITHUB_WORKSPACE/.alive-lite-verified/source-sha.txt"
           echo "Alive-lite Z3 proof tests passed" >> "$GITHUB_STEP_SUMMARY"
+      - name: Enforce permanent AL-03 concrete and Z3 proof manifest
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools -p 'test_validate_al03_manifest.py' -v
+          python3 tools/validate_al03_manifest.py \
+            --manifest tools/al03_proof_manifest.json \
+            --source compiler/crates/opt/tests/support/alive_lite_typeid_wide.rs \
+            --concrete "$RUNNER_TEMP/alive-lite-concrete.log" \
+            --proofs "$RUNNER_TEMP/alive-lite-proof.log" \
+            --source-sha "${{ steps.source.outputs.sha }}" \
+            --output alive-lite-al03-manifest.json
+          cat alive-lite-al03-manifest.json >> "$GITHUB_STEP_SUMMARY"
+
       - name: Check AL-01 direct TypeId proof test with strict Clippy
         if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
         shell: bash
@@ -418,13 +442,14 @@ jobs:
             alive-lite-memory-proofs.jsonl
             alive-lite-typeid-stage-proofs.jsonl
             alive-lite-typeid-source-proofs.jsonl
+            alive-lite-al03-manifest.json
           retention-days: 14
       - name: Cache exact passing source revision
         if: success() && steps.verified.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: .alive-lite-verified
-          key: alive-lite-source-v1-${{ hashFiles('.github/workflows/verify-alive-lite.yml') }}-${{ steps.source.outputs.sha }}
+          key: alive-lite-source-v1-${{ hashFiles('.github/workflows/verify-alive-lite.yml', 'tools/al03_proof_manifest.json', 'tools/validate_al03_manifest.py', 'tools/test_validate_al03_manifest.py') }}-${{ steps.source.outputs.sha }}
       - name: Report previously validated revision
         if: steps.verified.outputs.cache-hit == 'true' && !inputs.force_recheck && github.event_name != 'push'
         run: echo "Exact compiler revision previously passed Alive-lite proofs" >> "$GITHUB_STEP_SUMMARY"
