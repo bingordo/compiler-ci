@@ -1,0 +1,110 @@
+name: X7 M2.U3.C shared reviewed form admission
+on:
+  push:
+    branches: [ci/x7-m2u3c-shared-form-20261110]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-address:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 32
+    steps:
+      - name: Checkout exact compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 77fe4f5e2ed36b4a9c6473a4b72fe6ac6fdb8e52
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact source and generate sixteen address modes
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 77fe4f5e2ed36b4a9c6473a4b72fe6ac6fdb8e52
+          python3 tools/regen_x86_lea_patterns.py --check
+          python3 - <<'PY'
+          from pathlib import Path
+          dag=Path("crates/backend-x86/src/dag_match.rs").read_text()
+          assert "fn select_native_function(" in dag
+          assert "plan.memory_replacements.get(&inst.id)" in dag
+          assert "plan.addresses.get(&inst.id)" in dag
+          assert "select_address_modes(block,counts,&mut combined)" in dag
+          assert Path("crates/backend-x86/src/generated_lea_patterns.rs").read_text().count("    AddressRule {")==16
+          selector=Path("crates/backend-x86/src/x7_late_selector.rs").read_text()
+          native=Path("crates/backend-x86/src/native_typeid.rs").read_text()
+          assert "fn reviewed_memory_source_form(" in selector
+          assert "let instr = reviewed_memory_source_form(" in selector
+          assert "crate::x7_late_selector::reviewed_memory_source_form(" in native
+          assert "m2u3c_native_and_post_ra_share_reviewed_feature_and_direction_gates" in selector
+          assert "fn emit_adjacent_reviewed_i64_memory_bin(" in native
+          print("X7_M2U3C_SHARED_FORM_ADMISSION_PASS count=16")
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          """)
+          PY
+      - name: New shared memory form policy, direction and negative feature tests
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib m2u3c_native_and_post_ra_share_reviewed_feature_and_direction_gates --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --no-default-features --lib m2u3c_native_and_post_ra_share_reviewed_feature_and_direction_gates --offline
+          cargo test -p compiler-backend-x86 --features x7-c-defined-64 --lib m2u3c_native_and_post_ra_share_reviewed_feature_and_direction_gates --offline
+      - name: Shared native signed address/CFG/overflow/operand tests
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib dag_match::tests::native_address_selector --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --lib dag_match --offline
+      - name: Native x86 complete GAS/ELF C tests, flags and fallback
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --offline
+          cargo test -p compiler-backend-x86 --no-default-features --offline
+          cargo test -p compiler-backend-x86 --features x7-c-defined-64 --offline
+          cargo test -p compiler-backend-x86 --features "x7-c-defined-64 x7-c-defined-sub x7-c-defined-bitwise" --offline
+      - name: Existing reviewed memory-form machine-byte census
+        run: |
+          set -euo pipefail
+          cargo test --release -p compiler-backend-x86 --features x7-c-defined-64 \
+            --test x7_g10_n20c_compile_benchmark --offline -- --nocapture \
+            | tee /tmp/x7-m2u3c-census.log
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          lines=[s for s in Path("/tmp/x7-m2u3c-census.log").read_text().splitlines()
+                 if "X7_N20C_BENCH_JSON " in s]
+          assert len(lines)==1
+          d=json.loads(lines[0].split("X7_N20C_BENCH_JSON ",1)[1])
+          assert (d["selected_total"],d["selected_single"],d["selected_branch"],
+                  d["selected_pressure"],d["text_bytes_saved"])==(120,60,60,0,360),d
+          print("X7_M2U3C_NATIVE_MACHINE_PARITY_PASS folds=120 bytes=360")
+          PY
+  full-workspace:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout exact compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 77fe4f5e2ed36b4a9c6473a4b72fe6ac6fdb8e52
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Private frontend source authorization
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub SSH and install gdb
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+          sudo apt-get update -qq
+          sudo apt-get install -y gdb
+      - name: Whole compiler TypeId, fallback, and opt-in 64-bit
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 77fe4f5e2ed36b4a9c6473a4b72fe6ac6fdb8e52
+          cargo test --workspace
+          cargo test -p compiler-backend-x86 --no-default-features
+          cargo test -p compiler-backend-x86 --features x7-c-defined-64
+          echo X7_M2U3C_FULL_WORKSPACE_PASS
