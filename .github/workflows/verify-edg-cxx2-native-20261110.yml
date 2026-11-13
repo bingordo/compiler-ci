@@ -29,7 +29,7 @@ jobs:
       run:
         shell: edg-container-exec "bash -eo pipefail {0}"
     env:
-      EDG_SOURCE_SHA: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+      EDG_SOURCE_SHA: 2a6f3808ca29a1129e67450429a16e7f862b92a6
       EDG_RELEASE_TAG: edgcpfe-ci-799603e0b5ab
       EDG_RELEASE_SHA256: fa769825e70766fbefe017806816b2338acd03daa93bb5562369c293972ce64c
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -49,7 +49,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: bingundu/edgcpp
-          ref: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+          ref: 2a6f3808ca29a1129e67450429a16e7f862b92a6
           path: edgcpp
           persist-credentials: false
 
@@ -58,31 +58,25 @@ jobs:
           test "$(git -C edgcpp rev-parse HEAD)" = "$EDG_SOURCE_SHA"
           git -C compiler rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: Configure matching EDG native metadata only
+      # A prebuilt archive predating the source hook cannot validate its
+      # semantics. Compile a genuinely matched native EDG callable library.
+      # Keep Actions in compiler-ci; no compiler-repo CI is initiated.
+      - name: Build exact source-owned EDG callable native library
         env:
           EDG_BASE: ${{ github.workspace }}/edgcpp/bases/docker/dev-env/gcc
         working-directory: edgcpp
         run: |
+          set -euo pipefail
           cmake --preset linux-gcc-release \
             -DEDG_BUILD_LIB=OFF \
             -DEDG_BUILD_CALLABLE_LIBRARY=ON \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-          cmake --build build/gcc-release --target error-info --parallel 2
-
-      - name: Restore exact EDG prebuilt native archive
-        working-directory: edgcpp
-        run: |
-          set -euo pipefail
-          url="https://github.com/bingundu/edgcpp/releases/download/$EDG_RELEASE_TAG/edgcpfe-ci-x86_64-callable-release-linux-x86_64.tar.gz"
-          mkdir -p build/gcc-release/lib build/prebuilt-edg
-          curl --fail --location --silent --show-error --retry 4 --retry-delay 2 \
-            "$url" --output build/prebuilt-edg/archive.tar.gz
-          printf '%s  %s\n' "$EDG_RELEASE_SHA256" build/prebuilt-edg/archive.tar.gz | sha256sum --check --status
-          tar -xzf build/prebuilt-edg/archive.tar.gz -C build/prebuilt-edg
-          grep -Fx "commit=$EDG_SOURCE_SHA" build/prebuilt-edg/BUILD-INFO.txt
-          grep -Fx 'platform=linux-x86_64' build/prebuilt-edg/BUILD-INFO.txt
-          test -s build/prebuilt-edg/lib/libedgcpfe.a
-          cp build/prebuilt-edg/lib/libedgcpfe.a build/gcc-release/lib/libedgcpfe.a
+          cmake --build build/gcc-release --target edgcpfe --parallel 2
+          test -s build/gcc-release/lib/libedgcpfe.a
+          # Distinguish the source-hook archive from the previously restored
+          # release archive. No mixed-source native objects are permitted.
+          ar t build/gcc-release/lib/libedgcpfe.a | grep -Fxq 'lower_il.c.o'
+          echo "EDG callable archive built wholly from source revision $EDG_SOURCE_SHA" >>"$GITHUB_STEP_SUMMARY"
 
       - name: Check out C++0 EDG linker-symbol export candidate
         uses: actions/checkout@v4
@@ -99,7 +93,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/edgcpp-rust
-          ref: ab8989bb6f12339fcae64935f9fc424d4f90c678
+          ref: c2a8cdf2cb246919c2c960df3adaebd600df8ba5
           path: edg-rust-call-target
           persist-credentials: false
 
@@ -128,6 +122,7 @@ jobs:
           cargo test --manifest-path edg-rust-call-target/Cargo.toml --lib cxx5_native_call_dispatch_wire_tests -- --nocapture
           cargo test --manifest-path edg-rust-call-target/Cargo.toml --lib cxx5_virtual_member_info_wire_tests -- --nocapture
           cargo test --manifest-path edg-rust-call-target/Cargo.toml --lib callee_vptr_field_tests -- --nocapture
+          cargo test --manifest-path edg-rust-call-target/Cargo.toml --lib cxx5_prelower_virtual_call_origin_tests -- --nocapture
           cargo test --manifest-path edg-rust-call-target/Cargo.toml --lib audit_complete_wire_field_tags_tests -- --nocapture
 
       - name: Probe native EDG logical virtual member and vptr metadata
@@ -158,6 +153,15 @@ jobs:
           grep -F 'EDG_VIRTUAL_MEMBER ' "$RUNNER_TEMP/edg-virtual-member.log" | head -n 20
           grep -F 'EDG_VIRTUAL_MEMBER ' "$RUNNER_TEMP/edg-virtual-member.log" | grep -F 'Base::f'
           grep -F 'EDG_VIRTUAL_MEMBER ' "$RUNNER_TEMP/edg-virtual-member.log" | grep -F 'Derived::f'
+          # The exact EDG method display name may include '()' after
+          # full native compilation. Identity is the source routine ID;
+          # text spelling is diagnostic, not a source admission test.
+          grep -F 'EDG_PRELOWER_VIRTUAL_ORIGIN ' "$RUNNER_TEMP/edg-virtual-member.log" | sed -n '1,12p' || true
+          awk '/EDG_PRELOWER_VIRTUAL_ORIGIN / &&
+               /original_name=Some\("Base::f/ &&
+               /machine_slot_proven=false/ &&
+               /executable_abi_proven=false/ {found=1}
+               END {exit !found}' "$RUNNER_TEMP/edg-virtual-member.log"
           grep -F 'EDG_VIRTUAL_MEMBER ' "$RUNNER_TEMP/edg-virtual-member.log" | grep -Fq 'executable_abi_proven=false'
           g++ -std=c++17 -O0 -o "$RUNNER_TEMP/virtual-member-gcc" virtual-member-source.cpp
           "$RUNNER_TEMP/virtual-member-gcc"
@@ -191,6 +195,7 @@ jobs:
                /machine_slot_proven=false/ &&
                /executable_abi_proven=false/ {found=1}
                END {exit !found}' "$RUNNER_TEMP/edg-virtual-iostream.log"
+          grep -F 'EDG_PRELOWER_VIRTUAL_ORIGIN ' "$RUNNER_TEMP/edg-virtual-iostream.log" | sed -n '1,12p'
           grep -F 'EDG_INDIRECT_CALLEE_VPTR ' "$RUNNER_TEMP/edg-virtual-iostream.log" | sed -n '1,12p'
           # Ordinary C++ function pointers have no EDG vptr field witness.
           cat >ordinary-function-pointer.cpp <<'CPP'
@@ -200,13 +205,17 @@ jobs:
           cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edg-rust-call-target/Cargo.toml" \
             --example parse -- --g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number" \
             ordinary-function-pointer.cpp >"$RUNNER_TEMP/edg-ordinary-pointer.log" 2>&1
+          if grep -Fq 'EDG_PRELOWER_VIRTUAL_ORIGIN ' "$RUNNER_TEMP/edg-ordinary-pointer.log"; then
+            echo "ordinary function pointer incorrectly claimed prelower virtual call origin" >&2
+            exit 1
+          fi
           if grep -Fq 'EDG_INDIRECT_CALLEE_VPTR ' "$RUNNER_TEMP/edg-ordinary-pointer.log"; then
             echo "ordinary function pointer was incorrectly classified as vptr-derived" >&2
             exit 1
           fi
           g++ -std=c++17 -O0 -o "$RUNNER_TEMP/ordinary-pointer-gcc" ordinary-function-pointer.cpp
           "$RUNNER_TEMP/ordinary-pointer-gcc"
-          echo "Native EDG vptr-callee field structure proven in unmodified libstdc++ widen, independent function-pointer negative and G++ controls green; no virtual ABI/codegen admitted" >>"$GITHUB_STEP_SUMMARY"
+          echo "Native source-rebuilt EDG prelower virtual routine origin plus unmodified libstdc++ widen vptr field trace verified; independent function-pointer negatives and G++ controls green; no virtual ABI/codegen admitted" >>"$GITHUB_STEP_SUMMARY"
 
       - name: Verify TypeId-native SysV GP variadic ABI acceptance and rejection
         working-directory: compiler
