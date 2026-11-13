@@ -1,0 +1,79 @@
+name: IR F37 Alive-lite authoritative TypeId SMT proof acceptance
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ir-f37-alive-typeid-z3-20261113.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  typeid-z3:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      ALIVE_LITE_SEEDS: '12'
+    steps:
+      - name: Checkout exact F37 compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 85178a543150445102b8cce6a18d64eb3d8dc189
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check source SHA and restrict Cargo workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 85178a543150445102b8cce6a18d64eb3d8dc189
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo "Exact compiler SHA 85178a543150445102b8cce6a18d64eb3d8dc189" >> "$GITHUB_STEP_SUMMARY"
+      - name: Install independent Z3 solver
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y z3
+          z3 --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-f37-alive-typeid-z3-v1
+      - name: Alive-lite non-ignored replay and fail-closed controls
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test alive_lite -- --nocapture
+      - name: F37 direct TypeId complete source optimizer single-block Z3 proofs
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test alive_lite prove_actual_optimizer_passes -- --ignored --nocapture
+      - name: F37 direct TypeId seeded source optimization Z3 proofs
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test alive_lite prove_seeded_mutations_against_actual_passes -- --ignored --nocapture
+      - name: F37 direct TypeId PRE diamond CFG/PHI Z3 proofs
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test alive_lite prove_cfg_phi_and_real_pre_transforms -- --ignored --nocapture
+      - name: Existing TypeId native composed source Z3 proofs
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test alive_lite al02_source_pipeline_composed_z3_proofs -- --ignored --nocapture
+          cargo test -p compiler-opt --test alive_lite al02_typeid_stage_proof_ledger -- --ignored --nocapture
+          cargo test -p compiler-opt --test alive_lite al01_direct_typeid_proves_changed_cse -- --ignored --nocapture
+      - name: Prior memory and TypeId backend retirement controls
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test memory_execution_oracle -- --nocapture
+          cargo test -p compiler-opt --test loop_trap_semantics -- --nocapture
+          cargo test -p compiler-opt --test pre_licm_semantic_matrix -- --nocapture
+          cargo test -p compiler-ir --lib
+          cargo test -p compiler-backend-x86 --lib
+      - name: Strict all-target Clippy on new proof harness and compiler
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
