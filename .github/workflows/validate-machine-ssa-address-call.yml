@@ -1,0 +1,80 @@
+name: Validate selected machine SSA addresses and indirect calls
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/validate-machine-ssa-address-call.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  x86-memory-calls:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 8e9a8a7a6643336d38790746e35c0f7f18d68d67
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify x86 source and isolate native crates
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "8e9a8a7a6643336d38790746e35c0f7f18d68d67"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo "Compiler SHA: 8e9a8a7a6643336d38790746e35c0f7f18d68d67" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: selected-machine-address-call-x86
+      - name: Execute x86 on-disk machine SSA, memory and indirect call C11 oracles
+        working-directory: compiler
+        run: |
+          cargo test --offline -p compiler-backend-x86 --test machine_text_v1 -- --nocapture
+          cargo test --offline -p compiler-backend-x86 --test machine_typeid_fixture_cli
+          cargo test --offline -p compiler-backend --test machine_ssa_dominance
+      - name: Strict x86/shared backend lint
+        working-directory: compiler
+        run: cargo clippy --offline -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
+  arm64-memory-calls:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 8e9a8a7a6643336d38790746e35c0f7f18d68d67
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify ARM64 source and isolate native crates
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          test "$(git -C compiler rev-parse HEAD)" = "8e9a8a7a6643336d38790746e35c0f7f18d68d67"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: selected-machine-address-call-arm64
+      - name: Execute selected AArch64 machine width/CFG and C11 runtime checks
+        working-directory: compiler
+        run: |
+          cargo test --offline -p compiler-backend-aarch64 --test machine_text_v1 -- --nocapture
+          cargo test --offline -p compiler-backend-aarch64 --test machine_text_v2 -- --nocapture
+          cargo test --offline -p compiler-backend --test machine_ssa_dominance
+      - name: Strict AArch64 library and replay tests lint
+        working-directory: compiler
+        run: |
+          cargo clippy --offline -p compiler-backend-aarch64 --lib --test machine_text_v1 --test machine_text_v2 -- -D warnings
