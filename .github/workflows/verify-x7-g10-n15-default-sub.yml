@@ -1,0 +1,98 @@
+name: X7.G10.N15 default SUB production and fallback gate
+on:
+  push:
+    branches: [ci/x7-g10-n15-default-sub-20261109]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  feature-matrix-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - name: Checkout exact compiler N15 candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5940864fbb554cd562d368a446062646b84c48fe
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check source-pinned ADD/SUB form generator and independent native flags oracle
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 5940864fbb554cd562d368a446062646b84c48fe
+          mkdir -p /tmp/x7-n15-intel /tmp/x7-n15-native
+          rev=35eface1b7ee003a1cda95005ec5fd83de658a64
+          for name in MOV ADD XOR SUB; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 45 \
+              "https://raw.githubusercontent.com/intel/SDM/${rev}/data/instruction/${name}.xml" \
+              -o "/tmp/x7-n15-intel/${name}.xml"
+          done
+          python3 tools/x86_g10_regen_physical_forms.py --xml-dir /tmp/x7-n15-intel --check
+          python3 tools/regen_x86_forms.py --check
+          python3 -m unittest discover -s tools -p 'test_x86_g10_native_iforms.py' -v
+          python3 tools/x86_g10_native_iforms.py --xml-dir /tmp/x7-n15-intel --out-dir /tmp/x7-n15-native
+          cc -O2 -std=c11 -Wall -Wextra -Werror -fno-strict-aliasing \
+            tools/tests/x86_g10_native_iforms.c /tmp/x7-n15-native/native_forms.S \
+            -o /tmp/x7-n15-native/native_oracle
+          /tmp/x7-n15-native/native_oracle
+          python3 tools/x86_g10_validate_native_bytes.py \
+            --binary /tmp/x7-n15-native/native_oracle \
+            --evidence /tmp/x7-n15-native/source_form_evidence.json
+      - name: Focused backend matrix and normal default GAS/direct ELF native C oracle
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          """)
+          PY
+          cargo test -p compiler-backend-x86 --test x7_g10_n15_default_feature_matrix --offline
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --test x7_g10_n15_default_feature_matrix --offline
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --test x7_g10_n15_no_default_fallback --offline
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --features x7-c-defined-add --test x7_g10_n15_default_feature_matrix --offline
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --features x7-c-defined-sub --test x7_g10_n15_default_feature_matrix --offline
+          cargo test -p compiler-backend-x86 --test x7_g10_n14_sub_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --test x7_g10_n12_c_defined_native --offline
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation \
+            --lib x7_late_selector --offline
+          cargo test -p compiler-backend-x86 --lib x7_late_selector --offline
+          echo X7_G10_N15_FEATURE_MATRIX_NATIVE_PASS
+  complete-workspace:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact compiler N15 candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5940864fbb554cd562d368a446062646b84c48fe
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Install native debugger for workspace DWARF tests
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gdb
+      - name: Authenticate private C frontend Git dependencies
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Configure GitHub SSH host key
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+      - name: Complete default workspace and opt-out x86 regression suite
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 5940864fbb554cd562d368a446062646b84c48fe
+          cargo test --workspace
+          cargo test -p compiler-backend-x86 --no-default-features
+          cargo test -p compiler-backend-x86 \
+            --features x7-native-form-validation,x7-c-defined-sub
+          echo X7_G10_N15_FULL_WORKSPACE_PASS
