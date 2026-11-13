@@ -1,0 +1,68 @@
+name: M6 TypeId MemorySSA CFG phi and callback barrier parity
+on:
+  push:
+    branches: [ci/m6-native-memoryssa-cfg-1089-20261111]
+    paths: ['.github/workflows/m6-native-memoryssa-cfg-1089.yml']
+permissions:
+  contents: read
+jobs:
+  native-memoryssa-cfg:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ff597c68daeee9629147404f2a7ec0d952fdf4f8
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Attest pinned source and no Function CFG test adapters
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = ff597c68daeee9629147404f2a7ec0d952fdf4f8
+          python3 - <<'PY'
+          from pathlib import Path
+          root=Path("compiler")
+          source=(root/"crates/opt/tests/m6_typeid_memoryssa_cfg.rs").read_text()
+          cargo=(root/"crates/opt/Cargo.toml").read_text()
+          for token in ("native_memoryssa_join_with_distinct_writes_keeps_phi",
+                        "native_memoryssa_loop_backedge_keeps_header_memory_phi",
+                        "native_memoryssa_call_indirect_is_clobber_and_reuse_barrier",
+                        "native_memoryssa_interblock_callback_blocks_forwarding",
+                        "MemorySsa::build(&module,0)", "TypedSsaModule",
+                        "eliminate_redundant_loads_typed"):
+              assert token in source,token
+          assert "from_legacy" not in source
+          assert "project_legacy_compat_function" not in source
+          assert "struct Function" not in source
+          assert 'name = "m6_typeid_memoryssa_cfg"' in cargo
+          assert (root/"crates/opt/src/memory_ssa.rs").exists()
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: m6-native-memoryssa-cfg-1089
+      - name: Execute native CFG/barrier parity and direct alias/ELF baseline
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --features typeid-memory-ssa --test m6_typeid_memoryssa_cfg -- --nocapture --test-threads=1
+          cargo test -p compiler-opt --features typeid-memory-ssa --test m6_typeid_memoryssa -- --nocapture --test-threads=1
+          cargo test -p compiler-opt --features typeid-memory-ssa --lib -- --test-threads=2
+          cargo clippy -p compiler-opt --features typeid-memory-ssa --all-targets -- -D warnings
+      - name: Compare legacy MemorySSA barriers with new composed M6
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --features legacy-experimental-ssa --test indirect_call_memory_barriers -- --test-threads=1
+          cargo test -p compiler-opt --features legacy-experimental-ssa --test ct03_memoryssa_invalidation_native -- --test-threads=1
+          cargo test -p compiler-opt --features typeid-egraph --test m6_typeid_matrix -- --test-threads=1
+          cargo test -p compiler-opt --features typeid-egraph --test m6_typeid_egraph -- --test-threads=1
+          cargo test -p compiler --features typeid-egraph --bin compiler m6_checked_oberon_source_vs_c_oracle -- --test-threads=1
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --features typeid-egraph --lib m6_real_checked_mini_c_source_vs_gcc -- --test-threads=1
+          cargo clippy -p compiler-opt --features typeid-egraph --all-targets -- -D warnings
