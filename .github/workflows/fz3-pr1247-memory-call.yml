@@ -1,0 +1,92 @@
+name: FZ-3 PR1247 memory alias and internal-call native reference
+on:
+  push:
+    branches: [fuzz/fz3-memory-call-pr1247]
+  workflow_dispatch:
+permissions: { contents: read }
+jobs:
+  oracle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 23
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ba1c0685da5fd95ef26801150d523e3f4c5dc61f
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify tested exact source
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "ba1c0685da5fd95ef26801150d523e3f4c5dc61f"
+          test -s compiler/crates/opt/tests/typeid_native_memory_call.rs
+          test -s compiler/crates/opt/tests/fixtures/typeid_native_memory_call.toml
+      - name: Isolate dependency-free Rust compiler crates
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: fz3-native-memory-calls
+          cache-workspace-crates: 'true'
+      - name: Clippy new independent reference and native reproducer
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt --test typeid_native_memory_call --test typeid_native_reference_ddmin --example typeid_native_diff_repro --example delta_reduce -- -D warnings -A dead_code
+      - name: Native alias memory and internal call oracle raw and optimized GAS ELF
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typeid_native_memory_call -- --nocapture
+      - name: Previous independent TypeId native and pinned fingerprint
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typeid_native_reference_ddmin -- --nocapture
+      - name: External serialized IR oracle for raw and optimized modes
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/fz3-memory-call"
+          mkdir -p "$root"
+          cargo run -p compiler-opt --example typeid_fuzz -- \
+            crates/opt/tests/fixtures/typeid_native_memory_call.toml "$root/generated"
+          cargo build -p compiler-opt --example typeid_native_diff_repro
+          oracle="./target/debug/examples/typeid_native_diff_repro"
+          input="$root/generated/0000-before.ir"
+          test -s "$input"
+          for mode in raw disabled scalar; do
+            set +e
+            if [ "$mode" = raw ]; then
+              "$oracle" "$input" --a 5 --b 7 --sink both
+            else
+              "$oracle" "$input" --a 5 --b 7 --sink both --optimize "$mode"
+            fi
+            status=$?
+            set -e
+            test "$status" -eq 1
+          done
+          # The independent reference must still reject a fabricated
+          # expected/observed wrong-value fingerprint on clean compiler output.
+          set +e
+          "$oracle" "$input" --a 5 --b 7 --sink both \
+            --optimize scalar --expected 12 --observed 4294967294
+          status=$?
+          set -e
+          test "$status" -eq 1
+      - name: Previous ddmin and cross-pass native regression
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typeid_delta_dominance
+          cargo test -p compiler-opt --test delta_reduce_ir
+          cargo test -p compiler-opt --test typeid_fuzz_corpus_reduce
+          cargo test -p compiler-opt --test typeid_fuzz_interactions
+          cargo test -p compiler-opt --test typeid_fuzz_pass_registry
+          cargo test -p compiler-opt --test typed_core_native_verifier
+      - name: Save memory/call replay artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fz3-pr1247-memory-call-reference
+          path: ${{ runner.temp }}/fz3-memory-call/
+          retention-days: 7
