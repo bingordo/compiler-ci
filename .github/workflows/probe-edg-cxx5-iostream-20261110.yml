@@ -1,0 +1,311 @@
+name: EDG C++5 installed libstdc++ iostream header and native probe
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/probe-edg-cxx5-iostream-20261110.yml
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/probe-edg-cxx5-iostream-20261110.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: edg-cxx5-iostream-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  direct-edg:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container:
+      image: ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8
+    defaults:
+      run:
+        shell: edg-container-exec "bash -eo pipefail {0}"
+    env:
+      EDG_SOURCE_SHA: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+      EDG_RELEASE_TAG: edgcpfe-ci-799603e0b5ab
+      EDG_RELEASE_SHA256: fa769825e70766fbefe017806816b2338acd03daa93bb5562369c293972ce64c
+      CARGO_PROFILE_DEV_DEBUG: '1'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUST_TOOLCHAIN_VERSION: 1.99.1
+    steps:
+      - name: Checkout private compiler pilot with scoped CI key
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d37dcb240ea20c79f7bb32aa7a3f4b11959d0941
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+
+      - name: Check out exact EDG headers and configuration
+        uses: actions/checkout@v7
+        with:
+          repository: bingundu/edgcpp
+          ref: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+          path: edgcpp
+          persist-credentials: false
+
+      - name: Record compiler and EDG source revision
+        run: |
+          test "$(git -C edgcpp rev-parse HEAD)" = "$EDG_SOURCE_SHA"
+          git -C compiler rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Configure matching EDG native metadata only
+        env:
+          EDG_BASE: ${{ github.workspace }}/edgcpp/bases/docker/dev-env/gcc
+        working-directory: edgcpp
+        run: |
+          cmake --preset linux-gcc-release \
+            -DEDG_BUILD_LIB=OFF \
+            -DEDG_BUILD_CALLABLE_LIBRARY=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          cmake --build build/gcc-release --target error-info --parallel 2
+
+      - name: Restore exact EDG prebuilt native archive
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          url="https://github.com/bingundu/edgcpp/releases/download/$EDG_RELEASE_TAG/edgcpfe-ci-x86_64-callable-release-linux-x86_64.tar.gz"
+          mkdir -p build/gcc-release/lib build/prebuilt-edg
+          curl --fail --location --silent --show-error --retry 4 --retry-delay 2 \
+            "$url" --output build/prebuilt-edg/archive.tar.gz
+          printf '%s  %s\n' "$EDG_RELEASE_SHA256" build/prebuilt-edg/archive.tar.gz | sha256sum --check --status
+          tar -xzf build/prebuilt-edg/archive.tar.gz -C build/prebuilt-edg
+          grep -Fx "commit=$EDG_SOURCE_SHA" build/prebuilt-edg/BUILD-INFO.txt
+          grep -Fx 'platform=linux-x86_64' build/prebuilt-edg/BUILD-INFO.txt
+          test -s build/prebuilt-edg/lib/libedgcpfe.a
+          cp build/prebuilt-edg/lib/libedgcpfe.a build/gcc-release/lib/libedgcpfe.a
+
+      - name: Check out C++0 EDG linker-symbol export candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/edgcpp-rust
+          ref: 47db6477df35d9b473fdb59736ad8353acbe4f64
+          path: edg-rust
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: |
+          if ! command -v cargo >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN_VERSION"
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install "$RUST_TOOLCHAIN_VERSION" --profile minimal
+          rustup default "$RUST_TOOLCHAIN_VERSION"
+
+      - name: Test source-authoritative EDG C++ dialect and class admission wire events
+        env:
+          EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+          EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+          EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+          EDGCPP_EDG_REVISION: ${{ env.EDG_SOURCE_SHA }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test --manifest-path edg-rust/Cargo.toml --lib decodes_cpp_dialect_and_immutable_record_triviality_proofs
+
+      - name: Verify production adapter uses fixed EDG bridge
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          grep -Fq '47db6477df35d9b473fdb59736ad8353acbe4f64' tools/edg-driver/Cargo.toml
+
+      - name: Build direct EDG to compiler-ir and x86 backend adapter
+        working-directory: compiler
+        env:
+          EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+          EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+          EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+          EDGCPP_EDG_REVISION: ${{ env.EDG_SOURCE_SHA }}
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test --manifest-path tools/edg-driver/Cargo.toml
+          cargo build --manifest-path tools/edg-driver/Cargo.toml
+
+
+      - name: Probe installed G++ headers through EDG then native TypeId without source fallback
+        working-directory: edgcpp/build/gcc-release
+        env:
+          CXX5_ARTIFACTS: ${{ runner.temp }}/edg-cxx5-iostream-probe
+          EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+          EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+          EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+          EDGCPP_EDG_REVISION: ${{ env.EDG_SOURCE_SHA }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source ./environment.sh
+          compiler="${GITHUB_WORKSPACE}/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          fixture="${GITHUB_WORKSPACE}/compiler/tools/edg-driver/tests/fixtures/edg_native_cxx5_iostream.cpp"
+          mkdir -p "$CXX5_ARTIFACTS"
+          cp "$fixture" "$CXX5_ARTIFACTS/iostream.cpp"
+          cd "$CXX5_ARTIFACTS"
+          g++ --version >gxx-version.txt
+          g++ -std=c++17 -v -E -x c++ /dev/null >gxx-include-search.log 2>&1
+          # EDG does not discover GCC's C++ standard-library search paths.
+          # Derive them from the installed compiler, rather than hardcoding a
+          # GCC version, distro triplet or replacement standard-library stub.
+          mapfile -t include_dirs < <(awk '
+            /#include <\.\.\.> search starts here:/{active=1;next}
+            /^End of search list/{active=0}
+            active && /^ /{sub(/^[[:space:]]+/,"");print}
+          ' gxx-include-search.log)
+          test "${#include_dirs[@]}" -ge 3
+          include_flags=()
+          for dir in "${include_dirs[@]}"; do
+            test -d "$dir"
+            include_flags+=("-I$dir")
+          done
+          printf '%s\n' "${include_flags[@]}" >edg-include-flags.txt
+          g++ -std=c++17 -Wall -Wextra -Werror iostream.cpp -o gxx-reference
+          timeout 15s ./gxx-reference >gxx-reference.out 2>gxx-reference.err
+          git -C "$GITHUB_WORKSPACE/compiler" rev-parse HEAD | tee compiler-sha.log
+          gxx_version="$(g++ -dumpfullversion -dumpversion)"
+          IFS=. read -r gnu_major gnu_minor gnu_patch <<<"$gxx_version"
+          gnu_number=$((10#${gnu_major}*10000 + 10#${gnu_minor:-0}*100 + 10#${gnu_patch:-0}))
+          printf 'GCC %s mapped to EDG GNU emulation %d\\n' "$gxx_version" "$gnu_number" | tee -a gxx-version.txt
+          edg_options=(--g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number")
+          if ! cargo run --quiet --manifest-path "${GITHUB_WORKSPACE}/edg-rust/Cargo.toml" --example parse -- "${edg_options[@]}" "${include_flags[@]}" iostream.cpp >edg-parse.log 2>&1; then
+            echo "EDG_CXX5 gate=system_libstdcxx_header_parse result=blocked" >&2
+            tail -n 100 edg-parse.log >&2
+            exit 1
+          fi
+          echo "EDG_CXX5 gate=system_libstdcxx_header_parse result=pass"
+          fixtures="${GITHUB_WORKSPACE}/compiler/tools/edg-driver/tests/fixtures"
+          cp "$fixtures/edg_native_cxx5_header_roots.h" .
+          for label in header_roots header_unused; do
+            cp "$fixtures/edg_native_cxx5_$label.cpp" "source_$label.cpp"
+            g++ -std=c++17 -Wall -Wextra -Werror "source_$label.cpp" -o "reference_$label"
+            timeout 15s "./reference_$label" >"reference_$label.out" 2>"reference_$label.err"
+            rm -f "native_$label.o"
+            "$compiler" "native_$label.o" --typeid-native "${edg_options[@]}" "${include_flags[@]}" "source_$label.cpp" >"native_$label.log" 2>&1 || {
+              echo "EDG_CXX5 source-rooted header fixture rejected: $label" >&2
+              tail -n 20 "native_$label.log" >&2
+              test ! -e "native_$label.o"
+              exit 1
+            }
+            test "$(od -An -tx1 -N4 "native_$label.o" | tr -d '[:space:]')" = 7f454c46
+            g++ "native_$label.o" -o "native_$label"
+            timeout 15s "./native_$label" >"native_$label.out" 2>"native_$label.err"
+            test "$(sha256sum "reference_$label.out" | cut -d' ' -f1)" = "$(sha256sum "native_$label.out" | cut -d' ' -f1)"
+            test "$(sha256sum "reference_$label.err" | cut -d' ' -f1)" = "$(sha256sum "native_$label.err" | cut -d' ' -f1)"
+            echo "EDG_CXX5 gate=source_rooted_header_runtime fixture=$label result=pass"
+          done
+          cp "$fixtures/edg_native_cxx5_header_effectful.cpp" effectful.cpp
+          g++ -std=c++17 -Wall -Wextra -Werror -fsyntax-only effectful.cpp
+          rm -f effectful.o
+          if "$compiler" effectful.o --typeid-native "${edg_options[@]}" "${include_flags[@]}" effectful.cpp >effectful-native.log 2>&1; then
+            echo "EDG_CXX5 unsafe omission of dynamic global side effects" >&2
+            exit 1
+          fi
+          test ! -e effectful.o
+          grep -E -m1 'dynamic initialization|global memory' effectful-native.log || {
+            tail -n 12 effectful-native.log >&2
+            exit 1
+          }
+          echo "EDG_CXX5 gate=source_global_dynamic_effect_rejected result=pass"
+          cp "${GITHUB_WORKSPACE}/compiler/tools/edg-driver/tests/fixtures/edg_native_cxx5_bare_main.cpp" bare.cpp
+          cp "${GITHUB_WORKSPACE}/compiler/tools/edg-driver/tests/fixtures/edg_native_cxx5_iosfwd_unused.cpp" iosfwd.cpp
+          cat >iostream_unused.cpp <<'EOF'
+          #include <iostream>
+          int main() { return 0; }
+          EOF
+          for unit in bare iosfwd iostream_unused iostream; do
+            cargo run --quiet --manifest-path "${GITHUB_WORKSPACE}/compiler/tools/edg-driver/Cargo.toml" --example edg_tu_provenance -- "${edg_options[@]}" "${include_flags[@]}" "$unit.cpp" >"$unit-provenance.log" 2>&1 || {
+              echo "EDG_TU_PROVENANCE probe failed: $unit" >&2
+              tail -n 30 "$unit-provenance.log" >&2
+              exit 1
+            }
+            grep -m1 EDG_TU_PROVENANCE "$unit-provenance.log"
+            grep -E 'EDG_TU_(DEFINITION_COUNT|GLOBAL|DYNAMIC_INIT)' "$unit-provenance.log" | head -n 12 || true
+          done
+          for label in bare iosfwd iostream_unused; do
+            if ! g++ -std=c++17 -Wall -Wextra -Werror -fsyntax-only "$label.cpp"; then
+              echo "EDG_CXX5 G++ control source invalid: $label" >&2
+              exit 1
+            fi
+            set +e
+            timeout 30s "$compiler" "$label.o" --typeid-native "${edg_options[@]}" "${include_flags[@]}" "$label.cpp" >"$label-native.log" 2>&1
+            control_status=$?
+            set -e
+            echo "$label=$control_status" | tee -a native-control-status.txt
+            if test "$control_status" -eq 139 || test "$control_status" -eq 124; then
+              echo "EDG_CXX5 unsafe crash/timeout in source control $label" >&2
+              exit 1
+            fi
+            if test "$control_status" -ne 0; then
+              test ! -e "$label.o"
+              grep -E -m1 '^Error:' "$label-native.log" || tail -n 4 "$label-native.log"
+            else
+              test "$(od -An -tx1 -N4 "$label.o" | tr -d '[:space:]')" = 7f454c46
+              g++ -std=c++17 -Wall -Wextra -Werror "$label.cpp" -o "$label-reference"
+              g++ "$label.o" -o "$label-native"
+              timeout 15s "./$label-reference" >"$label-reference.out" 2>"$label-reference.err"
+              timeout 15s "./$label-native" >"$label-native.out" 2>"$label-native.err"
+              test "$(sha256sum "$label-reference.out" | cut -d' ' -f1)" = "$(sha256sum "$label-native.out" | cut -d' ' -f1)"
+              test "$(sha256sum "$label-reference.err" | cut -d' ' -f1)" = "$(sha256sum "$label-native.err" | cut -d' ' -f1)"
+              echo "EDG_CXX5 gate=native_no_libstdcxx_effects fixture=$label result=pass"
+            fi
+          done
+          # Observe the real status and runtime resource envelope. if ! cmd hides 124/137/139 and makes a killed process look
+          # like an ordinary unsupported-IR diagnostic.
+          echo "memory.max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || true)" >native-resource.log
+          cat /sys/fs/cgroup/memory.events >>native-resource.log 2>/dev/null || true
+          SECONDS=0
+          set +e
+          timeout 60s "$compiler" native.o --typeid-native "${edg_options[@]}" "${include_flags[@]}" iostream.cpp >native-compile.log 2>&1
+          native_status=$?
+          set -e
+          echo "exit_status=$native_status elapsed_seconds=$SECONDS" | tee native-status.log
+          cat /sys/fs/cgroup/memory.events >>native-resource.log 2>/dev/null || true
+          if test "$native_status" -eq 139; then
+            echo "EDG_CXX5 native compiler segfault; collecting debugger evidence" >&2
+            if ! command -v gdb >/dev/null 2>&1; then
+              if command -v dnf >/dev/null 2>&1; then
+                dnf -y install gdb >gdb-install.log 2>&1 || true
+              elif command -v apt-get >/dev/null 2>&1; then
+                apt-get update -qq >gdb-install.log 2>&1 &&
+                  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gdb >>gdb-install.log 2>&1 || true
+              fi
+            fi
+            if command -v gdb >/dev/null 2>&1; then
+              timeout 50s gdb -batch -quiet \
+                -ex 'set pagination off' \
+                -ex 'set print frame-arguments none' \
+                -ex run -ex 'thread apply all bt 28' \
+                --args "$compiler" native.o --typeid-native "${edg_options[@]}" "${include_flags[@]}" iostream.cpp \
+                >native-gdb.log 2>&1 || true
+              grep -A35 -m1 'Program received signal' native-gdb.log | head -n 50 >&2 || true
+            else
+              echo 'GDB_UNAVAILABLE' >native-gdb.log
+            fi
+          fi
+          if test "$native_status" -ne 0; then
+            echo "EDG_CXX5 gate=native_typeid_codegen result=blocked exit_status=$native_status" >&2
+            tail -n 25 native-compile.log >&2
+            tail -n 20 native-resource.log >&2
+            test ! -e native.o
+            exit 1
+          fi
+          test "$(od -An -tx1 -N4 native.o | tr -d '[:space:]')" = 7f454c46
+          readelf -Ws native.o >native-symbols.txt
+          g++ native.o -o native-executable
+          timeout 15s ./native-executable >native.out 2>native.err
+          test "$(sha256sum gxx-reference.out | cut -d' ' -f1)" = "$(sha256sum native.out | cut -d' ' -f1)"
+          test "$(sha256sum gxx-reference.err | cut -d' ' -f1)" = "$(sha256sum native.err | cut -d' ' -f1)"
+          echo "EDG_CXX5 gate=libstdcxx_iostream_native_executable result=pass"
+
+      - name: Preserve C++5 system header, parser and native blocker evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: edg-cxx5-iostream-probe
+          path: ${{ runner.temp }}/edg-cxx5-iostream-probe/
+          if-no-files-found: ignore
