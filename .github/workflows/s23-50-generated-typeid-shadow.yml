@@ -1,0 +1,62 @@
+name: S23.50 generated TypeId shadow matcher, source-pinned
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-50-generated-typeid-shadow.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  generated-shadow:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Fetch exact compiler S23.50 candidate (never run on compiler Actions)
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2fc0a16eed6b6baffda20e4239fc17529de914b1
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Validate pinned source and isolate optimizer workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 2fc0a16eed6b6baffda20e4239fc17529de914b1
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+          python3 --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: s23-50-generated-shadow
+      - name: Validate Python parser and standalone generated Rust and SSA view
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m compileall -q tools/typeid-rule-gen
+          python3 -m unittest discover -s tools/typeid-rule-gen -p 'test_*.py' -v
+          python3 tools/typeid-rule-gen/rules.py tools/typeid-rule-gen/examples.rules --emit-ssa-rust > "$RUNNER_TEMP/shadow.rs"
+          rustc --edition=2021 --crate-type=lib "$RUNNER_TEMP/shadow.rs" -o "$RUNNER_TEMP/libshadow.rlib"
+      - name: Test native read-only TypeId adapter and existing algebra
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib --features experimental-typeid-generated-shadow generated_typeid_shadow::tests -- --nocapture
+          cargo test -p compiler-opt --test generated_native_integer_algebra -- --nocapture
+      - name: Strict native optimizer Clippy with generated shadow enabled
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --all-targets --features experimental-typeid-generated-shadow -- -D warnings
