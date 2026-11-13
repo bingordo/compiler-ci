@@ -1,0 +1,54 @@
+name: Validate selected machine SSA dominance and operand ordering
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/validate-machine-ssa-dominance.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  selected-ssa-dom:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout exact private compiler commit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 57f9a71eb6776879db2c13499b3e20c1be1b0e2f
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and isolate core/target backends
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "57f9a71eb6776879db2c13499b3e20c1be1b0e2f"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo "Exact compiler SHA: 57f9a71eb6776879db2c13499b3e20c1be1b0e2f" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: machine-ssa-dominance-gate
+      - name: Shared machine SSA verifier dominance and CFG tests
+        working-directory: compiler
+        run: |
+          cargo test --offline -p compiler-backend --test machine_ssa_dominance -- --nocapture
+          cargo test --offline -p compiler-backend --test machine_text_v1
+      - name: Real x86 and AArch64 target-selected SSA text/CLI/ELF tests
+        working-directory: compiler
+        run: |
+          cargo test --offline -p compiler-backend-x86 --test machine_text_v1 -- --nocapture
+          cargo test --offline -p compiler-backend-x86 --test machine_typeid_fixture_cli -- --nocapture
+          cargo test --offline -p compiler-backend-aarch64 --test machine_text_v1 -- --nocapture
+          cargo test --offline -p compiler-backend-aarch64 --test machine_text_v2 -- --nocapture
+      - name: Strict backend/ISA selected machine tests Clippy
+        working-directory: compiler
+        run: |
+          cargo clippy --offline -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
+          cargo clippy --offline -p compiler-backend-aarch64 --lib --test machine_text_v1 --test machine_text_v2 -- -D warnings
