@@ -1,0 +1,96 @@
+name: X7 signed DIV/REM generated descriptor exact-source verification
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-x7-generated-divrem-20261113.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: x7-divrem-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  generated:
+    name: 36-rule generator and strict reviewed descriptor
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5edcab89d8655aad0bc5d7a1b05ea8b15cb2b08c
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Enforce pinned source SHA
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "5edcab89d8655aad0bc5d7a1b05ea8b15cb2b08c"
+      - name: Python generator, source and mutation negative tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/regen_x86_selector_rules.py --check
+          python3 -m unittest discover -s tools -p test_x86_selector_rules.py -v
+      - name: Avoid resolving unrelated private frontends
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: x7-divrem-generated
+      - name: Exact selection, negative tests and all-targets Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib selector::tests::generated_divrem_descriptor -- --nocapture
+          cargo test -p compiler-backend-x86 --lib selector::tests -- --test-threads=2
+          cargo clippy -p compiler-backend-x86 --all-targets --all-features -- -D warnings
+  regression:
+    name: All-feature x86 and core TypeId regression
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5edcab89d8655aad0bc5d7a1b05ea8b15cb2b08c
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Enforce pinned source SHA
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "5edcab89d8655aad0bc5d7a1b05ea8b15cb2b08c"
+      - name: Avoid resolving unrelated private frontends
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: x7-divrem-regression
+      - name: Full default x86 backend regression
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 -- --test-threads=2
+      - name: Full all-features x86 backend regression
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --all-features -- --test-threads=2
+      - name: Install GDB required by existing DWARF test
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gdb
+      - name: All core TypeId regressions
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -- --test-threads=2
