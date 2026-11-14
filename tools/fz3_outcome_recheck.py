@@ -99,11 +99,21 @@ def recheck(report: Path, history_dir: Path, triage_dir: Path,
         ident = row["id"]
         base.require(ident not in new_ids and ident in history_by_id and
                      v2.fingerprint_id(row) == ident and
-                     v2.key(row) in current and
-                     ident not in state, "invalid or repeated new v2 finding")
+                     v2.key(row) in current, "invalid or repeated new v2 finding")
+        source_row = current[v2.key(row)]
+        base.require(row["occurrences"] == source_row["occurrences"] and
+                     row["first_seed"] == source_row["first_seed"] and
+                     row["first_profile"] == source_row["first_profile"],
+                     "new v2 finding metadata does not match original report")
         new_ids.add(ident)
-        source = v2.safe_witness(report, current[v2.key(row)]["minimized_ir"],
+        source = v2.safe_witness(report, source_row["minimized_ir"],
                                  "minimized.ir")
+        if ident in state:
+            base.require(state[ident]["last_run_token"] == token and
+                         state[ident]["state"] == "reproduces" and
+                         witness_path(history_dir, ident).read_bytes() == source.read_bytes(),
+                         "repeated v2 archive differs from already verified witness")
+            continue
         target = witness_path(history_dir, ident)
         status, detail = classify(oracle, source, row, timeout)
         base.require(status == "reproduces",
@@ -112,10 +122,16 @@ def recheck(report: Path, history_dir: Path, triage_dir: Path,
             base.require(target.read_bytes() == source.read_bytes(),
                          "distinct witnesses collide at same v2 fingerprint ID")
         copies.append((source, target, row))
-    # The triage's new list must be exactly all keys first introduced in this
-    # run, not a forged partial list that hides a required archive.
-    base.require(all(row["id"] in history_by_id for row in newly_reported),
-                 "new v2 issue roster references unknown fingerprint")
+    # If the same run is replayed, state already holds its archived IDs.
+    # Otherwise every new history key must be present in the signed triage
+    # manifest; a truncated manifest must not silently omit a new archive.
+    expected = {
+        row["id"] for row in history
+        if row["first_run"] == url and row["first_sha"] == sha
+        and row["id"] not in state
+    }
+    base.require(expected.issubset(new_ids),
+                 "new v2 issue roster omits an unarchived fingerprint")
     for source, target, row in copies:
         target.parent.mkdir(parents=True, exist_ok=True)
         if not target.exists():
