@@ -1,0 +1,62 @@
+name: IR F44 TypeId CT03 validation boundary audit
+on:
+  push:
+    branches:
+      - ci/ir-f44-ct03-validation-20261113
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  typeid-ct03:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler F44 source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b01f0df8d466aa5b3f8842a223cfb46ba91e2615
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pin and restrict core workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "b01f0df8d466aa5b3f8842a223cfb46ba91e2615"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo "Source SHA: b01f0df8d466aa5b3f8842a223cfb46ba91e2615" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-f44-ct03-typeid-v1
+      - name: Verify CT03 exact legacy handoff counts and native TypeId stage snapshots
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib --features verify-counts ct03_verify_counts:: -- --nocapture
+      - name: Standard and optional full optimizer unit suites
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --lib --features verify-counts
+      - name: Source pipeline and native CFG regressions
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_core_pipeline
+          cargo test -p compiler-opt --test pre_licm_semantic_matrix
+          cargo test -p compiler-opt --test typed_native_parity
+          cargo test -p compiler-ir --lib
+      - name: Strict all-target Clippy including verifier-count feature
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets --features compiler-opt/verify-counts -- -D warnings
