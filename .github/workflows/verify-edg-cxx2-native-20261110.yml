@@ -40,7 +40,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 08b1260a1599a085b69a7b781fb56a9a07affade
+          ref: 8d50f0b5f24858be57e9488abaca0d54fb392820
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -93,7 +93,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/edgcpp-rust
-          ref: 00f9e62feffb0760b014269980427f26c0744057
+          ref: 4ad56275d6aeeb2f1326ad4d43b14b2a100f77ed
           path: edg-rust-call-target
           persist-credentials: false
 
@@ -384,6 +384,7 @@ jobs:
           cargo test --manifest-path tools/edg-driver/Cargo.toml cxx5_external_member_pointer_abi_tests -- --nocapture
           cargo test --manifest-path tools/edg-driver/Cargo.toml cxx5_borrowed_record_storage_tests -- --nocapture
           cargo test --manifest-path tools/edg-driver/Cargo.toml aggregate_storage_reference_tests -- --nocapture
+          cargo test --manifest-path tools/edg-driver/Cargo.toml nested_halfword_is_layout_only -- --nocapture
           cargo test --manifest-path tools/edg-driver/Cargo.toml tagless_storage_never_admits_unknown_class_effects_or_value_use -- --nocapture
           cargo test --manifest-path tools/edg-driver/Cargo.toml nontrivial_record_rejection_has_exact_source_root_evidence -- --nocapture
           cargo test --manifest-path tools/edg-driver/Cargo.toml rejected_class_native_field_and_local_source_provenance_is_reported -- --nocapture
@@ -424,6 +425,41 @@ jobs:
           test "$(sha256sum reference.err | cut -d' ' -f1)" = "$(sha256sum native.err | cut -d' ' -f1)"
           # Program success requires native field write/read to preserve 131.
           echo 'EDG_NATIVE_AGGREGATE gate=240_bytes_align8_nested_union_execution result=pass'
+
+      - name: Execute source C++17 240 and 224 byte nested POD aggregate with G++ oracle
+        working-directory: edgcpp/build/gcc-release
+        env:
+          EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+          EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+          EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+          EDGCPP_EDG_REVISION: ${{ env.EDG_SOURCE_SHA }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source ./environment.sh
+          work="${RUNNER_TEMP}/edg-cxx5-nested-aggregate"
+          mkdir -p "$work"
+          cp "${GITHUB_WORKSPACE}/compiler/tools/edg-driver/tests/fixtures/edg_native_cxx5_nested_aggregate_240.cpp" "$work/fixture.cpp"
+          cd "$work"
+          g++ -std=c++17 -O0 -Wall -Wextra -Werror fixture.cpp -o reference
+          timeout 15s ./reference >reference.out 2>reference.err
+          rm -f native.o
+          version="$(g++ -dumpfullversion -dumpversion)"
+          IFS=. read -r major minor patch <<<"$version"
+          gnu_number=$((10#${major}*10000+10#${minor:-0}*100+10#${patch:-0}))
+          edg_flags=(--g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number")
+          "${GITHUB_WORKSPACE}/compiler/tools/edg-driver/target/debug/compiler-edg-driver" \
+            native.o --typeid-native "${edg_flags[@]}" fixture.cpp >compile.log 2>&1 || {
+              tail -n 35 compile.log >&2
+              test ! -e native.o
+              exit 1
+            }
+          test "$(od -An -tx1 -N4 native.o | tr -d '[:space:]')" = 7f454c46
+          g++ native.o -o native
+          timeout 15s ./native >native.out 2>native.err
+          test "$(sha256sum reference.out | cut -d' ' -f1)" = "$(sha256sum native.out | cut -d' ' -f1)"
+          test "$(sha256sum reference.err | cut -d' ' -f1)" = "$(sha256sum native.err | cut -d' ' -f1)"
+          echo 'EDG_CXX5_NATIVE gate=nested_240_224_POD_execution result=pass'
 
       - name: Execute real native EDG C++2 lifetime and compare independent G++ trace
         working-directory: edgcpp/build/gcc-release
@@ -576,6 +612,8 @@ jobs:
           int main() { std::cout << "Hello, world!"; }
           CPP
           for variant in hello-world hello-no-endl; do
+            # Source-only nested record diagnostic remains bounded and does
+            # not authorize class ABI or weaken the expected fail-closed gate.
             g++ -std=c++17 -Wall -Wextra -Werror "$variant.cpp" -o "$variant-reference"
             timeout 15s "./$variant-reference" >"$variant-reference.out" 2>"$variant-reference.err"
             test ! -s "$variant-reference.err"
@@ -639,24 +677,16 @@ jobs:
                 grep -F "ROUTINE_ID RoutineIdentity { routine: SymbolId($rejected_member)," "$variant-native-compile.log" | head -n 1 | tee -a "$GITHUB_STEP_SUMMARY" || true
               fi
               grep -E "^Error:|EDG -> compiler-ir rejected" "$variant-native-compile.log" | tail -n 1 | tee -a "$GITHUB_STEP_SUMMARY" || true
-              # This candidate correctly advances past the previous
-              # inherited-class witness and now reaches a genuinely
-              # materialized nontrivial record. Require this exact next
-              # fail-closed boundary, not an arbitrary compiler error.
-              grep -Fq 'EDG -> compiler-ir rejected source: C++ local record has user/nontrivial member or lifetime semantics' "$variant-native-compile.log"
-              # A source-specific conservative class-storage witness is
-              # mandatory, not merely an anonymous nontrivial record error.
-              grep -F 'C++ local record has user/nontrivial member or lifetime semantics' "$variant-native-compile.log" |
-                grep -Eq 'record=TypeId\([0-9]+\) conservative_roots=[1-9][0-9]* origins=\['
-              # The 240-byte three-field class is *still* unadmitted,
-              # but every source-owned field and scope/local origin must
-              # be present for the next bounded implementation step.
-              grep -F 'C++ local record has user/nontrivial member or lifetime semantics' "$variant-native-compile.log" |
-                grep -Fq 'native_layout=Some((240, 8)) record_shape=Some((3, 0))'
-              grep -F 'C++ local record has user/nontrivial member or lifetime semantics' "$variant-native-compile.log" |
-                grep -Fq 'native_field_evidence=[position=0'
-              grep -F 'C++ local record has user/nontrivial member or lifetime semantics' "$variant-native-compile.log" |
-                grep -Fq 'statement_decls='
+              # The original __C8 and its 224-byte pre-lowered nested
+              # subobject now pass independently verified storage checks.
+              # Preserve fail-closed semantics on the next unsupported
+              # automatic typeref until its qualifiers and lifetime are
+              # individually supported. No partial ELF is ever allowed.
+              grep -Fq 'EDG -> compiler-ir rejected source: C++ automatic record needs unsupported qualifier/reference semantics:' "$variant-native-compile.log"
+              grep -F 'C++ automatic record needs unsupported qualifier/reference semantics:' "$variant-native-compile.log" |
+                grep -Eq 'routine=SymbolId\([0-9]+\) local=SymbolId\([0-9]+\) local_type=TypeId\([0-9]+\) alias_type=TypeId\([0-9]+\) qualifiers='
+              grep -F 'EDG_CXX5_NESTED_STORAGE type_id=' "$variant-native-compile.log" |
+                grep -F 'bytes=224 align=8' | grep -Fq 'subobject_type=1 subobject_partner_present=1 subobject_partner_self=0'
               if test "$variant" = hello-no-endl; then
                 grep -F 'EDG_CXX5_CALL_GLOBAL path=' "$variant-native-compile.log" | grep -Fq 'name=Some("std::cout") source_link_proof=Ok("_ZSt4cout")'
               fi
@@ -679,7 +709,7 @@ jobs:
               grep -F 'EDG_NATIVE_SCOPE_OWNER ' "$variant-native-compile.log" |
                 grep -F 'class_bytes=240' | head -n 4 | tee -a "$GITHUB_STEP_SUMMARY"
               grep -F 'EDG_NATIVE_SCOPE_OWNER ' "$variant-native-compile.log" | head -n 20 | tee -a "$GITHUB_STEP_SUMMARY"
-              grep -F 'C++ local record has user/nontrivial member or lifetime semantics' "$variant-native-compile.log" | tail -n 1 | tee -a "$GITHUB_STEP_SUMMARY"
+              grep -F 'C++ automatic record needs unsupported qualifier/reference semantics:' "$variant-native-compile.log" | tail -n 1 | tee -a "$GITHUB_STEP_SUMMARY"
               echo "EDG_CXX5_NATIVE gate=iostream_fail_closed fixture=$variant result=pass"
             fi
           done
