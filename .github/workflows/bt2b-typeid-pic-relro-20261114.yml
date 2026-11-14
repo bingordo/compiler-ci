@@ -1,0 +1,56 @@
+name: BT2b TypeId x86 PIC RELRO and read-only global pointer relocation
+on:
+  push:
+    branches:
+      - ci/bt2b-typeid-pic-relro-20261114
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-relro:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5a440890c43046f8d2b40f3e25dc1b1b1328a592
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source and core-only workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "5a440890c43046f8d2b40f3e25dc1b1b1328a592"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo "BT2b pinned compiler 5a440890c43046f8d2b40f3e25dc1b1b1328a592" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: bt2b-x86-native-relro-v1
+      - name: Native TypeId x86 PIC GOT RELRO 8 ELF/GAS runtime sinks
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --test x7_shared_pic_global_native -- --nocapture
+      - name: Preserve historical x86 PIC and TypeId relocations
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test m4_pic_globals_shared_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test m4_pic_relocation_rebase_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test native_typeid_memory_calls
+          cargo test -p compiler-backend-x86 --test x7_shared_signed_index_native
+      - name: All core target compilation and strict Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check --workspace --all-targets
+          cargo clippy --workspace --all-targets -- -D warnings
