@@ -30,7 +30,7 @@ class OutcomeArchiveTests(unittest.TestCase):
         self.history.mkdir()
         self.oracle.write_text(
             "#!/usr/bin/env python3\n"
-            "print('OUTCOME_MISMATCH a=5 b=0 expected=sigfpe observed=value:5')\n"
+            "print('OUTCOMES_V1 a=5 b=0 expected=sigfpe observed=value:5')\n"
         )
         self.oracle.chmod(0o755)
 
@@ -88,7 +88,7 @@ class OutcomeArchiveTests(unittest.TestCase):
     def test_wrong_oracle_result_cannot_archive(self):
         row = self.fixture()
         self.oracle.write_text("#!/usr/bin/env python3\n"
-                               "print('OUTCOME_MISMATCH a=6 b=0 expected=sigfpe observed=value:5')\n")
+                               "print('OUTCOMES_V1 a=6 b=0 expected=sigfpe observed=value:5')\n")
         with self.assertRaisesRegex(ValueError, "did not reproduce"):
             self.run_recheck()
         self.assertFalse(recheck.witness_path(self.history, v2.fingerprint_id(row)).exists())
@@ -106,8 +106,9 @@ class OutcomeArchiveTests(unittest.TestCase):
         status, detail = recheck.classify(self.oracle,
                                           recheck.witness_path(self.history, ident),
                                           row, timeout=2)
-        self.assertEqual(status, "not-exact")
-        self.assertIn("no fix is inferred", detail)
+        self.assertEqual(status, "unavailable",
+                         "exit 1 must not claim agreement or a fix")
+        self.assertIn("oracle exited", detail)
 
     def test_oracle_errors_are_unavailable(self):
         row = self.fixture()
@@ -120,6 +121,156 @@ class OutcomeArchiveTests(unittest.TestCase):
         status, _ = recheck.classify(self.oracle, self.report /
                                      row["minimized_ir"], row, 2)
         self.assertEqual(status, "unavailable")
+
+    def test_unpinned_reports_distinguish_agreement_changed_error_and_reference_drift(self):
+        row = self.fixture()
+        self.run_recheck()
+        witness = recheck.witness_path(self.history, v2.fingerprint_id(row))
+        for observed, expected_status in (
+            ("sigfpe", "agrees"),
+            ("value:6", "changed-mismatch"),
+            ("value:5", "reproduces"),
+        ):
+            with self.subTest(observed=observed):
+                self.oracle.write_text(
+                    "#!/usr/bin/env python3\n"
+                    f"print('OUTCOMES_V1 a=5 b=0 expected=sigfpe observed={observed}')\n"
+                )
+                status, _ = recheck.classify(self.oracle, witness, row, 2)
+                self.assertEqual(status, expected_status)
+        self.oracle.write_text(
+            "#!/usr/bin/env python3\n"
+            "print('OUTCOMES_V1 a=5 b=0 expected=value:0 observed=value:0')\n"
+        )
+        status, detail = recheck.classify(self.oracle, witness, row, 2)
+        self.assertEqual(status, "unavailable")
+        self.assertIn("reference drift", detail)
+
+    def next_run(self, sha, run_number):
+        """Register one real-source-identified synthetic clean campaign."""
+        token = f"{run_number}.1"
+        url = f"https://github.com/bingordo/compiler-ci/actions/runs/{run_number}"
+        (self.report / "summary.txt").write_text(
+            f"status=no-mismatch\nsource_sha={sha}\ninjected=false\n"
+            "unique_failures=0\noutcome_unique_failures=0\n"
+            "outcome_duplicates=0\nevaluations=10\nmax_unique=4\n"
+        )
+        base.write_tsv(self.report / "outcome_fingerprints_v2.tsv",
+                       v2.V2_COLUMNS, [])
+        _, digest = base.verify_campaign(self.report, sha)
+        receipts = base.read_tsv(self.history / "processed_runs.tsv",
+                                 base.PROCESSED_COLUMNS)
+        receipts.append({
+            "run_token": token, "run_url": url, "source_sha": sha,
+            "report_digest": digest,
+        })
+        base.write_tsv(self.history / "processed_runs.tsv",
+                       base.PROCESSED_COLUMNS, receipts)
+        v2.reconcile(self.report, self.history, self.triage, sha, token, url)
+        return recheck.recheck(self.report, self.history, self.triage,
+                               self.output, self.oracle, sha, token, url)
+
+    def test_distinct_revision_fix_evidence_regression_and_no_duplicate_events(self):
+        row = self.fixture()
+        self.run_recheck()
+        sha2 = "abcdef0123456789abcdef0123456789abcdef01"
+        sha3 = "2222222222222222222222222222222222222222"
+        sha4 = "3333333333333333333333333333333333333333"
+        self.oracle.write_text(
+            "#!/usr/bin/env python3\n"
+            "print('OUTCOMES_V1 a=5 b=0 expected=sigfpe observed=sigfpe')\n"
+        )
+        result = self.next_run(sha2, 124)
+        self.assertEqual(result["agrees"], 1)
+        events = base.read_tsv(self.output / "outcome_events_v2.tsv",
+                               recheck.EVENT_COLUMNS)
+        self.assertEqual([r["event"] for r in events], ["suspected-fix"])
+        evidence = base.read_tsv(self.history / "outcome_agreements_v2.tsv",
+                                 recheck.AGREEMENT_COLUMNS)
+        self.assertEqual(evidence[0]["first_agree_sha"], sha2)
+        self.assertEqual(evidence[0]["second_agree_sha"], "")
+        result = self.next_run(sha3, 125)
+        self.assertEqual(result["agrees"], 1)
+        events = base.read_tsv(self.output / "outcome_events_v2.tsv",
+                               recheck.EVENT_COLUMNS)
+        self.assertEqual([r["event"] for r in events],
+                         ["second-revision-agreement"])
+        evidence = base.read_tsv(self.history / "outcome_agreements_v2.tsv",
+                                 recheck.AGREEMENT_COLUMNS)
+        self.assertEqual(evidence[0]["second_agree_sha"], sha3)
+        # A repeated run cannot produce another issue transition.
+        replay = recheck.recheck(self.report, self.history, self.triage,
+                                self.output, self.oracle, sha3, "125.1",
+                                "https://github.com/bingordo/compiler-ci/actions/runs/125")
+        self.assertEqual(replay["agrees"], 0)
+        self.assertEqual(base.read_tsv(self.output / "outcome_events_v2.tsv",
+                                       recheck.EVENT_COLUMNS), [])
+        self.oracle.write_text(
+            "#!/usr/bin/env python3\n"
+            "print('OUTCOMES_V1 a=5 b=0 expected=sigfpe observed=value:5')\n"
+        )
+        result = self.next_run(sha4, 126)
+        self.assertEqual(result["reproduces"], 1)
+        events = base.read_tsv(self.output / "outcome_events_v2.tsv",
+                               recheck.EVENT_COLUMNS)
+        self.assertEqual([r["event"] for r in events], ["regression"])
+        self.assertEqual(base.read_tsv(
+            self.history / "outcome_agreements_v2.tsv",
+            recheck.AGREEMENT_COLUMNS), [])
+        sha5 = "4" * 40
+        self.oracle.write_text(
+            "#!/usr/bin/env python3\n"
+            "print('OUTCOMES_V1 a=5 b=0 expected=sigfpe observed=value:7')\n"
+        )
+        self.assertEqual(self.next_run(sha5, 127)["changed-mismatch"], 1)
+        events = base.read_tsv(self.output / "outcome_events_v2.tsv",
+                               recheck.EVENT_COLUMNS)
+        self.assertEqual([r["event"] for r in events], ["changed-outcome"])
+        sha6 = "5" * 40
+        self.oracle.write_text(
+            "#!/usr/bin/env python3\n"
+            "print('OUTCOMES_V1 a=5 b=0 expected=value:0 observed=value:0')\n"
+        )
+        self.assertEqual(self.next_run(sha6, 128)["unavailable"], 1)
+        self.assertEqual(base.read_tsv(self.output / "outcome_events_v2.tsv",
+                                       recheck.EVENT_COLUMNS), [])
+
+    def test_same_revision_twice_does_not_count_as_two_agreements(self):
+        self.fixture()
+        self.run_recheck()
+        sha2 = "6" * 40
+        self.oracle.write_text(
+            "#!/usr/bin/env python3\n"
+            "print('OUTCOMES_V1 a=5 b=0 expected=sigfpe observed=sigfpe')\n"
+        )
+        self.next_run(sha2, 129)
+        self.assertEqual(
+            [row["event"] for row in base.read_tsv(
+                self.output / "outcome_events_v2.tsv", recheck.EVENT_COLUMNS)],
+            ["suspected-fix"]
+        )
+        self.next_run(sha2, 130)
+        self.assertEqual(base.read_tsv(self.output / "outcome_events_v2.tsv",
+                                       recheck.EVENT_COLUMNS), [])
+        evidence = base.read_tsv(self.history / "outcome_agreements_v2.tsv",
+                                 recheck.AGREEMENT_COLUMNS)
+        self.assertEqual(evidence[0]["first_agree_sha"], sha2)
+        self.assertEqual(evidence[0]["second_agree_sha"], "")
+
+    def test_unexpected_trap_direction_rechecks_as_agreement(self):
+        self.fixture()
+        row = {
+            "mode": "raw", "sink": "gas", "a": "5", "b": "0",
+            "expected": "value:5", "actual": "sigfpe",
+        }
+        self.oracle.write_text(
+            "#!/usr/bin/env python3\n"
+            "print('OUTCOMES_V1 a=5 b=0 expected=value:5 observed=value:5')\n"
+        )
+        state, _ = recheck.classify(self.oracle,
+                                    self.report / "outcome-000/minimized.ir",
+                                    row, 2)
+        self.assertEqual(state, "agrees")
 
     def test_changed_minimized_ir_after_triage_cannot_silently_archive(self):
         self.fixture()
