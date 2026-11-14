@@ -1,0 +1,51 @@
+name: BT4 AArch64 CTZ Select 12-argument indirect call TypeId native QEMU
+on:
+  push:
+    branches: [ci/bt4-ctz-select-indirect-typeid-20261114]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  retire-old-ctz-calls:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 357cee736431b16e422fa6c0767abdf87fd29c55
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin compiler and isolate target/backend workspace
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 357cee736431b16e422fa6c0767abdf87fd29c55
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
+          """)
+          PY
+      - name: Validate old Function caller is gone, TypeId spills and all AArch64 tests
+        run: |
+          set -euo pipefail
+          if grep -nE '(compiler_backend::Backend|machine::select\(|compiler_ir::Function)' crates/backend-aarch64/tests/ctz_select_calls.rs; then
+            echo "BT4 CTZ/Select still depends on historical Backend(Function)"; exit 1
+          fi
+          cargo check -p compiler-backend-aarch64 --all-targets
+          cargo test -p compiler-backend-aarch64 --test ctz_select_calls -- --nocapture
+          cargo test -p compiler-backend-aarch64 --tests
+          cargo clippy -p compiler-backend-aarch64 --all-targets -- -D warnings
+      - name: Install native AArch64 runtime and cross compiler
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu qemu-user
+      - name: Execute original 8192-random C11 CTZ select/void/indirect 12-arg ABI oracle in four sinks
+        env:
+          COMPILER_REQUIRE_AARCH64_QEMU: "1"
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-aarch64 --test ctz_select_calls -- --nocapture
+          echo BT4_ORIGINAL_CTZ_SELECT_12GP_TYPEID_QEMU_PASS
