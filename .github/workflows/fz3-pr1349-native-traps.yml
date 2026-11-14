@@ -1,0 +1,48 @@
+name: FZ-3 PR1349 native SIGFPE / value independent differential
+on:
+  push:
+    branches: [fuzz/fz3-trap-native-pr1349]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  traps:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e1c8d8ef49d55249bdc1b8081f73399ea3efd78a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source SHA
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "e1c8d8ef49d55249bdc1b8081f73399ea3efd78a"
+          test -s compiler/crates/opt/tests/typeid_native_trap_differential.rs
+      - name: Isolate dependency-free core workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: fz3-native-trap-sigfpe
+      - name: Clippy test-only native trap oracle
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt --test typeid_native_trap_differential -- -D warnings -A dead_code
+      - name: Independent TypeId reference vs actual GAS and ELF values and traps
+        working-directory: compiler
+        run: |
+          ulimit -c 0
+          cargo test -p compiler-opt --test typeid_native_trap_differential -- --nocapture
+      - name: Prior native FZ3 reference and pass activity regression
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typeid_native_reference_ddmin
+          cargo test -p compiler-opt --test typeid_native_campaign
+          cargo test -p compiler-opt --test typeid_fuzz_pass_registry
