@@ -33,7 +33,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: alive-lite-source-${{ inputs.source_ref || 'main' }}
+  group: alive-lite-source-${{ inputs.source_ref || 'main' }}-${{ github.event_name == 'pull_request' && github.head_ref || 'main' }}
   cancel-in-progress: true
 
 jobs:
@@ -159,6 +159,16 @@ jobs:
           timeout --signal=TERM --kill-after=10s 5m \
             cargo test -p compiler-opt --test alive_lite \
               al04_p4b2_exact_globals_scope_and_real_forward_changes -- --nocapture
+
+      - name: Permanent AL-04.P4b.3 pretrap call/global UNKNOWN and real-forward scope
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          timeout --signal=TERM --kill-after=10s 5m \
+            cargo test -p compiler-opt --test alive_lite \
+              al04_p4b3_pretrap_event_scope_fail_closed_and_real_forward -- --nocapture
 
       - name: Run non-Z3 Alive-lite checks and coverage ledger
         if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
@@ -422,6 +432,18 @@ jobs:
           "$RUNNER_TEMP/al04-visible-globals" | tee alive-lite-al04-visible-globals.log
           grep -Fx 'AL04_NATIVE_C_VISIBLE_GLOBALS cases=18 missing_write=1 wrong_global=1 wrong_byte=1 wrong_log=1 wrong_return=1 verdict=PASS' \
             alive-lite-al04-visible-globals.log
+
+      - name: Permanent AL-04.P4b.3 independent strict C11 pretrap oracle
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cc -std=c11 -O2 -Wall -Wextra -Werror \
+            compiler/crates/opt/tests/oracles/al04_pretrap_effects.c \
+            -o "$RUNNER_TEMP/al04-pretrap-effects"
+          "$RUNNER_TEMP/al04-pretrap-effects" | tee alive-lite-al04-pretrap.log
+          grep -Fx 'AL04_NATIVE_C_PRETRAP cases=16 wrong_first_call=1 wrong_second_call=1 wrong_first_write=1 wrong_second_write=1 wrong_trap=1 verdict=PASS' \
+            alive-lite-al04-pretrap.log
 
       - name: Install checksum-pinned Z3 4.8.12
         if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
@@ -705,6 +727,15 @@ jobs:
               log,
           ):
               raise SystemExit('Permanent AL-04.P4b.2 global-state UNSAT/SAT and independent bytes missing')
+          # P4b.3 must preserve exactly the call and public global-state
+          # history before BOTH signed-division traps, not merely the trap
+          # condition or events from successful returns. Require real
+          # changed native/legacy passes and explicit SAT rearrangements.
+          if not re.search(
+              r'AL04_PRETRAP_EFFECTS proofs=6 forward_changed=2\s+pipeline_changed=2 sat=8 independent=16 verdict=PROVEN',
+              log,
+          ):
+              raise SystemExit('Permanent AL-04.P4b.3 trap-prefix UN/SAT and independent expected histories missing')
           print(f'Validated {passed} Alive-lite tests and {len(proofs)} per-pass proof records')
           PY
           mkdir -p "$GITHUB_WORKSPACE/.alive-lite-verified"
