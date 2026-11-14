@@ -259,6 +259,45 @@ jobs:
           echo "compiler-opt: minicargo succeeded and GCC compiled $count new C units." >> "$GITHUB_STEP_SUMMARY"
           echo "This verifies native object compilation, not semantic correctness or a runnable compiler." >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Diagnose optimizer dev-dependency handling
+        if: always() && steps.optimizer.outcome == 'failure'
+        shell: bash
+        working-directory: mrustc
+        env:
+          RUSTC_VERSION: '1.90.0'
+          MRUSTC_TARGET_VER: '1.90'
+          OUTDIR_SUF: '-1.90.0'
+          PARLEVEL: '2'
+          CC: gcc
+        run: |
+          set -euo pipefail
+          manifest=../compiler/crates/opt/Cargo.toml
+          cp "$manifest" "$RUNNER_TEMP/compiler-opt-original.toml"
+          trap 'cp "$RUNNER_TEMP/compiler-opt-original.toml" "$manifest"' EXIT
+          # Diagnostic only: remove the dev-dependencies section in the CI
+          # checkout to test whether minicargo handles the x86/opt cycle.
+          python3 - "$manifest" <<'PY'
+          from pathlib import Path
+          import re, sys
+          path = Path(sys.argv[1])
+          original = path.read_text()
+          altered, count = re.subn(r'(?ms)^\[dev-dependencies\]\s*\n.*?(?=^\[|\Z)', '', original)
+          assert count == 1, 'Expected one dev-dependencies section'
+          path.write_text(altered)
+          PY
+          set +e
+          timeout --signal=TERM --kill-after=10s 12m bin/minicargo \
+            -L output-1.90.0 -o output-compiler-opt-no-dev \
+            ../compiler/crates/opt > "$RUNNER_TEMP/mrustc-opt-no-dev.log" 2>&1
+          rc=$?
+          set -e
+          echo "compiler-opt without dev-dependencies: minicargo exit $rc (diagnostic only)" >> "$GITHUB_STEP_SUMMARY"
+          if (( rc == 0 )); then
+            echo "Likely blocker: minicargo handles the real dev-dependency graph differently from Cargo." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Optimizer still fails without dev-dependencies; preserve original failure status." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          # Restore the exact original manifest before any other tests.
       - name: Translate compiler-backend and compile generated C with GCC
         if: always() && steps.translate.outcome == 'success'
         id: backend
@@ -317,6 +356,37 @@ jobs:
           test -s "$RUNNER_TEMP/mrustc-backend-gcc-objects/libcompiler-backend-probe.a"
           echo "compiler-backend: GCC compiled $count generated C units into a static archive." >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Translate AArch64 backend and compile generated C with host GCC
+        if: always() && steps.translate.outcome == 'success'
+        shell: bash
+        working-directory: mrustc
+        env:
+          RUSTC_VERSION: '1.90.0'
+          MRUSTC_TARGET_VER: '1.90'
+          OUTDIR_SUF: '-1.90.0'
+          PARLEVEL: '2'
+          CC: gcc
+        run: |
+          set -euo pipefail
+          # Build the AArch64 backend implementation as a host x86-64 Rust
+          # library translated to C; this does not execute AArch64 code.
+          find . -type f -name '*.c' -printf '%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/mrustc-aarch64-before.txt"
+          timeout --signal=TERM --kill-after=10s 30m bin/minicargo \
+            -L output-1.90.0 -o output-compiler-backend-aarch64 \
+            ../compiler/crates/backend-aarch64 > "$RUNNER_TEMP/mrustc-aarch64-probe.log" 2>&1
+          find . -type f -name '*.c' -printf '%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/mrustc-aarch64-after.txt"
+          comm -13 "$RUNNER_TEMP/mrustc-aarch64-before.txt" "$RUNNER_TEMP/mrustc-aarch64-after.txt" > "$RUNNER_TEMP/mrustc-aarch64-new.txt"
+          mapfile -t generated < "$RUNNER_TEMP/mrustc-aarch64-new.txt"
+          test "${#generated[@]}" -gt 0
+          mkdir -p "$RUNNER_TEMP/mrustc-aarch64-objects"
+          n=0
+          for relative in "${generated[@]}"; do
+            gcc -std=gnu11 -O0 -c "$relative" -o "$RUNNER_TEMP/mrustc-aarch64-objects/$n.o"
+            n=$((n + 1))
+          done
+          ar rcs "$RUNNER_TEMP/mrustc-aarch64-objects/libbackend-aarch64-probe.a" "$RUNNER_TEMP"/mrustc-aarch64-objects/*.o
+          test -s "$RUNNER_TEMP/mrustc-aarch64-objects/libbackend-aarch64-probe.a"
+          echo "compiler-backend-aarch64: mrustc→C and host GCC compiled $n units." >> "$GITHUB_STEP_SUMMARY"
       - name: Run compiler-ir executable through host rustc and mrustc/GCC
         if: always() && steps.translate.outcome == 'success'
         shell: bash
