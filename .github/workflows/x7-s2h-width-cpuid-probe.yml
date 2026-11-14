@@ -1,0 +1,88 @@
+name: X7 S2H audit exact Intel/XED operand widths and CPUID
+on:
+  push:
+    branches: [feature/x7-s2h-width-cpuid-probe-20261114]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: x7-s2-pinned-intel-xed-variant-join
+          run-id: 43626632638
+          repository: bingordo/compiler-ci
+          github-token: \${{ github.token }}
+          path: /tmp/variants
+      - name: Pin same Intel XML revision
+        run: |
+          curl --fail --silent --show-error --location --retry 2 --max-time 180 https://codeload.github.com/intel/SDM/tar.gz/35eface1b7ee003a1cda95005ec5fd83de658a64 -o /tmp/intel.tar.gz
+      - name: Count exact SHA-bound source register label, XED slot-width, and CPUID shapes
+        run: |
+          python3 - <<'PY'
+          import json,tarfile,hashlib,xml.etree.ElementTree as ET,re
+          from pathlib import Path
+          from collections import Counter,defaultdict
+          j=json.loads(Path('/tmp/variants/join-1.json').read_text())
+          forms={f['intel_iform_sha256']:f for f in j['forms']}
+          joined=defaultdict(list)
+          stats=Counter(); examples=defaultdict(list); cpuid=Counter(); cpuidExamples=defaultdict(list)
+          def add(key,example):
+              stats[key]+=1
+              if len(examples[key])<3: examples[key].append(example)
+          with tarfile.open('/tmp/intel.tar.gz') as t:
+            for m in t:
+              if not m.isfile() or not re.fullmatch(r'[^/]+/data/instruction/[^/]+\.xml',m.name): continue
+              root=ET.fromstring(t.extractfile(m).read())
+              for x in root.findall('.//iform'):
+                digest=hashlib.sha256(ET.tostring(x,encoding='utf-8')).hexdigest()
+                form=forms.get(digest)
+                if not form: continue
+                labels=defaultdict(list)
+                for op in x.findall('operand'):
+                    enc=(op.findtext('encoding') or '').strip()
+                    lab=op.find('label')
+                    names=[(v.text or '').strip() for v in lab.findall('.//varname')] if lab is not None else []
+                    labels[enc].extend(names)
+                grps=[]
+                for g in x.findall('cpuid-group'):
+                    grps.append((g.get('name'),tuple(sorted(set(''.join(f.itertext()).strip() for f in g.findall('cpuid-flag'))))))
+                cpuid[('src-groups-count',len(grps))]+=1
+                for v in form['xed_variants']:
+                    if v['excluded']:continue
+                    cs=v['identity'].get('cpuid_groups')
+                    k=('xed-cpuid-shape',str(cs)[:180])
+                    cpuid[k]+=1
+                    if len(cpuidExamples[k])<2:cpuidExamples[k].append({'iform':form['xed_iform'],'intel':grps,'xed':cs})
+                    for s in v['operand_slot_evidence']['slots']:
+                        if s['source_role']!='register' or not s['xed_slot_name']:continue
+                        loc=s['source_location']
+                        uniq=sorted(set(labels[loc]))
+                        width=s['xed_width']
+                        fixed=(width or {}).get('fixed') if isinstance(width,dict) else None
+                        scaled=(width or {}).get('scalable') if isinstance(width,dict) else None
+                        joined[loc].append((uniq,fixed,scaled))
+                        sw={'xmm':128,'ymm':256,'zmm':512,'mm':64,'r8':8,'r16':16,'r32':32,'r64':64,
+                            'AL':8,'AX':16,'EAX':32,'RAX':64}.get(uniq[0]) if len(uniq)==1 else None
+                        if sw is None:
+                            add(('unresolved',loc),{'iform':form['xed_iform'],'labels':uniq,'width':width})
+                        elif type(fixed) is int and scaled is None:
+                            stat='match' if fixed==sw else 'disagree'
+                            add((stat,loc,uniq[0],sw,fixed),{'iform':form['xed_iform'],'xed_slot':s['xed_slot_name'],'width':width,'labels':uniq})
+                        else:
+                            add(('xed-unresolved',loc,uniq[0],str(width)[:120]),{'iform':form['xed_iform'],'labels':uniq,'width':width})
+          print('AUDIT_SHA_MATCHED_FORMS',sum(1 for f in forms.values() if f['xed_variants']))
+          print('AUDIT_SLOT_COUNTS',sorted((k,len(v)) for k,v in joined.items()))
+          print('AUDIT_WIDTH_SUMMARY',sorted([(k,n) for k,n in stats.items() if k[0] in ('match','disagree','unresolved','xed-unresolved')],key=lambda x:-x[1])[:80])
+          for k,n in sorted(stats.items(),key=lambda x:-x[1]):
+            if k[0]=='disagree':print('AUDIT_WIDTH_DISAGREE',n,k,examples[k])
+          print('AUDIT_CPUID_SOURCE_COUNTS',sorted((k,n) for k,n in cpuid.items() if k[0]=='src-groups-count'))
+          print('AUDIT_CPUID_SHAPES',len([k for k in cpuid if k[0]=='xed-cpuid-shape']))
+          for k,n in sorted(cpuid.items(),key=lambda x:-x[1])[:50]:
+              if k[0]=='xed-cpuid-shape':print('AUDIT_CPUID',n,k[1],cpuidExamples[k])
+          assert joined and cpuid
+          PY
