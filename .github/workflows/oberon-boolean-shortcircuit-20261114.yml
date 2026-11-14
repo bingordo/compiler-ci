@@ -1,0 +1,63 @@
+name: Oberon native Boolean short-circuit differential
+on:
+  push:
+    paths:
+      - '.github/workflows/oberon-boolean-shortcircuit-20261114.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-boolean:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout frontend candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/oberon
+          ref: ebb5beba592bb080d717a93a80308ec7c9a36ea1
+          path: oberon
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 118aa455e79859b1d02d5d320eeda8448215b28d
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and use checked-out frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C oberon rev-parse HEAD)" = ebb5beba592bb080d717a93a80308ec7c9a36ea1
+          test "$(git -C compiler rev-parse HEAD)" = 118aa455e79859b1d02d5d320eeda8448215b28d
+          python3 - <<'PY'
+          from pathlib import Path
+          cargo=Path('compiler/crates/driver/Cargo.toml')
+          content=cargo.read_text()
+          old='oberon-front-ir = { git = "ssh://git@github.com/bingordo/oberon.git", rev = "ebb5beba592bb080d717a93a80308ec7c9a36ea1" }'
+          assert content.count(old)==1, 'frontend candidate pin mismatched'
+          cargo.write_text(content.replace(old,
+              'oberon-front-ir = { path = "../../../oberon/oberon/crates/front-ir" }'))
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: oberon-boolean-shortcircuit-v1
+      - name: Frontend Boolean guard admission
+        run: cargo test --manifest-path oberon/oberon/Cargo.toml -p oberon-front-ir native_boolean
+      - name: Native compiler build
+        run: cargo check --manifest-path compiler/Cargo.toml -p compiler --bin compiler
+      - name: Native ELF and GAS short-circuit oracle
+        run: cargo test --manifest-path compiler/Cargo.toml -p compiler --bin compiler native_boolean_short_circuit_matches_c_oracle_elf_and_gas -- --nocapture
+      - name: Strict frontend Clippy
+        run: cargo clippy --manifest-path oberon/oberon/Cargo.toml -p oberon-front-ir --all-targets -- -D warnings
