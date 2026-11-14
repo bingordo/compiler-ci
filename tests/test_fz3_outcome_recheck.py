@@ -133,14 +133,14 @@ class OutcomeArchiveTests(unittest.TestCase):
         ):
             with self.subTest(observed=observed):
                 self.oracle.write_text(
-                    "#!/usr/bin/env python3\\n"
-                    f"print('OUTCOMES_V1 a=5 b=0 expected=sigfpe observed={observed}')\\n"
+                    "#!/usr/bin/env python3\n"
+                    f"print('OUTCOMES_V1 a=5 b=0 expected=sigfpe observed={observed}')\n"
                 )
                 status, _ = recheck.classify(self.oracle, witness, row, 2)
                 self.assertEqual(status, expected_status)
         self.oracle.write_text(
-            "#!/usr/bin/env python3\\n"
-            "print('OUTCOMES_V1 a=5 b=0 expected=value:0 observed=value:0')\\n"
+            "#!/usr/bin/env python3\n"
+            "print('OUTCOMES_V1 a=5 b=0 expected=value:0 observed=value:0')\n"
         )
         status, detail = recheck.classify(self.oracle, witness, row, 2)
         self.assertEqual(status, "unavailable")
@@ -151,9 +151,9 @@ class OutcomeArchiveTests(unittest.TestCase):
         token = f"{run_number}.1"
         url = f"https://github.com/bingordo/compiler-ci/actions/runs/{run_number}"
         (self.report / "summary.txt").write_text(
-            f"status=no-mismatch\\nsource_sha={sha}\\ninjected=false\\n"
-            "unique_failures=0\\noutcome_unique_failures=0\\n"
-            "outcome_duplicates=0\\nevaluations=10\\nmax_unique=4\\n"
+            f"status=no-mismatch\nsource_sha={sha}\ninjected=false\n"
+            "unique_failures=0\noutcome_unique_failures=0\n"
+            "outcome_duplicates=0\nevaluations=10\nmax_unique=4\n"
         )
         base.write_tsv(self.report / "outcome_fingerprints_v2.tsv",
                        v2.V2_COLUMNS, [])
@@ -174,11 +174,11 @@ class OutcomeArchiveTests(unittest.TestCase):
         row = self.fixture()
         self.run_recheck()
         sha2 = "abcdef0123456789abcdef0123456789abcdef01"
-        sha3 = "23456789abcdef0123456789abcdef01234567"
-        sha4 = "3456789abcdef0123456789abcdef012345678"
+        sha3 = "2222222222222222222222222222222222222222"
+        sha4 = "3333333333333333333333333333333333333333"
         self.oracle.write_text(
-            "#!/usr/bin/env python3\\n"
-            "print('OUTCOMES_V1 a=5 b=0 expected=sigfpe observed=sigfpe')\\n"
+            "#!/usr/bin/env python3\n"
+            "print('OUTCOMES_V1 a=5 b=0 expected=sigfpe observed=sigfpe')\n"
         )
         result = self.next_run(sha2, 124)
         self.assertEqual(result["agrees"], 1)
@@ -206,8 +206,8 @@ class OutcomeArchiveTests(unittest.TestCase):
         self.assertEqual(base.read_tsv(self.output / "outcome_events_v2.tsv",
                                        recheck.EVENT_COLUMNS), [])
         self.oracle.write_text(
-            "#!/usr/bin/env python3\\n"
-            "print('OUTCOMES_V1 a=5 b=0 expected=sigfpe observed=value:5')\\n"
+            "#!/usr/bin/env python3\n"
+            "print('OUTCOMES_V1 a=5 b=0 expected=sigfpe observed=value:5')\n"
         )
         result = self.next_run(sha4, 126)
         self.assertEqual(result["reproduces"], 1)
