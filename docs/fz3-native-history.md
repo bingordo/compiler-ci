@@ -58,6 +58,55 @@ execution. Infrastructure errors, missing reports, invalid fingerprints,
 or injected results are never inserted into genuine history. The
 artifact upload uses `if: always()`, including triage output on failure.
 
+## Archived-witness lifecycle and regression detection
+
+A rotating fuzz campaign **cannot** prove that a bug is fixed merely because
+its fingerprint is absent from a subsequent nightly run. The nightly workflow
+now persists the **minimized `.ir` witness** for every new genuine fingerprint
+under `state/fz3/witnesses/<fingerprint-id>.ir` on the same durable history
+branch. Only validated, non-injected reports may populate these files.
+
+On subsequent runs, `tools/fz3_recheck.py` builds the unmodified current
+compiler's `typeid_native_diff_repro` executable and replays up to **16
+existing witnesses**, with a per-witness timeout. The starting index rotates
+by the full 16-witness window each run, so a history larger than the nightly
+budget is sampled fairly rather than permanently starving newer findings. It compares actual native
+GAS or ELF execution against the independent reference defined by the *saved
+original IR*, for the precise operand pair, optimization policy and sink.
+
+`state/fz3/rechecks.tsv` stores the last checked full compiler SHA and run,
+current exact signature state, the first agreeing SHA and the number of
+**distinct compiler revisions** that successfully replay with native/reference
+agreement. A run may report:
+
+- `reproduces` — the original exact wrong-value result persists
+- `not-reproduced` — executed saved IR now agrees with its reference; this
+  is a **possible fix**, not a correctness proof
+- `other-wrong-value` — output changed but is still wrong; not fixed
+- `unavailable` — original IR cannot be replayed, compiler/oracle fails,
+  expected reference changes or a timeout occurs; never considered fixed
+
+A first agreeing replay posts a tentative-fix comment on the existing
+fingerprint issue, **without closing it**. A second agreeing replay on a
+different full compiler SHA posts an additional evidence comment. If the
+*exact* wrong value reappears after previous clean reproduction, the workflow
+posts a **possible regression** and reopens the issue if it was closed.
+Changed wrong values receive their own note without claiming a fix.
+No duplicate issue is created. The lifecycle `events.tsv` is uploaded
+along with the full native report and minimized IR artifacts.
+
+Issue comments and reopening are only attempted for real, validated
+transitions. They must succeed **before** the updated persistent history can
+be committed; on failure the job and published state remain unchanged.
+Scripted tests simulate all transitions, invalid snapshots, missing
+witnesses, timeouts and reference changes. The nightly job remains red
+for genuine detected wrong-code, regardless of its classification as known.
+
+This is conservative *per-witness* evidence. It does not prove a root-cause
+fix, does not automatically close issues, and does not retroactively mark
+unseen seed combinations as passing. A `not-reproduced` recheck on one
+minimized input is not a substitute for the full native differential suite.
+
 ## CI validation and recovery
 
 The `tests/test_fz3_triage.py` suite covers new/known fingerprints,
