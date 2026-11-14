@@ -8,7 +8,7 @@ permissions:
 jobs:
   v2-history:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - name: Run strict v2 outcome triage and existing v1 regressions
@@ -16,3 +16,69 @@ jobs:
           set -euo pipefail
           python3 -m py_compile tools/fz3_outcome_triage.py tests/test_fz3_outcome_triage.py
           python3 -m unittest discover -s tests -p 'test_fz3_*.py' -v
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7fd3e00325691c6f865d73de511891753c522b80
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Source-pinned real GAS/direct-ELF v2 reconciliation smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          ulimit -c 0
+          source_sha="$(git -C compiler rev-parse HEAD)"
+          test "$source_sha" = "7fd3e00325691c6f865d73de511891753c522b80"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          cargo build --manifest-path compiler/Cargo.toml -p compiler-opt --example typeid_native_diff_repro
+          (cd compiler && cargo run -p compiler-opt --example typeid_native_campaign -- \
+            --out "$RUNNER_TEMP/fz3-native-v2" --source-sha "$source_sha" \
+            --first-seed 0 --seeds 2 --max-evaluations 240 \
+            --max-unique 4 --max-probes 12)
+          grep -qx 'outcome_unique_failures=0' "$RUNNER_TEMP/fz3-native-v2/summary.txt"
+          grep -qx 'stopped_at_budget=false' "$RUNNER_TEMP/fz3-native-v2/summary.txt"
+          python3 tools/fz3_triage.py \
+            --campaign "$RUNNER_TEMP/fz3-native-v2" \
+            --history-dir "$RUNNER_TEMP/fz3-history" \
+            --out "$RUNNER_TEMP/fz3-v1-triage" \
+            --source-sha "$source_sha" --run-token 123456.1 \
+            --run-url https://github.com/bingordo/compiler-ci/actions/runs/123456
+          python3 tools/fz3_outcome_triage.py \
+            --campaign "$RUNNER_TEMP/fz3-native-v2" \
+            --history-dir "$RUNNER_TEMP/fz3-history" \
+            --out "$RUNNER_TEMP/fz3-v2-triage" \
+            --source-sha "$source_sha" --run-token 123456.1 \
+            --run-url https://github.com/bingordo/compiler-ci/actions/runs/123456
+          python3 tools/fz3_outcome_recheck.py \
+            --campaign "$RUNNER_TEMP/fz3-native-v2" \
+            --history-dir "$RUNNER_TEMP/fz3-history" \
+            --triage-dir "$RUNNER_TEMP/fz3-v2-triage" \
+            --out "$RUNNER_TEMP/fz3-v2-recheck" \
+            --oracle compiler/target/debug/examples/typeid_native_diff_repro \
+            --source-sha "$source_sha" --run-token 123456.1 \
+            --run-url https://github.com/bingordo/compiler-ci/actions/runs/123456
+          test "$(wc -l < "$RUNNER_TEMP/fz3-history/outcome_processed_runs_v2.tsv")" -eq 2
+          test "$(wc -l < "$RUNNER_TEMP/fz3-native-v2/outcome_fingerprints_v2.tsv")" -eq 1
+          python3 tools/fz3_outcome_triage.py \
+            --campaign "$RUNNER_TEMP/fz3-native-v2" \
+            --history-dir "$RUNNER_TEMP/fz3-history" \
+            --out "$RUNNER_TEMP/fz3-v2-triage" \
+            --source-sha "$source_sha" --run-token 123456.1 \
+            --run-url https://github.com/bingordo/compiler-ci/actions/runs/123456
+          grep -qx 'replayed=1' "$RUNNER_TEMP/fz3-v2-triage/outcome_status_v2.txt"
+      - name: Upload exact-source v2 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fz3-v2-history-validation
+          path: |
+            ${{ runner.temp }}/fz3-native-v2/
+            ${{ runner.temp }}/fz3-v2-triage/
+            ${{ runner.temp }}/fz3-v2-recheck/
+          if-no-files-found: warn
+          retention-days: 7
