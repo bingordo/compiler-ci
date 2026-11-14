@@ -1,0 +1,67 @@
+# Source-pinned W1 TypeId CFG -> WebAssembly test.
+# Only self-contained core crates are built; private frontends are not required.
+name: Wasm W1 CFG dispatcher
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/wasm-w1-cfg.yml'
+  workflow_dispatch:
+    inputs:
+      compiler_sha:
+        description: 'Exact compiler SHA for the W1 verification'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  wasm-w1:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.compiler_sha || 'c103c182466b83d6e98587297fe8c6bc07b442e0' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record source pin and isolate credential-free workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Compiler source: $(git -C compiler rev-parse HEAD)"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-wasm"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+          cargo --version
+      - name: Ensure independent Node.js WebAssembly runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Cache self-contained Rust crates
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: wasm-w1-cfg
+      - name: Run W0 regression and W1 CFG validation and runtime tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend-wasm --tests -- --nocapture
+      - name: Run standalone TypeId CFG CLI through independent Wasm engine
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run -p compiler-backend-wasm --bin typeid-wasm -- \
+            crates/backend-wasm/tests/fixtures/w1_cfg.ir /tmp/w1-cfg.wasm
+          node crates/backend-wasm/tests/run_cfg.js /tmp/w1-cfg.wasm
+      - name: Strict W1 Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-wasm --all-targets -- -D warnings
