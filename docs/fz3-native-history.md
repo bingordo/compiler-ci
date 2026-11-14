@@ -86,47 +86,71 @@ requiring the same reference/native fingerprint after each mutation.
 
 ### Persistent v2 acceptance and replay
 
-The new **compiler-ci-only** steps run *after* normal v1 report validation.
-`tools/fz3_outcome_triage.py` requires the v1 report to have been registered
-for the exact source SHA and GitHub run/attempt. It independently validates
-v2 column names, counts, outcomes, signatures, safe relative file locations,
-per-case replay pins and bounded budgets. Injected or malformed reports fail
-closed; they cannot overwrite published history.
+The **compiler-ci-only** steps run after normal v1 report validation.
+`tools/fz3_outcome_triage.py` requires that the exact source SHA and GitHub
+run/attempt were registered by v1 triage. It separately validates v2 column
+names, counts, outcomes, unique fingerprints, safe relative witness paths
+and replay pins. Injected or malformed reports fail closed.
 
-The separate durable files, created on the first validated publication, are:
+The separate durable state is:
 
-- `state/fz3/outcome_fingerprints_v2.tsv`: exact cross-run fingerprints,
-  source SHA/run, observation counts and first seed/profile
-- `state/fz3/outcome_processed_runs_v2.tsv`: source-pinned per-run digest
-  for conflict rejection and idempotent replay
+- `state/fz3/outcome_fingerprints_v2.tsv`: cross-run exact fingerprints,
+  first/last source revision and run, observations, first seed/profile
+- `state/fz3/outcome_processed_runs_v2.tsv`: source-pinned run digest for
+  conflict detection and idempotent reconciliation
 - `state/fz3/outcome_witnesses_v2/<id>.ir`: minimized original-IR witnesses
-- `state/fz3/outcome_rechecks_v2.tsv`: last replay state and provenance
+- `state/fz3/outcome_rechecks_v2.tsv`: latest replay state and run
+- `state/fz3/outcome_agreements_v2.tsv`: the first and second **distinct
+  compiler SHAs** with verified reference/native agreement
 
-`tools/fz3_outcome_recheck.py` requires **successful exact replay of each
-new minimized IR** using the real native reproducer before archiving it.
-It rotates a bounded set of older witnesses for subsequent checks.
-A successful exact pinned replay is `reproduces`; a changed pin is
-`not-exact`, **not** proof of a fix; compiler/oracle/timeout failures are
-`unavailable`. This conservative v2 protocol does not issue tentative-fix
-comments, close bugs, or infer regression from a missing fuzz seed. Those
-would require an unpinned structured outcome oracle to distinguish genuine
-agreement from a different wrong result.
+New minimized witnesses must first reproduce the original exact TypeId
+reference/native mismatch before archiving. The existing
+`typeid_native_diff_repro --report-outcomes` emits
+`OUTCOMES_V1 a=<i32> b=<i32> expected=<value:u32|sigfpe>
+observed=<value:u32|sigfpe>` for **all successful native executions**,
+including correctly agreeing values or SIGFPEs. Its independent reference
+always runs the original, unoptimized IR. This reports actual outcomes
+rather than inferring correctness from the absence of a pinned signature.
 
-The workflow searches existing open/closed `compiler-ci` issues for
-`FZ3-OUTCOME:<id>` and opens an issue only for a new, replay-verified
-fingerprint. The v2 issue action, validation, replay and the existing v1
-issue/lifecycle and pass-trend steps must **all** succeed before a single
-atomic history-branch publication. Any failed step leaves persistent history
-uncommitted. A real compiler mismatch still makes the campaign red, even
-when the same symptom was previously deduplicated.
+Up to 16 archived witnesses are revisited per run with a rotating window.
+The exact `(mode, sink, a, b, reference, native)` result is classified as:
 
-**Acceptance status:** source-pinned compiler-ci test validation passed on
-November 14, 2026 for compiler commit `7fd3e003`. This verifies synthetic
-new/recurrent/rejected history, exact witness archiving, and a real 240-case
-no-mismatch campaign including both signed arithmetic recipe families.
-It does **not** establish that the first scheduled v2 history rollover,
-automated issue creation or subsequent cross-run rechecks have occurred.
-Keep the tracker open until that operational evidence exists.
+- `reproduces`: exact original mismatch still present
+- `agrees`: reference semantics are unchanged and current native agrees
+- `changed-mismatch`: reference is unchanged but native still differs
+  (including a changed unexpected trap)
+- `unavailable`: invalid output, interpreter/reference drift, missing
+  witness, timeout, signal/link/compiler failure; **never a fix**
+
+An older `not-exact` state from the pinned-replay implementation remains
+readable; new checks replace it with a precise classification.
+
+A first verified agreement may emit **suspected-fix** evidence without
+closing the issue. A second *distinct full compiler SHA* agreeing on the same
+witness emits stronger evidence, still not a proof of a fix. If the exact
+mismatch reappears after agreement, a **possible-regression** event may
+reopen a closed issue; a different wrong outcome never counts as fixed.
+Unavailable checks do not erase previously verified agreement evidence,
+but any confirmed mismatch resets it. Duplicate run attempts do not
+generate repeated notifications.
+
+New fingerprints produce issues marked `FZ3-OUTCOME:<id>` only after
+successful exact replay; recurring fingerprints never duplicate issues.
+Lifecycle comments are emitted only for validated transition events.
+The v1/v2 triage, minimization/replay, pass-trend collection, issue actions
+and lifecycle notifications must **all succeed** before a single atomic
+history-branch publication. A real compiler mismatch leaves the campaign
+red even if its symptom is already known.
+
+**Operational evidence:** two distinct, successful branch-triggered
+full native campaigns [#43638242020](https://github.com/bingordo/compiler-ci/actions/runs/43638242020)
+and [#43638418296](https://github.com/bingordo/compiler-ci/actions/runs/43638418296)
+initialized and updated persistent v2 history on November 14, 2026.
+No actual trap mismatch was observed, so the live fingerprint ledger and
+witness rechecks contain no bug instances. Lifecycle event behavior has
+been tested with simulated new/recurring wrong outcomes; real
+agreement/fix/regression notifications have not yet been observed.
+Ordinary scheduled main-branch operation should still be checked.
 
 ## Persistent source-pass activity trends
 
