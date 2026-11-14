@@ -1,0 +1,70 @@
+name: S23.50 generated TypeId rule source-pinned validation
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-50-typeid-generated-rules.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  s23-50-rule-validation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout exact S23.50 compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1fba4f5db0c3d38d3af01acf1f8aa39903e2658b
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact candidate and isolate core Rust workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 1fba4f5db0c3d38d3af01acf1f8aa39903e2658b
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - name: Install proof-only Z3
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends z3
+          z3 -version
+      - name: Parser, canonicalization and exhaustive i8 tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools/typeid_rules -v
+      - name: Ten independent UNSAT proofs, ten SAT controls and generated artifact parity
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/typeid_rules/generate.py --prove --timeout-ms 2500 --check crates/opt/src/generated/typeid_rules_s2350.rs
+      - name: Cargo cache for TypeId source-only opt tests
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: s23-50-typeid-rule-shadow
+      - name: Read-only TypeId matcher unit tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --features typeid-rule-shadow typeid_rule_shadow::tests -- --nocapture
+      - name: Existing native integer S23.20 SSA regression
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test generated_native_matchpd_arithmetic_s2320 -- --nocapture
+      - name: Strict opt Clippy including generated code
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --features typeid-rule-shadow --all-targets -- -D warnings
