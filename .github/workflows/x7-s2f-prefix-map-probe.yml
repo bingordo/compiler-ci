@@ -1,0 +1,77 @@
+name: X7 S2F inspect real prefix and map syntax
+on:
+  push:
+    branches: [feature/x7-s2f-prefix-map-probe-20261114]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download full S2E pinned artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s2-pinned-intel-xed-variant-join
+          run-id: 43619800718
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/variants
+      - name: Pin source XML corpus for encoding diagnostics
+        run: |
+          curl --fail --silent --show-error --location --retry 2 --max-time 180 https://codeload.github.com/intel/SDM/tar.gz/35eface1b7ee003a1cda95005ec5fd83de658a64 -o /tmp/intel.tar.gz
+      - name: Diagnose map and prefix representations from full corpus
+        run: |
+          python3 - <<'PY'
+          import json,tarfile,xml.etree.ElementTree as ET
+          from collections import Counter,defaultdict
+          from pathlib import Path
+          j=json.loads(Path('/tmp/variants/join-1.json').read_text())
+          by_name=defaultdict(list)
+          for f in j['forms']:
+            for v in f['xed_variants']:
+              if not v['excluded']:
+                by_name[f['xed_iform']].append(v)
+          corpus=defaultdict(set)
+          with tarfile.open('/tmp/intel.tar.gz') as t:
+            for m in t:
+              if not m.isfile() or '/data/instruction/' not in m.name or not m.name.endswith('.xml'): continue
+              root=ET.fromstring(t.extractfile(m).read())
+              for x in root.findall('.//iform'):
+                n=x.get('xed_iform','')
+                if n in by_name:
+                  corpus[n].add(x.get('encoding',''))
+          hist=Counter(); examples=defaultdict(list); fields=Counter()
+          import re
+          for n,variants in by_name.items():
+            for enc in corpus.get(n,[]):
+              mt=re.search(r'(?i)(?<!\\S)([0-9a-f]{2})\\s+/[r0-7](?:\\s|$)',enc)
+              if not mt: continue
+              byte=mt.group(1).upper()
+              for v in variants:
+                i=v['identity']
+                if i.get('opcode_base16','').upper()!=byte or i.get('partial_opcode') is not False: continue
+                space=i.get('encoding_space')
+                prefix=enc.split()[0] if enc.split() else ''
+                token=prefix.upper()
+                if token.startswith(('EVEX.','VEX.','XOP.')):
+                  flavor=token.split('.')[0]
+                  map_s=next((x for x in token.split('.') if x in ('0F','0F38','0F3A','MAP5','MAP6')), 'missing')
+                  pp=next((x for x in token.split('.') if x in ('66','F2','F3')), 'missing')
+                else:
+                  flavor='legacy'
+                  tokens=enc.upper().split()
+                  map_s='0F38' if '0F' in tokens and '38' in tokens[tokens.index('0F')+1:] and tokens.index('38')==tokens.index('0F')+1 else '0F3A' if '0F' in tokens and '3A' in tokens[tokens.index('0F')+1:] and tokens.index('3A')==tokens.index('0F')+1 else '0F' if '0F' in tokens else '0'
+                  pp=next((x for x in tokens if x in ('66','F2','F3')), 'missing')
+                key=(flavor,map_s,str(i.get('map')),pp,str(i.get('evex_pp')),str(i.get('osz_66_required')),str(i.get('f2_required')),str(i.get('f3_required')))
+                hist[key]+=1
+                if len(examples[key])<2: examples[key].append(n+': '+enc)
+                fields[(flavor,space)]+=1
+          print('MAP_SPACE_TOTALS', sorted(fields.items(),key=lambda x:-x[1]))
+          print('PREFIX_MAP_GROUPS',len(hist))
+          for key,count in sorted(hist.items(),key=lambda x:-x[1])[:120]:
+            print('MAP_PREFIX_EVIDENCE',count,key,examples[key])
+          assert hist
+          PY
