@@ -588,9 +588,11 @@ jobs:
         shell: bash
         env:
           ALIVE_LITE_FAILURE_DIR: ${{ runner.temp }}/alive-lite-failures
+          AL05_REPLAY_DIR: ${{ github.workspace }}/alive-lite-al05-replay
+          AL05_SOURCE_SHA: ${{ steps.source.outputs.sha }}
         run: |
           set -euo pipefail
-          mkdir -p "$ALIVE_LITE_FAILURE_DIR"
+          mkdir -p "$ALIVE_LITE_FAILURE_DIR" "$AL05_REPLAY_DIR"
           cd compiler
           timeout --signal=TERM --kill-after=15s 10m \
             cargo test -p compiler-opt --test alive_lite -- --ignored --nocapture --test-threads=1 \
@@ -898,12 +900,46 @@ jobs:
               log,
           ):
               raise SystemExit('Permanent AL-05 variable-trip inductive TypeId UNSAT/SAT evidence missing')
+          if not re.search(
+              r'AL05_REPLAY_V1 proofs=4 changed_cse=4\s+files=4 contract=al05-closed-i32-cse-loop-v1\s+ir=compiler-ir-native-module-3\s+sha=[0-9a-f]{40} solver=Z3 verdict=PROVEN',
+              log,
+          ):
+              raise SystemExit('AL-05 four source-pinned TypeId snapshot replay proofs missing')
           print(f'Validated {passed} Alive-lite tests and {len(proofs)} per-pass proof records')
           PY
           mkdir -p "$GITHUB_WORKSPACE/.alive-lite-verified"
           cp "$GITHUB_WORKSPACE/alive-lite-coverage.jsonl" "$GITHUB_WORKSPACE/alive-lite-proofs.jsonl" "$GITHUB_WORKSPACE/.alive-lite-verified/"
           printf '%s\n' "${{ steps.source.outputs.sha }}" > "$GITHUB_WORKSPACE/.alive-lite-verified/source-sha.txt"
           echo "Alive-lite Z3 proof tests passed" >> "$GITHUB_STEP_SUMMARY"
+      - name: AL-05 separately reprove archived TypeId induction snapshots
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
+        shell: bash
+        env:
+          AL05_REPLAY_INPUT_DIR: ${{ github.workspace }}/alive-lite-al05-replay
+          AL05_SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          cd compiler
+          timeout --signal=TERM --kill-after=10s 4m \
+            cargo test -p compiler-opt --test alive_lite \
+              al05_replay_v1_read_only_archived_files_with_z3 -- --ignored --nocapture \
+            2>&1 | tee "$GITHUB_WORKSPACE/alive-lite-al05-replay-readonly.log"
+          grep -F "AL05_REPLAY_READ_ONLY proofs=4 files=4 source_sha=${{ steps.source.outputs.sha }} contract=al05-closed-i32-cse-loop-v1 verdict=PROVEN" \
+            "$GITHUB_WORKSPACE/alive-lite-al05-replay-readonly.log"
+
+      - name: Verify AL-05 versioned source-tagged replay artifacts
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools -p 'test_validate_al05_replay.py' -v
+          python3 tools/validate_al05_replay.py \
+            --dir alive-lite-al05-replay \
+            --source-sha "${{ steps.source.outputs.sha }}" \
+            | tee alive-lite-al05-replay-summary.log
+          grep -F "AL05_REPLAY_ARTIFACTS files=4 source_sha=${{ steps.source.outputs.sha }} contract=al05-closed-i32-cse-loop-v1 ir=compiler-ir-native-module-3 verdict=PASS" \
+            alive-lite-al05-replay-summary.log
+
       - name: Enforce permanent AL-03 concrete and Z3 proof manifest
         if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
         shell: bash
@@ -951,6 +987,9 @@ jobs:
             alive-lite-typeid-stage-proofs.jsonl
             alive-lite-typeid-source-proofs.jsonl
             alive-lite-al03-manifest.json
+            alive-lite-al05-replay/*.replay
+            alive-lite-al05-replay-summary.log
+            alive-lite-al05-replay-readonly.log
             alive-lite-al04-native-c.log
           retention-days: 14
       - name: Cache exact passing source revision
