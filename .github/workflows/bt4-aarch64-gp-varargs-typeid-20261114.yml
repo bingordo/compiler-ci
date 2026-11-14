@@ -1,0 +1,51 @@
+name: BT4 AArch64 source-checked GP variadics TypeId native ELF GAS QEMU
+on:
+  push:
+    branches: [ci/bt4-aarch64-native-gp-varargs-20261114]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  retire-old-gp-variadic-caller:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 3fafbccf7a93bc62400d0a877574b5fac6e675d8
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin compiler and isolate target/backend workspace
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 3fafbccf7a93bc62400d0a877574b5fac6e675d8
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
+          """)
+          PY
+      - name: Validate GP variadic source contract and all AArch64 tests
+        run: |
+          set -euo pipefail
+          if grep -nE '(compiler_backend::Backend|machine::select\(|compiler_ir::Function)' crates/backend-aarch64/tests/gp_varargs.rs; then
+            echo "BT4 GP variadics still depend on historical Backend(Function)"; exit 1
+          fi
+          cargo check -p compiler-backend-aarch64 --all-targets
+          cargo test -p compiler-backend-aarch64 --test gp_varargs -- --nocapture
+          cargo test -p compiler-backend-aarch64 --tests
+          cargo clippy -p compiler-backend-aarch64 --all-targets -- -D warnings
+      - name: Install native AArch64 runtime and cross compiler
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu qemu-user
+      - name: Execute direct GP variadic printf ABI C11 oracle via ELF GAS PIC/nonPIC QEMU
+        env:
+          COMPILER_REQUIRE_AARCH64_QEMU: "1"
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-aarch64 --test gp_varargs -- --nocapture
+          echo BT4_GP_VARARGS_TYPEID_QEMU_PASS
