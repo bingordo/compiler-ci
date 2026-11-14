@@ -1,0 +1,153 @@
+name: S23.49b pinned real upstream C source TypeId demand census
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-49b-external-source-demand.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  external-source-typeid-demand:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler candidate (never run compiler Actions)
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 59d7b1d0416ca2315646eb7050324f0d5a61ff23
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact musl upstream source commit
+        uses: actions/checkout@v4
+        with:
+          repository: ifduyue/musl
+          ref: 7813e9119eb5fe681b6750b8a033a0490bca0941
+          path: musl
+          persist-credentials: false
+      - name: Checkout exact Lua upstream source commit
+        uses: actions/checkout@v4
+        with:
+          repository: lua/lua
+          ref: c42d820bc0c3bc4f2ad536e19d2f05405af10387
+          path: lua
+          persist-credentials: false
+      - name: Checkout exact zlib upstream source commit
+        uses: actions/checkout@v4
+        with:
+          repository: madler/zlib
+          ref: 99623ef7097352da7993ba614161fd6a311e046e
+          path: zlib
+          persist-credentials: false
+
+      - name: Check all four immutable source heads and capture-parser syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 59d7b1d0416ca2315646eb7050324f0d5a61ff23
+          test "$(git -C musl rev-parse HEAD)" = 7813e9119eb5fe681b6750b8a033a0490bca0941
+          test "$(git -C lua rev-parse HEAD)" = c42d820bc0c3bc4f2ad536e19d2f05405af10387
+          test "$(git -C zlib rev-parse HEAD)" = 99623ef7097352da7993ba614161fd6a311e046e
+          python3 -m py_compile \
+            compiler/tools/s23_49_capture_external_sources.py \
+            compiler/tools/s23_49_parse_external_shapes.py \
+            compiler/tools/s23_49_parse_independent_shapes.py
+          mkdir -p results
+          rustc --version
+          python3 --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: s23-49b-original-upstream-source
+
+      - name: Build unchanged native-IR production compiler (public Cargo Git over HTTPS)
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          cargo build --release -p compiler --bin compiler
+          test -x target/release/compiler
+
+      - name: Attempt every one of 81 unmodified musl, Lua and zlib source files
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -u compiler/tools/s23_49_capture_external_sources.py \
+            --compiler-root compiler \
+            --compiler-sha 59d7b1d0416ca2315646eb7050324f0d5a61ff23 \
+            --compiler compiler/target/release/compiler \
+            --musl-root musl --lua-root lua --zlib-root zlib \
+            --snapshots results/typeid_snapshots \
+            --output results/s23-49b-external-capture.json \
+            2>&1 | tee results/s23-49b-external-capture.log
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          a=json.loads(Path('results/s23-49b-external-capture.json').read_text())
+          assert a['schema']=='compiler.s2349b-pinned-external-source-capture.v1'
+          assert a['attempted']==81 and a['accepted']+a['rejected']==81
+          assert len(a['accepted_cases'])==a['accepted']
+          assert len(a['rejected_cases'])==a['rejected']
+          assert {x:v['attempted'] for x,v in a['repos'].items()}=={
+              'musl':41,'lua':20,'zlib':20}
+          print('S2349B_CAPTURE_GATE attempted=81 accepted=%d rejected=%d' %
+                (a['accepted'],a['rejected']), flush=True)
+          PY
+
+      - name: Analyze exact upstream TypeId producer DAG shapes, including zero-accepted case
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt \
+            --features experimental-typeid-generated-shadow \
+            --test native_s2349_independent_shape_census -- --nocapture \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/s23-49b-smoke.log"
+          grep 'S2349_SUMMARY cohort=synthetic_committed_control cases=1 stages=1' \
+            "$GITHUB_WORKSPACE/results/s23-49b-smoke.log"
+          S2349_EXTERNAL_CORPUS=1 \
+            S2349_SNAPSHOT_DIR="$GITHUB_WORKSPACE/results/typeid_snapshots" \
+            cargo test --release -p compiler-opt \
+              --features experimental-typeid-generated-shadow \
+              --test native_s2349_independent_shape_census -- --nocapture \
+              2>&1 | tee "$GITHUB_WORKSPACE/results/s23-49b-upstream-shapes.log"
+          python3 tools/s23_49_parse_external_shapes.py \
+            --capture "$GITHUB_WORKSPACE/results/s23-49b-external-capture.json" \
+            --log "$GITHUB_WORKSPACE/results/s23-49b-upstream-shapes.log" \
+            --output "$GITHUB_WORKSPACE/results/s23-49b-external-shapes.json" \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/s23-49b-external-summary.log"
+          grep '^S2349B_ACCOUNTING attempted=81 ' \
+            "$GITHUB_WORKSPACE/results/s23-49b-external-summary.log"
+          grep '^S2349B_COHORT ' \
+            "$GITHUB_WORKSPACE/results/s23-49b-external-summary.log" \
+            >> "$GITHUB_STEP_SUMMARY"
+          grep '^S2349B_RANK ' \
+            "$GITHUB_WORKSPACE/results/s23-49b-external-summary.log" \
+            | head -15 >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Verify former S23.49a requirements and strict Rust Clippy
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --features experimental-typeid-generated-shadow \
+            --test native_s2350_shadow_parity -- --nocapture
+          cargo clippy -p compiler-opt --features experimental-typeid-generated-shadow \
+            --test native_s2349_independent_shape_census -- -D warnings
+
+      - name: Preserve all source attempts, compiler failures, exact TypeId inputs and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s23-49b-original-musl-lua-zlib-source-demand
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
