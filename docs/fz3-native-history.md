@@ -33,6 +33,11 @@ The processed-run ledger includes the exact GitHub run/attempt token and
 a digest of the source report, making retries idempotent and rejecting
 silent replay with different data.
 
+A rerun is tracked by `run_id.run_attempt`; it is a separate validated
+attempt even when GitHub reuses the same Actions run URL. The ledger is
+updated only after issue triage succeeds. A jobless GitHub workflow dispatch
+or missing report is **not** recorded as a clean campaign.
+
 ## New and known findings
 
 Only a previously unseen genuine wrong-value key causes a **new issue
