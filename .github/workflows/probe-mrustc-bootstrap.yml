@@ -209,12 +209,32 @@ jobs:
           # compiler-opt depends on compiler-ir. minicargo must resolve and
           # compile the real local path dependency, not a synthetic stub.
           find . -type f -name '*.c' -printf '%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/mrustc-opt-c-before.txt"
+          set +e
           timeout --signal=TERM --kill-after=10s 30m bin/minicargo \
             -L output-1.90.0 -o output-compiler-opt \
-            ../compiler/crates/opt > "$RUNNER_TEMP/mrustc-opt-probe.log" 2>&1 || {
-              echo "compiler-opt translation failed (see restricted diagnostic log)" >> "$GITHUB_STEP_SUMMARY"
-              exit 1
-            }
+            ../compiler/crates/opt > "$RUNNER_TEMP/mrustc-opt-probe.log" 2>&1
+          rc=$?
+          set -e
+          if (( rc != 0 )); then
+            python3 - "$RUNNER_TEMP/mrustc-opt-probe.log" "$GITHUB_STEP_SUMMARY" <<'PY'
+          import pathlib, re, sys
+          log = pathlib.Path(sys.argv[1]).read_text(errors="replace")
+          classes = {
+              "manifest/dependency resolution": r"failed to (load|parse|select|resolve)|dependency|manifest|no lockfile",
+              "missing paths/files": r"No such file|not found|cannot open",
+              "unsupported Rust": r"unsupported|not implemented|unimplemented|unknown feature",
+              "Rust parse/type error": r"parse error|type error|error:|ERROR:",
+              "compiler crash": r"SIGSEGV|segmentation fault|panic|assertion failed",
+              "C toolchain error": r"gcc: error|fatal error:|compilation terminated",
+          }
+          with open(sys.argv[2], "a") as out:
+              print("compiler-opt minicargo failed (exit {}); diagnostic categories:".format("$rc"),file=out)
+              for label, rx in classes.items():
+                  print("- {}: {}".format(label, len(re.findall(rx, log, re.I))), file=out)
+              print("Diagnostic bytes: {}; lines: {}".format(len(log), log.count("\\n")), file=out)
+          PY
+            exit "$rc"
+          fi
           find . -type f -name '*.c' -printf '%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/mrustc-opt-c-after.txt"
           comm -13 "$RUNNER_TEMP/mrustc-opt-c-before.txt" "$RUNNER_TEMP/mrustc-opt-c-after.txt" > "$RUNNER_TEMP/mrustc-opt-c-new.txt"
           mapfile -t generated < "$RUNNER_TEMP/mrustc-opt-c-new.txt"
@@ -233,6 +253,39 @@ jobs:
           test -s "$RUNNER_TEMP/mrustc-opt-gcc-objects/libcompiler-opt-probe.a"
           echo "compiler-opt: minicargo succeeded and GCC compiled $count new C units." >> "$GITHUB_STEP_SUMMARY"
           echo "This verifies native object compilation, not semantic correctness or a runnable compiler." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run compiler-ir executable through host rustc and mrustc/GCC
+        if: always() && steps.translate.outcome == 'success'
+        shell: bash
+        env:
+          RUSTC_VERSION: '1.90.0'
+          MRUSTC_TARGET_VER: '1.90'
+          OUTDIR_SUF: '-1.90.0'
+          PARLEVEL: '2'
+          CC: gcc
+        run: |
+          set -euo pipefail
+          fixture="$PWD/bootstrap/mrustc-gcc-smoke"
+          timeout --signal=TERM --kill-after=10s 10m cargo run --quiet \
+            --manifest-path "$fixture/Cargo.toml" \
+            --target-dir "$RUNNER_TEMP/bootstrap-host-target" \
+            > "$RUNNER_TEMP/bootstrap-host.out"
+          (
+            cd mrustc
+            timeout --signal=TERM --kill-after=10s 25m bin/minicargo \
+              -L output-1.90.0 -o output-bootstrap-smoke \
+              "$fixture" > "$RUNNER_TEMP/bootstrap-mrustc.log" 2>&1
+          )
+          mapfile -t executables < <(find mrustc/output-bootstrap-smoke \
+            -maxdepth 2 -type f -executable -name '*smoke*' | LC_ALL=C sort)
+          if (( ${#executables[@]} != 1 )); then
+            echo "Expected one mrustc/GCC-linked smoke executable, got ${#executables[@]}" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          timeout 30s "${executables[0]}" > "$RUNNER_TEMP/bootstrap-mrustc.out"
+          diff -u "$RUNNER_TEMP/bootstrap-host.out" "$RUNNER_TEMP/bootstrap-mrustc.out"
+          grep -q '^compiler-ir-smoke:' "$RUNNER_TEMP/bootstrap-mrustc.out"
+          echo "Executable GCC oracle passed: mrustc output equals rustc output on compiler-ir integer semantics." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Mark experiment outcome
         if: always()
