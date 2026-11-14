@@ -130,6 +130,16 @@ jobs:
             cargo test -p compiler-opt --lib \
               partially_overlapped_bytes_keep_only_initialized_lanes -- --nocapture
 
+      - name: Verify permanent AL-04.P4a fail-closed effect contract
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          timeout --signal=TERM --kill-after=10s 5m \
+            cargo test -p compiler-opt --test alive_lite \
+              al04_p4a_ordered_frame_effects_and_fail_closed_scope -- --nocapture
+
       - name: Run non-Z3 Alive-lite checks and coverage ledger
         if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
         shell: bash
@@ -356,6 +366,18 @@ jobs:
           "$RUNNER_TEMP/al04-composed-bytes" | tee alive-lite-al04-composed-bytes.log
           grep -Fx 'AL04_NATIVE_C_COMPOSED_BYTES cases=32 wrong_shift=1 wrong_sign=1 lost_overwrite=1 verdict=PASS' \
             alive-lite-al04-composed-bytes.log
+
+      - name: Verify permanent AL-04.P4a independent C11 ordered effects
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cc -std=c11 -O2 -Wall -Wextra -Werror \
+            compiler/crates/opt/tests/oracles/al04_ordered_effects.c \
+            -o "$RUNNER_TEMP/al04-ordered-effects"
+          "$RUNNER_TEMP/al04-ordered-effects" | tee alive-lite-al04-ordered-effects.log
+          grep -Fx 'AL04_NATIVE_C_ORDERED_EFFECTS cases=18 wrong_order=1 wrong_argument=1 lost_write=1 verdict=PASS' \
+            alive-lite-al04-ordered-effects.log
 
       - name: Install checksum-pinned Z3 4.8.12
         if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
@@ -614,6 +636,14 @@ jobs:
               log,
           ):
               raise SystemExit('Missing permanent AL-04.P3c.3b composed-byte proof/negative controls')
+          # P4a proofs must include real changed direct and owned-TypeId
+          # outputs, and SAT mutants for external order/arguments/mutations.
+          # All unmodeled calls, trapping effects and globals still UNKNOWN.
+          if not re.search(
+              r'AL04_ORDERED_EFFECTS proofs=9 forward_changed=3\s+pipeline_changed=3 sat=3 independent=18 verdict=PROVEN',
+              log,
+          ):
+              raise SystemExit('Missing permanent AL-04.P4a ordered observable-call proofs or mutants')
           print(f'Validated {passed} Alive-lite tests and {len(proofs)} per-pass proof records')
           PY
           mkdir -p "$GITHUB_WORKSPACE/.alive-lite-verified"
