@@ -185,6 +185,52 @@ class ArchivedWitnessTest(unittest.TestCase):
             )
         self.assertFalse((self.history / "witnesses").exists())
 
+    def test_unavailable_replay_does_not_hide_subsequent_regression(self):
+        self.first()
+        self.behavior.write_text("agreement")
+        self.apply(SHA2, 124)
+        self.assertEqual(self.status()["agree_revisions"], "1")
+        self.behavior.write_text("error")
+        self.apply(SHA3, 125)
+        self.assertEqual(self.status()["state"], "unavailable")
+        self.assertEqual(self.status()["agree_revisions"], "1")
+        self.behavior.write_text("reproduces")
+        self.apply(SHA4, 126)
+        self.assertEqual(self.status()["state"], "reproduces")
+        self.assertEqual([x["event"] for x in self.events()], ["regression"])
+
+    def test_capped_rechecks_rotate_and_eventually_cover_all_old_witnesses(self):
+        self.history.mkdir()
+        archive = self.history / "witnesses"
+        archive.mkdir()
+        records = []
+        for i in range(18):
+            sample = self.row()
+            sample["a"] = str(i + 5)
+            key = base.fingerprint_id(sample)
+            records.append({
+                "id": key, **{field: sample[field] for field in base.KEY},
+                "first_sha": SHA1, "first_run": RUN + "99",
+                "last_sha": SHA1, "last_run": RUN + "99",
+                "runs": "1", "observations": "1",
+                "first_profile": "linear-pure", "first_seed": str(i),
+            })
+            (archive / f"{key}.ir").write_text("archived IR")
+        base.write_tsv(self.history / "fingerprints.tsv",
+                       base.HISTORY_COLUMNS, records)
+        self.behavior.write_text("error")
+        self.apply(SHA2, 123, limit=16)
+        first = {row["id"] for row in base.read_tsv(
+            self.history / "rechecks.tsv", check.STATUS_COLUMNS)}
+        self.assertEqual(len(first), 16)
+        self.apply(SHA3, 124, limit=16)
+        second = {row["id"] for row in base.read_tsv(
+            self.history / "rechecks.tsv", check.STATUS_COLUMNS)
+                  if row["last_run_token"] == "124.1"}
+        self.assertEqual(len(second), 16)
+        self.assertEqual(len(first | second), 18,
+                         "every archived fingerprint must eventually be checked")
+
     def test_invalid_limits_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "unsafe recheck budgets"):
             check.recheck(self.history, self.campaign, self.triage_out,
