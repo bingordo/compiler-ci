@@ -1,0 +1,51 @@
+name: Source-pinned IR BT3b AArch64 local/narrow memory migration
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-ir-bt3b-local-native-20261114.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  typeid-local-memory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install independent cross-assembler, GCC and QEMU runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu qemu-user
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e0bece5e485b0ed29a605303bfe9af43d999c280
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert pinned compiler revision
+        run: test "$(git -C compiler rev-parse HEAD)" = e0bece5e485b0ed29a605303bfe9af43d999c280
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: ir-bt3b-local-native
+      - name: Warnings-denied IR/backend/AArch64 all-target check
+        working-directory: compiler
+        run: RUSTFLAGS="-D warnings" cargo check -p compiler-ir -p compiler-backend -p compiler-backend-aarch64 --all-targets
+      - name: Original C11 local memory oracle in ELF/GAS and PIC/non-PIC via QEMU
+        working-directory: compiler
+        env:
+          COMPILER_REQUIRE_AARCH64_QEMU: "1"
+        run: cargo test -p compiler-backend-aarch64 --test local_memory -- --nocapture
+      - name: AArch64 backend full native/assembler regression suite
+        working-directory: compiler
+        run: cargo test -p compiler-backend-aarch64 --all-targets -- --test-threads=2
+      - name: Strict all-target AArch64 Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-aarch64 --all-targets -- -D warnings
