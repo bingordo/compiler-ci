@@ -1,0 +1,68 @@
+name: FZ-3 PR1340 bounded native source-pass activity validation
+on:
+  push:
+    branches: [fuzz/fz3-pass-activity-pr1340]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  coverage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 22
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 228e76f0fd507594e6ade4ad720e078d41c06a78
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "228e76f0fd507594e6ade4ad720e078d41c06a78"
+          grep -q 'pass_coverage.tsv' compiler/crates/opt/tests/support/typeid_native_campaign.rs
+      - name: Isolate self-contained compiler core
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: fz3-pass-activity
+      - name: Lint observer-based native activity instrumentation
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt --test typeid_native_campaign --example typeid_native_campaign -- -D warnings -A dead_code
+      - name: Run bounded native campaign unit and end-to-end regressions
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --example typeid_native_campaign -- --nocapture
+          cargo test -p compiler-opt --test typeid_native_campaign -- --nocapture
+          cargo test -p compiler-opt --test typeid_fuzz_pass_registry -- --nocapture
+      - name: Inspect complete pass-stage activity matrix from real native executions
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          root="$RUNNER_TEMP/fz3-pass-activity"
+          cargo run -p compiler-opt --example typeid_native_campaign -- \
+            --out "$root" --source-sha "$sha" \
+            --first-seed 0 --seeds 1 --max-evaluations 120 \
+            --max-unique 2 --max-probes 12
+          test -s "$root/pass_coverage.tsv"
+          test "$(wc -l < "$root/pass_coverage.tsv")" -eq 133
+          grep -q '^disabled' "$root/pass_coverage.tsv"
+          grep -q '^scalar' "$root/pass_coverage.tsv"
+          grep -q '^cost-aware' "$root/pass_coverage.tsv"
+          grep -q '^unique_failures=0$' "$root/summary.txt"
+      - name: Preserve evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fz3-pr1340-native-pass-activity
+          path: ${{ runner.temp }}/fz3-pass-activity/
+          if-no-files-found: warn
+          retention-days: 7
