@@ -1,0 +1,65 @@
+name: IR F45 direct-TypeId AL04 P3C2 byte-lane proof
+on:
+  push:
+    branches:
+      - ci/ir-f45-p3c2-memory-20261113
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  p3c2-proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler F45 source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7bcdd48078fba97f92f9e06c3852c26842325bc6
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and restrict workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "7bcdd48078fba97f92f9e06c3852c26842325bc6"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo "Source SHA: 7bcdd48078fba97f92f9e06c3852c26842325bc6" >> "$GITHUB_STEP_SUMMARY"
+      - name: Install Z3 for AL04 SMT proof and counterexample controls
+        run: sudo apt-get update && sudo apt-get install -y z3
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-f45-al04-p3c2-v1
+      - name: All ignored Alive-lite memory SMT proofs with negative controls
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test alive_lite alive_lite_memory:: -- --ignored --nocapture
+      - name: Nonignored Alive-lite correctness and fail-closed controls
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test alive_lite
+      - name: Native TypeId memory and independent generated execution oracles
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test memory_execution_oracle
+          cargo test -p compiler-opt --test generated_native_oracle
+      - name: Core IR and x86 backend suites
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --lib
+          cargo test -p compiler-backend-x86 --lib
+      - name: Strict all-target Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
