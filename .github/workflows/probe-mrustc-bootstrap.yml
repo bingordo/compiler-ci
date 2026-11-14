@@ -194,6 +194,46 @@ jobs:
           echo "GCC successfully compiled $count newly generated C units into object files." >> "$GITHUB_STEP_SUMMARY"
           echo "Compiler-ir is a library: this checks native object production, not runtime correctness." >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Translate compiler-opt and compile generated C with GCC
+        id: optimizer
+        shell: bash
+        working-directory: mrustc
+        env:
+          RUSTC_VERSION: '1.90.0'
+          MRUSTC_TARGET_VER: '1.90'
+          OUTDIR_SUF: '-1.90.0'
+          PARLEVEL: '2'
+          CC: gcc
+        run: |
+          set -euo pipefail
+          # compiler-opt depends on compiler-ir. minicargo must resolve and
+          # compile the real local path dependency, not a synthetic stub.
+          find . -type f -name '*.c' -printf '%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/mrustc-opt-c-before.txt"
+          timeout --signal=TERM --kill-after=10s 30m bin/minicargo \
+            -L output-1.90.0 -o output-compiler-opt \
+            ../compiler/crates/opt > "$RUNNER_TEMP/mrustc-opt-probe.log" 2>&1 || {
+              echo "compiler-opt translation failed (see restricted diagnostic log)" >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            }
+          find . -type f -name '*.c' -printf '%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/mrustc-opt-c-after.txt"
+          comm -13 "$RUNNER_TEMP/mrustc-opt-c-before.txt" "$RUNNER_TEMP/mrustc-opt-c-after.txt" > "$RUNNER_TEMP/mrustc-opt-c-new.txt"
+          mapfile -t generated < "$RUNNER_TEMP/mrustc-opt-c-new.txt"
+          if (( ${#generated[@]} == 0 )); then
+            echo "compiler-opt: no new generated C files" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/mrustc-opt-gcc-objects"
+          count=0
+          for relative in "${generated[@]}"; do
+            [[ -f "$relative" ]] || exit 1
+            gcc -std=gnu11 -O0 -c "$relative" -o "$RUNNER_TEMP/mrustc-opt-gcc-objects/$count.o"
+            count=$((count + 1))
+          done
+          ar rcs "$RUNNER_TEMP/mrustc-opt-gcc-objects/libcompiler-opt-probe.a" "$RUNNER_TEMP"/mrustc-opt-gcc-objects/*.o
+          test -s "$RUNNER_TEMP/mrustc-opt-gcc-objects/libcompiler-opt-probe.a"
+          echo "compiler-opt: minicargo succeeded and GCC compiled $count new C units." >> "$GITHUB_STEP_SUMMARY"
+          echo "This verifies native object compilation, not semantic correctness or a runnable compiler." >> "$GITHUB_STEP_SUMMARY"
+
       - name: Mark experiment outcome
         if: always()
         shell: bash
