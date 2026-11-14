@@ -1,0 +1,113 @@
+name: S23.50g Boolean producer-alias migration, source-pinned
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-50g-boolean-producer-alias.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  generated-shadow:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Fetch exact compiler S23.50 candidate (never run on compiler Actions)
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 818abd849902d778b82e70eeaab086b22b870984
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Validate pinned source and isolate optimizer workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 818abd849902d778b82e70eeaab086b22b870984
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+          python3 --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: s23-50-generated-shadow
+      - name: Validate Python parser and standalone generated Rust and SSA view
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m compileall -q tools/typeid-rule-gen
+          python3 -m unittest discover -s tools/typeid-rule-gen -p 'test_*.py' -v
+          python3 tools/typeid-rule-gen/rules.py tools/typeid-rule-gen/examples.rules --emit-ssa-rust > "$RUNNER_TEMP/shadow.rs"
+          rustc --edition=2021 --crate-type=lib "$RUNNER_TEMP/shadow.rs" -o "$RUNNER_TEMP/libshadow.rlib"
+      - name: Install SHA256-pinned Z3 release for offline mathematical proofs
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="5.3.1"
+          asset="z3-${version}-x64-glibc-2.39.zip"
+          archive="${RUNNER_TEMP}/${asset}"
+          curl --fail --location --retry 4 --retry-all-errors \
+            --connect-timeout 15 --max-time 180 \
+            --output "${archive}" \
+            "https://github.com/Z3Prover/z3/releases/download/z3-${version}/${asset}"
+          echo "acca9625e8cc8edeb9647b653a1bd696544ddeb5d1c2970a4576734a0c175b40  ${archive}" | sha256sum --check -
+          mkdir -p "${RUNNER_TEMP}/z3-release"
+          unzip -q "${archive}" -d "${RUNNER_TEMP}/z3-release"
+          solver="$(find "${RUNNER_TEMP}/z3-release" -type f -path '*/bin/z3' -print -quit)"
+          test -n "${solver}"
+          chmod +x "${solver}"
+          echo "$(dirname "${solver}")" >> "${GITHUB_PATH}"
+          "${solver}" -version
+      - name: Prove every S23.50 rule at all five integer widths, with SAT controls
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/typeid-rule-gen/prove.py tools/typeid-rule-gen/examples.rules \
+            --timeout-ms 2500 --process-timeout 5 \
+            --manifest "${RUNNER_TEMP}/s2350-proof-manifest.json"
+          python3 - "${RUNNER_TEMP}/s2350-proof-manifest.json" <<'PY'
+          import json, sys
+          with open(sys.argv[1], encoding="utf-8") as stream:
+              proof = json.load(stream)
+          assert proof["schema"] == "compiler.typeid-proofs.v1"
+          assert proof["logic"] == "QF_BV"
+          assert proof["family_count"] == 22
+          assert proof["proof_count"] == 270
+          assert proof["sat_negative_controls"] == 5
+          assert len({(p["id"], p["width"], p["orientation"]) for p in proof["proofs"]}) == 270
+          assert all(p["result"] == "unsat" for p in proof["proofs"])
+          PY
+      - name: Test native read-only TypeId adapter and existing algebra
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib --features experimental-typeid-generated-shadow generated_typeid_shadow::tests -- --nocapture
+          cargo test -p compiler-opt --test generated_native_integer_algebra -- --nocapture
+          cargo test -p compiler-opt --features experimental-typeid-generated-shadow --test native_s2350_shadow_parity -- --nocapture
+      - name: Execute proved generated native TypeId rewrites with verifier and rollback
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --features experimental-typeid-generated-rewrites --test native_s2350_shadow_parity -- --nocapture
+          cargo test -p compiler-opt --features experimental-typeid-generated-rewrites --test native_s2350_migration_batch -- --nocapture
+          cargo test -p compiler-opt --features experimental-typeid-generated-rewrites --test native_s2350_cancellation_batch -- --nocapture
+          cargo test -p compiler-opt --features experimental-typeid-generated-rewrites --test native_s2350_boolean_alias_batch -- --nocapture
+          cargo test -p compiler-opt --features experimental-typeid-generated-rewrites --test generated_native_integer_algebra -- --nocapture
+          cargo test -p compiler-opt --features experimental-typeid-generated-rewrites --test generated_native_boolean_dag -- --nocapture
+      - name: Strict native optimizer Clippy with generated shadow enabled
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --all-targets --features experimental-typeid-generated-rewrites -- -D warnings
