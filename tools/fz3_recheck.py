@@ -130,13 +130,19 @@ def recheck(history_dir: Path, campaign: Path, triage_dir: Path,
     checked = 0
     unavailable = 0
     not_reproduced = 0
-    for row in history:
+    # Rotate a deterministic capped window over *old* witnesses. Without
+    # rotation, more than 16 historical fingerprints would permanently starve
+    # every record after the first 16.
+    new_ids = {row["id"] for row in new}
+    previous_witnesses = [row for row in history if row["id"] not in new_ids]
+    if previous_witnesses:
+        start = int(run_token.split(".")[0]) % len(previous_witnesses)
+        candidates = (previous_witnesses[start:] + previous_witnesses[:start])[:limit]
+    else:
+        candidates = []
+    for row in candidates:
         fp_id = row["id"]
-        if fp_id in {x["id"] for x in new}:
-            continue  # Do not claim a fresh finding is fixed on the same run.
         witness = archived_path(history_dir, fp_id)
-        if checked >= limit:
-            break
         checked += 1
         if not witness.is_file():
             state, detail = "unavailable", "archived minimized IR unavailable"
@@ -152,7 +158,7 @@ def recheck(history_dir: Path, campaign: Path, triage_dir: Path,
         event = None
         if state == "not-reproduced":
             not_reproduced += 1
-            if old_state != "not-reproduced":
+            if old_state != "not-reproduced" and old_agreement == 0:
                 next_agreement = 1
                 first_agree_sha = sha
                 event = "suspected-fix"
@@ -169,7 +175,9 @@ def recheck(history_dir: Path, campaign: Path, triage_dir: Path,
                 # Do not erase prior clean evidence on infrastructure failure.
                 next_agreement = old_agreement
                 first_agree_sha = old["first_agree_sha"]
-        elif state == "reproduces" and old_state == "not-reproduced":
+        elif state == "reproduces" and old_agreement > 0:
+            # A failed/unsupported replay between agreement and recurrence
+            # must not erase previous evidence or hide the regression.
             event = "regression"
         elif state == "other-wrong-value" and old_state not in (
             "other-wrong-value", "unavailable"
