@@ -58,6 +58,23 @@ execution. Infrastructure errors, missing reports, invalid fingerprints,
 or injected results are never inserted into genuine history. The
 artifact upload uses `if: always()`, including triage output on failure.
 
+## Independent signed integer trap checks
+
+The same **compiler-ci-only nightly** workflow also runs the
+`typeid_native_trap_differential` tests from compiler main. These execute
+GAS/direct ELF binaries in separate Linux x86-64 child processes and compare
+defined i32 results and the exact **SIGFPE** outcome for signed divide/remainder
+by zero and signed `MIN/-1` overflow against the original TypeId reference,
+both before and after optimization. Some cases also execute aliased
+local-memory stores before division.
+
+An unexpected value or a different signal makes the nightly job fail.
+A compiler/link/reference infrastructure error is **not** counted as a
+valid trap. This currently contributes to the CI regression gate, **not**
+to the persistent wrong-*value* fingerprint ledger or its automatic issue
+deduplication. Future work may add separate signal-class fingerprints and
+minimized trap reproductions without conflating them with wrong-value bugs.
+
 ## Persistent source-pass activity trends
 
 The native campaign now emits `pass_coverage.tsv` from the existing
