@@ -1,0 +1,148 @@
+name: Prototype mrustc-to-C compiler bootstrap
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/probe-mrustc-bootstrap.yml'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Compiler source branch, tag, or SHA'
+        required: false
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mrustc-bootstrap-${{ inputs.source_ref || 'main' }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    steps:
+      - name: Checkout compiler using existing read-only deploy key
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || 'main' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+
+      - name: Checkout pinned mrustc
+        uses: actions/checkout@v4
+        with:
+          repository: thepowersgang/mrustc
+          ref: master
+          path: mrustc
+          persist-credentials: false
+
+      - name: Identify mrustc cache revision
+        id: mrustc-revision
+        shell: bash
+        run: echo "sha=$(git -C mrustc rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore prebuilt mrustc and Rust 1.90 libraries
+        id: mrustc-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            mrustc/bin
+            mrustc/output-1.90.0
+          key: mrustc-bootstrap-v1-${{ runner.os }}-ubuntu2404-rust190-${{ steps.mrustc-revision.outputs.sha }}
+
+      - name: Install mrustc build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends build-essential zlib1g-dev pkg-config cmake curl python3 libssl-dev
+
+      - name: Record reproducibility inputs and target crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Compiler SHA: $(git -C compiler rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          echo "mrustc SHA: $(git -C mrustc rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Host: $(uname -m) / $(lsb_release -rs)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Rust crate editions:" >> "$GITHUB_STEP_SUMMARY"
+          grep -Rh '^edition[[:space:]]*=' compiler/crates/*/Cargo.toml | sort | uniq -c >> "$GITHUB_STEP_SUMMARY"
+          echo "First target: compiler-ir (no frontend dependency); then compiler-opt, backend, driver." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build mrustc and matching Rust 1.90 libraries
+        id: toolchain
+        shell: bash
+        working-directory: mrustc
+        env:
+          RUSTC_VERSION: '1.90.0'
+          MRUSTC_TARGET_VER: '1.90'
+          OUTDIR_SUF: '-1.90.0'
+          PARLEVEL: '2'
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.mrustc-cache.outputs.cache-hit }}" == "true" ]] && \
+             [[ -x bin/mrustc ]] && [[ -x bin/minicargo ]] && \
+             [[ -f output-1.90.0/libcore.rlib ]]; then
+            echo "Using cached mrustc toolchain and Rust libraries" >> "$GITHUB_STEP_SUMMARY"
+          else
+            # Missing/incomplete caches rebuild in this runner.
+            timeout --signal=TERM --kill-after=10s 20m make -j2
+            timeout --signal=TERM --kill-after=10s 10m make RUSTCSRC
+            timeout --signal=TERM --kill-after=10s 55m make -f minicargo.mk LIBS
+          fi
+          test -x bin/mrustc
+          test -x bin/minicargo
+          test -f output-1.90.0/libcore.rlib
+
+      - name: Cache validated mrustc toolchain
+        if: success() && steps.mrustc-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            mrustc/bin
+            mrustc/output-1.90.0
+          key: mrustc-bootstrap-v1-${{ runner.os }}-ubuntu2404-rust190-${{ steps.mrustc-revision.outputs.sha }}
+
+      - name: Attempt compiler-ir Rust-to-C emission
+        id: translate
+        shell: bash
+        working-directory: mrustc
+        env:
+          RUSTC_VERSION: '1.90.0'
+          MRUSTC_TARGET_VER: '1.90'
+          OUTDIR_SUF: '-1.90.0'
+          PARLEVEL: '2'
+        run: |
+          set -euo pipefail
+          # This is deliberately a bounded first-crate feasibility probe, not
+          # an assertion that the full Cargo workspace is supported.
+          set +e
+          timeout --signal=TERM --kill-after=10s 20m bin/minicargo \
+            -L output-1.90.0 \
+            ../compiler/crates/ir/Cargo.toml > "$RUNNER_TEMP/mrustc-probe.log" 2>&1
+          rc=$?
+          set -e
+          echo "mrustc/minicargo exit code: $rc" >> "$GITHUB_STEP_SUMMARY"
+          echo "Generated C files: $(find output-1.90.0 -name '*.c' -type f | wc -l)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Result is exploratory; do not infer full toolchain compatibility." >> "$GITHUB_STEP_SUMMARY"
+          # Print bounded diagnostic classification without exposing source or
+          # the generated C in public CI logs/artifacts.
+          if (( rc != 0 )); then
+            echo "First target failed; inspect private source with appropriate access." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "probe_exit=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Mark experiment outcome
+        if: always()
+        shell: bash
+        env:
+          TOOLCHAIN_OUTCOME: ${{ steps.toolchain.outcome }}
+          TRANSLATE_OUTCOME: ${{ steps.translate.outcome }}
+          PROBE_EXIT: ${{ steps.translate.outputs.probe_exit }}
+        run: |
+          echo "mrustc build: $TOOLCHAIN_OUTCOME" >> "$GITHUB_STEP_SUMMARY"
+          echo "Translation step: $TRANSLATE_OUTCOME; minicargo exit: ${PROBE_EXIT:-not reached}" >> "$GITHUB_STEP_SUMMARY"
+          echo "No Mini-C compilation or full bootstrap is claimed by this prototype." >> "$GITHUB_STEP_SUMMARY"
