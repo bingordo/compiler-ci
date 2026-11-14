@@ -1,0 +1,125 @@
+name: X7 S3B exact Intel ADD 32/64 SMT and independent 64-bit GAS ELF
+on:
+  push:
+    branches: [feature/x7-s3b-width-add-source-native-20261114]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source-smt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 24
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1dd25ea35ae2f5b7f2c9a40cdfc3f433f4bb60ed
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Exact pinned Intel ADD iform and helper source
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/s3b-intel
+          rev=35eface1b7ee003a1cda95005ec5fd83de658a64
+          curl --fail --silent --show-error --location --retry 2 --max-time 60 \
+            "https://raw.githubusercontent.com/intel/SDM/${rev}/data/instruction/ADD.xml" -o /tmp/s3b-intel/ADD.xml
+          curl --fail --silent --show-error --location --retry 2 --max-time 60 \
+            "https://raw.githubusercontent.com/intel/SDM/${rev}/data/definitions.xml.gz" -o /tmp/s3b-intel/definitions.xml.gz
+      - name: Independent 32/64-bit ADD value helper RFLAGS SMT and 64-bit mutations
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 1dd25ea35ae2f5b7f2c9a40cdfc3f433f4bb60ed
+          python3 -m venv /tmp/s3b-z3
+          /tmp/s3b-z3/bin/python -m pip install --disable-pip-version-check 'z3-solver==4.13.4.0'
+          export X7_S3B_PINNED_ADD_XML=/tmp/s3b-intel/ADD.xml
+          export X7_S3B_PINNED_DEFINITIONS_GZ=/tmp/s3b-intel/definitions.xml.gz
+          /tmp/s3b-z3/bin/python -m unittest discover -s tools -p test_x86_s3_add_width_proof.py -v
+          /tmp/s3b-z3/bin/python tools/x86_s3_add_width_proof.py \
+            --intel-add-xml /tmp/s3b-intel/ADD.xml \
+            --definitions-gz /tmp/s3b-intel/definitions.xml.gz \
+            --out /tmp/s3b-width-proof.json
+          /tmp/s3b-z3/bin/python tools/x86_s3_add_width_proof.py \
+            --intel-add-xml /tmp/s3b-intel/ADD.xml \
+            --definitions-gz /tmp/s3b-intel/definitions.xml.gz \
+            --out /tmp/s3b-width-proof.json --check
+          python3 - <<'PY'
+          import json
+          j=json.load(open('/tmp/s3b-width-proof.json'))
+          assert j['smt_unsat_total']==28
+          assert [x['width_bits'] for x in j['widths']]==[32,64]
+          assert all(x['all_source_arithmetic_models_equivalent'] for x in j['widths'])
+          assert j['eligible_machine_forms']==0 and j['production_selection_eligible'] is False
+          print('X7_S3B_ACTUAL_PINNED_ADD32_64_SMT_PASS',j['source_iform_sha256'])
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-s3b-32-64-pinned-add-smt-only-no-admission
+          path: /tmp/s3b-width-proof.json
+          if-no-files-found: warn
+  native-64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1dd25ea35ae2f5b7f2c9a40cdfc3f433f4bb60ed
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Download all six actual pinned Intel ALU XML records
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 1dd25ea35ae2f5b7f2c9a40cdfc3f433f4bb60ed
+          mkdir -p /tmp/s3b-intel /tmp/s3b-native
+          rev=35eface1b7ee003a1cda95005ec5fd83de658a64
+          for n in MOV ADD SUB AND OR XOR; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 60 \
+              "https://raw.githubusercontent.com/intel/SDM/${rev}/data/instruction/${n}.xml" \
+              -o "/tmp/s3b-intel/${n}.xml"
+          done
+      - name: Independent REX.W literal bytes versus GAS and real C11 flags
+        run: |
+          set -euo pipefail
+          python3 tools/x86_g10_regen_physical_forms.py --xml-dir /tmp/s3b-intel --check
+          python3 tools/regen_x86_forms.py --check
+          python3 -m unittest discover -s tools -p test_x86_g10_n20_rexw_native.py -v
+          python3 tools/x86_g10_n20_rexw_native.py --xml-dir /tmp/s3b-intel --out-dir /tmp/s3b-native
+          cc -O2 -std=c11 -Wall -Wextra -Werror \
+            tools/tests/x86_g10_n20_rexw_native.c /tmp/s3b-native/n20_rexw_forms.S \
+            -o /tmp/s3b-native/rexw-oracle
+          /tmp/s3b-native/rexw-oracle
+          python3 tools/x86_g10_n20_validate_bytes.py \
+            --binary /tmp/s3b-native/rexw-oracle \
+            --evidence /tmp/s3b-native/n20_rexw_evidence.json
+          python3 - <<'PY'
+          import json
+          j=json.load(open('/tmp/s3b-native/n20_rexw_evidence.json'))
+          assert j['source_forms']==5 and len(j['fixtures'])==10
+          a={x['intel_form_sha256'] for x in j['fixtures'] if x['source_iform']=='ADD_GPRv_MEMv'}
+          assert len(a)==1 and len(next(iter(a)))==64
+          print('X7_S3B_ADD_64_NATIVE_SOURCE_FORM_SHA',next(iter(a)))
+          PY
+      - name: Real I64 SSA CFG phi and pressure GAS ELF with strict fallback
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text('''[workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          ''')
+          PY
+          cargo test -p compiler-backend-x86 --features x7-c-defined-64 \
+            --test x7_g10_n19_64_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-c-defined-64 \
+            --test x7_g10_n20_cfg_pressure_64_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --test x7_g10_n15_no_default_fallback --offline
+          echo X7_S3B_64BIT_GAS_ELF_CFG_PRESSURE_PASS
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-s3b-64bit-rexw-gas-direct-elf-no-admission
+          path: /tmp/s3b-native/n20_rexw_evidence.json
+          if-no-files-found: warn
