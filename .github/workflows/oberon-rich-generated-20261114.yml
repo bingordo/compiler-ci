@@ -1,0 +1,80 @@
+name: Oberon rich generated differential
+on:
+  push:
+    paths:
+      - '.github/workflows/oberon-rich-generated-20261114.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  rich-differential:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact rich Oberon frontend candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/oberon
+          ref: b038a8673e0fcec16b585824337c77c5ce697838
+          path: oberon
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact compiler differential runner
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 06d77be451e4fb8582cd844d3965d528a341bba3
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify frontend pin and link local source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C oberon rev-parse HEAD)" = b038a8673e0fcec16b585824337c77c5ce697838
+          test "$(git -C compiler rev-parse HEAD)" = 06d77be451e4fb8582cd844d3965d528a341bba3
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('compiler/crates/driver/Cargo.toml')
+          s=p.read_text()
+          old='oberon-front-ir = { git = "ssh://git@github.com/bingordo/oberon.git", rev = "b038a8673e0fcec16b585824337c77c5ce697838" }'
+          assert s.count(old)==1, "pinned frontend does not match generator candidate"
+          p.write_text(s.replace(old,
+             'oberon-front-ir = { path = "../../../oberon/oberon/crates/front-ir" }'))
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            compiler -> target
+            oberon/oberon -> target
+          key: oberon-rich-generated-v1
+      - name: Generator deterministic oracle unit tests
+        run: cargo test --manifest-path oberon/oberon/Cargo.toml --bin obgen
+      - name: Checked native frontend unit tests
+        run: cargo test --manifest-path oberon/oberon/Cargo.toml -p oberon-front-ir
+      - name: Build reference C and Cranelift driver plus generator
+        run: cargo build --manifest-path oberon/oberon/Cargo.toml --bin obgen --bin obc
+      - name: Build native standalone compiler
+        run: cargo build --manifest-path compiler/Cargo.toml -p compiler --bin compiler
+      - name: Run four rich seeds x 44 inputs against native ELF/GAS, C and Cranelift
+        shell: bash
+        run: |
+          set -euo pipefail
+          export OBGEN="$PWD/oberon/oberon/target/debug/obgen"
+          export OBC="$PWD/oberon/oberon/target/debug/obc"
+          export COMPILER="$PWD/compiler/target/debug/compiler"
+          export FUZZ_WORK="$PWD/findings/rich"
+          FUZZ_VARIANT=rich FUZZ_BASE=1 FUZZ_SEEDS=4 bash compiler/tests/oberon_fuzz.sh
+      - name: Retain failed generated programs and logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oberon-rich-generated-failures
+          path: findings/rich
+          if-no-files-found: ignore
+          retention-days: 14
