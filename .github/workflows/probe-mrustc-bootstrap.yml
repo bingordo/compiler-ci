@@ -38,6 +38,20 @@ jobs:
           path: mrustc
           persist-credentials: false
 
+      - name: Identify mrustc cache revision
+        id: mrustc-revision
+        shell: bash
+        run: echo "sha=$(git -C mrustc rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore prebuilt mrustc and Rust 1.90 libraries
+        id: mrustc-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            mrustc/bin
+            mrustc/output-1.90.0
+          key: mrustc-bootstrap-v1-${{ runner.os }}-ubuntu2404-rust190-${{ steps.mrustc-revision.outputs.sha }}
+
       - name: Install mrustc build dependencies
         run: |
           sudo apt-get update -qq
@@ -65,10 +79,28 @@ jobs:
           PARLEVEL: '2'
         run: |
           set -euo pipefail
-          timeout --signal=TERM --kill-after=10s 20m make -j2
-          timeout --signal=TERM --kill-after=10s 55m make -f minicargo.mk LIBS
+          if [[ "${{ steps.mrustc-cache.outputs.cache-hit }}" == "true" ]] && \
+             [[ -x bin/mrustc ]] && [[ -x bin/minicargo ]] && \
+             [[ -f output-1.90.0/libcore.rlib ]]; then
+            echo "Using cached mrustc toolchain and Rust libraries" >> "$GITHUB_STEP_SUMMARY"
+          else
+            # Missing/incomplete caches rebuild in this runner.
+            timeout --signal=TERM --kill-after=10s 20m make -j2
+            timeout --signal=TERM --kill-after=10s 10m make RUSTCSRC
+            timeout --signal=TERM --kill-after=10s 55m make -f minicargo.mk LIBS
+          fi
           test -x bin/mrustc
           test -x bin/minicargo
+          test -f output-1.90.0/libcore.rlib
+
+      - name: Cache validated mrustc toolchain
+        if: success() && steps.mrustc-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            mrustc/bin
+            mrustc/output-1.90.0
+          key: mrustc-bootstrap-v1-${{ runner.os }}-ubuntu2404-rust190-${{ steps.mrustc-revision.outputs.sha }}
 
       - name: Attempt compiler-ir Rust-to-C emission
         id: translate
