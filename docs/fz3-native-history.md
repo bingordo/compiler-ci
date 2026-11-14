@@ -58,6 +58,48 @@ execution. Infrastructure errors, missing reports, invalid fingerprints,
 or injected results are never inserted into genuine history. The
 artifact upload uses `if: always()`, including triage output on failure.
 
+## Persistent source-pass activity trends
+
+The native campaign now emits `pass_coverage.tsv` from the existing
+production TypeId stage observer. It records the **actual number of complete
+optimizer invocations per input module recipe** (`visits`) and boundaries
+where the serialized verified IR changed (`edits`). Counts cover each of
+the **21 core passes**, each optional retry pass, CTFE and native-integer
+optimization, separately for Disabled, ScalarLeaves and CostAwareCfg modes.
+
+Raw/unoptimized native executions never count as optimizer invocations.
+The file always has **132 explicit mode/stage rows**, including zero visits
+for modes not reached under a bounded campaign. A pass edit is not evidence
+of compiler correctness; the previous **FZ-2.5 Partial** classification
+for all 21 core passes is unaffected.
+
+The `tools/fz3_pass_trends.py` reconciler requires an authentic
+non-injected native campaign, an exactly matching source SHA and a
+previously validated native report/run in `processed_runs.tsv`. It rejects
+unknown stages, repeated stage keys, inconsistent counts and impossible
+`edits > visits`. No incomplete or injected campaign can silently be
+counted as certified.
+
+The dedicated history branch stores:
+
+- `state/fz3/pass_runs.tsv`: 132 per-run rows, with exact run attempt,
+  source SHA, inline mode, stage, visits, edits and a budget-truncation flag
+- `state/fz3/pass_totals.tsv`: cumulative run counts, visits, edits and
+  counts of runs in which each stage was reached or changed
+- per-run `pass_trends/pass_trend.md` and `pass_trend.tsv` artifacts,
+  listing the most active edited stages and total history
+
+Reconciliation is idempotent: repeating the same CI run must preserve its
+counts, while replaying it with different data is rejected. The ledger
+is published only after the normal FZ-3 native triage, archived-witness
+checks and issue actions succeed. The raw artifact remains available on
+both clean and failure runs.
+
+These metrics track **observed pass activity**, not branch coverage,
+opcode coverage, a correctness oracle for each pass, or performance.
+More source-semantic test cases and independently checked pass interactions
+are still required for certification.
+
 ## Archived-witness lifecycle and regression detection
 
 A rotating fuzz campaign **cannot** prove that a bug is fixed merely because
