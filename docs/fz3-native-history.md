@@ -8,10 +8,11 @@ in Actions artifacts for 14 days.
 
 ## Persistent history
 
-A dedicated **`fz3-native-fingerprint-history`** branch contains only
-`state/fz3/fingerprints.tsv` and `state/fz3/processed_runs.tsv` (plus
-its initial checkout files). History is kept separately from the
-default branch to avoid a daily stream of unrelated CI-source commits.
+A dedicated **`fz3-native-fingerprint-history`** branch holds the
+existing v1 wrong-value ledger (`state/fz3/fingerprints.tsv` and
+`processed_runs.tsv`) alongside its archived witnesses, lifecycle and
+pass-activity files. V2 trap/return data uses **separate versioned files**.
+History is kept off the default branch to avoid unrelated daily commits.
 The nightly job checks this branch out with repository-scoped
 `GITHUB_TOKEN` credentials (`contents: write`). Its concurrency group
 serializes scheduled and manual executions, preventing two runs from
@@ -58,22 +59,74 @@ execution. Infrastructure errors, missing reports, invalid fingerprints,
 or injected results are never inserted into genuine history. The
 artifact upload uses `if: always()`, including triage output on failure.
 
-## Independent signed integer trap checks
+## Signed arithmetic trap fuzzing and v2 outcome history
 
-The same **compiler-ci-only nightly** workflow also runs the
-`typeid_native_trap_differential` tests from compiler main. These execute
-GAS/direct ELF binaries in separate Linux x86-64 child processes and compare
-defined i32 results and the exact **SIGFPE** outcome for signed divide/remainder
-by zero and signed `MIN/-1` overflow against the original TypeId reference,
-both before and after optimization. Some cases also execute aliased
-local-memory stores before division.
+The production compiler remains unchanged by FZ-3. In the **test-only**
+TypeId campaign, two seed-parity-rotating signed `DivS`/`RemS` recipes
+exercise defined results, divisor zero, signed overflow and aliased/overwritten
+local i32 memory. Both GAS and direct ELF output run in Linux x86-64 child
+processes. The original, **unoptimized** TypeId CFG reference supplies the
+expected outcome. Only an exact native `SIGFPE` counts as a trap; a linker
+error, unrelated signal or unsupported reference is an infrastructure failure,
+not a genuine compiler fingerprint. The independent
+`typeid_native_trap_differential` regression suite also runs nightly.
 
-An unexpected value or a different signal makes the nightly job fail.
-A compiler/link/reference infrastructure error is **not** counted as a
-valid trap. This currently contributes to the CI regression gate, **not**
-to the persistent wrong-*value* fingerprint ledger or its automatic issue
-deduplication. Future work may add separate signal-class fingerprints and
-minimized trap reproductions without conflating them with wrong-value bugs.
+The 240-evaluation nightly limit remains five profiles × three operands ×
+four inline modes × two sinks × two seeds. Trap discrepancies are recorded
+independently from the original v1 `fingerprints.tsv`, using
+`outcome_fingerprints_v2.tsv` in campaign artifacts. Its exact key is
+
+`(optimizer mode, sink, i32 a, i32 b, expected Outcome, actual Outcome)`,
+
+where each outcome is `sigfpe` or `value:<u32>`. A new versioned hash
+namespace prevents collisions with v1 symptom IDs. Both missing and
+unexpected traps, as well as different defined results, are eligible.
+Every genuine mismatch is reduced through verifier-gated TypeId ddmin while
+requiring the same reference/native fingerprint after each mutation.
+
+### Persistent v2 acceptance and replay
+
+The new **compiler-ci-only** steps run *after* normal v1 report validation.
+`tools/fz3_outcome_triage.py` requires the v1 report to have been registered
+for the exact source SHA and GitHub run/attempt. It independently validates
+v2 column names, counts, outcomes, signatures, safe relative file locations,
+per-case replay pins and bounded budgets. Injected or malformed reports fail
+closed; they cannot overwrite published history.
+
+The separate durable files, created on the first validated publication, are:
+
+- `state/fz3/outcome_fingerprints_v2.tsv`: exact cross-run fingerprints,
+  source SHA/run, observation counts and first seed/profile
+- `state/fz3/outcome_processed_runs_v2.tsv`: source-pinned per-run digest
+  for conflict rejection and idempotent replay
+- `state/fz3/outcome_witnesses_v2/<id>.ir`: minimized original-IR witnesses
+- `state/fz3/outcome_rechecks_v2.tsv`: last replay state and provenance
+
+`tools/fz3_outcome_recheck.py` requires **successful exact replay of each
+new minimized IR** using the real native reproducer before archiving it.
+It rotates a bounded set of older witnesses for subsequent checks.
+A successful exact pinned replay is `reproduces`; a changed pin is
+`not-exact`, **not** proof of a fix; compiler/oracle/timeout failures are
+`unavailable`. This conservative v2 protocol does not issue tentative-fix
+comments, close bugs, or infer regression from a missing fuzz seed. Those
+would require an unpinned structured outcome oracle to distinguish genuine
+agreement from a different wrong result.
+
+The workflow searches existing open/closed `compiler-ci` issues for
+`FZ3-OUTCOME:<id>` and opens an issue only for a new, replay-verified
+fingerprint. The v2 issue action, validation, replay and the existing v1
+issue/lifecycle and pass-trend steps must **all** succeed before a single
+atomic history-branch publication. Any failed step leaves persistent history
+uncommitted. A real compiler mismatch still makes the campaign red, even
+when the same symptom was previously deduplicated.
+
+**Acceptance status:** source-pinned compiler-ci test validation passed on
+November 14, 2026 for compiler commit `7fd3e003`. This verifies synthetic
+new/recurrent/rejected history, exact witness archiving, and a real 240-case
+no-mismatch campaign including both signed arithmetic recipe families.
+It does **not** establish that the first scheduled v2 history rollover,
+automated issue creation or subsequent cross-run rechecks have occurred.
+Keep the tracker open until that operational evidence exists.
 
 ## Persistent source-pass activity trends
 
@@ -174,12 +227,15 @@ paths and signatures, duplicate rows, and **injected self-test rejection**.
 The dedicated `fz3-triage-validation.yml` workflow also runs an actual
 bounded no-injection native campaign and reconciles its report twice.
 
-To inspect history:
+To inspect history (the v2 files only exist after first validated
+nightly publication):
 
 ```sh
 git fetch origin fz3-native-fingerprint-history
 git show origin/fz3-native-fingerprint-history:state/fz3/fingerprints.tsv
 git show origin/fz3-native-fingerprint-history:state/fz3/processed_runs.tsv
+git show origin/fz3-native-fingerprint-history:state/fz3/outcome_fingerprints_v2.tsv
+git show origin/fz3-native-fingerprint-history:state/fz3/outcome_processed_runs_v2.tsv
 ```
 
 History/triage changes never claim a compiler bug is fixed. Human review
