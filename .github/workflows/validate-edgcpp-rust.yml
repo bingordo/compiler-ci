@@ -48,7 +48,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/edgcpp-rust
-          ref: ${{ inputs.source_ref || 'e35675af95f7d91656f9e04de0820438f3f4df81' }}
+          ref: ${{ inputs.source_ref || '5370dddd177b5feb03bfcaa68166bcf3bfc475e3' }}
           path: edgcpp-rust
           persist-credentials: false
       - name: Record exact revision
@@ -59,7 +59,7 @@ jobs:
           test "${#sha}" -eq 40
           echo "EDG Rust commit: $sha" | tee -a "$GITHUB_STEP_SUMMARY"
           if [[ "${{ github.event_name }}" != workflow_dispatch ]]; then
-            test "$sha" = e35675af95f7d91656f9e04de0820438f3f4df81
+            test "$sha" = 5370dddd177b5feb03bfcaa68166bcf3bfc475e3
           fi
       - name: Check out source headers matching the pinned EDG library
         uses: actions/checkout@v4
@@ -126,6 +126,15 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/edg-cfg-targeted.log"
           # A filtered-out zero-test run is not a successful targeted gate.
           grep -Eq 'test result: ok[.] [1-9][0-9]* passed; 0 failed' "$RUNNER_TEMP/edg-cfg-targeted.log"
+      - name: Verify EDG lifetime ownership cardinalities and wire schema
+        working-directory: edgcpp-rust
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          python3 tools/gen_wire_schema.py --check
+          cargo test --features codegen --lib native_lifetime_owners_reject_missing_roots_scope_links_and_tail_scopes -- --nocapture
+          cargo test --features codegen --lib lifetime_child_counts_reject_dropped_subtrees_and_mismatched_owners -- --nocapture
+
       - name: Validate ordered EDG startup wire records
         working-directory: edgcpp-rust
         run: |
@@ -197,6 +206,46 @@ jobs:
           grep -Fq 'EDG_BASE_OFFSET derived=118 base=119 position=0 virtual=false offset=Some(0)' "$RUNNER_TEMP/cout-base-offset.log"
           grep -Fq 'EDG_BASE_OFFSET derived=115 base=118 position=0 virtual=true offset=None' "$RUNNER_TEMP/cout-base-offset.log"
           echo 'Original std::cout inheritance base offset snapshot captured' >> "$GITHUB_STEP_SUMMARY"
+      - name: Verify C11 and C++20 source lifetime ownership against pinned EDG and GCC
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source build/gcc-release/environment.sh
+          cat >build/gcc-release/lifetime-owner-c11.c <<'C'
+          int owner_c(int x) {
+            int result = x;
+            { int nested = x + 3; result += nested; }
+            if (result > 0) { int last = result + 1; result = last; }
+            return result;
+          }
+          int main(void) { return owner_c(2) != 8; }
+          C
+          cat >build/gcc-release/lifetime-owner-cpp20.cpp <<'CPP'
+          struct Local {
+            int value;
+            explicit Local(int x) : value(x) {}
+            ~Local() { value = 0; }
+          };
+          int owner_cpp(int x) {
+            Local a{x};
+            { Local b{x + 1}; if (b.value != x + 1) return 97; }
+            return a.value;
+          }
+          int main() { return owner_cpp(7) != 7; }
+          CPP
+          cd build/gcc-release
+          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" \
+            --example parse -- --c11 lifetime-owner-c11.c >"$RUNNER_TEMP/lifetime-c11.log" 2>&1
+          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" \
+            --example parse -- --c++20 lifetime-owner-cpp20.cpp >"$RUNNER_TEMP/lifetime-cpp20.log" 2>&1
+          grep -Fq 'EDG status: 0' "$RUNNER_TEMP/lifetime-c11.log"
+          grep -Fq 'EDG status: 0' "$RUNNER_TEMP/lifetime-cpp20.log"
+          gcc -std=c11 -O0 -Wall -Wextra -Werror lifetime-owner-c11.c -o "$RUNNER_TEMP/lifetime-c11"
+          g++ -std=c++20 -O0 -Wall -Wextra -Werror lifetime-owner-cpp20.cpp -o "$RUNNER_TEMP/lifetime-cpp20"
+          "$RUNNER_TEMP/lifetime-c11"
+          "$RUNNER_TEMP/lifetime-cpp20"
+          echo 'Pinned EDG C11/C++20 owner snapshots and GCC source oracles passed' >> "$GITHUB_STEP_SUMMARY"
       - name: Run all Rust library tests with codegen
         working-directory: edgcpp-rust
         run: |
@@ -224,5 +273,7 @@ jobs:
             ${{ runner.temp }}/base-offset-probe.log
             ${{ runner.temp }}/cout-base-offset.log
             ${{ runner.temp }}/cout-include-search.log
+            ${{ runner.temp }}/lifetime-c11.log
+            ${{ runner.temp }}/lifetime-cpp20.log
           if-no-files-found: ignore
           retention-days: 14
