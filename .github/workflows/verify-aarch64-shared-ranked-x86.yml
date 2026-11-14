@@ -1,0 +1,116 @@
+name: Shared x86 AArch64 cost-ranked generated rule selector
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-aarch64-shared-ranked-x86.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: cross-target-form-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  generated:
+    name: Shared typed catalog plus full reviewed x86 recipe/REX/C11 gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d5228a5fb460fe51182f4721f51ce5c336ad9cd6
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require pinned compiler SHA
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "d5228a5fb460fe51182f4721f51ce5c336ad9cd6"
+      - name: Generator consistency and negative manifest cases
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/regen_aarch64_native_selector_rules.py --check
+          python3 -m unittest discover -s tools -p test_regen_aarch64_native_selector_rules.py -v
+          python3 tools/regen_x86_selector_rules.py --check
+          python3 tools/regen_aarch64_scalar_gp_forms.py --check
+          python3 -m unittest discover -s tools -p test_regen_aarch64_scalar_gp_forms.py -v
+          python3 tools/regen_x86_forms.py --check
+          python3 tools/regen_x86_scalar_bin_forms.py --check
+          python3 tools/regen_x86_scalar_misc_forms.py --check
+          python3 tools/regen_x86_gp_recipes.py --check
+          python3 -m unittest discover -s tools -p test_x86_gp_recipes.py -v
+          python3 -m unittest discover -s tools -p test_x86_scalar_bin_forms.py -v
+          python3 -m unittest discover -s tools -p test_x86_scalar_misc_forms.py -v
+      - name: Isolate compiler core Rust workspace from private source frontends
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: shared-ranked-focused
+      - name: Physical recipe shape and exact REX SIB byte oracles
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib ranked_selector::tests -- --nocapture
+          cargo test -p compiler-backend-x86 --lib selector::tests -- --nocapture
+          cargo test -p compiler-backend --lib form_catalog::tests -- --nocapture
+          cargo test -p compiler-backend-x86 --lib catalog_form_tests -- --nocapture
+          cargo test -p compiler-backend-x86 --lib vector_match::tests -- --nocapture
+          cargo test -p compiler-backend-x86 --lib generated_gp_recipe_tests -- --nocapture
+          cargo test -p compiler-backend-x86 --lib generated_scalar_bin_tests -- --nocapture
+          cargo test -p compiler-backend-x86 --lib generated_scalar_misc_tests -- --nocapture
+      - name: GCC C11 native and shared signed index ELF and GAS
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --features x7-shared-machine-cutover --test x7_shared_signed_index_native -- --test-threads=1
+      - name: All targets all features strict Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-x86 --all-targets --all-features -- -D warnings
+  regressions:
+    name: Full x86 default and all-feature with shared IR/TypeId
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d5228a5fb460fe51182f4721f51ce5c336ad9cd6
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require pinned compiler SHA
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "d5228a5fb460fe51182f4721f51ce5c336ad9cd6"
+      - name: Isolate compiler core Rust workspace from private source frontends
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: shared-ranked-regressions
+      - name: Full default x86 backend regression
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 -- --test-threads=2
+      - name: Full all-features x86 backend regression
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --all-features -- --test-threads=2
+      - name: Install GDB for existing DWARF oracle
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gdb
+      - name: Full core TypeId IR and optimization regressions
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -- --test-threads=2
