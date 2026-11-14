@@ -1,0 +1,64 @@
+name: IR F38 CT03 multi-edit native TypeId cutover
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ir-f38-ct03-typeid-20261113.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-typeid:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact F38 compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e93acb65b6f847f23a14655c2771c9f7457674cb
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source SHA and isolate core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "e93acb65b6f847f23a14655c2771c9f7457674cb"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo "Validated compiler SHA: e93acb65b6f847f23a14655c2771c9f7457674cb" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-f38-ct03-typeid-v1
+      - name: Run migrated CT-03 independent GAS and ELF executable oracle
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test ct03_multi_edit_native -- --nocapture
+      - name: Run PRE/LICM, TypeId PRE, and CT-03 rollback controls
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test pre_native -- --nocapture
+          cargo test -p compiler-opt --test typed_pre_native -- --nocapture
+          cargo test -p compiler-opt --test pre_licm_semantic_matrix -- --nocapture
+          cargo test -p compiler-opt --test ct03_closeout -- --nocapture
+          cargo test -p compiler-opt --features verify-counts --lib successive_ -- --nocapture
+      - name: F35-F37 memory and IR/backend regressions
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test loop_trap_semantics
+          cargo test -p compiler-opt --test memory_execution_oracle
+          cargo test -p compiler-ir --lib
+          cargo test -p compiler-backend-x86 --lib
+      - name: Strict all-target Clippy including test targets
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
