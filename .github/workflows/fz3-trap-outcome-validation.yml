@@ -1,0 +1,82 @@
+name: FZ-3 TypeId SIGFPE outcome source-pinned verification
+on:
+  push:
+    branches: [ci/fz3-trap-outcome-20261114]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fz3-outcome:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ci
+          persist-credentials: false
+      - name: Checkout exact compiler PR source, never run compiler Actions
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 4c98c083e0a59b2acb8ef1fce0336237230c36f4
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source identity and isolate core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "4c98c083e0a59b2acb8ef1fce0336237230c36f4"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: fz3-trap-outcome-source-pinned
+      - name: Unit and native oracle regression suites
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          ulimit -c 0
+          cargo test -p compiler-opt --test typeid_native_trap_differential -- --nocapture
+          cargo test -p compiler-opt --test typeid_native_campaign -- --nocapture
+          cargo test -p compiler-opt --test typeid_native_reference_ddmin -- --nocapture
+          cargo build -p compiler-opt --example typeid_native_diff_repro --example typeid_native_campaign
+      - name: Run bounded even-seed signed DivS recipe
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          ulimit -c 0
+          cargo run -p compiler-opt --example typeid_native_campaign -- \
+            --out "$RUNNER_TEMP/fz3-div" --source-sha 4c98c083e0a59b2acb8ef1fce0336237230c36f4 \
+            --first-seed 0 --seeds 1 --max-evaluations 48 --max-unique 2 --max-probes 12
+          grep -qx 'outcome_unique_failures=0' "$RUNNER_TEMP/fz3-div/summary.txt"
+          grep -q '^schema_version' "$RUNNER_TEMP/fz3-div/outcome_fingerprints_v2.tsv"
+          test "$(wc -l < "$RUNNER_TEMP/fz3-div/outcome_fingerprints_v2.tsv")" -eq 1
+      - name: Run bounded odd-seed signed RemS recipe
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          ulimit -c 0
+          cargo run -p compiler-opt --example typeid_native_campaign -- \
+            --out "$RUNNER_TEMP/fz3-rem" --source-sha 4c98c083e0a59b2acb8ef1fce0336237230c36f4 \
+            --first-seed 1 --seeds 1 --max-evaluations 72 --max-unique 2 --max-probes 12
+          grep -qx 'outcome_unique_failures=0' "$RUNNER_TEMP/fz3-rem/summary.txt"
+          grep -q '^schema_version' "$RUNNER_TEMP/fz3-rem/outcome_fingerprints_v2.tsv"
+          test "$(wc -l < "$RUNNER_TEMP/fz3-rem/outcome_fingerprints_v2.tsv")" -eq 1
+      - name: Keep source-pinned campaign evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fz3-outcomes-source-pinned
+          path: |
+            ${{ runner.temp }}/fz3-div/
+            ${{ runner.temp }}/fz3-rem/
+          if-no-files-found: warn
+          retention-days: 7
