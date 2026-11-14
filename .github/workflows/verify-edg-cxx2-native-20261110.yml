@@ -40,7 +40,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 0d1fbcf60dccada70a078f7f315491e1d7649953
+          ref: d7a3b200860661079bfcc8b7bb85c1a0cfa8cf35
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -424,6 +424,37 @@ jobs:
           test "$(sha256sum reference.err | cut -d' ' -f1)" = "$(sha256sum native.err | cut -d' ' -f1)"
           # Program success requires native field write/read to preserve 131.
           echo 'EDG_NATIVE_AGGREGATE gate=240_bytes_align8_nested_union_execution result=pass'
+
+      - name: Execute source C++17 240 and 224 byte nested POD aggregate with G++ oracle
+        working-directory: edgcpp/build/gcc-release
+        env:
+          EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+          EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+          EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+          EDGCPP_EDG_REVISION: ${{ env.EDG_SOURCE_SHA }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source ./environment.sh
+          work="${RUNNER_TEMP}/edg-cxx5-nested-aggregate"
+          mkdir -p "$work"
+          cp "${GITHUB_WORKSPACE}/compiler/tools/edg-driver/tests/fixtures/edg_native_cxx5_nested_aggregate_240.cpp" "$work/fixture.cpp"
+          cd "$work"
+          g++ -std=c++17 -O0 -Wall -Wextra -Werror fixture.cpp -o reference
+          timeout 15s ./reference >reference.out 2>reference.err
+          rm -f native.o
+          "${GITHUB_WORKSPACE}/compiler/tools/edg-driver/target/debug/compiler-edg-driver" \
+            native.o --typeid-native fixture.cpp >compile.log 2>&1 || {
+              tail -n 35 compile.log >&2
+              test ! -e native.o
+              exit 1
+            }
+          test "$(od -An -tx1 -N4 native.o | tr -d '[:space:]')" = 7f454c46
+          g++ native.o -o native
+          timeout 15s ./native >native.out 2>native.err
+          test "$(sha256sum reference.out | cut -d' ' -f1)" = "$(sha256sum native.out | cut -d' ' -f1)"
+          test "$(sha256sum reference.err | cut -d' ' -f1)" = "$(sha256sum native.err | cut -d' ' -f1)"
+          echo 'EDG_CXX5_NATIVE gate=nested_240_224_POD_execution result=pass'
 
       - name: Execute real native EDG C++2 lifetime and compare independent G++ trace
         working-directory: edgcpp/build/gcc-release
