@@ -1,0 +1,62 @@
+name: IR F39 mem2reg native TypeId profile acceptance
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ir-f39-mem2reg-typeid-20261113.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  profile-typeid:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      MEM2REG_REPETITIONS: '2'
+    steps:
+      - name: Checkout pinned compiler F39 source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e7baff0457118d14a865a4ffcf4c4cfd92b62a6e
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Validate source SHA and restrict core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "e7baff0457118d14a865a4ffcf4c4cfd92b62a6e"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo "Exact source SHA: e7baff0457118d14a865a4ffcf4c4cfd92b62a6e" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-f39-mem2reg-typeid-v1
+      - name: Execute opt-in TypeId mem2reg size and timing diagnostic
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test mem2reg_profile -- --ignored --nocapture
+      - name: Native memory promotion and profiling parity
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test mem2reg_native -- --nocapture
+          cargo test -p compiler-opt --test typed_mem2reg -- --nocapture
+          cargo test -p compiler-opt --test typeid_source_profile_parity -- --nocapture
+          cargo test -p compiler-opt --test typed_core_pipeline -- --nocapture
+      - name: IR and x86 backend libraries
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --lib
+          cargo test -p compiler-backend-x86 --lib
+      - name: Strict all-target Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
