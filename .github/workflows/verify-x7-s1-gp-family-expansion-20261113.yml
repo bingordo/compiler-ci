@@ -1,0 +1,135 @@
+name: X7 S0 S1 family-level GP generation and honest coverage scoreboard
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-x7-s1-gp-family-expansion-20261113.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: x7-s1-family-generation-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  generated:
+    name: S1 6 family specs to 27 ALU forms, 55 GP bytes, C11 and Clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 4240afdaef2b5775ee95c20af0c788c2ee616380
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require pinned compiler SHA
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "4240afdaef2b5775ee95c20af0c788c2ee616380"
+      - name: Generator consistency and negative manifest cases
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/regen_x86_forms.py --check
+          python3 tools/regen_x86_scalar_bin_forms.py --check
+          python3 tools/regen_x86_scalar_misc_forms.py --check
+          python3 tools/regen_x86_gp_recipes.py --check
+          python3 -m unittest discover -s tools -p test_x86_gp_recipes.py -v
+          python3 -m unittest discover -s tools -p test_report_x7_scalability.py -v
+          python3 tools/regen_x86_selector_rules.py --check
+          python3 tools/report_x7_scalability.py --check
+          python3 tools/report_x7_scalability.py --json > x7_s0_s1_coverage.json
+          python3 - <<'PY'
+          import json
+          data=json.load(open("x7_s0_s1_coverage.json"))
+          assert data["locally_checked"]["scalar_alu_family_records"]==6
+          assert data["locally_checked"]["scalar_alu_expanded_form_variants"]==27
+          assert data["locally_checked"]["gp_physical_recipe_variants"]==55
+          assert all(v is None for v in data["NOT_measured_by_checkout"].values())
+          PY
+          python3 -m unittest discover -s tools -p test_x86_scalar_bin_forms.py -v
+          python3 -m unittest discover -s tools -p test_x86_scalar_misc_forms.py -v
+      - name: Ensure no superseded GP Rust lookup outputs remain
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test ! -e crates/backend-x86/src/generated_scalar_bin_forms.rs
+          test ! -e crates/backend-x86/src/generated_scalar_misc_forms.rs
+          grep -F 'include!("generated_gp_recipes.rs");' crates/backend-x86/src/binary.rs
+          python3 -m unittest discover -s tools -p test_x86_gp_recipes.py -v
+      - name: Isolate compiler core Rust workspace from private source frontends
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: x7-s1-family-generation-focused
+      - name: All 55 GP recipes including opt-in XOR RMW exact byte oracles
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib generated_gp_recipe_tests -- --nocapture
+          cargo test -p compiler-backend-x86 --lib generated_scalar_bin_tests -- --nocapture
+          cargo test -p compiler-backend-x86 --lib generated_scalar_misc_tests -- --nocapture
+      - name: Verify generated semantic admission is independent of physical encoding
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --features x7-native-form-validation --lib generated_gp_recipe_tests::native_rmw_semantic_admission_is_source_generated_and_independent -- --nocapture
+      - name: Opt-in ADD/XOR-only memory RMW independent C11 ELF and GAS
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation --lib generated_gp_recipe_tests::reviewed_rmw_memory_add_xor_match_c11_gas_and_elf -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation --lib generated_gp_recipe_tests::physical_recipes_preserve_exact_rex_sib_bytes_and_signed_index_width -- --nocapture
+      - name: Independent negative-index TypeId GCC C11 native and shared ELF/GAS
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --features x7-shared-machine-cutover --test x7_shared_signed_index_native -- --test-threads=1
+      - name: All targets all features strict Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-x86 --all-targets --all-features -- -D warnings
+  regressions:
+    name: Full default all-features x86 and core TypeId regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 4240afdaef2b5775ee95c20af0c788c2ee616380
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require pinned compiler SHA
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "4240afdaef2b5775ee95c20af0c788c2ee616380"
+      - name: Isolate compiler core Rust workspace from private source frontends
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: x7-s1-family-generation-regressions
+      - name: Full default x86 backend regression
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 -- --test-threads=2
+      - name: Full all-features x86 backend regression
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --all-features -- --test-threads=2
+      - name: Install GDB for existing DWARF oracle
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gdb
+      - name: Full core TypeId IR and optimization regressions
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -- --test-threads=2
