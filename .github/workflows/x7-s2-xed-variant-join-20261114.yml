@@ -1,0 +1,142 @@
+name: X7 S2 pinned Intel-to-XED variant candidate join
+on:
+  push:
+    branches: [feature/x7-s2-xed-variant-join-ci-20261114]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source-contract-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 14
+    steps:
+      - name: Checkout exact compiler PR source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 8926c4e59e63c4bc201660505ec35bcc2f64e7f7
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Python schema, negative and deterministic tests
+        run: |
+          set -euo pipefail
+          python3 -m py_compile compiler/tools/x86_s2_xed_variant_join.py compiler/tools/x86_iform_batch_worklist.py compiler/tools/x86_g10_source_operand_shapes.py
+          python3 -m unittest discover -s compiler/tools -p test_x86_s2_xed_variant_join.py -v
+          python3 -m unittest discover -s compiler/tools -p test_x86_iform_batch_worklist.py -v
+          python3 -m unittest discover -s compiler/tools -p test_x86_g10_source_operand_shapes.py -v
+          python3 -m unittest discover -s compiler/tests -p test_import_xed_forms.py -v
+  real-upstream-join:
+    needs: source-contract-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - name: Checkout exact compiler PR source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 8926c4e59e63c4bc201660505ec35bcc2f64e7f7
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin and extract all real Intel SDM XML
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/intel-sdm-xml /tmp/x7-s2
+          curl --fail --silent --show-error --location --retry 2 --max-time 180 \
+            https://codeload.github.com/intel/SDM/tar.gz/35eface1b7ee003a1cda95005ec5fd83de658a64 \
+            -o /tmp/x7-s2/intel-sdm.tar.gz
+          python3 - <<'PY'
+          import re,tarfile
+          from pathlib import Path
+          with tarfile.open('/tmp/x7-s2/intel-sdm.tar.gz','r:gz') as tar:
+              rows=[m for m in tar if m.isfile() and
+                    re.fullmatch(r'[^/]+/data/instruction/[^/]+\.xml',m.name)]
+              assert 700<=len(rows)<=900, len(rows)
+              for m in rows:
+                  assert 0<m.size<4*1024*1024
+                  (Path('/tmp/intel-sdm-xml')/m.name.rsplit('/',1)[-1]).write_bytes(tar.extractfile(m).read())
+          print('PINNED_SOURCE_XML',len(rows))
+          PY
+      - name: Normalize 10859 Intel iforms with 1 and 8 deterministic shards
+        run: |
+          set -euo pipefail
+          for shards in 1 8; do
+            python3 compiler/tools/x86_iform_batch_worklist.py \
+              --xml-dir /tmp/intel-sdm-xml \
+              --out /tmp/x7-s2/worklist-$shards.json \
+              --normalize-out /tmp/x7-s2/normalized-$shards.json \
+              --shards "$shards"
+          done
+      - name: Build Intel XED real generated database at pinned revision
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/intelxed/xed.git /tmp/xed
+          git -C /tmp/xed checkout 0bcb6237345c5066726dcc08b3d87928df3b5b26
+          git clone --filter=blob:none https://github.com/intelxed/mbuild.git /tmp/mbuild
+          git -C /tmp/mbuild checkout 1b437e409221a2b5703b4d8896baa20d43e4ba1a
+          test "$(git -C /tmp/xed rev-parse HEAD)" = 0bcb6237345c5066726dcc08b3d87928df3b5b26
+          cd /tmp/xed
+          ./mfile.py --no-encoder
+          cd /tmp
+          python3 /tmp/xed/pysrc/xed_to_db.py --xed-dgen /tmp/xed/obj/dgen \
+            --out /tmp/x7-s2/xed-upstream.json --compact
+          python3 "$GITHUB_WORKSPACE/compiler/tools/import_xed_forms.py" \
+            --xed-json /tmp/x7-s2/xed-upstream.json \
+            --xed-revision 0bcb6237345c5066726dcc08b3d87928df3b5b26 \
+            --legacy-forms "$GITHUB_WORKSPACE/compiler/data/x86_encoding_forms.json" \
+            --output /tmp/x7-s2/xed-normalized.json \
+            --report /tmp/x7-s2/xed-report.json
+      - name: Source-bound exact variant join, 1/8 parity, zero ISA admission
+        run: |
+          set -euo pipefail
+          for shards in 1 8; do
+            python3 compiler/tools/x86_s2_xed_variant_join.py \
+              --normalized-intel /tmp/x7-s2/normalized-$shards.json \
+              --normalized-xed /tmp/x7-s2/xed-normalized.json \
+              --output /tmp/x7-s2/join-$shards.json
+          done
+          cmp /tmp/x7-s2/join-1.json /tmp/x7-s2/join-8.json
+          python3 compiler/tools/x86_s2_xed_variant_join.py \
+            --normalized-intel /tmp/x7-s2/normalized-1.json \
+            --normalized-xed /tmp/x7-s2/xed-normalized.json \
+            --output /tmp/x7-s2/join-1.json --check
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          j=json.loads(Path('/tmp/x7-s2/join-1.json').read_text())
+          assert j['intel_iforms']==10859, j['intel_iforms']
+          assert j['xed_inventory_variants']>1000, j['xed_inventory_variants']
+          assert j['semantics_proven']==j['encoding_proven']==j['production_selection_eligible']==0
+          assert all(not r['production_selection_eligible'] for r in j['forms'])
+          print('X7_S2_FULL_XED_JOIN',j['summary'])
+          assert sum(n for k,n in j['summary'].items() if k!='no_exact_xed_iform_name_match')>0
+          PY
+      - name: Archive source-bound candidate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-s2-pinned-intel-xed-variant-join
+          if-no-files-found: warn
+          path: |
+            /tmp/x7-s2/join-1.json
+            /tmp/x7-s2/xed-report.json
+  typeid-core-regression:
+    needs: source-contract-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact compiler PR source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 8926c4e59e63c4bc201660505ec35bcc2f64e7f7
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Test native x86 and core TypeId crates without compiler Actions
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --tests --offline --quiet
+          cargo test -p compiler-opt --lib --offline --quiet
