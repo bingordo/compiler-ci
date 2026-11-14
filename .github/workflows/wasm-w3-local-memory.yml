@@ -1,0 +1,58 @@
+# Source-pinned W3 TypeId -> Wasm private-memory and native differential checks.
+name: Wasm W3 local memory and native differential
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/wasm-w3-local-memory.yml'
+  workflow_dispatch:
+    inputs:
+      compiler_sha:
+        description: 'Exact compiler SHA to verify'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  wasm-w3:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact compiler SHA
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.compiler_sha || 'e7a0eaf6fb3449d4c1079c4caa00d7021eb23cd8' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Print SHA and restrict to standalone credential-free crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Compiler source: $(git -C compiler rev-parse HEAD)"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-wasm"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+          cc --version | head -1
+      - name: Setup independent JavaScript WebAssembly runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Cache standalone Rust crates
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: wasm-w3-memory
+      - name: Run all W0-W3 Wasm tests including native TypeId memory differential
+        working-directory: compiler
+        run: cargo test -p compiler-backend-wasm --tests -- --nocapture
+      - name: Strict backend Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-wasm --all-targets -- -D warnings
