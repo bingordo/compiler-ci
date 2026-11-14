@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Archive exact native trap witnesses and conservatively recheck old ones.
+"""Archive exact native trap witnesses and track independently verified outcomes.
 
-A saved v2 witness must reproduce its pinned TypeId reference/native outcome
-pair before history publication. The pinned CLI cannot distinguish agreement
-from a changed wrong outcome on exit 1, so those results are NOT called fixes.
+The unpinned TypeId oracle reports original-reference and compiled-native
+outcomes even when they agree. Only distinct source revisions with identical
+original-reference semantics establish tentative agreement evidence.
+Infrastructure failures and reference drift never imply a fix.
 """
 from __future__ import annotations
 
@@ -18,9 +19,12 @@ import fz3_triage as base
 import fz3_outcome_triage as v2
 
 STATUS_COLUMNS = ("id", "state", "last_sha", "last_run_token", "last_run", "detail")
-STATES = {"reproduces", "not-exact", "unavailable"}
+STATES = {"reproduces", "not-exact", "agrees", "changed-mismatch", "unavailable"}
+AGREEMENT_COLUMNS = ("id", "first_agree_sha", "second_agree_sha")
+EVENT_COLUMNS = ("id", "event", "source_sha", "run_url", "detail")
+EVENTS = {"suspected-fix", "second-revision-agreement", "regression", "changed-outcome"}
 RESULT = re.compile(
-    r"OUTCOME_MISMATCH a=(-?[0-9]+) b=(-?[0-9]+) "
+    r"OUTCOMES_V1 a=(-?[0-9]+) b=(-?[0-9]+) "
     r"expected=(sigfpe|value:[0-9]+) observed=(sigfpe|value:[0-9]+)\Z"
 )
 SAFE_ID = re.compile(r"[a-f0-9]{20}\Z")
@@ -33,11 +37,11 @@ def witness_path(root: Path, ident: str) -> Path:
 
 def classify(oracle: Path, witness: Path, row: dict[str, str],
              timeout: int) -> tuple[str, str]:
+    """Classify actual typed outcomes; never infer a fix from an absent pin."""
     args = [
         str(oracle.resolve()), str(witness.resolve()),
         "--a", row["a"], "--b", row["b"], "--sink", row["sink"],
-        "--expected-outcome", row["expected"],
-        "--observed-outcome", row["actual"],
+        "--report-outcomes",
     ]
     if row["mode"] != "raw":
         args.extend(["--optimize", row["mode"]])
@@ -46,17 +50,26 @@ def classify(oracle: Path, witness: Path, row: dict[str, str],
                                 text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as error:
         return "unavailable", f"execution unavailable: {error}"[:180]
-    if result.returncode == 1:
-        return "not-exact", "pinned outcome absent; no fix is inferred"
     if result.returncode != 0:
         return "unavailable", (result.stderr.strip() or
                                f"oracle exited {result.returncode}")[:180]
     match = RESULT.fullmatch(result.stdout.strip())
-    if match is None or match.groups() != (
-        row["a"], row["b"], row["expected"], row["actual"]
+    if match is None:
+        return "unavailable", "malformed or non-versioned native outcome report"
+    a, b, expected, actual = match.groups()
+    if (a, b) != (row["a"], row["b"]) or not (
+        v2.valid_outcome(expected) and v2.valid_outcome(actual)
     ):
-        return "unavailable", "malformed or mismatched pinned oracle result"
-    return "reproduces", "exact original-reference/native outcome reproduced"
+        return "unavailable", "noncanonical outcome or triggering-input mismatch"
+    if expected != row["expected"]:
+        return "unavailable", (
+            f"independent original-reference drift: {row['expected']} -> {expected}"
+        )
+    if actual == row["actual"]:
+        return "reproduces", "exact native trap/return signature still reproduces"
+    if actual == expected:
+        return "agrees", "native execution agrees with the independent original reference"
+    return "changed-mismatch", f"native outcome changed to {actual}; still incorrect"
 
 
 def recheck(report: Path, history_dir: Path, triage_dir: Path,
@@ -89,6 +102,22 @@ def recheck(report: Path, history_dir: Path, triage_dir: Path,
                      base.RUN_TOKEN.fullmatch(row["last_run_token"]) is not None,
                      "corrupt or orphan v2 witness lifecycle")
         state[row["id"]] = row
+    agreement_rows = base.read_tsv(
+        history_dir / "outcome_agreements_v2.tsv", AGREEMENT_COLUMNS
+    )
+    agreements = {}
+    for record in agreement_rows:
+        ident = record["id"]
+        base.require(ident in history_by_id and ident not in agreements and
+                     base.HEX40.fullmatch(record["first_agree_sha"]) is not None and
+                     (not record["second_agree_sha"] or (
+                         base.HEX40.fullmatch(record["second_agree_sha"]) is not None and
+                         record["second_agree_sha"] != record["first_agree_sha"]
+                     )), "invalid agreement evidence")
+        agreements[ident] = record
+    base.require(all(row["state"] != "agrees" or row["id"] in agreements
+                     for row in state.values()),
+                 "agreeing witness lacks independent SHA evidence")
 
     # First validate every new item against the live exact-source compiler.
     # A malformed, missing, or non-reproducing witness aborts the entire run
@@ -149,7 +178,9 @@ def recheck(report: Path, history_dir: Path, triage_dir: Path,
         selected = (older[start:] + older[:start])[:limit]
     else:
         selected = []
-    counts = {"reproduces": 0, "not-exact": 0, "unavailable": 0}
+    counts = {"reproduces": 0, "agrees": 0,
+              "changed-mismatch": 0, "unavailable": 0}
+    events = []
     for row in selected:
         ident = row["id"]
         previous = state.get(ident)
@@ -161,23 +192,60 @@ def recheck(report: Path, history_dir: Path, triage_dir: Path,
         else:
             status, detail = "unavailable", "archived minimized witness missing"
         counts[status] += 1
+        event = None
+        if status == "agrees":
+            if ident not in agreements:
+                agreements[ident] = {
+                    "id": ident, "first_agree_sha": sha, "second_agree_sha": "",
+                }
+                event = "suspected-fix"
+            elif not agreements[ident]["second_agree_sha"] and (
+                agreements[ident]["first_agree_sha"] != sha
+            ):
+                agreements[ident]["second_agree_sha"] = sha
+                event = "second-revision-agreement"
+        elif status in ("reproduces", "changed-mismatch"):
+            if ident in agreements:
+                # A genuine mismatch invalidates previous agreement evidence,
+                # even if an infrastructure outage occurred in between.
+                if status == "reproduces":
+                    event = "regression"
+                else:
+                    event = "changed-outcome"
+                del agreements[ident]
+            elif status == "changed-mismatch" and previous and (
+                previous["state"] == "reproduces"
+            ):
+                event = "changed-outcome"
         state[ident] = {
             "id": ident, "state": status, "last_sha": sha,
             "last_run_token": token, "last_run": url,
             "detail": detail.replace("\t", " ").replace("\n", " ")[:180],
         }
+        if event:
+            base.require(event in EVENTS, "invalid v2 lifecycle transition")
+            events.append({
+                "id": ident, "event": event, "source_sha": sha,
+                "run_url": url, "detail": state[ident]["detail"],
+            })
     out.mkdir(parents=True, exist_ok=True)
     base.write_tsv(history_dir / "outcome_rechecks_v2.tsv", STATUS_COLUMNS,
                    sorted(state.values(), key=lambda row: row["id"]))
+    base.write_tsv(history_dir / "outcome_agreements_v2.tsv", AGREEMENT_COLUMNS,
+                   sorted(agreements.values(), key=lambda row: row["id"]))
+    base.write_tsv(out / "outcome_events_v2.tsv", EVENT_COLUMNS, events)
     (out / "outcome_recheck_v2.md").write_text(
         "# FZ-3 v2 archived trap/return rechecks\n\n"
         f"Verified and archived new exact outcomes: {len(copies)}\n\n"
         f"Previously archived checked: {sum(counts.values())}\n\n"
         f"Exact reproductions: {counts['reproduces']}; "
-        f"not exact: {counts['not-exact']}; "
+        f"independently agreeing: {counts['agrees']}; "
+        f"changed mismatches: {counts['changed-mismatch']}; "
         f"unavailable: {counts['unavailable']}.\n\n"
-        "An absent pinned signature is NOT proof of agreement, nor of a fix. "
-        "There is no automatic issue closing or regression attribution.\n",
+        f"Verified lifecycle transitions: {len(events)}.\n"
+        "Agreement is only tentative fix evidence. Two different SHA "
+        "replays are required for stronger evidence. No issue is automatically closed; "
+        "unsupported code, original-reference drift, and timeouts are unavailable.\n",
         encoding="utf-8",
     )
     return {"archived": len(copies), **counts}
