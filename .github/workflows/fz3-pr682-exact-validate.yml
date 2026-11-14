@@ -1,0 +1,70 @@
+name: Exact source FZ3 PR682 persistent triage validation
+on:
+  push:
+    branches: [validate-fz3-triage-pr682-exact]
+  workflow_dispatch:
+permissions: { contents: read }
+jobs:
+  triage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler-ci
+          ref: 8d90e0be2f657c8af0b2c8f392d5cfaa16b7a3ae
+          path: ci
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler-ci
+          ref: fz3-native-fingerprint-history
+          path: history
+          persist-credentials: false
+      - name: Verify exact PR and prepared durable history branch
+        run: |
+          set -euo pipefail
+          test "$(git -C ci rev-parse HEAD)" = "8d90e0be2f657c8af0b2c8f392d5cfaa16b7a3ae"
+          test -s ci/tools/fz3_triage.py
+          test -s history/state/fz3/fingerprints.tsv
+          test -s history/state/fz3/processed_runs.tsv
+          python3 -m py_compile ci/tools/fz3_triage.py ci/tests/test_fz3_triage.py
+          python3 -m unittest discover -s ci/tests -p test_fz3_triage.py -v
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: main
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Configure core compiler workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: fz3-triage-pr682-real
+      - name: Exercise actual clean native report with checked-out history
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          cp -R ../history/state/fz3 "$RUNNER_TEMP/test-history"
+          cargo run -p compiler-opt --example typeid_native_campaign -- \
+            --out "$RUNNER_TEMP/report" --source-sha "$sha" \
+            --first-seed 0 --seeds 1 --max-evaluations 8 \
+            --max-unique 2 --max-probes 12
+          for attempt in 1 2; do
+            python3 ../ci/tools/fz3_triage.py \
+              --campaign "$RUNNER_TEMP/report" \
+              --history-dir "$RUNNER_TEMP/test-history" \
+              --out "$RUNNER_TEMP/triage" \
+              --source-sha "$sha" --run-token 68312.1 \
+              --run-url https://github.com/bingordo/compiler-ci/actions/runs/68312
+          done
+          grep -q '^replayed=1$' "$RUNNER_TEMP/triage/status.txt"
+          grep -q '^new=0$' "$RUNNER_TEMP/triage/status.txt"
