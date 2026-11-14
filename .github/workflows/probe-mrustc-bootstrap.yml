@@ -259,6 +259,64 @@ jobs:
           echo "compiler-opt: minicargo succeeded and GCC compiled $count new C units." >> "$GITHUB_STEP_SUMMARY"
           echo "This verifies native object compilation, not semantic correctness or a runnable compiler." >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Translate compiler-backend and compile generated C with GCC
+        if: always() && steps.translate.outcome == 'success'
+        id: backend
+        shell: bash
+        working-directory: mrustc
+        env:
+          RUSTC_VERSION: '1.90.0'
+          MRUSTC_TARGET_VER: '1.90'
+          OUTDIR_SUF: '-1.90.0'
+          PARLEVEL: '2'
+          CC: gcc
+        run: |
+          set -euo pipefail
+          # The target-neutral backend depends on compiler-ir, not compiler-opt.
+          # Run it independently to map bootstrap coverage despite opt failure.
+          find . -type f -name '*.c' -printf '%P\\n' | LC_ALL=C sort > "$RUNNER_TEMP/mrustc-backend-before.txt"
+          set +e
+          timeout --signal=TERM --kill-after=10s 30m bin/minicargo \
+            -L output-1.90.0 -o output-compiler-backend \
+            ../compiler/crates/backend > "$RUNNER_TEMP/mrustc-backend-probe.log" 2>&1
+          rc=$?
+          set -e
+          find . -type f -name '*.c' -printf '%P\\n' | LC_ALL=C sort > "$RUNNER_TEMP/mrustc-backend-after.txt"
+          comm -13 "$RUNNER_TEMP/mrustc-backend-before.txt" "$RUNNER_TEMP/mrustc-backend-after.txt" > "$RUNNER_TEMP/mrustc-backend-new.txt"
+          echo "compiler-backend: minicargo exit=$rc, newly generated C files=$(wc -l < "$RUNNER_TEMP/mrustc-backend-new.txt")" >> "$GITHUB_STEP_SUMMARY"
+          if (( rc != 0 )); then
+            # Public repo: publish only categorical diagnostics, never private
+            # source excerpts, generated C, or paths from the error log.
+            python3 - "$RUNNER_TEMP/mrustc-backend-probe.log" "$GITHUB_STEP_SUMMARY" <<'PY'
+          import pathlib, re, sys
+          log = pathlib.Path(sys.argv[1]).read_text(errors="replace")
+          classes = {
+              "dependency resolution": r"dependency|manifest|lockfile|couldn't find|not found",
+              "Rust source parsing or type error": r"parse error|type error|error:|ERROR:",
+              "unsupported language/compiler feature": r"unsupported|not implemented|unimplemented",
+              "mrustc crash": r"SIGSEGV|segmentation fault|panic|assertion failed",
+              "host C compiler error": r"gcc: error|fatal error:|compilation terminated",
+          }
+          with open(sys.argv[2], "a") as out:
+              print("compiler-backend diagnostic categories:", file=out)
+              for name, pattern in classes.items():
+                  print("- {}: {}".format(name, len(re.findall(pattern, log, re.I))), file=out)
+          PY
+            exit "$rc"
+          fi
+          mapfile -t generated < "$RUNNER_TEMP/mrustc-backend-new.txt"
+          test "${#generated[@]}" -gt 0
+          mkdir -p "$RUNNER_TEMP/mrustc-backend-gcc-objects"
+          count=0
+          for relative in "${generated[@]}"; do
+            test -f "$relative"
+            gcc -std=gnu11 -O0 -c "$relative" -o "$RUNNER_TEMP/mrustc-backend-gcc-objects/$count.o"
+            count=$((count + 1))
+          done
+          ar rcs "$RUNNER_TEMP/mrustc-backend-gcc-objects/libcompiler-backend-probe.a" "$RUNNER_TEMP"/mrustc-backend-gcc-objects/*.o
+          test -s "$RUNNER_TEMP/mrustc-backend-gcc-objects/libcompiler-backend-probe.a"
+          echo "compiler-backend: GCC compiled $count generated C units into a static archive." >> "$GITHUB_STEP_SUMMARY"
+
       - name: Run compiler-ir executable through host rustc and mrustc/GCC
         if: always() && steps.translate.outcome == 'success'
         shell: bash
