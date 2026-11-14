@@ -13,20 +13,23 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: ci
-      - name: Verify durable history branch is available
+      - name: Checkout initialized durable history
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler-ci
           ref: fz3-native-fingerprint-history
           path: persistent-history
           persist-credentials: false
-      - name: Check initialized persistent history TSVs
+      - name: Validate history schema and pure Python triage regression
+        shell: bash
         run: |
           set -euo pipefail
-          head -n 1 persistent-history/state/fz3/fingerprints.tsv | grep -q 
-          set -euo pipefail
+          test -s persistent-history/state/fz3/fingerprints.tsv
+          test -s persistent-history/state/fz3/processed_runs.tsv
+          grep -q '^id' persistent-history/state/fz3/fingerprints.tsv
+          grep -q '^run_token' persistent-history/state/fz3/processed_runs.tsv
           python3 -m py_compile ci/tools/fz3_triage.py ci/tests/test_fz3_triage.py
-          python3 -m unittest discover -s ci/tests -p 'test_fz3_triage.py' -v
+          python3 -m unittest discover -s ci/tests -p test_fz3_triage.py -v
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
@@ -45,7 +48,7 @@ jobs:
         with:
           workspaces: compiler -> target
           key: fz3-triage-live-input
-      - name: Run true no-injection TypeId native report through triage twice
+      - name: Reconcile actual native report with the durable ledger twice
         working-directory: compiler
         shell: bash
         run: |
@@ -60,132 +63,17 @@ jobs:
           python3 ../ci/tools/fz3_triage.py \
             --campaign "$report" --history-dir "$RUNNER_TEMP/history" \
             --out "$RUNNER_TEMP/triage" --source-sha "$source_sha" \
-            --run-token '123456.1' \
+            --run-token 123456.1 \
             --run-url https://github.com/bingordo/compiler-ci/actions/runs/123456
           grep -q '^new=0$' "$RUNNER_TEMP/triage/status.txt"
           grep -q '^processed=1$' "$RUNNER_TEMP/triage/status.txt"
           python3 ../ci/tools/fz3_triage.py \
             --campaign "$report" --history-dir "$RUNNER_TEMP/history" \
             --out "$RUNNER_TEMP/triage" --source-sha "$source_sha" \
-            --run-token '123456.1' \
+            --run-token 123456.1 \
             --run-url https://github.com/bingordo/compiler-ci/actions/runs/123456
           grep -q '^replayed=1$' "$RUNNER_TEMP/triage/status.txt"
-      - name: Upload validated synthetic and live history evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: fz3-cross-run-triage-validation
-          path: |
-            ${{ runner.temp }}/history/
-            ${{ runner.temp }}/triage/
-          if-no-files-found: warn
-          retention-days: 7
-id\\tmode\\tsink\\ta\\tb'
-          head -n 1 persistent-history/state/fz3/processed_runs.tsv | grep -q 
-          set -euo pipefail
-          python3 -m py_compile ci/tools/fz3_triage.py ci/tests/test_fz3_triage.py
-          python3 -m unittest discover -s ci/tests -p 'test_fz3_triage.py' -v
-      - uses: actions/checkout@v4
-        with:
-          repository: bingordo/compiler
-          ref: main
-          path: compiler
-          ssh-key: ${{ secrets.CI_KEY }}
-          persist-credentials: false
-      - name: Isolate dependency-free compiler core
-        run: |
-          cat > compiler/Cargo.toml <<'EOF'
-          [workspace]
-          resolver = "2"
-          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
-          EOF
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: compiler -> target
-          key: fz3-triage-live-input
-      - name: Run true no-injection TypeId native report through triage twice
-        working-directory: compiler
-        shell: bash
-        run: |
-          set -euo pipefail
-          source_sha="$(git rev-parse HEAD)"
-          report="$RUNNER_TEMP/fz3-history-real-report"
-          cargo run -p compiler-opt --example typeid_native_campaign -- \
-            --out "$report" --source-sha "$source_sha" \
-            --first-seed 0 --seeds 1 --max-evaluations 8 \
-            --max-unique 2 --max-probes 12
-          python3 ../ci/tools/fz3_triage.py \
-            --campaign "$report" --history-dir "$RUNNER_TEMP/history" \
-            --out "$RUNNER_TEMP/triage" --source-sha "$source_sha" \
-            --run-token '123456.1' \
-            --run-url https://github.com/bingordo/compiler-ci/actions/runs/123456
-          grep -q '^new=0$' "$RUNNER_TEMP/triage/status.txt"
-          grep -q '^processed=1$' "$RUNNER_TEMP/triage/status.txt"
-          python3 ../ci/tools/fz3_triage.py \
-            --campaign "$report" --history-dir "$RUNNER_TEMP/history" \
-            --out "$RUNNER_TEMP/triage" --source-sha "$source_sha" \
-            --run-token '123456.1' \
-            --run-url https://github.com/bingordo/compiler-ci/actions/runs/123456
-          grep -q '^replayed=1$' "$RUNNER_TEMP/triage/status.txt"
-      - name: Upload validated synthetic and live history evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: fz3-cross-run-triage-validation
-          path: |
-            ${{ runner.temp }}/history/
-            ${{ runner.temp }}/triage/
-          if-no-files-found: warn
-          retention-days: 7
-run_token\\trun_url'
-      - name: Syntax and pure Python history/dedup regression
-        run: |
-          set -euo pipefail
-          python3 -m py_compile ci/tools/fz3_triage.py ci/tests/test_fz3_triage.py
-          python3 -m unittest discover -s ci/tests -p 'test_fz3_triage.py' -v
-      - uses: actions/checkout@v4
-        with:
-          repository: bingordo/compiler
-          ref: main
-          path: compiler
-          ssh-key: ${{ secrets.CI_KEY }}
-          persist-credentials: false
-      - name: Isolate dependency-free compiler core
-        run: |
-          cat > compiler/Cargo.toml <<'EOF'
-          [workspace]
-          resolver = "2"
-          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
-          EOF
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: compiler -> target
-          key: fz3-triage-live-input
-      - name: Run true no-injection TypeId native report through triage twice
-        working-directory: compiler
-        shell: bash
-        run: |
-          set -euo pipefail
-          source_sha="$(git rev-parse HEAD)"
-          report="$RUNNER_TEMP/fz3-history-real-report"
-          cargo run -p compiler-opt --example typeid_native_campaign -- \
-            --out "$report" --source-sha "$source_sha" \
-            --first-seed 0 --seeds 1 --max-evaluations 8 \
-            --max-unique 2 --max-probes 12
-          python3 ../ci/tools/fz3_triage.py \
-            --campaign "$report" --history-dir "$RUNNER_TEMP/history" \
-            --out "$RUNNER_TEMP/triage" --source-sha "$source_sha" \
-            --run-token '123456.1' \
-            --run-url https://github.com/bingordo/compiler-ci/actions/runs/123456
-          grep -q '^new=0$' "$RUNNER_TEMP/triage/status.txt"
-          grep -q '^processed=1$' "$RUNNER_TEMP/triage/status.txt"
-          python3 ../ci/tools/fz3_triage.py \
-            --campaign "$report" --history-dir "$RUNNER_TEMP/history" \
-            --out "$RUNNER_TEMP/triage" --source-sha "$source_sha" \
-            --run-token '123456.1' \
-            --run-url https://github.com/bingordo/compiler-ci/actions/runs/123456
-          grep -q '^replayed=1$' "$RUNNER_TEMP/triage/status.txt"
-      - name: Upload validated synthetic and live history evidence
+      - name: Upload validated history evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
