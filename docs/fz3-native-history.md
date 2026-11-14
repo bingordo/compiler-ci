@@ -68,7 +68,9 @@ branch. Only validated, non-injected reports may populate these files.
 
 On subsequent runs, `tools/fz3_recheck.py` builds the unmodified current
 compiler's `typeid_native_diff_repro` executable and replays up to **16
-existing witnesses**, with a per-witness timeout. It compares actual native
+existing witnesses**, with a per-witness timeout. The starting index rotates
+by the full 16-witness window each run, so a history larger than the nightly
+budget is sampled fairly rather than permanently starving newer findings. It compares actual native
 GAS or ELF execution against the independent reference defined by the *saved
 original IR*, for the precise operand pair, optimization policy and sink.
 
