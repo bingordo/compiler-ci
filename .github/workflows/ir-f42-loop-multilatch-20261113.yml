@@ -1,0 +1,67 @@
+name: IR F42 native TypeId loop and multilatch acceptance
+on:
+  push:
+    branches:
+      - ci/ir-f42-loop-multilatch-20261113
+  pull_request:
+    paths:
+      - '.github/workflows/ir-f42-loop-multilatch-20261113.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  loop-typeid:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler F42 source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 477ea49aa055d1803c52340bd592e251b88e1e3a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin exact source and restrict core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "477ea49aa055d1803c52340bd592e251b88e1e3a"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo "Source SHA: 477ea49aa055d1803c52340bd592e251b88e1e3a" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-f42-loop-multilatch-v1
+      - name: Independent CFG and nested multi-latch reference and TypeId loop oracle
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test pre_licm_semantic_matrix -- --nocapture
+      - name: Adjacent loop, native emitter, induction and PRE regressions
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test loop_trap_semantics
+          cargo test -p compiler-opt --test native_cfg_differential
+          cargo test -p compiler-opt --test typed_licm_native
+          cargo test -p compiler-opt --test typed_induction_native
+          cargo test -p compiler-opt --test pre_native
+          cargo test -p compiler-opt --test generated_native_oracle
+      - name: Core IR and x86 backend tests
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-ir --lib
+          cargo test -p compiler-backend-x86 --lib
+      - name: Strict Clippy all core targets
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
