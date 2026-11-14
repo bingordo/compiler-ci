@@ -1,0 +1,67 @@
+name: EXPERIMENT legacy deletion fallout (DO NOT MERGE)
+on:
+  push:
+    branches:
+      - ci/experiment-legacy-deletion-20261113
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fallout:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - probe: remove-old-full-optimizer
+            compiler_sha: 8a22a2e31bd0444345605b3e5cca1508a4006349
+          - probe: remove-old-backend-ABI-and-impls
+            compiler_sha: 1eaa53bb0b66917cfa6414887e318b0358778180
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout deletion experiment, exact source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ matrix.compiler_sha }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact ref, limit to core libraries, keep AArch64
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "${{ matrix.compiler_sha }}"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo "Experimental deletion: ${{ matrix.probe }} source ${{ matrix.compiler_sha }}" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: experimental-legacy-removal-${{ matrix.probe }}-v1
+      - name: Core production library compile and full test-target dependency scan
+        working-directory: compiler
+        shell: bash
+        run: |
+          set +e
+          cargo check --workspace --lib 2>&1 | tee /tmp/legacy-probe-library.log
+          library_status=${PIPESTATUS[0]}
+          cargo check --workspace --all-targets 2>&1 | tee /tmp/legacy-probe-all-targets.log
+          all_status=${PIPESTATUS[0]}
+          echo "LIBRARY_CHECK_EXIT=$library_status" >> "$GITHUB_STEP_SUMMARY"
+          echo "ALL_TARGETS_CHECK_EXIT=$all_status" >> "$GITHUB_STEP_SUMMARY"
+          echo "PROBE=${{ matrix.probe }} library=$library_status all-targets=$all_status"
+          echo "---- precise compile error fingerprints (library) ----"
+          grep -E 'error\\[E[0-9]+\\]|error:|--> crates/' /tmp/legacy-probe-library.log | head -80 || true
+          echo "---- precise compile error fingerprints (all-targets) ----"
+          grep -E 'error\\[E[0-9]+\\]|error:|--> crates/' /tmp/legacy-probe-all-targets.log | head -160 || true
+          if [ "$library_status" -eq 0 ] && [ "$all_status" -eq 0 ]; then
+            exit 0
+          fi
+          # A RED probe is informative and deliberately blocks a merge.
+          exit 1
