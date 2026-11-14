@@ -1,0 +1,248 @@
+name: X7 S2 Intel source register memory alternative normalization
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-x7-s2-source-rm-variants-20261113.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: x7-s2-source-variants-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  generated:
+    name: S2 exact r/m source variant contracts, 55 GP bytes, C11 and Clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1b4a1d37da7ab002347fd11b5816fd5646157abe
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require pinned compiler SHA
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "1b4a1d37da7ab002347fd11b5816fd5646157abe"
+      - name: S2 direct Intel XML role and full-worklist synthetic regression
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 -m py_compile tools/x86_g10_source_operand_shapes.py tools/x86_iform_batch_worklist.py
+          python3 -m unittest discover -s tools -p test_x86_g10_source_operand_shapes.py -v
+          python3 -m unittest discover -s tools -p test_x86_iform_batch_worklist.py -v
+          python3 -m unittest discover -s tools -p test_x86_g10_catalog_census.py -v
+      - name: Generator consistency and negative manifest cases
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/regen_x86_forms.py --check
+          python3 tools/regen_x86_scalar_bin_forms.py --check
+          python3 tools/regen_x86_scalar_misc_forms.py --check
+          python3 tools/regen_x86_gp_recipes.py --check
+          python3 -m unittest discover -s tools -p test_x86_gp_recipes.py -v
+          python3 -m unittest discover -s tools -p test_report_x7_scalability.py -v
+          python3 tools/regen_x86_selector_rules.py --check
+          python3 tools/report_x7_scalability.py --check
+          python3 tools/report_x7_scalability.py --json > x7_s0_s1_coverage.json
+          python3 - <<'PY'
+          import json
+          data=json.load(open("x7_s0_s1_coverage.json"))
+          assert data["locally_checked"]["scalar_alu_family_records"]==6
+          assert data["locally_checked"]["scalar_alu_expanded_form_variants"]==27
+          assert data["locally_checked"]["gp_physical_recipe_variants"]==55
+          assert all(v is None for v in data["NOT_measured_by_checkout"].values())
+          PY
+          python3 -m unittest discover -s tools -p test_x86_scalar_bin_forms.py -v
+          python3 -m unittest discover -s tools -p test_x86_scalar_misc_forms.py -v
+      - name: Ensure no superseded GP Rust lookup outputs remain
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test ! -e crates/backend-x86/src/generated_scalar_bin_forms.rs
+          test ! -e crates/backend-x86/src/generated_scalar_misc_forms.rs
+          grep -F 'include!("generated_gp_recipes.rs");' crates/backend-x86/src/binary.rs
+          python3 -m unittest discover -s tools -p test_x86_gp_recipes.py -v
+      - name: Isolate compiler core Rust workspace from private source frontends
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: x7-s2-source-variants-focused
+      - name: All 55 GP recipes including opt-in XOR RMW exact byte oracles
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib generated_gp_recipe_tests -- --nocapture
+          cargo test -p compiler-backend-x86 --lib generated_scalar_bin_tests -- --nocapture
+          cargo test -p compiler-backend-x86 --lib generated_scalar_misc_tests -- --nocapture
+      - name: Verify generated semantic admission is independent of physical encoding
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --features x7-native-form-validation --lib generated_gp_recipe_tests::native_rmw_semantic_admission_is_source_generated_and_independent -- --nocapture
+      - name: Opt-in ADD/XOR-only memory RMW independent C11 ELF and GAS
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation --lib generated_gp_recipe_tests::reviewed_rmw_memory_add_xor_match_c11_gas_and_elf -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation --lib generated_gp_recipe_tests::physical_recipes_preserve_exact_rex_sib_bytes_and_signed_index_width -- --nocapture
+      - name: Independent negative-index TypeId GCC C11 native and shared ELF/GAS
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --features x7-shared-machine-cutover --test x7_shared_signed_index_native -- --test-threads=1
+      - name: All targets all features strict Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-x86 --all-targets --all-features -- -D warnings
+  regressions:
+    name: Full default all-features x86 and core TypeId regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1b4a1d37da7ab002347fd11b5816fd5646157abe
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require pinned compiler SHA
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "1b4a1d37da7ab002347fd11b5816fd5646157abe"
+      - name: Isolate compiler core Rust workspace from private source frontends
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: x7-s2-source-variants-regressions
+      - name: Full default x86 backend regression
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 -- --test-threads=2
+      - name: Full all-features x86 backend regression
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --all-features -- --test-threads=2
+      - name: Install GDB for existing DWARF oracle
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gdb
+      - name: Full core TypeId IR and optimization regressions
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -- --test-threads=2
+  pinned-intel-corpus:
+    name: Pinned Intel 10859 iform source roles, 1/8 shard parity, zero admission
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1b4a1d37da7ab002347fd11b5816fd5646157abe
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin source revision and run operand-shape negative tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "1b4a1d37da7ab002347fd11b5816fd5646157abe"
+          python3 -m unittest discover -s tools -p test_x86_g10_source_operand_shapes.py -v
+          python3 -m unittest discover -s tools -p test_x86_iform_batch_worklist.py -v
+      - name: Retrieve full pinned Intel XML corpus (no implicit git HEAD)
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/x7-s2-intel-xml /tmp/x7-s2-census
+          revision=35eface1b7ee003a1cda95005ec5fd83de658a64
+          curl --fail --silent --show-error --location --retry 2 --max-time 180 \
+            "https://codeload.github.com/intel/SDM/tar.gz/${revision}" \
+            -o /tmp/x7-s2-census/pinned-sdm.tar.gz
+          python3 - <<'PY'
+          from pathlib import Path
+          import tarfile,re
+          target=Path("/tmp/x7-s2-intel-xml")
+          with tarfile.open("/tmp/x7-s2-census/pinned-sdm.tar.gz","r:gz") as tar:
+              n=0
+              for member in tar:
+                  if not (member.isfile() and re.fullmatch(
+                      r"[^/]+/data/instruction/[^/]+\.xml",member.name)):
+                      continue
+                  assert 0 < member.size < 4*1024*1024
+                  data=tar.extractfile(member).read()
+                  assert len(data)==member.size
+                  (target/member.name.rsplit("/",1)[-1]).write_bytes(data)
+                  n+=1
+                  assert n<=900
+          assert 700<=n<=900,n
+          print("PINNED_SDM_XML",n)
+          PY
+      - name: Normalize entire pinned source corpus with one and eight shards
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/x86_iform_batch_worklist.py \
+            --xml-dir /tmp/x7-s2-intel-xml \
+            --out /tmp/x7-s2-census/worklist-1.json \
+            --normalize-out /tmp/x7-s2-census/normalized-1.json \
+            --shards 1
+          python3 tools/x86_iform_batch_worklist.py \
+            --xml-dir /tmp/x7-s2-intel-xml \
+            --out /tmp/x7-s2-census/worklist-8.json \
+            --normalize-out /tmp/x7-s2-census/normalized-8.json \
+            --shards 8
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          base=Path("/tmp/x7-s2-census")
+          a=json.loads((base/"normalized-1.json").read_text())
+          b=json.loads((base/"normalized-8.json").read_text())
+          assert a["total_source_iforms"]==b["total_source_iforms"]==10859
+          for data in (a,b):
+              assert data["production_selection_eligible"]==0
+              assert data["semantic_proven"]==data["encoding_proven"]==0
+              assert data["source_operand_shapes_parsed"]+data["source_operand_shapes_blocked"]==10859
+              assert (data["source_register_memory_alternative_occurrences"]==
+                      data["observed_operand_roles"].get("register_or_memory",0))
+              assert not any(row["production_selection_eligible"]
+                             for row in data["forms"])
+          assert (a["source_register_memory_alternative_occurrences"]==
+                  b["source_register_memory_alternative_occurrences"])
+          aa={row["form_id"]:(row["source_shape_sha256"],row["blockers"])
+              for row in a["forms"]}
+          bb={row["form_id"]:(row["source_shape_sha256"],row["blockers"])
+              for row in b["forms"]}
+          assert aa==bb and len(aa)==10859
+          assert a["blocker_counts"]==b["blocker_counts"]
+          print("X7_S2_FULL_SOURCE_ROLE_REPORT",json.dumps({
+              "iforms":a["total_source_iforms"],
+              "parsed":a["source_operand_shapes_parsed"],
+              "unparsed":a["source_operand_shapes_blocked"],
+              "role_counts":a["observed_operand_roles"],
+              "rm_alternative_occurrences":a["source_register_memory_alternative_occurrences"],
+              "source_unresolved_roles":a["blocker_counts"].get("source_operand_role_unresolved",0),
+              "variant_join_required":a["blocker_counts"].get("source_operand_register_memory_variant_unjoined",0),
+              "admitted":0,
+          },sort_keys=True))
+          PY
+      - name: Archive exact pinned source role census and blockers
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-s2-intel-source-rm-variants
+          if-no-files-found: warn
+          path: |
+            /tmp/x7-s2-census/normalized-1.json
+            /tmp/x7-s2-census/normalized-8.json
+          retention-days: 7
