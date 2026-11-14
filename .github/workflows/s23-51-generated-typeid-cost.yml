@@ -1,0 +1,132 @@
+name: S23.51 source-pinned generated TypeId matcher cost
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-51-generated-typeid-cost.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  s2351-real-typeid:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Fetch exact compiler candidate (never run compiler Actions)
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e0c428ca0b5023bea05f610081fbd82d3984d905
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source SHA and isolate optimizer workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = e0c428ca0b5023bea05f610081fbd82d3984d905
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          mkdir -p results
+          rustc --version
+          python3 --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: s2351-optimizer-matcher-cost
+      - name: Labeled Python codegen scaling, no synthetic rule admission
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile tools/s23_51_rule_codegen_stress.py tools/s23_51_parse_matcher_cost.py
+          python3 tools/s23_51_rule_codegen_stress.py --sizes 129,152,500,1000,5000 \
+            --output "$GITHUB_WORKSPACE/results/s23-51-codegen-size.json" \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/s23-51-codegen-size.log"
+          python3 - "$GITHUB_WORKSPACE/results/s23-51-codegen-size.json" <<'PY'
+          import json,sys
+          a=json.load(open(sys.argv[1]))
+          assert a['schema']=='compiler.s2351-rule-generation-size.v1'
+          assert a['rows'][0]['kind']=='approved_real_dsl' and a['rows'][0]['families']==22
+          assert [x['families'] for x in a['rows'][1:]]==[129,152,500,1000,5000]
+          assert all(x['kind'].startswith('synthetic') and
+                     not x['proof_checked'] and not x['generated_native_rule_admission']
+                     for x in a['rows'][1:])
+          PY
+      - name: Committed v3 TypeId smoke, not a real-source result
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --features experimental-typeid-generated-rewrites \
+            --test native_s2351_matcher_cost -- --nocapture \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/s23-51-smoke.log"
+          grep 'S2351_SUMMARY cohort=synthetic_committed_smoke cases=1 stages=1' \
+            "$GITHUB_WORKSPACE/results/s23-51-smoke.log"
+      - name: Reuse immutable S23.48 verified source-TypeId snapshots
+        uses: actions/download-artifact@v4
+        with:
+          name: s23-48-exact-source-typeid-stage-attribution
+          run-id: 43349934825
+          repository: bingordo/compiler-ci
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: captured
+      - name: Check original 46/44/2 source denominator
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s captured/typeid_snapshots/manifest.tsv
+          test -s captured/s23-47-source-capture.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          r=json.loads(Path('captured/s23-47-source-capture.json').read_text())
+          assert (r['attempted'],r['accepted'],r['rejected'])==(46,44,2)
+          assert len(r['accepted_cases'])==44
+          assert len(Path('captured/typeid_snapshots/manifest.tsv').read_text().splitlines())==44
+          PY
+      - name: Measure handwritten, shadow and generated paths on 88 original snapshots
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          S2351_SNAPSHOT_DIR="$GITHUB_WORKSPACE/captured/typeid_snapshots" \
+            cargo test --release -p compiler-opt \
+              --features experimental-typeid-generated-rewrites \
+              --test native_s2351_matcher_cost -- --nocapture \
+              2>&1 | tee "$GITHUB_WORKSPACE/results/s23-51-real-cost.log"
+          python3 tools/s23_51_parse_matcher_cost.py \
+            --capture "$GITHUB_WORKSPACE/captured/s23-47-source-capture.json" \
+            --log "$GITHUB_WORKSPACE/results/s23-51-real-cost.log" \
+            --output "$GITHUB_WORKSPACE/results/s23-51-real-cost.json" \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/s23-51-real-summary.log"
+          grep '^S2351_ACCOUNTING attempted=46 accepted=44 rejected=2 cases=88' \
+            "$GITHUB_WORKSPACE/results/s23-51-real-summary.log"
+          grep '^S2351_COHORT ' "$GITHUB_WORKSPACE/results/s23-51-real-summary.log" \
+            >> "$GITHUB_STEP_SUMMARY"
+      - name: Prior native TypeId parity and strict Clippy
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --features experimental-typeid-generated-rewrites \
+            --test native_s2350_boolean_alias_batch -- --nocapture
+          cargo test -p compiler-opt --features experimental-typeid-generated-rewrites \
+            --test native_s2350_cancellation_batch -- --nocapture
+          cargo clippy -p compiler-opt --test native_s2351_matcher_cost \
+            --features experimental-typeid-generated-rewrites -- -D warnings
+          cargo clippy -p compiler-opt --all-targets -- -D warnings
+      - name: Save per-case real source costs and labeled synthetic sizing
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s23-51-cost-22-approved-plus-labeled-stress
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
