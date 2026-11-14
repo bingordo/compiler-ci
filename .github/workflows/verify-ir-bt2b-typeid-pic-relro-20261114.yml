@@ -1,0 +1,101 @@
+name: IR BT2b native TypeId PIC GOT/RELRO test retirement
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-ir-bt2b-typeid-pic-relro-20261114.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ir-bt2b-typeid-pic-relro-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  native-pic-matrix:
+    name: Source-owned TypeId PIC global ELF/GAS framed/frameless, C11 and strict Clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: be4be6e4e969b7463989b91bc452c559882419d5
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned source and replacement of old emitter
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "be4be6e4e969b7463989b91bc452c559882419d5"
+          test -f crates/backend-x86/tests/m4_pic_globals_shared_native.rs
+          ! grep -E '^use compiler_backend::Backend|^use compiler_ir::.*Function' crates/backend-x86/tests/m4_pic_globals_shared_native.rs
+          grep -F 'NativeTypeIdBackend' crates/backend-x86/tests/m4_pic_globals_shared_native.rs
+          grep -F 'R_X86_64_GOTPCREL' crates/backend-x86/tests/m4_pic_globals_shared_native.rs
+          grep -F '.rela.data.rel.ro' crates/backend-x86/tests/m4_pic_globals_shared_native.rs
+      - name: Isolate core workspace from private frontend dependencies
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: ir-bt2b-native-pic-focused
+      - name: Exact retained preemptible/owned/hidden/RELRO original C11 oracle, four native modes
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --test m4_pic_globals_shared_native -- --nocapture --test-threads=1
+      - name: Adjacent source-owned TypeId external GOT native/shared engine
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --features x7-shared-machine-cutover --test x7_shared_pic_global_native -- --nocapture --test-threads=1
+      - name: TypeId signed indexing/displacement independent C11 GAS and ELF
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --features x7-shared-machine-cutover --test x7_shared_signed_index_native -- --nocapture --test-threads=1
+      - name: Fail on all-target x86 Clippy warnings
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-x86 --all-targets --all-features -- -D warnings
+  core-regression:
+    name: Full x86 default/all-features and TypeId IR/opt regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: be4be6e4e969b7463989b91bc452c559882419d5
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned source
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "be4be6e4e969b7463989b91bc452c559882419d5"
+      - name: Isolate core workspace from private frontend dependencies
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: ir-bt2b-native-pic-regressions
+      - name: Full default x86 backend tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 -- --test-threads=2
+      - name: Full all-features x86 backend tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --all-features -- --test-threads=2
+      - name: Install GDB for historical DWARF oracle
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gdb
+      - name: Full core TypeId IR/optimization tests
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -- --test-threads=2
