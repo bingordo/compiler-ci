@@ -1,0 +1,68 @@
+name: Oberon native BOOLEAN procedure ABI differential
+on:
+  push:
+    paths:
+      - '.github/workflows/oberon-boolean-procedures-20261114.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  boolean-abi:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout checked frontend candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/oberon
+          ref: d0e5a75f89d1f32ce359c48e40803b281217a774
+          path: oberon
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout native compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: cc11661bbc36fd68ca36f4b488375592bd9876ed
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned candidate commits and use local frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C oberon rev-parse HEAD)" = d0e5a75f89d1f32ce359c48e40803b281217a774
+          test "$(git -C compiler rev-parse HEAD)" = cc11661bbc36fd68ca36f4b488375592bd9876ed
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('compiler/crates/driver/Cargo.toml')
+          s=p.read_text()
+          old='oberon-front-ir = { git = "ssh://git@github.com/bingordo/oberon.git", rev = "d0e5a75f89d1f32ce359c48e40803b281217a774" }'
+          assert s.count(old)==1, "checked frontend ABI candidate pin mismatched"
+          p.write_text(s.replace(old,'oberon-front-ir = { path = "../../../oberon/oberon/crates/front-ir" }'))
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: native-oberon-boolean-procedures-v1
+      - name: Complete source checked frontend IR tests
+        run: cargo test --manifest-path oberon/oberon/Cargo.toml -p oberon-front-ir
+      - name: Native compiler build
+        run: cargo check --manifest-path compiler/Cargo.toml -p compiler --bin compiler
+      - name: Direct ELF and GAS BOOLEAN ABI C oracle
+        run: cargo test --manifest-path compiler/Cargo.toml -p compiler --bin compiler native_boolean_procedure_abi_short_circuit_args_and_results_elf_gas -- --nocapture
+      - name: Previous first-class Boolean value executable oracle
+        run: cargo test --manifest-path compiler/Cargo.toml -p compiler --bin compiler native_boolean_values_locals_globals_and_short_circuit_elf_gas -- --nocapture
+      - name: Oberon source against C reference compiler
+        run: cargo test --manifest-path compiler/Cargo.toml -p compiler --bin compiler m6_checked_oberon_source_vs_c_oracle -- --nocapture
+      - name: Strict frontend Clippy
+        run: cargo clippy --manifest-path oberon/oberon/Cargo.toml -p oberon-front-ir --all-targets -- -D warnings
+      - name: Strict native compiler Clippy
+        run: cargo clippy --manifest-path compiler/Cargo.toml -p compiler --all-targets -- -D warnings
