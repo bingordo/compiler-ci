@@ -1,0 +1,64 @@
+name: BT1 TypeId pure-arm direct emission parity
+on:
+  push:
+    branches:
+      - ci/bt1-typeid-ifconversion-parity-20261113
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-pure-arm-parity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler PR source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b306be7b9286d26083e1d0517616a8850a925fe6
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and core-only workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "b306be7b9286d26083e1d0517616a8850a925fe6"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo "BT1 pinned source: b306be7b9286d26083e1d0517616a8850a925fe6" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: bt1-pure-ifconv-native-parity-v1
+      - name: Critical pure-arm native C11 differential in 4 emission modes
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typed_if_conversion_pure -- --nocapture
+      - name: Existing empty-arm TypeId and historical CMOV differential oracles
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_if_conversion_native -- --nocapture
+          cargo test -p compiler-opt --test if_conversion_native -- --nocapture
+          cargo test -p compiler-opt --test typed_native_parity -- --nocapture
+      - name: x86 direct-TypeId backend and IR/optimizer unit regressions
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test native_typeid_direct
+          cargo test -p compiler-backend-x86 --test native_typeid_memory_calls
+          cargo test -p compiler-backend-x86 --test x7_shared_signed_index_native
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-ir --lib
+      - name: All-target compile and strict Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check --workspace --all-targets
+          cargo clippy --workspace --all-targets -- -D warnings
