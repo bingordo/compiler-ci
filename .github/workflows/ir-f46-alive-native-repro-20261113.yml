@@ -1,0 +1,67 @@
+name: IR F46 native Alive-lite failure reducer and replay
+on:
+  push:
+    branches:
+      - ci/ir-f46-alive-native-repro-20261113
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  alive-typeid-reducer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact F46 compiler SHA
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7329f01cd56d84a4cfa37fb7ed533297c02cdaad
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and pin lean core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "7329f01cd56d84a4cfa37fb7ed533297c02cdaad"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo "F46 source SHA: 7329f01cd56d84a4cfa37fb7ed533297c02cdaad" >> "$GITHUB_STEP_SUMMARY"
+      - name: Install Z3
+        run: sudo apt-get update && sudo apt-get install -y z3
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-f46-native-alive-v1
+      - name: Native typed replay/delta reduction and nonignored full Alive-lite
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test alive_lite -- --nocapture
+      - name: Existing select/full TypeId SMT proofs and replay oracles
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test alive_lite prove_seeded_select_against_real_optimizer_passes -- --ignored --nocapture
+          cargo test -p compiler-opt --test alive_lite prove_select_phi_traps_against_real_passes -- --ignored --nocapture
+          cargo test -p compiler-opt --test alive_lite alive_lite_codec::prove_saved_replay_fixtures_against_real_passes -- --ignored --nocapture
+          cargo test -p compiler-opt --test alive_lite alive_lite_typeid:: -- --ignored --nocapture
+          cargo test -p compiler-opt --test alive_lite alive_lite_memory:: -- --ignored --nocapture
+      - name: TypeId replay/minimizer and independent native execution regressions
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typeid_native_reference_ddmin
+          cargo test -p compiler-opt --test memory_execution_oracle
+          cargo test -p compiler-opt --test generated_native_oracle
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-ir --lib
+      - name: Strict all core targets Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
