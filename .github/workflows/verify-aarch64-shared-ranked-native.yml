@@ -1,0 +1,103 @@
+name: AArch64 shared cost-ranked TypeId native selector parity
+on:
+  push:
+    branches: [ci/aarch64-shared-ranked-selector-20261113]
+permissions:
+  contents: read
+jobs:
+  aarch64-targeted:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - name: Configure SSH for compiler checkout
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub SSH host
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - name: Checkout compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d5228a5fb460fe51182f4721f51ce5c336ad9cd6
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Report exact compiler revision under test
+        env:
+          COMPILER_SHA: d5228a5fb460fe51182f4721f51ce5c336ad9cd6
+        run: |
+          printf 'Native AArch64 verification of bingordo/compiler at `%s`\n' "$COMPILER_SHA" >> "$GITHUB_STEP_SUMMARY"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Prepare isolated AArch64 workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p aarch64-workspace/crates aarch64-workspace/tools
+          cp -a compiler/crates/ir compiler/crates/opt compiler/crates/backend \
+            compiler/crates/backend-x86 compiler/crates/backend-aarch64 \
+            compiler/crates/driver aarch64-workspace/crates/
+          cp -a compiler/examples compiler/tests aarch64-workspace/
+          cp -a compiler/tools aarch64-workspace/
+          cat > aarch64-workspace/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend",
+                     "crates/backend-x86", "crates/backend-aarch64", "crates/driver"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aarch64-workspace
+          key: aarch64-targeted
+      - name: Verify AArch64 generated catalog and negative source-manifest gates
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/regen_aarch64_native_selector_rules.py --check
+          python3 -m unittest discover -s tools -p test_regen_aarch64_native_selector_rules.py -v
+          python3 tools/regen_aarch64_scalar_gp_forms.py --check
+          python3 -m unittest discover -s tools -p test_regen_aarch64_scalar_gp_forms.py -v
+      - name: Check AArch64 backend (warnings are errors)
+        working-directory: aarch64-workspace
+        run: RUSTFLAGS="-D warnings" cargo check -p compiler-backend-aarch64 --all-targets
+      - name: Test shared IR and register allocator
+        working-directory: aarch64-workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir -p compiler-backend -- --test-threads=1
+      - name: Focused generated ranked-rule parity and strict malformed index tests
+        working-directory: aarch64-workspace
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib ranked_selector::tests -- --nocapture
+          cargo test -p compiler-backend-aarch64 --lib generated_native_selector_tests -- --nocapture
+      - name: Test AArch64 backend natively
+        working-directory: aarch64-workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v cc
+          command -v objcopy
+          cargo test -p compiler-backend-aarch64 --all-targets -- --test-threads=1
+          echo 'Native AArch64 checks passed, including .eh_frame DWARF CFI, frame-pointer-free C backtrace across generated calls, near-16KB frames and independent assembler differential tests.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Build actual Oberon compiler frontend with AArch64 object target
+        working-directory: aarch64-workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUSTFLAGS="-D warnings" cargo build -p compiler --bin compiler
+      - name: Compile checked Oberon to AArch64 ELF, link and run native C oracle
+        working-directory: aarch64-workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          COMPILER_DRIVER="$PWD/target/debug/compiler" bash tests/aarch64_driver_integration.sh
+          echo 'Current-main checked Oberon/Mini-C -> AArch64 native ELF/GAS, globals, PIC and Linux GP varargs integration passed.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Run all source-pinned AArch64 offline oracle and batch tests
+        working-directory: aarch64-workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools -p 'test_aarch64*.py' -v
+          echo 'Offline source fingerprints, encoding oracle, and scalable AArch64 batch planner passed.' >> "$GITHUB_STEP_SUMMARY"
