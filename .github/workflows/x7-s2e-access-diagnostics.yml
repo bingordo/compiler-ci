@@ -1,0 +1,52 @@
+name: X7 S2E classify actual Intel-XED access discrepancies
+on:
+  push:
+    branches: [feature/x7-s2e-access-diagnostics-20261114]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  classify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          repository: bingordo/compiler-ci
+          run-id: 43618784571
+          github-token: ${{ github.token }}
+          name: x7-s2-pinned-intel-xed-variant-join
+          path: /tmp/previous
+      - name: Diagnose source read/nonread and XED rw disagreement
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          from collections import Counter,defaultdict
+          j=json.loads(Path('/tmp/previous/join-1.json').read_text())
+          counter=Counter(); examples=defaultdict(list)
+          uniques=set(); repeated=Counter(); stat=Counter()
+          for form in j['forms']:
+              for v in form['xed_variants']:
+                  for slot in v['operand_slot_evidence']['slots']:
+                      if slot['status'] != 'access_discrepancy_requires_manual_review':
+                          continue
+                      reason=('read' if slot['source_has_read_record'] else '-')+('/nonread' if slot['source_has_nonread_record'] else '')
+                      key=(slot['source_location'],slot['source_role'],reason,slot['xed_access'],slot['xed_lookup_function'])
+                      counter[key]+=1
+                      uniques.add(form['form_id'])
+                      repeated[form['xed_iform']]+=1
+                      stat[(form['join_status'],bool(v['excluded']),bool(v['xed_inventory_blockers']))]+=1
+                      if len(examples[key])<5:
+                          examples[key].append({'iform':form['xed_iform'],'form':form['form_id'][:12],'variant':v['variant_id'][:12],
+                            'xed_slot':slot['xed_slot_name'],'source_occurrences':slot['source_occurrences'],
+                            'excluded':v['excluded']})
+          print('S2E_TOTAL_DISCREPANCIES',sum(counter.values()),'distinct_intel_form_ids',len(uniques),'distinct_xed_names',len(repeated))
+          print('S2E_STATUS',sorted(stat.items(),key=lambda x:-x[1]))
+          for k,n in sorted(counter.items(),key=lambda x:(-x[1],x[0])):
+              print('S2E_DISCREPANCY',n,repr(k),json.dumps(examples[k],sort_keys=True))
+          print('S2E_TOP_NAMES',repeated.most_common(40))
+          assert sum(counter.values())==276
+          PY
