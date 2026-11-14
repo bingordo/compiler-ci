@@ -1,0 +1,86 @@
+name: BT4 audit exact historical AArch64 and x86 backend callers
+on:
+  push:
+    branches: [ci/bt4-aarch64-old-backend-source-audit-20261114]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source-inventory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1b605067a648e0a60dd15dd0524ebdcc59a80d88
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Print exact remaining historical callers and file inventory
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 1b605067a648e0a60dd15dd0524ebdcc59a80d88
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          patterns={
+            "legacy_backend_import":re.compile(r"^\s*use\s+compiler_backend::(?:Backend\b|\{[^}]*\bBackend\b)"),
+            "legacy_backend_impl":re.compile(r"\bimpl\s+Backend\s+for\b"),
+            "legacy_machine_select":re.compile(r"\bmachine::select\s*\("),
+            "legacy_backend_emit":re.compile(r"\.emit_(?:object|assembly)(?:_linked|_with_globals|_linked_with_globals|_linked_with_initializers|_linked_with_gp_varargs)?\s*\("),
+            "legacy_function_type":re.compile(r"\b(?:pub\s+)?(?:fn\s+\w+\s*\([^)]*\)\s*->\s*Function|Function\s*\{)"),
+          }
+          roots={
+            "a64_test":Path("crates/backend-aarch64/tests"),
+            "a64_source":Path("crates/backend-aarch64/src"),
+            "x86_test":Path("crates/backend-x86/tests"),
+            "x86_source":Path("crates/backend-x86/src"),
+            "shared_backend":Path("crates/backend/src"),
+          }
+          entries=[]
+          for scope,path in roots.items():
+            for f in sorted(path.rglob("*.rs")):
+              for idx,line in enumerate(f.read_text().splitlines(),1):
+                if line.lstrip().startswith("//"):
+                  continue
+                for label,regexp in patterns.items():
+                  if regexp.search(line):
+                    entries.append({
+                      "scope":scope,"file":str(f),"line":idx,
+                      "category":label,"text":line.strip()[:200]
+                    })
+          report={
+            "compiler_source_sha":"1b605067a648e0a60dd15dd0524ebdcc59a80d88",
+            "schema_version":1,
+            "counts":{scope:{label:sum(
+              e["scope"]==scope and e["category"]==label for e in entries)
+              for label in patterns} for scope in roots},
+            "unique_files_by_scope":{
+              scope:sorted(set(e["file"] for e in entries if e["scope"]==scope))
+              for scope in roots},
+            "entries":entries,
+          }
+          Path("/tmp/bt4-old-backend-inventory.json").write_text(
+            json.dumps(report,sort_keys=True,indent=2)+"\n")
+          print("BT4_OLD_BACKEND_SCOPE_COUNTS",
+            json.dumps(report["counts"],sort_keys=True))
+          for scope,items in report["unique_files_by_scope"].items():
+            print("BT4_OLD_BACKEND_FILES",scope,len(items))
+            for f in items:
+              print(" ",f)
+          print("BT4_A64_TEST_BACKEND_IMPORTS",
+            [e for e in entries if e["scope"]=="a64_test" and
+              e["category"]=="legacy_backend_import"])
+          print("BT4_A64_SOURCE_BACKEND_IMPLS",
+            [e for e in entries if e["scope"]=="a64_source" and
+              e["category"]=="legacy_backend_impl"])
+          print("BT4_A64_SOURCE_LEGACY_SELECT",
+            [e for e in entries if e["scope"]=="a64_source" and
+              e["category"]=="legacy_machine_select"][:60])
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bt4-old-backend-source-audit-no-production-mutation
+          path: /tmp/bt4-old-backend-inventory.json
+          if-no-files-found: error
