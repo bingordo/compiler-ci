@@ -1,0 +1,64 @@
+name: Oberon native multidimensional INC DEC differential
+on:
+  push:
+    paths:
+      - '.github/workflows/oberon-native-multidim-inc-dec-20261114.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-inc-dec:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout frontend candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/oberon
+          ref: 3ca9976fe4fa7dad762da989de1e5ed7441f1769
+          path: oberon
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 185be5e97639aa58895afa6d5acdf5b9aa22e936
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and link exact candidate frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C oberon rev-parse HEAD)" = 3ca9976fe4fa7dad762da989de1e5ed7441f1769
+          test "$(git -C compiler rev-parse HEAD)" = 185be5e97639aa58895afa6d5acdf5b9aa22e936
+          python3 - <<'PY'
+          from pathlib import Path
+          cargo = Path('compiler/crates/driver/Cargo.toml')
+          content = cargo.read_text()
+          old = 'oberon-front-ir = { git = "ssh://git@github.com/bingordo/oberon.git", rev = "3ca9976fe4fa7dad762da989de1e5ed7441f1769" }'
+          assert content.count(old) == 1, "frontend candidate pin mismatched"
+          cargo.write_text(content.replace(old, 'oberon-front-ir = { path = "../../../oberon/oberon/crates/front-ir" }'))
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: oberon-native-multidim-inc-dec-v1
+      - name: Frontend multidimensional INC DEC admission
+        run: cargo test --manifest-path oberon/oberon/Cargo.toml -p oberon-front-ir native_multidim_inc_dec
+      - name: Frontend unsupported index arity admission
+        run: cargo test --manifest-path oberon/oberon/Cargo.toml -p oberon-front-ir native_inc_dec_reject_unsupported_targets
+      - name: Native compiler build
+        run: cargo check --manifest-path compiler/Cargo.toml -p compiler --bin compiler
+      - name: Native ELF and GAS once-evaluated multidimensional oracle
+        run: cargo test --manifest-path compiler/Cargo.toml -p compiler --bin compiler native_multidim_inc_dec_indexes_once_in_elf_and_gas -- --nocapture
+      - name: Strict frontend Clippy
+        run: cargo clippy --manifest-path oberon/oberon/Cargo.toml -p oberon-front-ir --all-targets -- -D warnings
