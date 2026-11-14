@@ -1,0 +1,62 @@
+name: Oberon first-class BOOLEAN values ELF GAS differential
+on:
+  push:
+    paths:
+      - '.github/workflows/oberon-boolean-values-20261114.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-boolean-values:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact frontend candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/oberon
+          ref: 9829ee8360843a603c474c38cf87fa0694f03902
+          path: oberon
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 86cd62e3a772928248590471c3ffa860f19a1fe6
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned source and overlay local frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C oberon rev-parse HEAD)" = 9829ee8360843a603c474c38cf87fa0694f03902
+          test "$(git -C compiler rev-parse HEAD)" = 86cd62e3a772928248590471c3ffa860f19a1fe6
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('compiler/crates/driver/Cargo.toml')
+          text = path.read_text()
+          old = 'oberon-front-ir = { git = "ssh://git@github.com/bingordo/oberon.git", rev = "9829ee8360843a603c474c38cf87fa0694f03902" }'
+          assert text.count(old) == 1, "native compiler's frontend pin differs from tested revision"
+          path.write_text(text.replace(old,'oberon-front-ir = { path = "../../../oberon/oberon/crates/front-ir" }'))
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: oberon-boolean-values-v1
+      - name: All frontend projection unit tests
+        run: cargo test --manifest-path oberon/oberon/Cargo.toml -p oberon-front-ir
+      - name: Native compiler check
+        run: cargo check --manifest-path compiler/Cargo.toml -p compiler --bin compiler
+      - name: Executable ELF and GAS Boolean value oracle
+        run: cargo test --manifest-path compiler/Cargo.toml -p compiler --bin compiler native_boolean_values_locals_globals_and_short_circuit_elf_gas -- --nocapture
+      - name: Strict frontend Clippy
+        run: cargo clippy --manifest-path oberon/oberon/Cargo.toml -p oberon-front-ir --all-targets -- -D warnings
