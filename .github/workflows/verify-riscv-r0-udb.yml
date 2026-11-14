@@ -1,4 +1,4 @@
-name: Verify RV64 R0 UDB encoding importer
+name: Verify RV64 UDB encoding importer and GNU assembler parity
 on:
   workflow_dispatch:
   push:
@@ -14,7 +14,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ce99d6b0d614ee12c90b969eff4a2a4141c99c83
+          ref: ded92bd17d8223a00867147a0423a6e92fd57f33
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -25,16 +25,17 @@ jobs:
           path: udb
           sparse-checkout: |
             spec/std/isa/inst/I
+            spec/std/isa/inst/M
           sparse-checkout-cone-mode: true
-      - name: Verify pinned source commits
+      - name: Verify pinned source revisions
         run: |
-          test "$(git -C compiler rev-parse HEAD)" = "ce99d6b0d614ee12c90b969eff4a2a4141c99c83"
+          test "$(git -C compiler rev-parse HEAD)" = "ded92bd17d8223a00867147a0423a6e92fd57f33"
           test "$(git -C udb rev-parse HEAD)" = "d583fecd3d95841b9d6751f800337d1e2999c3fd"
-      - name: Install independent GNU RISC-V tools
+      - name: Install independent RV64 GNU toolchain
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y python3-yaml binutils-riscv64-linux-gnu
-      - name: Run encoding importer unit tests and checked regeneration
+      - name: Unit tests and pinned RV64I/M catalog generation
         working-directory: compiler
         run: |
           set -euo pipefail
@@ -42,33 +43,21 @@ jobs:
           python3 tools/riscv_udb_import.py \
             --udb-root ../udb \
             --udb-sha d583fecd3d95841b9d6751f800337d1e2999c3fd \
-            --instruction I/add --instruction I/addi \
-            --instruction I/beq --instruction I/jal \
-            --output data/riscv_udb_r0_catalog.json --check
-      - name: Independently assemble ADD and ADDI and compare bytes
-        working-directory: compiler
-        run: |
-          set -euo pipefail
-          cat > /tmp/rv64-r0.s <<'EOF'
-          .text
-          add x1,x2,x3
-          addi x1,x2,-1
-          EOF
-          riscv64-linux-gnu-as -march=rv64i -mabi=lp64 /tmp/rv64-r0.s -o /tmp/rv64-r0.o
-          riscv64-linux-gnu-objcopy -O binary -j .text /tmp/rv64-r0.o /tmp/rv64-r0.bin
+            --manifest data/riscv_udb_rv64_manifest.txt \
+            --output /tmp/riscv_udb_rv64_catalog.json
           python3 - <<'PY'
           import json
           from pathlib import Path
-          import sys
-          sys.path.insert(0, 'tools')
-          from riscv_udb_import import encode_instruction
-          forms = {f['name']: f for f in json.loads(Path('data/riscv_udb_r0_catalog.json').read_text())['instructions']}
-          words = [
-              encode_instruction(forms['add'], {'xd': 1, 'xs1': 2, 'xs2': 3}),
-              encode_instruction(forms['addi'], {'xd': 1, 'xs1': 2, 'imm': -1}),
-          ]
-          expected = b''.join(word.to_bytes(4, 'little') for word in words)
-          actual = Path('/tmp/rv64-r0.bin').read_bytes()
-          assert actual == expected, f'GNU assembler {actual.hex()} != importer {expected.hex()}'
-          print('Independent GNU assembler byte parity:', actual.hex())
+          obj=json.loads(Path('/tmp/riscv_udb_rv64_catalog.json').read_text())
+          assert obj['coverage']['described'] == 66, obj['coverage']
+          assert obj['coverage']['semantic_proven'] == 0
+          assert obj['coverage']['selected'] == 0
+          print('RV64_CATALOG_JSON_BEGIN')
+          print(json.dumps(obj,separators=(',',':'),ensure_ascii=True))
+          print('RV64_CATALOG_JSON_END')
           PY
+      - name: Compare source-generated encoding bytes against GNU assembler
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/riscv_udb_gas_oracle.py /tmp/riscv_udb_rv64_catalog.json
