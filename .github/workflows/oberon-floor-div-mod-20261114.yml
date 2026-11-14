@@ -1,0 +1,63 @@
+name: Oberon native floor DIV MOD differential
+on:
+  push:
+    paths:
+      - '.github/workflows/oberon-floor-div-mod-20261114.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-division:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout frontend candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/oberon
+          ref: c32ce5b92d28de62a613943300a98fe18fec078a
+          path: oberon
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 53c79aa6cfda001697614080c87a2e80704aa7aa
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact SHA and use local candidate frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C oberon rev-parse HEAD)" = c32ce5b92d28de62a613943300a98fe18fec078a
+          test "$(git -C compiler rev-parse HEAD)" = 53c79aa6cfda001697614080c87a2e80704aa7aa
+          python3 - <<'PY'
+          from pathlib import Path
+          file = Path('compiler/crates/driver/Cargo.toml')
+          contents = file.read_text()
+          original = 'oberon-front-ir = { git = "ssh://git@github.com/bingordo/oberon.git", rev = "c32ce5b92d28de62a613943300a98fe18fec078a" }'
+          assert contents.count(original) == 1, "compiler candidate dependency does not pin this frontend"
+          file.write_text(contents.replace(original,
+              'oberon-front-ir = { path = "../../../oberon/oberon/crates/front-ir" }'))
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: oberon-native-floor-div-mod-v1
+      - name: Frontend IR admission tests
+        run: cargo test --manifest-path oberon/oberon/Cargo.toml -p oberon-front-ir native_runtime_div_mod
+      - name: Native driver build
+        run: cargo check --manifest-path compiler/Cargo.toml -p compiler --bin compiler
+      - name: Native ELF and GAS floor-division differential oracle
+        run: cargo test --manifest-path compiler/Cargo.toml -p compiler --bin compiler oberon_floor_div_mod_native_elf_and_gas_match_c_oracle -- --nocapture
+      - name: Strict frontend Clippy
+        run: cargo clippy --manifest-path oberon/oberon/Cargo.toml -p oberon-front-ir --all-targets -- -D warnings
