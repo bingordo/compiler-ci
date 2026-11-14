@@ -136,7 +136,9 @@ def recheck(history_dir: Path, campaign: Path, triage_dir: Path,
     new_ids = {row["id"] for row in new}
     previous_witnesses = [row for row in history if row["id"] not in new_ids]
     if previous_witnesses:
-        start = int(run_token.split(".")[0]) % len(previous_witnesses)
+        # Advance by a full check window so consecutive runs cover all
+        # fingerprints in ceil(total/limit) runs instead of moving one item.
+        start = (int(run_token.split(".")[0]) * limit) % len(previous_witnesses)
         candidates = (previous_witnesses[start:] + previous_witnesses[:start])[:limit]
     else:
         candidates = []
