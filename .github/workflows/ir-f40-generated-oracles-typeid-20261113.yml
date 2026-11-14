@@ -1,0 +1,63 @@
+name: IR F40 generated native oracles TypeId acceptance
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ir-f40-generated-oracles-typeid-20261113.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-typeid:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler F40 source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 063190e97309cf82a25976bff907c32cc3d2a7fd
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin source and restrict core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "063190e97309cf82a25976bff907c32cc3d2a7fd"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo "Exact compiler SHA: 063190e97309cf82a25976bff907c32cc3d2a7fd" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-f40-generated-native-typeid-v1
+      - name: Run generated full-pipeline C differential and SIGFPE oracle
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test generated_native_oracle -- --nocapture
+      - name: Run adjacent native optimizer and runtime regression suites
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test generated_native_oracle -- --list
+          cargo test -p compiler-opt --test native_cfg_differential
+          cargo test -p compiler-opt --test memory_execution_oracle
+          cargo test -p compiler-opt --test loop_trap_semantics
+          cargo test -p compiler-opt --test pre_native
+          cargo test -p compiler-opt --test typed_native_parity
+      - name: IR and x86 backend libraries
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --lib
+          cargo test -p compiler-backend-x86 --lib
+      - name: Strict Clippy across core test targets
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
