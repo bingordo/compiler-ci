@@ -1,0 +1,120 @@
+name: S23.49 independent unchanged source TypeId shape census
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-49-independent-typeid-shapes.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-pinned-independent-shapes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 80
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Fetch exact compiler source, never run compiler Actions
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b6822d1623944c2f43972fa2d24eb00d10f345f0
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+
+      - name: Verify exact compiler pin and independent census syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = b6822d1623944c2f43972fa2d24eb00d10f345f0
+          python3 -m py_compile compiler/tools/s23_49_capture_independent_sources.py \
+            compiler/tools/s23_49_parse_independent_shapes.py
+          rustc --version
+          cc --version | head -1
+          mkdir -p results
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: s23-49-independent-source-typeid
+
+      - name: Build unchanged release production compiler
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          cargo build --release -p compiler --bin compiler
+          test -x target/release/compiler
+
+      - name: Capture 43 fixed new repository source attempts and exact source/ELF provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -u compiler/tools/s23_49_capture_independent_sources.py \
+            --root compiler \
+            --compiler-sha b6822d1623944c2f43972fa2d24eb00d10f345f0 \
+            --compiler compiler/target/release/compiler \
+            --snapshots results/typeid_snapshots \
+            --output results/s23-49-source-capture.json \
+            2>&1 | tee results/s23-49-source-capture.log
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path('results/s23-49-source-capture.json').read_text())
+          assert data['schema']=='compiler.s2349-independent-source-capture.v1'
+          assert data['attempted']==43
+          assert data['accepted']+data['rejected']==43
+          assert data['accepted']>=5, 'Too few accepted unchanged source files; keep raw rejects'
+          assert len(data['accepted_cases'])==data['accepted']
+          assert len(data['rejected_cases'])==data['rejected']
+          PY
+
+      - name: TypeId original-producer shape census on independently accepted input stages
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --features experimental-typeid-generated-shadow \
+            --test native_s2349_independent_shape_census -- --nocapture \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/s23-49-shape-smoke.log"
+          grep 'S2349_SUMMARY cohort=synthetic_committed_control cases=1 stages=1' \
+            "$GITHUB_WORKSPACE/results/s23-49-shape-smoke.log"
+          S2349_SNAPSHOT_DIR="$GITHUB_WORKSPACE/results/typeid_snapshots" \
+            cargo test --release -p compiler-opt \
+              --features experimental-typeid-generated-shadow \
+              --test native_s2349_independent_shape_census -- --nocapture \
+              2>&1 | tee "$GITHUB_WORKSPACE/results/s23-49-real-shapes.log"
+          python3 tools/s23_49_parse_independent_shapes.py \
+            --capture "$GITHUB_WORKSPACE/results/s23-49-source-capture.json" \
+            --log "$GITHUB_WORKSPACE/results/s23-49-real-shapes.log" \
+            --output "$GITHUB_WORKSPACE/results/s23-49-independent-shapes.json" \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/s23-49-shape-summary.log"
+          grep '^S2349_ACCOUNTING attempted=43 ' \
+            "$GITHUB_WORKSPACE/results/s23-49-shape-summary.log"
+          grep '^S2349_COHORT ' "$GITHUB_WORKSPACE/results/s23-49-shape-summary.log" \
+            >> "$GITHUB_STEP_SUMMARY"
+          grep '^S2349_RANK ' "$GITHUB_WORKSPACE/results/s23-49-shape-summary.log" \
+            | head -15 >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Existing native source observation and strict analyzer Clippy
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --features experimental-typeid-generated-shadow \
+            --test native_s2350_shadow_parity -- --nocapture
+          cargo clippy -p compiler-opt --test native_s2349_independent_shape_census \
+            --features experimental-typeid-generated-shadow -- -D warnings
+
+      - name: Preserve all attempted source rejections and verified TypeId snapshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s23-49-independent-source-shapes-and-rejections
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
