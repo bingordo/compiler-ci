@@ -1,0 +1,74 @@
+name: Verify RV64 R0 UDB encoding importer
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-riscv-r0-udb.yml']
+permissions:
+  contents: read
+jobs:
+  imported-encodings:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 15d471d31c2bb2d040ba59c4ccf169d0de6a144f
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: riscv/riscv-unified-db
+          ref: d583fecd3d95841b9d6751f800337d1e2999c3fd
+          path: udb
+          sparse-checkout: |
+            spec/std/isa/inst/I
+          sparse-checkout-cone-mode: true
+      - name: Verify pinned source commits
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "15d471d31c2bb2d040ba59c4ccf169d0de6a144f"
+          test "$(git -C udb rev-parse HEAD)" = "d583fecd3d95841b9d6751f800337d1e2999c3fd"
+      - name: Install independent GNU RISC-V tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y python3-yaml binutils-riscv64-linux-gnu
+      - name: Run encoding importer unit tests and checked regeneration
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools/tests -p test_riscv_udb_import.py -v
+          python3 tools/riscv_udb_import.py \
+            --udb-root ../udb \
+            --udb-sha d583fecd3d95841b9d6751f800337d1e2999c3fd \
+            --instruction I/add --instruction I/addi \
+            --instruction I/beq --instruction I/jal \
+            --output data/riscv_udb_r0_catalog.json --check
+      - name: Independently assemble ADD and ADDI and compare bytes
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cat > /tmp/rv64-r0.s <<'EOF'
+          .text
+          add x1,x2,x3
+          addi x1,x2,-1
+          EOF
+          riscv64-linux-gnu-as -march=rv64i -mabi=lp64 /tmp/rv64-r0.s -o /tmp/rv64-r0.o
+          riscv64-linux-gnu-objcopy -O binary -j .text /tmp/rv64-r0.o /tmp/rv64-r0.bin
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          sys.path.insert(0, 'tools')
+          from riscv_udb_import import encode_instruction
+          forms = {f['name']: f for f in json.loads(Path('data/riscv_udb_r0_catalog.json').read_text())['instructions']}
+          words = [
+              encode_instruction(forms['add'], {'xd': 1, 'xs1': 2, 'xs2': 3}),
+              encode_instruction(forms['addi'], {'xd': 1, 'xs1': 2, 'imm': -1}),
+          ]
+          expected = b''.join(word.to_bytes(4, 'little') for word in words)
+          actual = Path('/tmp/rv64-r0.bin').read_bytes()
+          assert actual == expected, f'GNU assembler {actual.hex()} != importer {expected.hex()}'
+          print('Independent GNU assembler byte parity:', actual.hex())
+          PY
