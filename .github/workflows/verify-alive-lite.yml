@@ -117,6 +117,19 @@ jobs:
             cargo test -p compiler-opt --test typed_global_memory \
               p3c3_two_origin_byte_phi_typeid_and_legacy_parity -- --nocapture
 
+      - name: Verify permanent AL-04.P3c.3b composed-byte TypeId parity
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          timeout --signal=TERM --kill-after=10s 5m \
+            cargo test -p compiler-opt --test typed_global_memory \
+              p3c3b_composed_byte_typeid_and_legacy_parity -- --nocapture
+          timeout --signal=TERM --kill-after=10s 5m \
+            cargo test -p compiler-opt --lib \
+              partially_overlapped_bytes_keep_only_initialized_lanes -- --nocapture
+
       - name: Run non-Z3 Alive-lite checks and coverage ledger
         if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
         shell: bash
@@ -331,6 +344,18 @@ jobs:
           "$RUNNER_TEMP/al04-byte-phi-pair" | tee alive-lite-al04-byte-phi.log
           grep -Fx 'AL04_NATIVE_C_BYTE_PHI cases=288 wrong_origin_detected=1 wrong_sign_detected=1 clobber_detected=1 verdict=PASS' \
             alive-lite-al04-byte-phi.log
+
+      - name: Verify permanent AL-04.P3c.3b independent strict C11 oracle
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cc -std=c11 -O2 -Wall -Wextra -Werror \
+            compiler/crates/opt/tests/oracles/al04_composed_bytes.c \
+            -o "$RUNNER_TEMP/al04-composed-bytes"
+          "$RUNNER_TEMP/al04-composed-bytes" | tee alive-lite-al04-composed-bytes.log
+          grep -Fx 'AL04_NATIVE_C_COMPOSED_BYTES cases=32 wrong_shift=1 wrong_sign=1 lost_overwrite=1 verdict=PASS' \
+            alive-lite-al04-composed-bytes.log
 
       - name: Install checksum-pinned Z3 4.8.12
         if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
@@ -567,7 +592,7 @@ jobs:
           # signed shift counts, removed overwrites and source signedness
           # are required SAT mutants; the independent oracle is above.
           if not re.search(
-              r'AL04_NARROW_STORE_VALUE proofs=66 forward_changed=12\s+pipeline_changed=[1-9][0-9]* sat=12 independent=198 verdict=PROVEN',
+              r'AL04_NARROW_STORE_VALUE proofs=66 forward_changed=14\s+pipeline_changed=[1-9][0-9]* sat=12 independent=198 verdict=PROVEN',
               log,
           ):
               raise SystemExit('Missing accepted AL-04.P3c.2 changed store-to-load proofs and SAT masks')
@@ -580,6 +605,15 @@ jobs:
               log,
           ):
               raise SystemExit('Missing proved AL-04.P3c.3a changed two-origin byte-PHI forward and SAT controls')
+          # AL-04.P3c.3b proves changed native/legacy byte composition
+          # through a single shared memory SMT interpreter. Retain SAT
+          # counterexamples for wrong sources/sign/assembled shift and
+          # independent native C11 expectations above.
+          if not re.search(
+              r'AL04_COMPOSED_BYTES proofs=18 forward_changed=4\s+pipeline_changed=[1-9][0-9]* sat=12 independent=32 verdict=PROVEN',
+              log,
+          ):
+              raise SystemExit('Missing permanent AL-04.P3c.3b composed-byte proof/negative controls')
           print(f'Validated {passed} Alive-lite tests and {len(proofs)} per-pass proof records')
           PY
           mkdir -p "$GITHUB_WORKSPACE/.alive-lite-verified"
