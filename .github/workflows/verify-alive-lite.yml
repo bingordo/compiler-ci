@@ -97,6 +97,16 @@ jobs:
             cargo test -p compiler-opt --test alive_lite --no-run \
             2>&1 | tee "$RUNNER_TEMP/alive-lite-build.log"
           test -n "$(find target/debug/deps -maxdepth 1 -type f -name 'alive_lite-*' -executable -print -quit)"
+      - name: Verify native TypeId and legacy narrow-store reconstruction parity
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          timeout --signal=TERM --kill-after=10s 5m \
+            cargo test -p compiler-opt --test typed_global_memory \
+              p3c2_typed_and_legacy_narrow_store_reconstruction_match -- --nocapture
+
       - name: Run non-Z3 Alive-lite checks and coverage ledger
         if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
         shell: bash
@@ -287,6 +297,18 @@ jobs:
           "$RUNNER_TEMP/al04-narrow-read-c" | tee alive-lite-al04-narrow-read.log
           grep -Fx 'AL04_NATIVE_C_NARROW_READ cases=128 wrong_sign_detected=1 lost_overlap_detected=1 verdict=PASS' \
             alive-lite-al04-narrow-read.log
+
+      - name: Verify permanent AL-04.P3c.2 store-reconstruction C11 oracle
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cc -std=c11 -O2 -Wall -Wextra -Werror \
+            compiler/crates/opt/tests/oracles/al04_store_reconstruction.c \
+            -o "$RUNNER_TEMP/al04-store-reconstruction-c"
+          "$RUNNER_TEMP/al04-store-reconstruction-c" | tee alive-lite-al04-store-reconstruction.log
+          grep -Fx 'AL04_NATIVE_C_STORE_RECON cases=198 wrong_sign=1 lost_later=1 wrong_mask=1 trap_cases=8 verdict=PASS' \
+            alive-lite-al04-store-reconstruction.log
 
       - name: Install checksum-pinned Z3 4.8.12
         if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
@@ -518,6 +540,15 @@ jobs:
               log,
           ):
               raise SystemExit('Missing proved changed narrow-read forwarding and signedness mutants')
+          # Store-to-load reconstruction must prove an actual altered SSA
+          # program, not just compare a no-op pair. Wrong generated masks,
+          # signed shift counts, removed overwrites and source signedness
+          # are required SAT mutants; the independent oracle is above.
+          if not re.search(
+              r'AL04_NARROW_STORE_VALUE proofs=66 forward_changed=12\s+pipeline_changed=20 sat=12 independent=198 verdict=PROVEN',
+              log,
+          ):
+              raise SystemExit('Missing accepted AL-04.P3c.2 changed store-to-load proofs and SAT masks')
           print(f'Validated {passed} Alive-lite tests and {len(proofs)} per-pass proof records')
           PY
           mkdir -p "$GITHUB_WORKSPACE/.alive-lite-verified"
