@@ -1,0 +1,73 @@
+# Source-pinned W0 TypeId -> WebAssembly smoke test.
+# Only the self-contained core crates are built; private frontends are excluded.
+name: Wasm W0 scalar smoke
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/wasm-w0-scalar.yml'
+  workflow_dispatch:
+    inputs:
+      compiler_sha:
+        description: 'Exact bingordo/compiler commit SHA to verify'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  wasm-w0:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.compiler_sha || '4b862bfdae654fc05ffb1d5e2b73cce9bc2aa3ab' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+
+      - name: Record source pin and isolate credential-free workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Compiler source: $(git -C compiler rev-parse HEAD)"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-wasm"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+          cargo --version
+
+      - name: Ensure independent Node.js WebAssembly runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Cache self-contained Rust crates
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: wasm-w0-scalar
+
+      - name: Validate and execute binary with 1000 deterministic vectors
+        working-directory: compiler
+        run: cargo test -p compiler-backend-wasm --test scalar_smoke -- --nocapture
+
+      - name: Validate CLI output independently with Node WebAssembly
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run -p compiler-backend-wasm --bin typeid-wasm -- \
+            crates/backend-wasm/tests/fixtures/w0_scalar.ir /tmp/w0-scalar.wasm
+          node crates/backend-wasm/tests/run_wasm.js /tmp/w0-scalar.wasm
+
+      - name: Strict compiler-backend-wasm Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-wasm --all-targets -- -D warnings
