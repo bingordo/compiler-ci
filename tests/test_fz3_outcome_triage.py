@@ -1,6 +1,7 @@
 """FZ-3 v2 trap-history validation, deduplication and fail-closed tests."""
 from __future__ import annotations
 
+import hashlib
 import sys
 import tempfile
 import unittest
@@ -57,7 +58,13 @@ class OutcomeTriageTests(unittest.TestCase):
         )
         base.write_tsv(self.report / "fingerprints.tsv", base.CAMPAIGN_COLUMNS, [])
         base.write_tsv(self.report / "outcome_fingerprints_v2.tsv", v2.V2_COLUMNS, rows)
-        _, digest = base.verify_campaign(self.report, sha)
+        if injected == "false":
+            _, digest = base.verify_campaign(self.report, sha)
+        else:
+            digest = hashlib.sha256(
+                (self.report / "summary.txt").read_bytes() + b"\0" +
+                (self.report / "fingerprints.tsv").read_bytes()
+            ).hexdigest()
         base.write_tsv(self.history / "processed_runs.tsv", base.PROCESSED_COLUMNS,
                        [{"run_token": "123.1", "run_url": URL,
                          "source_sha": sha, "report_digest": digest}])
