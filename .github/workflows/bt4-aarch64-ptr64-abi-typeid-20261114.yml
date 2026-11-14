@@ -1,0 +1,51 @@
+name: BT4 AArch64 original Ptr64 call PHI spill ABI TypeId GCC QEMU
+on:
+  push:
+    branches: [ci/bt4-aarch64-ptr64-abi-typeid-20261114]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  retire-old-ptr64-caller:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 27ee66cfbd728495586dd586e8bfaafbb506659b
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin compiler and isolate target/backend workspace
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 27ee66cfbd728495586dd586e8bfaafbb506659b
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
+          """)
+          PY
+      - name: Validate pointer call/phi/spill original source and all AArch64 tests
+        run: |
+          set -euo pipefail
+          if grep -nE '(compiler_backend::Backend|machine::select\(|compiler_ir::Function)' crates/backend-aarch64/tests/ptr64_calls.rs; then
+            echo "BT4 GP variadics still depend on historical Backend(Function)"; exit 1
+          fi
+          cargo check -p compiler-backend-aarch64 --all-targets
+          cargo test -p compiler-backend-aarch64 --test ptr64_calls -- --nocapture
+          cargo test -p compiler-backend-aarch64 --tests
+          cargo clippy -p compiler-backend-aarch64 --all-targets -- -D warnings
+      - name: Install native AArch64 runtime and cross compiler
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu qemu-user
+      - name: Execute all four original pointer high-bit, 10-argument, PHI and 32-live call C11 oracles
+        env:
+          COMPILER_REQUIRE_AARCH64_QEMU: "1"
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-aarch64 --test ptr64_calls -- --nocapture
+          echo BT4_ALL_FOUR_PTR64_ORIGINAL_C11_QEMU_PASS
