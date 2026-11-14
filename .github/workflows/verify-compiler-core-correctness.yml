@@ -35,7 +35,7 @@ concurrency:
 jobs:
   native:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 23
     steps:
       - name: Checkout workflow for cache-key versioning
         uses: actions/checkout@v4
@@ -96,7 +96,7 @@ jobs:
           from pathlib import Path
           Path('Cargo.toml').write_text("""[workspace]
           resolver = "2"
-          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
           """)
           PY
       # Cargo may need to download a new dependency on a cold cache or after a lockfile change.
@@ -161,6 +161,34 @@ jobs:
           grep -F 'test native_assembly_and_elf_match_independent_unsigned_c_reference ... ok' "$RUNNER_TEMP/extended-opt-tests.log"
           grep -F 'test native_asm_and_direct_elf_match_unoptimized_and_wrapping_c ... ok' "$RUNNER_TEMP/extended-opt-tests.log"
           grep -F 'test promoted_loop_and_mixed_array_execute_identically_from_both_native_formats ... ok' "$RUNNER_TEMP/extended-opt-tests.log"
+      - name: AL-05 cross toolchain for native ELF/GAS differential
+        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
+          aarch64-linux-gnu-gcc --version
+          qemu-aarch64 --version
+      - name: AL-05 native x86 and AArch64 ELF/GAS with strict C11 oracle
+        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
+        shell: bash
+        working-directory: compiler
+        env:
+          AL05_REQUIRE_AARCH64: '1'
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 9m \
+            cargo test -p compiler-opt --test al05_native_bridge -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/al05-native-bridge.log"
+          for arch in x86_64 aarch64; do
+            for format in elf gas; do
+              grep -F "AL05_NATIVE_TARGET arch=$arch format=$format functions=8 changed_cse=4 comparisons=3736 traps=16 verdict=PASS" \
+                "$RUNNER_TEMP/al05-native-bridge.log"
+            done
+          done
+
       - name: Record successful exact source SHA
         if: success() && (steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck)
         shell: bash
@@ -186,6 +214,8 @@ jobs:
             ${{ runner.temp }}/native-division-tests.log
             ${{ runner.temp }}/ssa-verifier-tests.log
             ${{ runner.temp }}/extended-opt-tests.log
+            ${{ runner.temp }}/al05-native-bridge.log
+            /tmp/al05-native-*/
             /tmp/compiler-native-cfg-differential-*/
           if-no-files-found: ignore
           retention-days: 14
