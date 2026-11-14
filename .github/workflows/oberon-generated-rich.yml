@@ -1,0 +1,122 @@
+name: Oberon rich source differential (live pin)
+on:
+  push:
+    paths:
+      - '.github/workflows/oberon-generated-rich.yml'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Compiler branch, tag, or exact SHA
+        required: true
+        default: main
+        type: string
+      base_seed:
+        description: First deterministic seed
+        required: true
+        default: '1'
+        type: string
+      seeds:
+        description: Number of consecutive seeds (1-64)
+        required: true
+        default: '8'
+        type: string
+  schedule:
+    - cron: '31 10 * * 0'
+permissions:
+  contents: read
+concurrency:
+  group: oberon-rich-${{ inputs.source_ref || 'main' }}
+  cancel-in-progress: true
+jobs:
+  rich-differential:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      FUZZ_BASE: ${{ inputs.base_seed || '1' }}
+      FUZZ_SEEDS: ${{ inputs.seeds || '8' }}
+    steps:
+      - name: Check out compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || 'main' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Resolve exact checked Oberon frontend revision
+        id: frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os,re
+          from pathlib import Path
+          content=Path('compiler/crates/driver/Cargo.toml').read_text()
+          match=re.search(r'^oberon-front-ir\s*=\s*\{[^}]*\brev\s*=\s*"([0-9a-f]{40})"',content,re.M)
+          if not match:
+              raise SystemExit('compiler frontend dependency is not an exact pinned revision')
+          with open(os.environ['GITHUB_OUTPUT'],'a') as out:
+              print('sha='+match.group(1),file=out)
+          print('Pinned Oberon frontend: '+match.group(1))
+          PY
+          git -C compiler rev-parse HEAD
+      - name: Checkout pinned Oberon frontend and reference compilers
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/oberon
+          ref: ${{ steps.frontend.outputs.sha }}
+          path: oberon
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned revision and link local frontend for CI
+        shell: bash
+        env:
+          FRONTEND_SHA: ${{ steps.frontend.outputs.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git -C oberon rev-parse HEAD)" = "$FRONTEND_SHA"
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('compiler/crates/driver/Cargo.toml')
+          content=p.read_text()
+          old='oberon-front-ir = { git = "ssh://git@github.com/bingordo/oberon.git", rev = "'+__import__('os').environ['FRONTEND_SHA']+'" }'
+          assert content.count(old)==1,'checked compiler frontend pin does not match checkout'
+          p.write_text(content.replace(old,
+              'oberon-front-ir = { path = "../../../oberon/oberon/crates/front-ir" }'))
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            compiler -> target
+            oberon/oberon -> target
+          key: oberon-rich-live-v1
+      - name: Verify deterministic generator feature witnesses
+        run: cargo test --manifest-path oberon/oberon/Cargo.toml --bin obgen compiler_rich
+      - name: Build generator and C/Cranelift reference compiler
+        run: cargo build --manifest-path oberon/oberon/Cargo.toml --bin obgen --bin obc
+      - name: Build native compiler
+        run: cargo build --manifest-path compiler/Cargo.toml -p compiler --bin compiler
+      - name: Execute native ELF/GAS and C/Cranelift oracle on fresh pinned source
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$FUZZ_BASE" =~ ^[0-9]+$ ]]
+          [[ "$FUZZ_SEEDS" =~ ^[1-9][0-9]*$ ]]
+          test "$FUZZ_SEEDS" -le 64
+          export OBGEN="$PWD/oberon/oberon/target/debug/obgen"
+          export OBC="$PWD/oberon/oberon/target/debug/obc"
+          export COMPILER="$PWD/compiler/target/debug/compiler"
+          export FUZZ_WORK="$PWD/findings/rich"
+          FUZZ_VARIANT=rich bash compiler/tests/oberon_fuzz.sh
+      - name: Retain failing seeds for exact replay
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oberon-rich-generated-failures
+          path: findings/rich
+          if-no-files-found: ignore
+          retention-days: 14
