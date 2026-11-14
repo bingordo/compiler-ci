@@ -1,0 +1,66 @@
+name: BT3b AArch64 TypeId globals relocations and constructor C11/QEMU
+on:
+  push:
+    branches:
+      - ci/bt3b-aarch64-native-globals-20261114
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  aarch64-native-globals:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c3e55e1154240b44566da7111a4d2997645af9a4
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source and core workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "c3e55e1154240b44566da7111a4d2997645af9a4"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo "BT3b globals pinned source c3e55e1154240b44566da7111a4d2997645af9a4" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: bt3b-aarch64-native-globals-v1
+      - name: TypeId globals ELF GAS and ctor emission on ordinary host
+        working-directory: compiler
+        run: cargo test -p compiler-backend-aarch64 --test typeid_globals_native -- --nocapture
+      - name: Install AArch64 C cross toolchain and QEMU
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user binutils-aarch64-linux-gnu
+          command -v aarch64-linux-gnu-gcc
+          command -v qemu-aarch64
+      - name: Cross-run native TypeId ELF GAS constructors globals and relocation C11 oracle
+        working-directory: compiler
+        env:
+          COMPILER_REQUIRE_AARCH64_QEMU: '1'
+        run: cargo test -p compiler-backend-aarch64 --test typeid_globals_native -- --nocapture
+      - name: Preserve previous 16arg alias recursion and multi-call QEMU oracles
+        working-directory: compiler
+        env:
+          COMPILER_REQUIRE_AARCH64_QEMU: '1'
+        run: cargo test -p compiler-backend-aarch64 --test typeid_abi_calls_native -- --nocapture
+      - name: Preserve AArch64 legacy native tests and strict core checks
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-aarch64 --lib
+          cargo test -p compiler-backend-aarch64 --test module_globals
+          cargo check --workspace --all-targets
+          cargo clippy --workspace --all-targets -- -D warnings
