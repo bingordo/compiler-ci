@@ -1,0 +1,65 @@
+name: IR F43 native TypeId historical unit oracles
+on:
+  push:
+    branches:
+      - ci/ir-f43-unit-typeid-20261113
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  typed-unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout pinned compiler F43 source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ac42f6a2e39b49041efcc1a3541a778456a3f50e
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pin and restrict core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "ac42f6a2e39b49041efcc1a3541a778456a3f50e"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo "Source SHA: ac42f6a2e39b49041efcc1a3541a778456a3f50e" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-f43-typeid-unit-v1
+      - name: Complete compiler optimizer library unit suite
+        working-directory: compiler
+        run: cargo test -p compiler-opt --lib -- --nocapture
+      - name: Legacy CT03 verifier-count instrumentation remains valid
+        working-directory: compiler
+        run: cargo test -p compiler-opt --lib --features verify-counts -- --nocapture
+      - name: Native TypeId pipeline and effect/trap execution regressions
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_core_pipeline
+          cargo test -p compiler-opt --test typed_native_parity
+          cargo test -p compiler-opt --test memory_execution_oracle
+          cargo test -p compiler-opt --test generated_native_oracle
+          cargo test -p compiler-opt --test pre_native
+      - name: Core IR and x86 library suites
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --lib
+          cargo test -p compiler-backend-x86 --lib
+      - name: Strict all-target Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets --features compiler-opt/verify-counts -- -D warnings
