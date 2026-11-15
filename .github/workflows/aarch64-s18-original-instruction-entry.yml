@@ -70,3 +70,73 @@ jobs:
                   print('S18_ARCH_STATE_REFS',op,refs)
                   print('S18_ARCH_STATE_ASSIGNMENT_COUNT',op,sum(1 for l in asl.splitlines() if ('PSTATE.' in l or 'X[' in l or 'R[' in l) and '=' in l))
           PY
+
+  full-instruction-aslref-frontier:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container:
+      image: ocaml/opam:alpine-3.21-ocaml-5.2
+      options: --user root
+    env:
+      OPAMROOT: /home/opam/.opam
+      OPAMROOTISOK: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: herd/herdtools7
+          ref: cfc4f56c522ec0d701acaf5a23139b47e8711299
+          path: herd
+          persist-credentials: false
+      - name: Build authentic upstream ASLRef
+        shell: sh
+        run: |
+          set -eu
+          apk add --no-cache bash python3 curl coreutils git gmp-dev pkgconf
+          opam install -y dune menhir zarith
+          (cd herd && opam exec -- dune build -p aslref --profile release)
+          ./herd/_build/default/asllib/aslref.exe --version | grep -Fx 'aslref version 1.0-EAC2'
+      - name: Identify executable original-body architectural dependencies
+        shell: sh
+        run: |
+          set -eu
+          curl -fLsS --retry 3 --connect-timeout 20 --max-time 240 --max-filesize 200000000 -o /tmp/arm2026.tar.gz https://developer.arm.com/-/cdn-downloads/permalink/Exploration-Tools-A64-ISA/ISA_A64/ISA_A64_xml_A_profile-2026-09.tar.gz
+          echo '44cfb89c763c7eea8e59de0ad2221e3c012e6aa77899bd7f1c3e1f24537191d7  /tmp/arm2026.tar.gz' | sha256sum -c -
+          python3 - <<'PY'
+          import hashlib, re, subprocess, tarfile, tempfile, importlib.util, pathlib, sys
+          from argparse import Namespace
+          from pathlib import Path
+          bundler=Path('herd/herd/libdir/asl-pseudocode/bundler.py')
+          raw=bundler.read_bytes()
+          assert hashlib.sha1(b'blob '+str(len(raw)).encode()+b'\0'+raw).hexdigest()=='938d34fe4d74f38f20ff9932f994c359e2266a9f'
+          spec=importlib.util.spec_from_file_location('arm_s18_bundler',bundler)
+          module=importlib.util.module_from_spec(spec)
+          sys.modules[spec.name]=module
+          spec.loader.exec_module(module)
+          import xml.etree.ElementTree as ET
+          exe=str(Path('herd/_build/default/asllib/aslref.exe').resolve())
+          root='ISA_A64_xml_A_profile-2026-09/'
+          with tarfile.open('/tmp/arm2026.tar.gz','r:gz') as tar, tempfile.TemporaryDirectory() as tmp:
+              folder=Path(tmp)
+              shared=tar.extractfile(root+'shared_pseudocode.xml').read()
+              matches=[''.join(ps.itertext()) for ps in ET.fromstring(shared).iter('ps') if ps.get('name')=='shared/functions/integer/AddWithCarry']
+              assert len(matches)==1
+              helper=matches[0]
+              assert hashlib.sha256(helper.encode()).hexdigest()=='1e80df3bc60c0393805a5c93aab8aeca6a3428e22fe2dc1d8c484f8f969e5129'
+              for op,xml_sha,asl_sha in (
+                  ('ADC','6535744522e9bff885ea0aa9d637a4677f1a81f47abf734066ba3afdbe2995e8','6e33c1fd8333a38350e914b99abc0fd41c4c997e349eac5fe98b655af83fe64b'),
+                  ('ADCS','9ad6edcba8c59737e1fdccd209462d0625f834f6d33785f80002bc45ae9db12c','79dfb059a270d335ad0471f5168a6888a54545d4fcd4fd933719cd225735672a')):
+                  filename=op.lower()+'.xml'
+                  raw=tar.extractfile(root+filename).read()
+                  assert hashlib.sha256(raw).hexdigest()==xml_sha
+                  (folder/filename).write_bytes(raw)
+                  original=module.one_instruction_to_string(folder/filename)
+                  assert hashlib.sha256(original.encode()).hexdigest()==asl_sha
+                  source=helper+'\n'+original+'\nfunc main() => integer\nbegin\n  instr_'+op.lower()+"('"+('0'*32)+"');\n  return 0;\nend;\n"
+                  path=folder/(op.lower()+'.asl')
+                  path.write_text(source)
+                  r=subprocess.run([exe,'--version-eac1','--type-check-strict','--no-exec','-1',path.name],cwd=folder,capture_output=True,timeout=60)
+                  stderr=r.stderr.decode('utf8','replace')
+                  categories={key:len(re.findall(key,stderr,re.I)) for key in ('unbound','undefined','type error','grammar error','not declared','does not exist')}
+                  print('S18_ORIGINAL_ASL_TYPE_FRONTIER',op,'rc',r.returncode,'categories',categories,'bytes',len(r.stderr),'source_modified',False)
+                  assert r.returncode!=0, 'unexpectedly complete architecture state without register inputs'
+          PY
