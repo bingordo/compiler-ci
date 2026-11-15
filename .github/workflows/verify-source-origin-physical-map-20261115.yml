@@ -1,0 +1,74 @@
+name: X86 source-origin TypeId and exact physical MachineIR annotations
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-source-origin-physical-map-20261115.yml']
+permissions:
+  contents: read
+jobs:
+  original-typeid-and-physical-metadata:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a19586768b948a8a1aee21ae72d5730c15df0d3e
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Exact compiler commit only in compiler-ci
+        run: test "$(git -C compiler rev-parse HEAD)" = "a19586768b948a8a1aee21ae72d5730c15df0d3e"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x86-source-origin-core
+      - name: Isolate TypeId, optimizer and x86 backend only
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Source spans and exact physical instruction anchor tests
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test source_provenance -- --nocapture
+          cargo test -p compiler-backend-x86 --test annotated_machine_asm -- --nocapture
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-ir --lib
+          cargo check -p compiler-backend-x86
+          echo SOURCE_ORIGIN_VERIFIED_PHYSICAL_ANNOTATIONS_PASS
+  real-driver-annotated-gas:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust pinned frontend host
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a19586768b948a8a1aee21ae72d5730c15df0d3e
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Exact source
+        run: test "$(git -C compiler rev-parse HEAD)" = "a19586768b948a8a1aee21ae72d5730c15df0d3e"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x86-source-origin-driver
+      - name: Check default -dp emits unknown and retains GAS machine bytes
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test x86_annotated_asm -- --nocapture
+          cargo check -p compiler
+          echo SOURCE_ORIGIN_DEFAULT_DRIVER_GAS_PARITY_PASS
