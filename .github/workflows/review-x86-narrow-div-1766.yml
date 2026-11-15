@@ -1,0 +1,66 @@
+name: Source-pinned narrow signed division review 1766
+
+on:
+  push:
+    branches: [review/x86-narrow-div-1766]
+    paths: ['.github/workflows/review-x86-narrow-div-1766.yml']
+  pull_request:
+    paths: ['.github/workflows/review-x86-narrow-div-1766.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 24
+    steps:
+      - name: Checkout compiler-ci config
+        uses: actions/checkout@v4
+      - name: Checkout exact compiler source with read-only deploy key
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 63215a5f58ba6cc10a4a51409de253b7d7601e4c
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned source SHA
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "63215a5f58ba6cc10a4a51409de253b7d7601e4c"
+          git show -s --format='%H %s' HEAD
+      - name: Use standalone compiler core workspace on runner
+        working-directory: compiler
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          """)
+          PY
+      - name: Cache Rust compiler core build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: review-x86-narrow-div-1766
+      - name: Run C11 SIGFPE trap and ordinary result oracle in both sinks and frame modes
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --test review_narrow_signed_div_traps -- --nocapture
+      - name: Preserve existing 32-bit and 64-bit signed and unsigned trap corpus
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --test m4_scalar_div_traps -- --nocapture
+      - name: Source-owned generic integer and module ABI verifiers
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test typed_opcode_types -- --nocapture
+          cargo test -p compiler-ir --test typed_module_abi -- --nocapture
+      - name: Compile backend libraries for both native architectures
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 -p compiler-backend-aarch64 --lib --no-run
+      - name: Strict affected core Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-backend -p compiler-backend-x86 --lib -- -D warnings
