@@ -116,6 +116,39 @@ jobs:
           realpath "$source" > "$RUNNER_TEMP/real-ir-c-path.txt"
           echo "Actual mrustc compiler-ir generated C bytes: $(stat -c %s "$source")" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Inventory actual generated-C atomic syntax separately
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          from collections import Counter
+          import os, re
+          files = sorted((Path("mrustc") / "output-compiler-bootstrap").rglob("*.c"))
+          assert files, "no mrustc-generated C sources"
+          atomic_keyword = re.compile(rb'\b_Atomic\b')
+          atomic_identifier = re.compile(rb'\batomic_[A-Za-z_]\w*\b')
+          total_keyword = total_identifiers = 0
+          by_name = Counter()
+          for path in files:
+              data = path.read_bytes()
+              keyword_count = len(atomic_keyword.findall(data))
+              names = atomic_identifier.findall(data)
+              identifier_count = len(names)
+              total_keyword += keyword_count
+              total_identifiers += identifier_count
+              by_name.update(name.decode("ascii") for name in names)
+              if keyword_count or identifier_count:
+                  print(f"C_ATOMIC file={path.name} _Atomic={keyword_count} atomic_prefix={identifier_count}")
+          print(f"C_ATOMIC TOTAL files={len(files)} _Atomic={total_keyword} atomic_prefix={total_identifiers}")
+          print("C_ATOMIC identifier examples:", ", ".join(
+              f"{k}:{v}" for k,v in by_name.most_common(8)))
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as out:
+              print("### Exact raw mrustc-generated C atomic lexical counts", file=out)
+              print(f"_Atomic keyword occurrences: {total_keyword}", file=out)
+              print(f"atomic_* identifier occurrences: {total_identifiers}", file=out)
+              print("These are raw-source lexical counts; not preprocessed tokens or proof of atomic operations.", file=out)
+          PY
+
       - name: Independently validate actual generated C with GCC
         run: |
           set -euo pipefail
