@@ -109,6 +109,31 @@ jobs:
           workspaces: compiler -> target
           key: native-cfg-correctness-v1
           cache-workspace-crates: 'true'
+      - name: FS-1 draft pointer roots, effects and actual TypeId optimizer observation barriers
+        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 5m \
+            cargo test -p compiler-ir \
+              --test semantics --test typed_memory_provenance -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/fs1-pointer-effects-ir.log"
+          grep -F 'FS1_EFFECT_CLASS roots=9 offsets=8 checked=2 loads=5 stores=6 calls=5 pointer_cse_non_speculative=true unknown_calls=conservative verdict=PASS' \
+            "$RUNNER_TEMP/fs1-pointer-effects-ir.log"
+          grep -F 'FS1_POINTER_PROVENANCE valid=1 invalid=10 offset_mints_extent=false raw_pointer_mints_extent=false pointer_type_checks=6 verdict=PASS' \
+            "$RUNNER_TEMP/fs1-pointer-effects-ir.log"
+          timeout --signal=TERM --kill-after=10s 6m \
+            cargo test -p compiler-opt --test fs1_effect_preservation -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/fs1-effect-preservation.log"
+          grep -E 'FS1_EFFECT_TRACE modes=2 stages=[1-9][0-9]* events=7 external_calls=3 store_barriers=2 load_barriers=2 mutants=4 verdict=PASS' \
+            "$RUNNER_TEMP/fs1-effect-preservation.log"
+          timeout --signal=TERM --kill-after=10s 4m \
+            cargo clippy -p compiler-ir --test semantics \
+              --test typed_memory_provenance -- -D warnings
+          timeout --signal=TERM --kill-after=10s 4m \
+            cargo clippy -p compiler-opt --test fs1_effect_preservation -- -D warnings
+
       - name: Run native CFG and trap correctness tests
         if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
         shell: bash
@@ -259,6 +284,8 @@ jobs:
             ${{ runner.temp }}/native-division-tests.log
             ${{ runner.temp }}/ssa-verifier-tests.log
             ${{ runner.temp }}/fs1-scalar-semantics.log
+            ${{ runner.temp }}/fs1-pointer-effects-ir.log
+            ${{ runner.temp }}/fs1-effect-preservation.log
             ${{ runner.temp }}/extended-opt-tests.log
             ${{ runner.temp }}/al05-native-bridge.log
             ${{ runner.temp }}/al05-affine-native-bridge.log
