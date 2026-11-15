@@ -190,3 +190,62 @@ jobs:
                   print('S20_ORIGINAL_TYPED_OWNER_DIFFERENTIAL',op,outcomes)
                   assert len(outcomes)==3 and outcomes[0][1]!=0
           PY
+
+      - name: Execute original ADC ADCS with source-owned register and flag state
+        shell: sh
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import sys,tarfile,tempfile,subprocess,hashlib
+          from pathlib import Path
+          sys.path.insert(0,'compiler/tools')
+          from aarch64_a32_original_register_bank import original_register_bank,register_state_candidate
+          from aarch64_a32_source_state_owners import pinned_state_sources
+          from aarch64_a32_addwithcarry_asl_runtime import published_addwithcarry
+          from aarch64_a32_adc_full_instruction_frontier import INSTRUCTIONS
+          from aarch64_a32_asl_source_links import ROOT
+          from aarch64_a32_aslref_compat import load_bundler
+          archive=Path('/tmp/arm2026.tar.gz')
+          bank=original_register_bank(archive)
+          state=register_state_candidate(pinned_state_sources(archive),bank)
+          helper=published_addwithcarry(archive)
+          bundler=load_bundler(Path('herd/herd/libdir/asl-pseudocode/bundler.py'))
+          exe=str(Path('herd/_build/default/asllib/aslref.exe').resolve())
+          print('S21_OWNED_STATE_SIGNATURES')
+          for line in state.splitlines():
+              if any(k in line for k in ('PSTATE','var _R','getter X','setter X','func X','type PSTATE')):
+                  print('S21_STATE_LINE',line.strip()[:125])
+          def lit(bits,value): return "'"+format(value,'0'+str(bits)+'b')+"'"
+          with tarfile.open(archive,'r:gz') as tar,tempfile.TemporaryDirectory() as tmp:
+              folder=Path(tmp)
+              for op,pin in INSTRUCTIONS.items():
+                  path=folder/(op.lower()+'.xml')
+                  path.write_bytes(tar.extractfile(ROOT+op.lower()+'.xml').read())
+                  original=bundler.one_instruction_to_string(path)
+                  assert hashlib.sha256(original.encode()).hexdigest()==pin['bundled_sha256']
+                  for bits in (32,64):
+                      instruction=(0x1a000000 | ((bits==64)<<31) | ((op=='ADCS')<<29) | (2<<16) | (1<<5) | 3)
+                      main=[
+                          'func main() => integer','begin',
+                          '    _R[1] = '+lit(64,1)+';',
+                          '    _R[2] = '+lit(64,2)+';',
+                          '    _R[3] = '+lit(64,0)+';',
+                          '    PSTATE.N = '+lit(1,1)+';',
+                          '    PSTATE.Z = '+lit(1,1)+';',
+                          '    PSTATE.C = '+lit(1,1)+';',
+                          '    PSTATE.V = '+lit(1,1)+';',
+                          '    '+pin['entry']+'('+lit(32,instruction)+');',
+                          '    assert _R[3] == '+lit(64,4)+';',
+                      ]
+                      for k in ('N','Z','C','V'):
+                          v=0 if op=='ADCS' else 1
+                          main.append('    assert PSTATE.'+k+' == '+lit(1,v)+';')
+                      main+=['    return 0;','end;','']
+                      script=state+'\n'+helper+'\n'+original+'\n'+'\n'.join(main)
+                      f=folder/(op.lower()+str(bits)+'.asl')
+                      f.write_text(script)
+                      run=subprocess.run([exe,'--version-eac1','--type-check-strict','-1',f.name],cwd=folder,capture_output=True,timeout=50)
+                      print('S21_ORIGINAL_INSTRUCTION_EXECUTION',op,bits,'encoding',hex(instruction),'rc',run.returncode,
+                            'errors',[x[:210] for x in run.stderr.decode('utf-8','replace').splitlines()[:7]])
+                      assert run.returncode==0
+          PY
