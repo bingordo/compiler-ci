@@ -19,7 +19,11 @@ patterns = {
     "GNU attributes": r"__attribute__\s*\(",
     "GNU inline assembly": r"\b(?:__asm__|asm)\s*(?:volatile\s*)?\(",
     "GNU builtins": r"__builtin_\w+",
-    "C11 atomics": r"\b(?:_Atomic|atomic_\w+)\b",
+    # Keep the qualifier separate from atomic_* API identifiers. The
+    # previous combined count did not establish actual _Atomic use.
+    "C11 _Atomic keyword": r"\b_Atomic\b",
+    "C11 atomic API identifiers": r"\batomic_[A-Za-z_]\w*\b",
+    "GNU atomic builtin identifiers": r"\b(?:__atomic_|__sync_)[A-Za-z_]\w*\b",
     "setjmp/longjmp": r"\b(?:setjmp|longjmp|sigsetjmp|siglongjmp)\s*\(",
     "goto": r"\bgoto\s+\w+\s*;",
     "switch": r"\bswitch\s*\(",
@@ -33,9 +37,15 @@ patterns = {
 totals = Counter()
 files = Counter()
 sizes = {}
+atomic_per_file = {}
 for path in sources:
     data = path.read_text(errors="replace")
     sizes[path] = len(data)
+    atomic_per_file[path] = {
+        "atomic_qualifier": len(re.findall(patterns["C11 _Atomic keyword"], data)),
+        "atomic_api": len(re.findall(patterns["C11 atomic API identifiers"], data)),
+        "gnu_builtin": len(re.findall(patterns["GNU atomic builtin identifiers"], data)),
+    }
     for feature, expression in patterns.items():
         count = len(re.findall(expression, data))
         if count:
@@ -63,3 +73,11 @@ if not selected:
 selection_file.write_text("".join(str(p) + "\n" for p in selected[:4]))
 for p in selected[:4]:
     print(f"C_SAMPLE path={p} bytes={sizes[p]}")
+    counts = atomic_per_file[p]
+    # This is a conservative raw-source inventory. Macro expansion and
+    # string/comment contexts may affect whether any construct is active.
+    print(f"C_SAMPLE_ATOMIC_HINT name={p.name} "
+          f"atomic_qualifier={counts['atomic_qualifier']} "
+          f"atomic_api={counts['atomic_api']} "
+          f"gnu_builtin={counts['gnu_builtin']} "
+          "gcc_required_for_native_build=yes")
