@@ -183,7 +183,7 @@ jobs:
           test "$(sha256sum reference.err | cut -d' ' -f1)" = "$(sha256sum native.err | cut -d' ' -f1)"
           echo "EDG_STATIC_NATIVE gate=hookfree_scalar_global_elf_gxx_parity result=pass" | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: Require original iostream clean rejection until source-owned global initialization is implemented
+      - name: Require original iostream clean rejection at C++ object/reference ABI boundaries
         working-directory: edgcpp/build/gcc-release
         run: |
           set -euo pipefail
@@ -256,10 +256,28 @@ jobs:
           # startup and class ABI are implemented in a subsequent patch.
           test "$failures" -eq 2
           for variant in hello-world hello-no-endl; do
-            grep -Fq 'native global runtime/startup effects require TypeId initialization and teardown:' "$variant-native-compile.log"
             test ! -e "$variant.o"
+            if test "$variant" = hello-world; then
+              grep -Fq 'C++ direct member call requires exact EDG &object' "$variant-native-compile.log"
+            else
+              grep -Fq 'C++ reference cannot use C source-pointer memory path' "$variant-native-compile.log"
+            fi
           done
-          echo "EDG_GLOBAL_NATIVE gate=external_scalar_executable_and_iostream_effects_fail_closed result=pass" | tee -a "$GITHUB_STEP_SUMMARY"
+          # A genuinely effectful nontrivial file-scope constructor must not
+          # be treated as a static integer image or as harmless template IL.
+          effectful="$GITHUB_WORKSPACE/compiler/tools/edg-driver/tests/fixtures/edg_native_cxx5_header_effectful.cpp"
+          cp "$effectful" effectful-global.cpp
+          g++ -std=c++17 -Wall -Wextra -Werror -fsyntax-only effectful-global.cpp
+          rm -f effectful-global.o
+          set +e
+          timeout 90s "$compiler" effectful-global.o --typeid-native --dump-edg-global-provenance \
+            "${edg_flags[@]}" "${include_flags[@]}" effectful-global.cpp >effectful-global-native.log 2>&1
+          status=$?
+          set -e
+          test "$status" -ne 0
+          test ! -e effectful-global.o
+          grep -Fq 'EDG -> compiler-ir rejected source:' effectful-global-native.log
+          echo "EDG_GLOBAL_NATIVE gate=static_integer_executable_and_effectful_iostream_fail_closed result=pass" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Keep original-source diagnostics and native ELF evidence
         if: always()
