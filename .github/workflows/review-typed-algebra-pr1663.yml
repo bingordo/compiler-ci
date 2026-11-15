@@ -14,13 +14,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 0929bfb09cba6e67ed2f9ab19c1640770f90b747
+          ref: c7c75ae580a66caa2cdb13221cb59d217e037de0
           path: compiler
           fetch-depth: 3
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - name: Confirm immutable compiler head
-        run: test "$(git -C compiler rev-parse HEAD)" = "0929bfb09cba6e67ed2f9ab19c1640770f90b747"
+        run: test "$(git -C compiler rev-parse HEAD)" = "c7c75ae580a66caa2cdb13221cb59d217e037de0"
       - name: Core-only workspace for independent CI
         shell: bash
         run: |
@@ -60,10 +60,12 @@ jobs:
           use std::{env,hint::black_box,time::Instant};
           fn main() {
               let mode=env::args().nth(1).expect("mode");
-              let src=include_str!("../tests/fixtures/typed_algebra_cross_block_v3.ir");
+              let src=if mode=="removed" {include_str!("../tests/fixtures/typed_algebra_diamond_v3.ir")}
+                  else {include_str!("../tests/fixtures/typed_algebra_cross_block_v3.ir")};
               let fixture=read_native_module_text_v3(src).unwrap();
               let mut prepared=fixture.clone();
-              assert_eq!(simplify_typed(&mut prepared).unwrap(),0);
+              let initial=simplify_typed(&mut prepared).unwrap();
+              if mode=="removed" {assert!(initial>0);} else {assert_eq!(initial,0);}
               let mut samples=Vec::new();
               for _ in 0..500 {
                   let start=Instant::now();
@@ -72,9 +74,11 @@ jobs:
                           assert_eq!(simplify_typed(&mut prepared).unwrap(),0);
                           black_box(&prepared);
                       },
-                      "rewrite" => {
+                      "rewrite" | "removed" => {
                           let mut m=fixture.clone();
-                          assert_eq!(simplify_typed(&mut m).unwrap(),0);
+                          let removed=simplify_typed(&mut m).unwrap();
+                          if mode=="removed" {assert!(removed>0);}
+                          else {assert_eq!(removed,0);}
                           assert_ne!(m,fixture);
                           black_box(m);
                       },
@@ -97,7 +101,7 @@ jobs:
         run: |
           set -euo pipefail
           : > /tmp/algebra_abba.txt
-          for mode in noop rewrite; do
+          for mode in noop rewrite removed; do
             for round in 1 2 3 4 5; do
               for side in parent compiler compiler parent; do
                 printf '%s %s %s ' "$mode" "$round" "$side" >> /tmp/algebra_abba.txt
@@ -111,10 +115,10 @@ jobs:
           from statistics import median
           groups=defaultdict(list)
           for line in open("/tmp/algebra_abba.txt"):
-              case,round,side,reported,ns=line.split()
+              case,iteration,side,reported,ns=line.split()
               assert case==reported
               groups[case,side].append(int(ns))
-          for case in ("noop","rewrite"):
+          for case in ("noop","rewrite","removed"):
               a=median(groups[case,"parent"])
               b=median(groups[case,"compiler"])
               print("CT11_ALGEBRA_ABBA",case,"parent_ns",a,"candidate_ns",b,"speedup",round(a/b,4))
