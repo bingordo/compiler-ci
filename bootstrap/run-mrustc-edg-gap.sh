@@ -39,7 +39,11 @@ cp build/prebuilt-edg/lib/libedgcpfe.a build/gcc-release/lib/libedgcpfe.a
 source build/gcc-release/environment.sh
 cd /workspace
 
-echo "EDG_C_AUDIT source=$AUDIT_SOURCE"
+# Match the pinned EDG CI's GNU dialect configuration.
+version="$(gcc -dumpfullversion -dumpversion)"
+IFS=. read -r major minor patch <<< "$version"
+gnu_number=$((10#${major}*10000+10#${minor:-0}*100+10#${patch:-0}))
+echo "EDG_C_AUDIT source=$AUDIT_SOURCE gnu_version=$gnu_number"
 timeout --signal=TERM --kill-after=10s 20m cargo build --quiet \
   --manifest-path edgcpp-rust/Cargo.toml --example parse
 parser=/workspace/edgcpp-rust/target/debug/examples/parse
@@ -48,7 +52,7 @@ set +e
 (
   cd /workspace/edgcpp/build/gcc-release
   timeout --signal=TERM --kill-after=10s 90s \
-    "$parser" --gcc --c11 "$AUDIT_SOURCE"
+    "$parser" --gcc --c11 --no_strict_gnu --gnu_version "$gnu_number" "$AUDIT_SOURCE"
 ) > /audit-tmp/edg-generated-c-parse.log 2>&1
 parse_rc=$?
 set -e
@@ -72,7 +76,7 @@ set +e
 (
   cd /workspace/edgcpp/build/gcc-release
   timeout --signal=TERM --kill-after=10s 90s \
-    "$native" /audit-tmp/mrustc-edg-native.o --gcc --c11 "$AUDIT_SOURCE"
+    "$native" /audit-tmp/mrustc-edg-native.o --gcc --c11 --no_strict_gnu --gnu_version "$gnu_number" "$AUDIT_SOURCE"
 ) > /audit-tmp/edg-generated-c-native.log 2>&1
 native_rc=$?
 set -e
