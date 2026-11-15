@@ -1,0 +1,78 @@
+name: x86 native PIC legacy backend deletion acceptance
+on:
+  push:
+    branches: [ci/x86-pic-legacy-delete-20261114]
+    paths: ['.github/workflows/x86-pic-legacy-delete.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 72443ffb02dcc388c0a82d9590804b349444624a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Source-pin and isolate compiler core workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "72443ffb02dcc388c0a82d9590804b349444624a"
+          echo "Compiler source: 72443ffb02dcc388c0a82d9590804b349444624a" >> "$GITHUB_STEP_SUMMARY"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          if grep -Eq '^impl Backend for X86_64Pic[[:space:]]*\{' compiler/crates/backend-x86/src/lib.rs; then
+            echo 'Old x86 PIC Backend(Function) impl unexpectedly remains'
+            exit 1
+          fi
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x86-pic-native-cutover
+      - name: All-target compiler IR, shared/x86/AArch64 backends + opt library
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-ir -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --all-targets
+          cargo check -p compiler-opt --lib
+          cargo check -p compiler-backend-x86 --release --lib
+      - name: Original PIC/unwind/callback C11 oracles and module initializer unit tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend-x86 --test m4_6_source_unwind_native --test m4_6_unwind_shared_native --test m4_7_indirect_ssa_native -- --nocapture
+      - name: Existing adjacent native PIC/GOTPCREL and frame-pointer tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test m4_pic_globals_shared_native --test m4_6_unwind_shared_native --test m4_7_indirect_physical_native --test m4_7_gp_variadic_native --test x7_shared_pic_global_native --test rbp_alloc_native -- --nocapture
+      - name: Strict core production Clippy and affected x86 targets
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-aarch64 --lib -- -D warnings
+          cargo clippy -p compiler-backend-x86 --lib -- -D warnings -A unused-variables
+          cargo clippy -p compiler-backend-x86 --test m4_6_source_unwind_native --test m4_6_unwind_shared_native --test m4_7_indirect_ssa_native -- -D warnings -A unused-variables
+      - name: Install host GDB for shared backend debug tests
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y gdb
+      - name: Complete shared backend, x86 and AArch64 test suites with documented S23 exceptions
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend -- --nocapture
+          cargo test -p compiler-backend-x86 -- --skip s2342_native_x86_baseline_and_optimized_elf_gas_c11_oracle --skip native_s2334_additive_pair_cancellation_gas_elf
+          cargo test -p compiler-backend-aarch64
+      - name: Record successful deletion acceptance
+        run: |
+          echo 'Legacy PIC Backend removed; owned native TypeId PIC/CFI/indirect C callbacks, x86 and ARM backend all-target, strict Clippy, GDB/shared backend and full x86 except two existing unrelated S23 baseline failures PASS' >> "$GITHUB_STEP_SUMMARY"
