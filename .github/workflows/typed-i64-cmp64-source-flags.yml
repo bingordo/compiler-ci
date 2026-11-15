@@ -1,0 +1,49 @@
+name: Validate late TypeId CMP64 source flags and GCC oracle
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/typed-i64-cmp64-source-flags.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  x86-physical-flags:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact compiler T5 source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ba253d6202cb5e956577135f77d7cf0af1d35b56
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check exact source pin and isolate native workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "ba253d6202cb5e956577135f77d7cf0af1d35b56"
+          mkdir -p x86-workspace/crates
+          for crate in ir opt backend backend-x86 backend-aarch64; do
+            cp -a "compiler/crates/$crate" "x86-workspace/crates/$crate"
+          done
+          cp -a compiler/tools compiler/tests compiler/data x86-workspace/
+          cat > x86-workspace/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: x86-workspace -> target
+          key: typed-i64-native-source-flags
+      - name: Verify 10 i64 predicates with 14x14 samples x four GAS/ELF GCC oracles
+        working-directory: x86-workspace
+        run: |
+          cargo test -p compiler-backend-x86 --test typed_i64_compare_branch_native -- --nocapture
+      - name: Verify generated source-only flag admission and physical x86 regression
+        working-directory: x86-workspace
+        run: |
+          cargo test -p compiler-backend-x86 --lib native_typeid -- --nocapture
+          cargo test -p compiler-backend-x86 --test native_typeid_function_signatures -- --nocapture
