@@ -1,0 +1,68 @@
+# Source-pinned WebAssembly W6c memory/import host callback reentry guard.
+name: Wasm W6c guarded host callbacks
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/wasm-w6c-host-callback-guard.yml'
+  workflow_dispatch:
+    inputs:
+      compiler_sha:
+        description: 'Exact compiler source commit'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  wasm-w6c:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.compiler_sha || 'a99291ac1e2335e93136c9a7de037c271d322c01' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify compiler SHA and isolate backend workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "${{ inputs.compiler_sha || 'a99291ac1e2335e93136c9a7de037c271d322c01' }}"
+          echo "Exact compiler commit: $(git -C compiler rev-parse HEAD)"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+          cc --version | head -1
+      - name: Node WebAssembly runtime for reentry traps
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Cache standalone Rust workspace
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: wasm-w6c-host-guard
+      - name: W0-W6c Rust and Node WebAssembly host callback/differential tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend-wasm --tests -- --nocapture
+      - name: Shared backend library tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend --lib
+      - name: x86 AArch64 RISC-V native library tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 -p compiler-backend-aarch64 -p compiler-backend-riscv64 --lib
+      - name: Complete native x86 integration regression tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --tests
+      - name: Strict backend Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-wasm -p compiler-backend --all-targets -- -D warnings
