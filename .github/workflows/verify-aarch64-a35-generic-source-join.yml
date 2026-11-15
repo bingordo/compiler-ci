@@ -1,0 +1,55 @@
+name: AArch64 A3.5 scalable Arm catalog generic DAG candidate join
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-aarch64-a35-generic-source-join.yml'
+permissions:
+  contents: read
+jobs:
+  pinned-aarchmrs-candidate-bridge:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e21792eb4c226709d4b521d7462d4e7739799a37
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Test generic matching and AARCHMRS source proof gates
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = e21792eb4c226709d4b521d7462d4e7739799a37
+          python3 -m unittest discover -s compiler/tools -p 'test_aarch64_a35_candidate_bridge.py' -v
+          python3 -m unittest discover -s compiler/tools -p 'test_aarch64_mrs_catalog.py' -v
+          python3 -m unittest discover -s compiler/tools -p 'test_x86_generic_form_matcher.py' -v
+          python3 compiler/tools/regen_aarch64_scalar_gp_forms.py --check
+          python3 compiler/tools/regen_aarch64_native_selector_rules.py --check
+      - name: Import pinned original 2026-09 AARCHMRS and join reviewed GP forms
+        run: |
+          set -euo pipefail
+          curl -fLsS --retry 3 --connect-timeout 20 --max-time 240 \
+            'https://kernel.googlesource.com/pub/scm/linux/kernel/git/maz/AARCHMRS/+/1346b16d47619400448f3cb6d4f22d62d3b76848/Instructions.json?format=TEXT' \
+            -o /tmp/aarchmrs-instructions.b64
+          base64 -d /tmp/aarchmrs-instructions.b64 > /tmp/aarchmrs-instructions.json
+          echo 'ef75f3ec02df1b9b9c0612f4ea259d6710ac3de686b097d8f9c83d1d97aa800a  /tmp/aarchmrs-instructions.json' | sha256sum -c -
+          python3 compiler/tools/aarch64_mrs_catalog.py \
+            --instructions /tmp/aarchmrs-instructions.json \
+            --expect-sha256 ef75f3ec02df1b9b9c0612f4ea259d6710ac3de686b097d8f9c83d1d97aa800a \
+            --out /tmp/aarchmrs-a64-catalog.json
+          python3 compiler/tools/aarch64_a35_candidate_bridge.py \
+            --aarchmrs-catalog /tmp/aarchmrs-a64-catalog.json \
+            --reviewed-forms compiler/data/aarch64_scalar_gp_forms.json \
+            --out /tmp/aarch64-a35-source-candidates.json
+          python3 - <<'PY'
+          import json
+          j=json.load(open('/tmp/aarch64-a35-source-candidates.json'))
+          assert j['reviewed_form_count']==12
+          assert j['typed_dag_matcher_reused']
+          assert j['source_join_is_proof'] is False
+          assert j['selection_eligible'] is False
+          assert all(not r['selection_eligible'] and not r['asl_semantic_equivalence_proven'] and not r['machine_effect_equivalence_proven'] for r in j['forms'])
+          print('A35_REAL_AARCHMRS_FORM_JOIN',j['source_joined_form_count'],'of',j['reviewed_form_count'])
+          print('A35_JOIN_DETAILS',[(r['reviewed_operation'],r['width_bits'],r['candidate_count'],r['blocker_counts']) for r in j['forms']])
+          PY
