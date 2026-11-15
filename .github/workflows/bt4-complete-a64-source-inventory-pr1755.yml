@@ -1,0 +1,164 @@
+# Ephemeral BT4 exact candidate; compiler repo has no available Actions minutes.
+name: BT4 AArch64 historical retirement full-workspace and QEMU acceptance
+on:
+  pull_request:
+    paths: ['.github/workflows/bt4-complete-a64-source-inventory-pr1755.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  full-workspace:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: d846f7e5a513619ea7c2a16300ec705e6609a282
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d846f7e5a513619ea7c2a16300ec705e6609a282
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub SSH host
+        run: ssh-keyscan github.com >> "$HOME/.ssh/known_hosts"
+      - name: Check exact source and persistent BT4 source boundary
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          python3 compiler/tools/check_bt4_backend_boundary.py
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: bt4-aarch64-workspace-1755
+      - name: Whole workspace all-target Cargo compilation, including driver
+        working-directory: compiler
+        run: cargo check --workspace --all-targets
+      - name: Whole workspace strict Clippy (no global exemptions)
+        working-directory: compiler
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Driver Rust integration and ABI smoke tests
+        working-directory: compiler
+        run: cargo test -p compiler --bin compiler
+      - name: x86 original native CMOV and TypeId ABI direct C oracles
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test if_conversion_typeid_remaining
+          cargo test -p compiler-backend-x86 --test native_typeid_select_cmov --test typed_alias_calls_native
+  native-aarch64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 35
+    env:
+      SOURCE_SHA: d846f7e5a513619ea7c2a16300ec705e6609a282
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d846f7e5a513619ea7c2a16300ec705e6609a282
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Exact pin and isolated core workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          python3 compiler/tools/check_bt4_backend_boundary.py
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: bt4-aarch64-unit-1755
+      - name: Strict native ARM64 all-target compilation
+        working-directory: compiler
+        run: RUSTFLAGS='-D warnings' cargo check -p compiler-backend-aarch64 --all-targets
+      - name: Exact AArch64 native TypeId and historical test oracle suite
+        working-directory: compiler
+        run: cargo test -p compiler-backend-aarch64 --all-targets -- --test-threads=1
+      - name: Native ARM64 strict library Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
+  qemu-aarch64-driver:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: d846f7e5a513619ea7c2a16300ec705e6609a282
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d846f7e5a513619ea7c2a16300ec705e6609a282
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust Github and install A64 cross GCC/QEMU
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          ssh-keyscan github.com >> "$HOME/.ssh/known_hosts"
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu qemu-user
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: bt4-aarch64-qemu-1755
+      - name: Build TypeId source driver for AArch64
+        working-directory: compiler
+        run: cargo build -p compiler --bin compiler
+      - name: Execute two source-owned Mini-C C ABI oracles through ELF and GAS with and without PIC
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          cat > "$tmp/start.S" <<'EOF'
+          .text
+          .global _start
+          .type _start,%function
+          _start:
+            bl main
+            mov x8,#93
+            svc #0
+          EOF
+          cat > "$tmp/answer.c" <<'EOF'
+          int answer(int x) { return x + 7; }
+          EOF
+          cat > "$tmp/answer-oracle.c" <<'EOF'
+          extern int answer(int);
+          int main(void) { return answer(5)!=12 || answer(-9)!=-2; }
+          EOF
+          cat > "$tmp/wide.c" <<'EOF'
+          long wide(long x) { return x*2+7; }
+          EOF
+          cat > "$tmp/wide-oracle.c" <<'EOF'
+          extern long wide(long);
+          int main(void) { return wide(12345678901L)!=24691357809L || wide(-4000000000L)!=-7999999993L; }
+          EOF
+          for testcase in answer wide; do
+            for fmt in obj asm; do
+              for pic in none pic; do
+                opts=()
+                if [ "$pic" = pic ]; then opts=(--pic); fi
+                ext=o; if [ "$fmt" = asm ]; then ext=s; fi
+                out="$tmp/$testcase-$fmt-$pic.$ext"
+                target/debug/compiler "$tmp/$testcase.c" --language mini-c --target aarch64 --ir typeid --emit "$fmt" "${opts[@]}" -o "$out"
+                exe="$tmp/$testcase-$fmt-$pic"
+                aarch64-linux-gnu-gcc -nostdlib -static -no-pie -fno-pie -fno-stack-protector -O0 "$tmp/start.S" "$tmp/$testcase-oracle.c" "$out" -o "$exe"
+                timeout 30 qemu-aarch64 "$exe"
+                echo "PASS $testcase $fmt $pic"
+              done
+            done
+          done
