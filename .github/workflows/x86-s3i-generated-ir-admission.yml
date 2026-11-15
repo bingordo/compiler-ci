@@ -1,0 +1,133 @@
+name: X7 S3.I generated compiler IR source admission
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/x86-s3i-generated-ir-admission.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  s3i-compiler-ir-admission:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SOURCE_SHA: '069ba8e9dacd811bf3407ef8af2c9076ad634ddb'
+    steps:
+      - name: Checkout exact source commit, never run compiler Actions
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 069ba8e9dacd811bf3407ef8af2c9076ad634ddb
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+
+      - name: Download pinned original Intel/XED source/SMT/native byte certificate S3.F
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3f-source-xed-flag-effect-no-admission
+          run-id: 43667287999
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3i-s3f
+
+      - name: Download actual physical post-RA selector and fallback proof S3.G
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3g-actual-selector-decision-evidence
+          run-id: 43670305205
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3i-s3g
+
+      - name: Download actual native TypeId i64 selector and fallback proof S3.H
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3h-native-typeid-i64-fusion-source-decisions
+          run-id: 43675286039
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3i-s3h
+
+      - name: Validate pin, isolate offline backend workspace and run admissions mutation tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          for file in /tmp/x7-s3i-s3f/source-xed-effects.json \
+                      /tmp/x7-s3i-s3g/real-selector-decisions.json \
+                      /tmp/x7-s3i-s3h/native-i64-source-decisions.json; do
+            test -s "$file"
+          done
+          mkdir -p /tmp/x7-s3i-evidence
+          cd compiler
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          """)
+          PY
+          PYTHONPATH=tools python3 -m unittest -v \
+            test_x86_s3g_selector_decision_join \
+            test_x86_s3h_native_typeid_decision_join \
+            test_x86_s3i_compiler_ir_admission
+          PYTHONPATH=tools python3 tools/x86_s3i_compiler_ir_admission.py \
+            --s3f /tmp/x7-s3i-s3f/source-xed-effects.json \
+            --s3g /tmp/x7-s3i-s3g/real-selector-decisions.json \
+            --s3h /tmp/x7-s3i-s3h/native-i64-source-decisions.json \
+            --check
+          echo X7_S3I_GENERATOR_REPRODUCIBLE_PASS | tee /tmp/x7-s3i-evidence/admission.txt
+
+      - name: Test production generated-selector gate and negative generated Rust contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-c-defined-64 x7-c-defined-bitwise' \
+            --lib x7_native_form_bridge --offline
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-c-defined-64 x7-c-defined-bitwise' \
+            --lib x7_late_selector --offline
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-c-defined-64 x7-c-defined-bitwise' \
+            --test x7_s3g_selector_decisions --offline
+
+      - name: Verify feature-disabled exact physical fallback
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --features x7-native-form-validation \
+            --test x7_s3g_selector_decisions --offline
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --features x7-c-defined-64 \
+            --lib native_typeid::reviewed_i64_source_tests --offline
+
+      - name: Verify actual native TypeId 32/64 GAS and direct ELF output
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-c-defined-64 x7-c-defined-bitwise' \
+            --lib native_typeid::reviewed_i64_source_tests --offline
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-c-defined-64 x7-c-defined-bitwise' \
+            --test x7_g10_n16_bitwise_native --offline
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-c-defined-64 x7-c-defined-bitwise' \
+            --test x7_g10_n19_64_native --offline
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --test x7_g10_n15_no_default_fallback --offline
+          echo X7_S3I_REAL_GAS_ELF_AND_FALLBACK_PASS | tee -a /tmp/x7-s3i-evidence/admission.txt
+
+      - name: Save reproducible generated-admission validation artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-s3i-compiler-ir-admission-green
+          path: /tmp/x7-s3i-evidence/admission.txt
+          if-no-files-found: error
