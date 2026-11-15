@@ -1,0 +1,131 @@
+name: X7 S3.H true native TypeId I64 fusion decisions
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/x86-s3h-native-i64-fusion-observer.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  x7-s3h-native-typeid:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 26
+    env:
+      SOURCE_SHA: '7000137c7fb2c739f21ccb6ea60e97a9fdc9558f'
+    steps:
+      - name: Checkout exact compiler branch SHA without invoking compiler Actions
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7000137c7fb2c739f21ccb6ea60e97a9fdc9558f
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+
+      - name: Obtain immutable S3.F original Intel/XED flags and effect certificate
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3f-source-xed-flag-effect-no-admission
+          run-id: 43667287999
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3h-s3f
+
+      - name: Prepare offline TypeId crates and Python negative controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          test -s /tmp/x7-s3h-s3f/source-xed-effects.json
+          mkdir -p /tmp/x7-s3h-evidence
+          cd compiler
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          """)
+          PY
+          PYTHONPATH=tools python3 -m unittest -v \
+            test_x86_s3g_selector_decision_join \
+            test_x86_s3h_native_typeid_decision_join
+          PYTHONPATH=tools python3 -m compileall -q \
+            tools/x86_s3h_native_typeid_decision_join.py
+
+      - name: Actual native TypeId I64 fusion decisions bitwise ON
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --features 'x7-c-defined-64 x7-c-defined-bitwise' \
+            --lib s3h_true_native_i64_selector_reports_exact_source_or_fallback \
+            --offline -- --nocapture 2>&1 | tee /tmp/x7-s3h-evidence/bitwise-on.log
+
+      - name: Actual native TypeId I64 fusion bitwise feature OFF and fallback
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --features x7-c-defined-64 \
+            --lib s3h_true_native_i64_selector_reports_exact_source_or_fallback \
+            --offline -- --nocapture 2>&1 | tee /tmp/x7-s3h-evidence/bitwise-off.log
+
+      - name: Join accepted actual native TypeId source SHA to pinned S3.F and enforce negatives
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          python3 tools/x86_s3h_native_typeid_decision_join.py \
+            --s3f /tmp/x7-s3h-s3f/source-xed-effects.json \
+            --enabled-log /tmp/x7-s3h-evidence/bitwise-on.log \
+            --disabled-log /tmp/x7-s3h-evidence/bitwise-off.log \
+            --out /tmp/x7-s3h-evidence/native-i64-source-decisions.json
+          python3 tools/x86_s3h_native_typeid_decision_join.py \
+            --s3f /tmp/x7-s3h-s3f/source-xed-effects.json \
+            --enabled-log /tmp/x7-s3h-evidence/bitwise-on.log \
+            --disabled-log /tmp/x7-s3h-evidence/bitwise-off.log \
+            --out /tmp/x7-s3h-evidence/native-i64-source-decisions.json --check
+          python3 - <<'PY'
+          import json
+          r=json.load(open('/tmp/x7-s3h-evidence/native-i64-source-decisions.json'))
+          assert r["total_actual_native_typeid_decisions"]==48
+          assert r["native_typeid_i64_selected_feature_on"]==6
+          assert r["native_typeid_i64_selected_bitwise_disabled"]==0
+          assert r["actual_source_iform_shas_matching_pinned_s3f"]==6
+          assert r["production_selection_eligible"] is False
+          print("X7_S3H_TRUE_NATIVE_TYPEID_SOURCE_SHA_PASS observed=48 admitted=0")
+          PY
+
+      - name: Run native emitter full I64 single-use, phi edge and width test group
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --features 'x7-c-defined-64 x7-c-defined-bitwise' \
+            --lib native_typeid::reviewed_i64_source_tests --offline
+
+      - name: Verify independent actual native TypeId GAS, direct ELF and feature-off fallback
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-c-defined-64 x7-c-defined-bitwise' \
+            --test x7_g10_n16_bitwise_native --offline
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-c-defined-64 x7-c-defined-bitwise' \
+            --test x7_g10_n19_64_native --offline
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --test x7_g10_n15_no_default_fallback --offline
+          echo X7_S3H_TRUE_TYPEID_NATIVE_GAS_ELF_AND_NO_DEFAULT_PASS
+
+      - name: Archive actual source SHA and single-use decisions; ISA admission remains blocked
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-s3h-native-typeid-i64-fusion-source-decisions
+          path: /tmp/x7-s3h-evidence/
+          if-no-files-found: error
