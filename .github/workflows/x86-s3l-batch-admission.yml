@@ -1,0 +1,152 @@
+name: X7 S3.L generic proof-bound batch admission
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/x86-s3l-batch-admission.yml'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  s3l-batch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      SOURCE_SHA: '6befe0526bf6554063e4b30b65482ba37f9a15c8'
+      PYTHONPATH: compiler/tools
+      X7_S3L_S3F: /tmp/x7-s3l/s3f/source-xed-effects.json
+      X7_S3L_S3G: /tmp/x7-s3l/s3g/real-selector-decisions.json
+      X7_S3L_S3H: /tmp/x7-s3l/s3h/native-i64-source-decisions.json
+      X7_S3L_S3J: /tmp/x7-s3l/s3j/add-sub-source-proof.json
+      X7_S3L_S3K: /tmp/x7-s3l/s3k/source-cmp-flags-admission.json
+    steps:
+      - name: Check out exact compiler SHA without running compiler Actions
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 6befe0526bf6554063e4b30b65482ba37f9a15c8
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Fetch original pinned source/XED/flag certificate S3.F
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3f-source-xed-flag-effect-no-admission
+          run-id: 43667287999
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3l/s3f
+      - name: Fetch original postalloc selector events S3.G
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3g-actual-selector-decision-evidence
+          run-id: 43670305205
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3l/s3g
+      - name: Fetch real TypeId I64 source selection events S3.H
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3h-native-typeid-i64-fusion-source-decisions
+          run-id: 43675286039
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3l/s3h
+      - name: Fetch independently source-proven ADD/SUB S3.J
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3j-add-sub-source-ir-proof
+          run-id: 43682964277
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3l/s3j
+      - name: Fetch independently proven flags-only CMP S3.K
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3k-flags-only-cmp-source-native-evidence
+          run-id: 43684448812
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3l/s3k
+      - name: Reproduce one batch admission index from pinned proof records
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          for file in "$X7_S3L_S3F" "$X7_S3L_S3G" "$X7_S3L_S3H" "$X7_S3L_S3J" "$X7_S3L_S3K"; do
+            test -s "$file"
+          done
+          mkdir -p /tmp/x7-s3l/out
+          python3 compiler/tools/x86_s3l_batch_admission.py \
+            --s3f "$X7_S3L_S3F" --s3g "$X7_S3L_S3G" \
+            --s3h "$X7_S3L_S3H" --s3j "$X7_S3L_S3J" \
+            --s3k "$X7_S3L_S3K" \
+            --out /tmp/x7-s3l/out/batch-admission.json
+          git -C compiler diff --exit-code -- \
+            crates/backend-x86/src/generated_x7_s3l_batch_admissions.rs
+          python3 compiler/tools/x86_s3l_batch_admission.py \
+            --s3f "$X7_S3L_S3F" --s3g "$X7_S3L_S3G" \
+            --s3h "$X7_S3L_S3H" --s3j "$X7_S3L_S3J" \
+            --s3k "$X7_S3L_S3K" \
+            --out /tmp/x7-s3l/out/batch-admission.json --check
+      - name: Generic family manifest, synthetic data-only new form, and negative source/flags/prefix mutations
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest -v test_x86_s3l_batch_admission
+          echo X7_S3L_GENERIC_BATCH_NEGATIVE_TESTS_PASS
+      - name: Prepare isolated offline Rust backend workspace
+        shell: bash
+        run: |
+          cd compiler
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          """)
+          PY
+      - name: Real compiler source admission index and cross-family selector tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-native-form-validation x7-c-defined-64 x7-c-defined-bitwise' \
+            --lib x7_native_form_bridge --offline
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-native-form-validation x7-c-defined-64 x7-c-defined-bitwise' \
+            --lib x7_late_selector --offline
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-native-form-validation x7-c-defined-64 x7-c-defined-bitwise' \
+            --test x7_s3j_arithmetic_ir_admission --offline
+      - name: Real native EQ signed and unsigned CMP in GAS/direct ELF plus 64-bit ALU tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-native-form-validation x7-c-defined-64 x7-c-defined-bitwise' \
+            --test x7_s3k_cmp_native --offline
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-c-defined-64 x7-c-defined-bitwise' \
+            --test x7_g10_n19_64_native --offline
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-c-defined-64 x7-c-defined-bitwise' \
+            --lib native_typeid::reviewed_i64_source_tests --offline
+      - name: Disabled-feature source selection and no-default fallback
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --features x7-native-form-validation \
+            --test x7_s3k_cmp_native --offline
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --test x7_g10_n15_no_default_fallback --offline
+          echo X7_S3L_REAL_BACKEND_GAS_ELF_AND_FALLBACK_PASS
+      - name: Archive normalized source-proof batch admission diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-s3l-batch-admission-source-proof-and-rejection-report
+          path: /tmp/x7-s3l/out/batch-admission.json
+          if-no-files-found: error
