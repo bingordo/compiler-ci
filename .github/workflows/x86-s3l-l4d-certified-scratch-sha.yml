@@ -1,0 +1,130 @@
+name: X7 S3.L L4d certified TypeId scratch and source SHA
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/x86-s3l-l4d-certified-scratch-sha.yml'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  typeid-scratch-certificate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: 'a190f256d5de8041012763e703afd2f69dfba99e'
+      PYTHONPATH: compiler/tools
+      X7_S3L_L4D_WORKLIST: /tmp/x7-s3l-l4d/source/original-source-xed-iforms.json
+      X7_S3L_L4D_SMT: /tmp/x7-s3l-l4d/smt/semantics-z3.json
+    steps:
+      - name: Checkout exact compiler source without compiler Actions
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a190f256d5de8041012763e703afd2f69dfba99e
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Import pinned original Intel/XED all-iform source worklist
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3l-l3c-source-XED-gated-production-admission
+          run-id: 43728544711
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3l-l4d/source
+      - name: Import original source operation and helper AST Z3 semantic proofs
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3l-l2b-l3a-9-ops-generic-helper-smt-source-evidence
+          run-id: 43687620382
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3l-l4d/smt
+      - name: Reprove generated source SHA provenance, exact XED and 4 native recipes
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          mkdir -p /tmp/x7-s3l-l4d/out
+          python3 compiler/tools/x86_s3l_l4a_flags_recipe.py \
+            --worklist "$X7_S3L_L4D_WORKLIST" \
+            --generic-smt "$X7_S3L_L4D_SMT" \
+            --report /tmp/x7-s3l-l4d/out/physical-recipes.json
+          python3 - <<'PY'
+          import json
+          r=json.load(open("/tmp/x7-s3l-l4d/out/physical-recipes.json"))
+          for x in r["native_physical_recipe_rows"]:
+              print("X7_S3L_L4D_PINNED_RECIPE",x["iform"],x["bits"],
+                    "INTEL_SHA",x["intel_iform_sha256"],
+                    "XED_VARIANT",x["xed_variant_id"])
+          PY
+          git -C compiler diff --exit-code -- \
+            crates/backend-x86/src/generated_x7_s3l_l4a_flags_only_recipes.rs
+          python3 compiler/tools/x86_s3l_l4a_flags_recipe.py \
+            --worklist "$X7_S3L_L4D_WORKLIST" \
+            --generic-smt "$X7_S3L_L4D_SMT" \
+            --report /tmp/x7-s3l-l4d/out/physical-recipes.json --check
+          python3 -m unittest -v test_x86_s3l_l4a_flags_recipe
+          echo X7_S3L_L4D_EXACT_ORIGINAL_INTEL_SOURCE_HASH_GATE_PASS
+      - name: Isolate backend offline Rust workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          """)
+          PY
+      - name: Test sealed SSA allocator scratch and public-selector strict fallback
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-native-form-validation x7-c-defined-64 x7-c-defined-bitwise' \
+            --lib x7_late_selector::l4d_typeid_reserved_scratch_proof_tests \
+            --offline -- --nocapture
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-native-form-validation x7-c-defined-64 x7-c-defined-bitwise' \
+            --lib x7_late_selector --offline
+          echo X7_S3L_L4D_SEALED_TYPEID_SCRATCH_PROOF_PASS
+      - name: Actual TypeId-selected four native forms must omit artificial kill MOV
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-native-form-validation x7-c-defined-64 x7-c-defined-bitwise' \
+            --test x7_s3l_l4c_typeid_flags_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-native-form-validation x7-c-defined-64 x7-c-defined-bitwise' \
+            --test x7_s3l_l4b_flags_window_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-native-form-validation x7-c-defined-64 x7-c-defined-bitwise' \
+            --test typed_i32_compare_branch_native --offline
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-native-form-validation x7-c-defined-64 x7-c-defined-bitwise' \
+            --test typed_i64_compare_branch_native --offline
+          echo X7_S3L_L4D_ACTUAL_TYPEID_NATIVE_GAS_ELF_SOURCE_SHA_PASS
+      - name: Retain no-default and narrow-feature fallback on true TypeId
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --test x7_s3l_l4c_typeid_flags_native --offline
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --features x7-native-form-validation \
+            --test x7_s3l_l4c_typeid_flags_native --offline
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --test x7_g10_n15_no_default_fallback --offline
+          echo X7_S3L_L4D_NO_DEFAULT_FALLBACK_PASS
+      - name: Archive original Intel/XED source proof and generated shape identity
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-s3l-l4d-allocator-certified-typeid-flags-source-SHA
+          path: /tmp/x7-s3l-l4d/out/physical-recipes.json
+          if-no-files-found: error
