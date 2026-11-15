@@ -135,17 +135,45 @@ if [[ -n "${AUDIT_LARGE_SOURCE:-}" && -s "$AUDIT_LARGE_SOURCE" &&
   grep -m 1 '^EDG_PROBE_RESULT ' /audit-tmp/edg-large-c-parse.log || true
 fi
 
+# Frontend acceptance alone proves nothing about attribute-aware ELF.
+# Test the exact public fixture inputs through the production native TypeId
+# driver even if the real C parser rejected its larger workload.
+timeout --signal=TERM --kill-after=10s 20m cargo build --quiet \
+  --manifest-path compiler/tools/edg-driver/Cargo.toml
+native=/workspace/compiler/tools/edg-driver/target/debug/compiler-edg-driver
+test -x "$native"
+for kind in alignment linkage abi naked; do
+  fixture="/workspace/bootstrap/fixtures/edg-gnu-attributes/${kind}.c"
+  output="/audit-tmp/edg-gnu-${kind}.o"
+  rm -f "$output"
+  set +e
+  (
+    cd /workspace/edgcpp/build/gcc-release
+    timeout --signal=TERM --kill-after=10s 90s \
+      "$native" "$output" --gcc --c11 --no_strict_gnu --gnu_version "$gnu_number" "$fixture"
+  ) > "/audit-tmp/edg-gnu-${kind}-native.log" 2>&1
+  kind_rc=$?
+  set -e
+  echo "EDG_GNU_ATTR_NATIVE_${kind^^}_EXIT=$kind_rc"
+  if (( kind_rc == 0 )); then
+    # Check that success actually produced an ELF64 object without depending
+    # on the absent 'file' utility in the pinned EDG container.
+    python3 - "$output" <<'PY'
+from pathlib import Path
+import sys
+data = Path(sys.argv[1]).read_bytes()
+assert data.startswith(b"\\x7fELF\\x02"), "native output must be ELF64"
+PY
+    echo "EDG_GNU_ATTR_NATIVE_${kind^^}_OBJECT=ELF64"
+  fi
+done
+
 if (( parse_rc != 0 )); then
   echo "EDG_C_TYPEID_EXIT=not_run_parser_failed"
   exit 0
 fi
 
-# A successful frontend parse alone does not prove our adapter supports the
-# source. Attempt native TypeId-to-ELF independently and report first blocker.
-timeout --signal=TERM --kill-after=10s 20m cargo build --quiet \
-  --manifest-path compiler/tools/edg-driver/Cargo.toml
-native=/workspace/compiler/tools/edg-driver/target/debug/compiler-edg-driver
-test -x "$native"
+# Same native TypeId gate for the real C unit that passed frontend parsing.
 set +e
 (
   cd /workspace/edgcpp/build/gcc-release
@@ -167,6 +195,11 @@ print("EDG_C_TYPEID_DIAGNOSTIC_COUNTS "
 PY
 if (( native_rc == 0 )); then
   test -s /audit-tmp/mrustc-edg-native.o
-  file /audit-tmp/mrustc-edg-native.o
+  python3 - /audit-tmp/mrustc-edg-native.o <<'PY'
+from pathlib import Path
+import sys
+data = Path(sys.argv[1]).read_bytes()
+assert data.startswith(b"\\x7fELF\\x02"), "native output must be ELF64"
+PY
   echo "EDG_C_TYPEID_OBJECT_CREATED=1 (semantics not yet compared with GCC)"
 fi
