@@ -162,7 +162,7 @@ for kind in alignment linkage abi naked; do
 from pathlib import Path
 import sys
 data = Path(sys.argv[1]).read_bytes()
-assert data.startswith(b"\\x7fELF\\x02"), "native output must be ELF64"
+assert data[:5] == bytes([127, 69, 76, 70, 2]), "native output must be ELF64"
 PY
     echo "EDG_GNU_ATTR_NATIVE_${kind^^}_OBJECT=ELF64"
   fi
@@ -199,7 +199,7 @@ if (( native_rc == 0 )); then
 from pathlib import Path
 import sys
 data = Path(sys.argv[1]).read_bytes()
-assert data.startswith(b"\\x7fELF\\x02"), "native output must be ELF64"
+assert data[:5] == bytes([127, 69, 76, 70, 2]), "native output must be ELF64"
 PY
   echo "EDG_C_TYPEID_OBJECT_CREATED=1 (semantics not yet compared with GCC)"
 fi
