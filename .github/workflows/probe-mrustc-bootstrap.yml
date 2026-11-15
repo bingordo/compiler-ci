@@ -394,6 +394,52 @@ jobs:
           ar rcs "$RUNNER_TEMP/mrustc-aarch64-objects/libbackend-aarch64-probe.a" "$RUNNER_TEMP"/mrustc-aarch64-objects/*.o
           test -s "$RUNNER_TEMP/mrustc-aarch64-objects/libbackend-aarch64-probe.a"
           echo "compiler-backend-aarch64: mrustc→C and host GCC compiled $n units." >> "$GITHUB_STEP_SUMMARY"
+      - name: Translate x86 backend and compile generated C with GCC
+        if: always() && steps.optimizer.outcome == 'success'
+        id: backend-x86
+        shell: bash
+        working-directory: mrustc
+        env:
+          RUSTC_VERSION: '1.90.0'
+          MRUSTC_TARGET_VER: '1.90'
+          OUTDIR_SUF: '-1.90.0'
+          PARLEVEL: '2'
+          CC: gcc
+        run: |
+          set -euo pipefail
+          # The x86 backend requires compiler-opt, so this runs only when
+          # the optimizer successfully translates and its C compiles with GCC.
+          find . -type f -name '*.c' -printf '%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/mrustc-x86-before.txt"
+          set +e
+          timeout --signal=TERM --kill-after=10s 30m bin/minicargo \
+            -L output-1.90.0 -o output-compiler-bootstrap \
+            ../compiler/crates/backend-x86 > "$RUNNER_TEMP/mrustc-x86-probe.log" 2>&1
+          rc=$?
+          set -e
+          if (( rc != 0 )); then
+            echo "::group::Full compiler-backend-x86 minicargo failure output"
+            cat "$RUNNER_TEMP/mrustc-x86-probe.log"
+            echo "::endgroup::"
+            echo "compiler-backend-x86: minicargo exit=$rc" >> "$GITHUB_STEP_SUMMARY"
+            exit "$rc"
+          fi
+          find . -type f -name '*.c' -printf '%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/mrustc-x86-after.txt"
+          comm -13 "$RUNNER_TEMP/mrustc-x86-before.txt" "$RUNNER_TEMP/mrustc-x86-after.txt" > "$RUNNER_TEMP/mrustc-x86-new.txt"
+          mapfile -t generated < "$RUNNER_TEMP/mrustc-x86-new.txt"
+          if (( ${#generated[@]} == 0 )); then
+            echo "compiler-backend-x86: no newly emitted C files" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/mrustc-x86-objects"
+          count=0
+          for relative in "${generated[@]}"; do
+            test -f "$relative"
+            gcc -std=gnu11 -O0 -c "$relative" -o "$RUNNER_TEMP/mrustc-x86-objects/$count.o"
+            count=$((count + 1))
+          done
+          ar rcs "$RUNNER_TEMP/mrustc-x86-objects/libcompiler-backend-x86-probe.a" "$RUNNER_TEMP"/mrustc-x86-objects/*.o
+          test -s "$RUNNER_TEMP/mrustc-x86-objects/libcompiler-backend-x86-probe.a"
+          echo "compiler-backend-x86: mrustc and GCC compiled $count new C units into an archive." >> "$GITHUB_STEP_SUMMARY"
       - name: Run compiler-ir executable through host rustc and mrustc/GCC
         if: always() && steps.translate.outcome == 'success'
         shell: bash
