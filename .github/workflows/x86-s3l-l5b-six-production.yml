@@ -1,0 +1,155 @@
+name: X7 S3.L L5b six independently source-backed TypeId production forms
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/x86-s3l-l5b-six-production.yml'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  six-source-backed-typeid:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 46
+    env:
+      SOURCE_SHA: '72972c699c3c476395ccb6823be338b07d699554'
+      PYTHONPATH: compiler/tools
+      X7_S3L_L4A_WORKLIST: /tmp/x7-l5b-production/source/original-source-xed-iforms.json
+      X7_S3L_L4A_SMT: /tmp/x7-l5b-production/smt/semantics-z3.json
+      X7_S3L_L4A_S2: /tmp/x7-l5b-production/s2/join-1.json
+      X7_S3L_L4A_OP_AST: /tmp/x7-l5b-production/smt/operations.json
+      X7_S3L_L4A_INTEL_DIR: /tmp/x7-l5b-production/intel
+    steps:
+      - name: Checkout exact compiler with no compiler repo Actions
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 72972c699c3c476395ccb6823be338b07d699554
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Original pinned S2 XED 10859-form corpus
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s2-pinned-intel-xed-variant-join
+          run-id: 43635408689
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-l5b-production/s2
+      - name: Previously original Intel/XED GP-memory proof worklist
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3l-l3c-source-XED-gated-production-admission
+          run-id: 43728544711
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-l5b-production/source
+      - name: Independent original pinned nine-operation source AST and Z3
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3l-l2b-l3a-9-ops-generic-helper-smt-source-evidence
+          run-id: 43687620382
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-l5b-production/smt
+      - name: Fetch exact original Intel register-only TEST source form
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          mkdir -p "$X7_S3L_L4A_INTEL_DIR" /tmp/x7-l5b-production/out
+          curl --fail --silent --show-error --location --retry 2 --max-time 50 \
+            "https://raw.githubusercontent.com/intel/SDM/35eface1b7ee003a1cda95005ec5fd83de658a64/data/instruction/TEST.xml" \
+            -o "$X7_S3L_L4A_INTEL_DIR/TEST.xml"
+      - name: Reproduce six exact source/XED/SMT TypeId production forms from data
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/x86_s3l_l4a_flags_recipe.py \
+            --worklist "$X7_S3L_L4A_WORKLIST" \
+            --generic-smt "$X7_S3L_L4A_SMT" \
+            --s2 "$X7_S3L_L4A_S2" \
+            --operation-ast "$X7_S3L_L4A_OP_AST" \
+            --intel-dir "$X7_S3L_L4A_INTEL_DIR" \
+            --report /tmp/x7-l5b-production/out/six-source-production.json
+          git -C compiler diff --exit-code -- \
+            crates/backend-x86/src/generated_x7_s3l_l4a_flags_only_recipes.rs
+          python3 compiler/tools/x86_s3l_l4a_flags_recipe.py \
+            --worklist "$X7_S3L_L4A_WORKLIST" \
+            --generic-smt "$X7_S3L_L4A_SMT" \
+            --s2 "$X7_S3L_L4A_S2" \
+            --operation-ast "$X7_S3L_L4A_OP_AST" \
+            --intel-dir "$X7_S3L_L4A_INTEL_DIR" \
+            --report /tmp/x7-l5b-production/out/six-source-production.json --check
+          python3 -m unittest -v \
+            test_x86_s3l_l4a_flags_recipe \
+            test_x86_s3l_l5b_regreg_source
+          python3 - <<'PY'
+          import json
+          r=json.load(open('/tmp/x7-l5b-production/out/six-source-production.json'))
+          assert r["native_physical_recipe_count"]==6,r
+          assert r["new_production_TypeId_admissions"]==6,r
+          assert len(r["source_iforms"])==3,r
+          for x in r["native_physical_recipe_rows"]:
+              assert x["c_defined_production"],x
+              assert len(x["intel_iform_sha256"])==64,x
+              assert len(x["xed_variant_id"])==64,x
+          print("X7_S3L_L5B_SIX_FORM_SOURCE_XED_SMT_PRODUCTION_PASS")
+          PY
+      - name: Isolate compiler IR/native backend offline workspace
+        shell: bash
+        run: |
+          cd compiler
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          """)
+          PY
+      - name: Real default-feature TypeId GP-only TEST and memory CMP/TEST GAS and direct ELF
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 \
+            --test x7_s3l_l5b_regreg_typeid_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 \
+            --test x7_s3l_l4c_typeid_flags_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 \
+            --test x7_s3l_l4b_flags_window_native --offline
+          cargo test -p compiler-backend-x86 \
+            --lib x7_late_selector --offline
+          echo X7_S3L_L5B_SIX_REAL_DEFAULT_TYPEID_NATIVE_GAS_ELF_PASS
+      - name: Independently enable only six reviewed source-flags forms
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --features x7-c-defined-source-flags \
+            --test x7_s3l_l5b_regreg_typeid_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --features x7-c-defined-source-flags \
+            --test x7_s3l_l4c_typeid_flags_native --offline
+          echo X7_S3L_L5B_ISOLATED_REVIEWED_SOURCE_FORMS_ONLY_PASS
+      - name: Strict no-default and independent validation fallbacks
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --test x7_s3l_l5b_regreg_typeid_native --offline
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --test x7_s3l_l4c_typeid_flags_native --offline
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --features 'x7-native-form-validation x7-c-defined-bitwise x7-c-defined-64' \
+            --test x7_s3l_l5b_regreg_typeid_native --offline
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --test x7_g10_n15_no_default_fallback --offline
+          echo X7_S3L_L5B_STRICT_FEATURE_OFF_AND_VALIDATION_FALLBACK_PASS
+      - name: Archive exact six original Intel/XED/SMT and native-receipt approvals
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-s3l-l5b-six-default-typeid-iform-width-native-proven
+          path: /tmp/x7-l5b-production/out/six-source-production.json
+          if-no-files-found: error
