@@ -1,0 +1,71 @@
+# Validate the standalone W0-W5 Wasm backend integrated with compiler main.
+# All compiler testing must stay in compiler-ci because compiler Actions minutes are exhausted.
+name: Wasm W0-W5 main integration
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/wasm-w0-w5-main-integration.yml'
+  workflow_dispatch:
+    inputs:
+      compiler_sha:
+        description: 'Exact compiler source SHA for integration'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout source-pinned integrated compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.compiler_sha || 'fcf09c76af5eabbb3ad1e92f6c7b59ff4b884700' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source SHA, preserve all five backends in isolated workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "${{ inputs.compiler_sha || 'fcf09c76af5eabbb3ad1e92f6c7b59ff4b884700' }}"
+          echo "Exact compiler SHA: $(git -C compiler rev-parse HEAD)"
+          grep -F '"crates/backend-riscv64"' compiler/Cargo.toml
+          grep -F '"crates/backend-wasm"' compiler/Cargo.toml
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+          cc --version | head -1
+      - name: Independent WebAssembly execution runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Cache core and backend dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: wasm-w0-w5-integration-main
+      - name: W0-W5 Wasm verification and x86 native differential suite
+        working-directory: compiler
+        run: cargo test -p compiler-backend-wasm --tests -- --nocapture
+      - name: Native backend common legalizer and support unit tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend --lib
+      - name: Native x86, AArch64 and RISC-V backend library tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 -p compiler-backend-aarch64 -p compiler-backend-riscv64 --lib
+      - name: Native x86 comprehensive integration regression
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --tests
+      - name: Strict Wasm and shared backend Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-wasm -p compiler-backend --all-targets -- -D warnings
