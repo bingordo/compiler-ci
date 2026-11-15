@@ -1,0 +1,59 @@
+name: Native TypeId LTO nested signature audit
+on:
+  push:
+    branches: [ci/ir-lto-nested-type-audit-20261115]
+    paths: [.github/workflows/ir-lto-nested-type-audit-20261115.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  lto-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SOURCE_SHA: dd4d6e436f9c3e4e8939753c7b68cef1343f8889
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler review source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: dd4d6e436f9c3e4e8939753c7b68cef1343f8889
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source pin
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: native-lto-nested-audit
+      - name: Focused TypeId type arena, LTO mapping and codec acceptance
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test lto_type_remap
+          cargo test -p compiler-ir --test lto_apply_type_map
+          cargo test -p compiler-ir --test native_type_records_v3
+          cargo test -p compiler-ir --test native_binary_v1
+          cargo test -p compiler-ir --test native_binary_corruption_matrix
+      - name: Complete IR regressions
+        working-directory: compiler
+        run: cargo test -p compiler-ir
+      - name: Optimizer and target compatibility
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --lib
+          cargo check -p compiler-backend-x86 -p compiler-backend-aarch64 -p compiler-backend-riscv64 -p compiler-backend-wasm --all-targets
+      - name: Strict IR lint
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir --all-targets -- -D warnings
