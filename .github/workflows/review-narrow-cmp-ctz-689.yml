@@ -1,0 +1,63 @@
+name: Source-pinned narrow comparisons and CTZ review 689
+on:
+  push:
+    branches: [review/narrow-cmp-ctz-689-860f830]
+    paths: ['.github/workflows/review-narrow-cmp-ctz-689.yml']
+  pull_request:
+    paths: ['.github/workflows/review-narrow-cmp-ctz-689.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 23
+    steps:
+      - name: Checkout compiler-ci workflow
+        uses: actions/checkout@v4
+      - name: Checkout source-pinned compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 860f8302fccff41bff150b86cbca6725a14110ce
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check source SHA
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "860f8302fccff41bff150b86cbca6725a14110ce"
+          git show -s --format='%H %s' HEAD
+      - name: Create temporary compiler core workspace
+        working-directory: compiler
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          """)
+          PY
+      - name: Cache core Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: review-narrow-compare-ctz-689
+      - name: Executable native i8/i16 comparisons and CTZ vs independent C11 math oracle
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --test review_narrow_compare_ctz_oracle -- --nocapture
+      - name: Preserve source-pinned i8/i16 shift executable oracle
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --test review_narrow_shift_oracle -- --nocapture
+      - name: Independent scalar semantics and TypeId generic verifier
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --lib native_int_semantics -- --nocapture
+          cargo test -p compiler-ir --test typed_integer_v2 -- --nocapture
+      - name: Compile both target backend libraries
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 -p compiler-backend-aarch64 --lib --no-run
+      - name: Deny all Clippy warnings in affected core crates
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-backend -p compiler-backend-x86 --lib -- -D warnings
