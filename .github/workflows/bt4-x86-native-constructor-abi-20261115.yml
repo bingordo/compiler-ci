@@ -1,0 +1,56 @@
+name: BT4 x86 production TypeId constructor oracle
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/bt4-x86-native-constructor-abi-20261115.yml'
+permissions:
+  contents: read
+jobs:
+  source-owned-constructor-abi:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Pin exact compiler source without spending compiler Actions
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1d5b2d717154e231800db54fbf6b4d7837ca1231
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm source and prevent old backend regrowth
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 1d5b2d717154e231800db54fbf6b4d7837ca1231
+          python3 compiler/tools/check_bt4_backend_boundary.py
+          python3 - <<'PY'
+          from pathlib import Path
+          x = Path("compiler/crates/backend-x86/tests/unit/lib.rs").read_text()
+          start = x.index("fn module_initializers_require_zero_argument_entry_on_all_x86_outputs")
+          end = x.index("fn production_backends_select_zero_idiom_from_typed_ssa")
+          body = x[start:end]
+          assert "emit_object_linked_with_initializers" not in body
+          assert "emit_assembly_linked_with_initializers" not in body
+          assert "native_typeid::emit_object_with_initializers" in body
+          assert "native_typeid::emit_assembly_with_initializers" in body
+          assert "for pic in [false,true]" in body
+          assert "for preserve_frame_pointer in [false,true]" in body
+          print("BT4 native constructor source-only emitter boundary PASS")
+          PY
+      - name: Offline backend workspace
+        shell: bash
+        run: |
+          cd compiler
+          printf '[workspace]\nresolver = "2"\nmembers = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]\n' > Cargo.toml
+      - name: Native constructor and entire backend library tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 --offline --lib module_initializers_require_zero_argument_entry_on_all_x86_outputs -- --nocapture
+          cargo test -p compiler-backend-x86 --offline --lib
+          cargo test -p compiler-backend-x86 --offline --lib --no-default-features
+          cargo check -p compiler-backend-x86 --offline
+          cargo check -p compiler-backend-x86 --offline --release
+          echo BT4_X86_NATIVE_CONSTRUCTOR_ABI_ALL_MODES_GREEN
