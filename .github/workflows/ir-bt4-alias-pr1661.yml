@@ -1,0 +1,54 @@
+# Ephemeral source-pinned BT4 test, never merge this workflow.
+name: BT4 audited alias and mixed ABI TypeId parity
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ir-bt4-alias-pr1661.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-alias:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_INCREMENTAL: '0'
+      SOURCE_SHA: f18eb27445f2357710e1dd976a17b24af4b9aa6d
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f18eb27445f2357710e1dd976a17b24af4b9aa6d
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and narrow core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-bt4-typed-alias
+      - name: Original aliasing and mixed-width ABI C oracle with native physical gates
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --test typed_alias_calls_native -- --nocapture
+      - name: Native call, i64 memory and independent related oracles
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test native_typeid_memory_calls --test native_typeid_call_liveness --test m4_i64_memory_call_native --test native_typeid_direct --test x6_add64_native --test rbp_alloc_native
+      - name: Affected crate all-targets
+        working-directory: compiler
+        run: cargo check -p compiler-ir -p compiler-backend -p compiler-backend-x86 --all-targets
+      - name: Strict original test lint
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-x86 --test typed_alias_calls_native -- -D warnings
