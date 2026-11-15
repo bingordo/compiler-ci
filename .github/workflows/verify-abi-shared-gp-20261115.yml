@@ -1,0 +1,90 @@
+name: Shared GP ABI placement x86 and AArch64 (compiler #1717)
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-abi-shared-gp-20261115.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  x86:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 6846eb487fcbea50dc00e3d26fae850fcc95d351
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact candidate
+        run: test "$(git -C compiler rev-parse HEAD)" = 6846eb487fcbea50dc00e3d26fae850fcc95d351
+      - name: Isolate tested core crates
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: abi-shared-gp-x86
+      - name: Install existing native DWARF test oracle
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gdb
+      - name: x86 ABI, shared backend and IR regression suite
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend-x86 --tests
+          cargo test -p compiler-backend -p compiler-ir
+      - name: x86 Clippy (except known unrelated pre-existing x7 lints)
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-backend-x86 --all-targets -- \
+            -D warnings \
+            -A clippy::suspicious_assignment_formatting \
+            -A unused_variables \
+            -A clippy::too_many_arguments
+  aarch64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 6846eb487fcbea50dc00e3d26fae850fcc95d351
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact candidate and native ARM host
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = 6846eb487fcbea50dc00e3d26fae850fcc95d351
+          test "$(uname -m)" = aarch64
+          command -v cc
+          command -v objcopy
+      - name: Isolate tested core crates
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: abi-shared-gp-aarch64
+      - name: Native AArch64 ELF/GAS/C ABI and frame regression tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-aarch64 --all-targets -- --test-threads=1
+          cargo test -p compiler-backend --lib
+      - name: AArch64 backend Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
