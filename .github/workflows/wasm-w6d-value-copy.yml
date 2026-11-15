@@ -1,0 +1,68 @@
+# W6d native TypeId v3 text/binary file -> Wasm, host value-copy and native differential.
+name: Wasm W6d TypeId file and safe scalar copy
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/wasm-w6d-value-copy.yml'
+  workflow_dispatch:
+    inputs:
+      compiler_sha:
+        description: 'Exact compiler commit to test'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  wasm-w6d:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout exact compiler SHA
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.compiler_sha || '934196d13596d62a609ddccfeced42cb5db36287' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin compiler SHA and isolate standalone backend crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "${{ inputs.compiler_sha || '934196d13596d62a609ddccfeced42cb5db36287' }}"
+          echo "Compiler source: $(git -C compiler rev-parse HEAD)"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+          cc --version | head -1
+      - name: Independent Node WebAssembly runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Cache standalone compiler backend build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: wasm-w6d-value-copy-module-v3
+      - name: Run W0-W6d Wasm CLI and native ELF scalar copy tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend-wasm --tests -- --nocapture
+      - name: Verify shared native backend library tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend --lib
+      - name: Verify native x86, AArch64 and RISC-V backend library tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 -p compiler-backend-aarch64 -p compiler-backend-riscv64 --lib
+      - name: Run native x86 backend integration regression tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --tests
+      - name: Strict Wasm and shared backend Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-wasm -p compiler-backend --all-targets -- -D warnings
