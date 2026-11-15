@@ -1,0 +1,79 @@
+name: X7 S3.J pinned ADD SUB compiler IR source admission
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/x86-s3j-add-sub-ir-admission.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  x7-s3j-source-to-selector:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      SOURCE_SHA: 'f33893d94f4f44dd9da57d6524c62248ec0a07cd'
+      INTEL_REV: '35eface1b7ee003a1cda95005ec5fd83de658a64'
+      PYTHONPATH: compiler/tools
+    steps:
+      - name: Checkout exact compiler commit (no compiler Actions)
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f33893d94f4f44dd9da57d6524c62248ec0a07cd
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Retrieve complete immutable pinned Intel XED source variant corpus
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s2-pinned-intel-xed-variant-join
+          run-id: 43635408689
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3j-s2
+      - name: Retrieve existing logic/compiler admission selector provenance
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3f-source-xed-flag-effect-no-admission
+          run-id: 43667287999
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3j-s3f
+      - name: Download exact original Intel ADD/SUB and arithmetic helper definition
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          mkdir -p /tmp/x7-s3j-intel /tmp/x7-s3j-evidence
+          test -s /tmp/x7-s3j-s2/join-1.json
+          for op in ADD SUB; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 45 \
+              "https://raw.githubusercontent.com/intel/SDM/${INTEL_REV}/data/instruction/${op}.xml" \
+              -o "/tmp/x7-s3j-intel/${op}.xml"
+          done
+          curl --fail --silent --show-error --location --retry 2 --max-time 45 \
+            "https://raw.githubusercontent.com/intel/SDM/${INTEL_REV}/data/definitions.xml.gz" \
+            -o /tmp/x7-s3j-intel/definitions.xml.gz
+          python3 -m venv /tmp/x7-s3j-venv
+          /tmp/x7-s3j-venv/bin/python -m pip install 'z3-solver==4.13.4.0'
+      - name: Execute source-verified ADD/SUB helper and width-specific SMT checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          /tmp/x7-s3j-venv/bin/python compiler/tools/x86_s3j_arithmetic_source_proof.py \
+            --intel-dir /tmp/x7-s3j-intel \
+            --definitions-gz /tmp/x7-s3j-intel/definitions.xml.gz \
+            --s2 /tmp/x7-s3j-s2/join-1.json \
+            --out /tmp/x7-s3j-evidence/add-sub-source-proof.json
+          /tmp/x7-s3j-venv/bin/python compiler/tools/x86_s3j_arithmetic_source_proof.py \
+            --intel-dir /tmp/x7-s3j-intel \
+            --definitions-gz /tmp/x7-s3j-intel/definitions.xml.gz \
+            --s2 /tmp/x7-s3j-s2/join-1.json \
+            --out /tmp/x7-s3j-evidence/add-sub-source-proof.json --check
+      - name: Upload source-bound arithmetic proof
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-s3j-add-sub-source-ir-proof
+          path: /tmp/x7-s3j-evidence/add-sub-source-proof.json
+          if-no-files-found: error
