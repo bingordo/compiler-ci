@@ -1,0 +1,64 @@
+# Source-pinned FP-1 test-only semantic differential and opcode class gate.
+# Temporary workflow lives exclusively in compiler-ci; do not merge it.
+name: FP-1 scalar IEEE comparison oracle and TypeId codec
+on:
+  push:
+    branches: [ci/fp1-scalar-oracle-20261115]
+    paths: [.github/workflows/fp1-scalar-oracle-20261115.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fp-oracle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      SOURCE_SHA: db1355b02f3bfbcab5b7154d6cd2e89101a44841
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact FP TypeId branch commit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: db1355b02f3bfbcab5b7154d6cd2e89101a44841
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify revision and isolate core workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: fp1-scalar-independent-oracle
+      - name: Focused FP differential and codec regression
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test native_fp_scalar_reference
+          cargo test -p compiler-ir --test native_fp_vector_semantics
+          cargo test -p compiler-ir --test native_fp_opcode_roundtrip
+          cargo test -p compiler-ir --lib native_binary_v1::opcode_tests
+      - name: Full compiler-ir regression suite
+        working-directory: compiler
+        run: cargo test -p compiler-ir
+      - name: Optimizer library and x86 AArch64 RV64 Wasm compatibility
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --lib
+          cargo check -p compiler-backend-x86 -p compiler-backend-aarch64 -p compiler-backend-riscv64 -p compiler-backend-wasm --all-targets
+      - name: Strict IR and optimizer lint
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir --all-targets -- -D warnings
+          cargo clippy -p compiler-opt --lib -- -D warnings
