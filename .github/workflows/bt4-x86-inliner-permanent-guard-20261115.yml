@@ -1,0 +1,67 @@
+name: BT4 x86 permanent inliner debug boundary
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/bt4-x86-inliner-permanent-guard-20261115.yml'
+permissions:
+  contents: read
+jobs:
+  boundary:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d59b19af0ef39197b1f8124a1a9d907bf389b42f
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Real source guard and self-test with two negative mutants
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = d59b19af0ef39197b1f8124a1a9d907bf389b42f
+          cd compiler
+          python3 tools/check_bt4_backend_boundary.py
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          guard = [sys.executable, "tools/check_bt4_backend_boundary.py"]
+          def rejection(path, before, after, clue):
+              src = path.read_text(encoding="utf-8")
+              assert before in src, (path, "original mutation target missing")
+              path.write_text(src.replace(before, after, 1), encoding="utf-8")
+              try:
+                  r = subprocess.run(guard, capture_output=True, text=True, check=False)
+                  assert r.returncode != 0, "guard accepted mutation"
+                  assert clue in r.stderr, (clue, r.stderr)
+              finally:
+                  path.write_text(src, encoding="utf-8")
+
+          x86 = Path("crates/backend-x86")
+          rejection(
+              x86 / "src/lib.rs",
+              '#[cfg(any(test, feature = "historical-function-oracle"))]',
+              '#[cfg(any(test, debug_assertions, feature = "historical-function-oracle"))]',
+              "historical Function inliner must be test/explicit-feature-only",
+          )
+          rejection(
+              x86 / "tests/unit/inliner_target_cost.rs",
+              "fn backend_callback_receives_verified_native_before_after_candidates",
+              "fn mutant_backend_callback_receives_verified_native_before_after_candidates",
+              "missing original historical inliner test",
+          )
+          print("BT4_DEBUG_INLINER_NEGATIVE_GATES_PASS")
+          PY
+          python3 tools/check_bt4_backend_boundary.py
+      - name: Original three test oracles still run in default lib suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          printf '[workspace]\nresolver="2"\nmembers=["crates/ir","crates/opt","crates/backend","crates/backend-x86"]\n' > Cargo.toml
+          cargo test -p compiler-backend-x86 --offline --lib inliner_target_cost_tests
+          echo BT4_PERMANENT_GUARD_GREEN
