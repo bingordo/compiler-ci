@@ -1,0 +1,71 @@
+# Temporary and source-pinned. Never run compiler-repo Actions.
+name: BT4 historical x86 emission archive parity
+on:
+  pull_request:
+    paths: ['.github/workflows/bt4-archive-x86-emission-pr1723.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  bt4:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_INCREMENTAL: '0'
+      SOURCE_SHA: c2eaff412d6b504bcb68274a69055315dcfca1fe
+    steps:
+      - name: Checkout exact compiler commit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c2eaff412d6b504bcb68274a69055315dcfca1fe
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pin and use core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: bt4-historical-x86-archive
+      - name: Native x86/AArch64 release excludes archive
+        working-directory: compiler
+        run: cargo check -p compiler-backend-x86 -p compiler-backend-aarch64 --release --lib
+      - name: Strict release clippy, exempt only known unrelated X7 visibility warning
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-x86 --lib --release -- -D warnings -A private_interfaces
+      - name: Explicit release oracle restores all historical functions
+        working-directory: compiler
+        run: cargo check -p compiler-backend-x86 --lib --release --features historical-function-oracle
+      - name: Full core backend and optimizer debug test/example compilation
+        working-directory: compiler
+        run: cargo check -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --all-targets
+      - name: Original low-level old x86 machine and allocator unit oracles
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --lib
+      - name: Legacy x86 inliner cost and old compiler-opt functional C oracles
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test inliner_target_cost
+          cargo test -p compiler-opt --test typed_phi_dead_linear --test if_conversion_native --test alias_phis --test bulk_zero_profile --test ct03_typed_alias_epoch_native --test global_memory_profile --test typed_phi_cfg
+      - name: Native TypeId and original ABI/TLS/metadata/branch C ELF GAS
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test typed_alias_calls_native --test typed_generated_cfg_native --test typed_i32_compare_branch_native --test typed_i64_compare_branch_native --test m4_8_checked_symbol_attributes_native --test native_typeid_direct
+      - name: Historical T5 flags and X7 source-linked physical policy tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test t5_x86_semantics --test t5_x86_flags_liveness
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation,x7-c-defined-64 --test x7_g10_late_selector_native --test x7_g10_n12_c_defined_native --test x7_g10_n14_sub_native --test x7_g10_n16_bitwise_native --test x7_g10_n19_64_native --test x7_g10_n20_cfg_pressure_64_native
