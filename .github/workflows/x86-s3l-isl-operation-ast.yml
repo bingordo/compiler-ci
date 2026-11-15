@@ -1,0 +1,79 @@
+name: X7 S3.L L2 generic Intel ISL operation AST
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/x86-s3l-isl-operation-ast.yml'
+permissions:
+  contents: read
+jobs:
+  s3l-generic-intel-ast:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    env:
+      SOURCE_SHA: '601ced77e0b3412feb1752ab17396ad651b7ff04'
+      PYTHONPATH: compiler/tools
+      X7_S3L_ISL_DIRECTORY: /tmp/x7-s3l-isl/source
+      X7_S3L_ISL_REPORT: /tmp/x7-s3l-isl/out/isl-operation-ast.json
+    steps:
+      - name: Checkout exact compiler source without Actions in compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 601ced77e0b3412feb1752ab17396ad651b7ff04
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Fetch original pinned Intel source for nine distinct operations
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          mkdir -p "$X7_S3L_ISL_DIRECTORY" /tmp/x7-s3l-isl/out
+          for op in ADD SUB CMP AND OR XOR TEST ADC SBB; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 50 \
+              "https://raw.githubusercontent.com/intel/SDM/35eface1b7ee003a1cda95005ec5fd83de658a64/data/instruction/${op}.xml" \
+              -o "$X7_S3L_ISL_DIRECTORY/${op}.xml"
+          done
+      - name: Normalize source operations and exact RFLAGS and implicit-input AST
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/x86_s3l_isl_operation_ast.py \
+            --intel-dir "$X7_S3L_ISL_DIRECTORY" \
+            --operations 'ADD,SUB,CMP,AND,OR,XOR,TEST,ADC,SBB' \
+            --out "$X7_S3L_ISL_REPORT"
+          python3 compiler/tools/x86_s3l_isl_operation_ast.py \
+            --intel-dir "$X7_S3L_ISL_DIRECTORY" \
+            --operations 'SBB,ADC,TEST,XOR,OR,AND,CMP,SUB,ADD' \
+            --out "$X7_S3L_ISL_REPORT" --check
+          echo X7_S3L_NINE_SOURCE_AST_DETERMINISTIC_PASS
+      - name: Validate generic AST without opcode cases and fail-closed unparsed syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest -v test_x86_s3l_isl_operation_ast
+          echo X7_S3L_ORIGINAL_INTEL_SOURCE_FLAGS_UNDEFINED_AF_AND_CF_INPUT_PASS
+      - name: Validate source-model useful semantics without claiming ISA selection
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,os
+          p=json.loads(open(os.environ['X7_S3L_ISL_REPORT']).read())
+          assert p["normalized_count"]==9 and p["blocked_count"]==0
+          assert p["newly_isa_admitted"]==0
+          assert p["actual_native_selection_count"] is None
+          by_name={r["name"]:r for r in p["normalized"]}
+          assert by_name["TEST"]["outputs"]==[]
+          assert by_name["AND"]["outputs"]!=[]
+          assert by_name["TEST"]["undefined_flags"]==["AF"]
+          assert by_name["ADC"]["implicit_flag_reads"]==["CF"]
+          assert by_name["SBB"]["implicit_flag_reads"]==["CF"]
+          print("X7_S3L_GENERIC_AST_SOURCE_WIDTH_AND_EFFECTS_PASS candidates=9 ISA_admissions=0")
+          PY
+      - name: Archive reproducible generic Intel AST source report
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-s3l-generic-isl-nine-operation-ast-not-admission
+          path: /tmp/x7-s3l-isl/out/isl-operation-ast.json
+          if-no-files-found: error
