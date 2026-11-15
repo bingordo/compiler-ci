@@ -1,0 +1,48 @@
+name: ASM1 postmerge main acceptance
+on:
+  push:
+    branches: [ci/asm-merge-gate]
+    paths: ['.github/workflows/asm-postmerge-main.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  x86-postmerge:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: abf84bfc96493aa88398f5519f236a818c9abbe2
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check exact main source SHA
+        run: test "$(git rev-parse HEAD)" = "abf84bfc96493aa88398f5519f236a818c9abbe2"
+      - name: Scope core workspace
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: asm1-postmerge-main
+      - name: Postmerge assembler and encoder acceptance
+        run: |
+          set -euo pipefail
+          python3 tools/regen_x86_att_forms.py --check
+          python3 -m unittest discover -s tools -p test_regen_x86_att_forms.py -v
+          cargo check -p compiler-backend-x86 --all-targets
+          cargo test -p compiler-backend-x86 --lib
+          for suite in att_asm att_module att_module_strings \
+            m4_global_data_only_native m4_global_definitions_native \
+            m4_global_pointer_relocations_native m4_global_external_native \
+            m4_global_branch_relax_native machine_text_v1; do
+            cargo test -p compiler-backend-x86 --test "$suite"
+          done
+          # Untouched main baseline warnings are separately tracked in #1590.
+          cargo clippy -p compiler-backend-x86 --lib --test att_asm --test att_module --test att_module_strings -- -D warnings -A unused_variables -A clippy::suspicious_assignment_formatting
+          echo 'ASM1_POSTMERGE_MAIN status=PASS' >> "$GITHUB_STEP_SUMMARY"
