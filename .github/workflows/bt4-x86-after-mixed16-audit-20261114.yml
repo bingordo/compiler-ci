@@ -1,0 +1,85 @@
+name: BT4 x86 old backend source inventory after additional TypeId migrations
+on:
+  push:
+    branches: [ci/bt4-x86-after-mixed16-audit-20261114]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  exact-source-legacy-x86-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: cf1e0c437a7dc3d2accb440b66f156916d1706cd
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Count exact current x86 pre-TypeId test and production callers
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = cf1e0c437a7dc3d2accb440b66f156916d1706cd
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,re
+          pin="cf1e0c437a7dc3d2accb440b66f156916d1706cd"
+          roots={
+              "x86_test":Path("crates/backend-x86/tests"),
+              "x86_source":Path("crates/backend-x86/src"),
+          }
+          checks={
+              "legacy_import":re.compile(r"^\s*use\s+compiler_backend::(?:Backend\b|\{[^}]*\bBackend\b)"),
+              "legacy_impl":re.compile(r"\bimpl\s+Backend\s+for\b"),
+              "legacy_selector":re.compile(r"\bmachine::select\s*\("),
+              "legacy_function_builder":re.compile(r"\bFunction\s*\{"),
+              "legacy_emit_call":re.compile(r"\.emit_(?:object|assembly)(?:_linked|_with_globals|_linked_with_globals|_linked_with_initializers|_linked_with_gp_varargs)?\s*\("),
+          }
+          entries=[]
+          for scope,root in roots.items():
+              for path in sorted(root.rglob("*.rs")):
+                  for lineno,line in enumerate(path.read_text().splitlines(),1):
+                      if line.lstrip().startswith("//"):
+                          continue
+                      for kind,regexp in checks.items():
+                          if regexp.search(line):
+                              entries.append({
+                                  "scope":scope,"kind":kind,"path":str(path),
+                                  "line":lineno,"text":line.strip()[:180],
+                              })
+          report={
+              "source_sha":pin,"checks":list(checks),
+              "counts":{scope:{kind:sum(
+                  e["scope"]==scope and e["kind"]==kind for e in entries)
+                  for kind in checks} for scope in roots},
+              "old_import_test_files":sorted(set(e["path"] for e in entries
+                  if e["scope"]=="x86_test" and e["kind"]=="legacy_import")),
+              "old_impl_source_lines":[e for e in entries
+                  if e["scope"]=="x86_source" and e["kind"]=="legacy_impl"],
+              "entries":entries,
+          }
+          retired=[
+              "m4_scalar_div_traps.rs",
+              "m4_i64_memory_call_native.rs",
+              "m4_global_pointer_relocations_native.rs",
+              "m4_relro_linkage_native.rs",
+              "mixed_sixteen_call_native.rs",
+              "module_signatures.rs",
+          ]
+          for name in retired:
+              f=Path("crates/backend-x86/tests")/name
+              old=checks["legacy_import"].search(f.read_text())
+              assert f.exists() and not old, (name,"still old Backend")
+              assert "NativeTypeIdBackend" in f.read_text(),name
+          Path("/tmp/bt4-x86-post-migration.json").write_text(
+              json.dumps(report,indent=2,sort_keys=True)+"\n")
+          print("BT4_X86_TEST_LEGACY_IMPORT_FILES",len(report["old_import_test_files"]))
+          print("BT4_X86_SOURCE_LEGACY_IMPLS",report["old_impl_source_lines"])
+          print("BT4_X86_EXACT_COUNTS",json.dumps(report["counts"],sort_keys=True))
+          print("BT4_X86_RETIRED_SIX_CHECKED",retired)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bt4-x86-old-backend-audit-after-four-typeid-migrations
+          path: /tmp/bt4-x86-post-migration.json
+          if-no-files-found: error
