@@ -1,0 +1,131 @@
+name: X7 S3.L L5c original Intel/XED GP-register CMP native validation
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/x86-s3l-l5c-register-cmp-20261115.yml'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  original-cmp-regreg-ssa-oracle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 48
+    env:
+      SOURCE_SHA: '12cf5b17741d511ac28bc4540752de9cd3ff062d'
+      PYTHONPATH: compiler/tools
+      X7_S3L_L4A_WORKLIST: /tmp/x7-l5c/source/original-source-xed-iforms.json
+      X7_S3L_L4A_SMT: /tmp/x7-l5c/smt/semantics-z3.json
+      X7_S3L_L4A_S2: /tmp/x7-l5c/s2/join-1.json
+      X7_S3L_L4A_OP_AST: /tmp/x7-l5c/smt/operations.json
+      X7_S3L_L4A_INTEL_DIR: /tmp/x7-l5c/intel
+    steps:
+      - name: Checkout exact compiler source without compiler Actions
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 12cf5b17741d511ac28bc4540752de9cd3ff062d
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Original S2 exact Intel source/XED unique form inventory
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s2-pinned-intel-xed-variant-join
+          run-id: 43635408689
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-l5c/s2
+      - name: Original source/XED memory family 200-form worklist
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3l-l3c-source-XED-gated-production-admission
+          run-id: 43728544711
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-l5c/source
+      - name: Independent Intel operation semantic AST and Z3 flags proofs
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3l-l2b-l3a-9-ops-generic-helper-smt-source-evidence
+          run-id: 43687620382
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-l5c/smt
+      - name: Fetch original pinned Intel CMP and TEST source XML
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          mkdir -p "$X7_S3L_L4A_INTEL_DIR" /tmp/x7-l5c/out
+          for name in CMP TEST; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 50 \
+              "https://raw.githubusercontent.com/intel/SDM/35eface1b7ee003a1cda95005ec5fd83de658a64/data/instruction/$name.xml" \
+              -o "$X7_S3L_L4A_INTEL_DIR/$name.xml"
+          done
+          test -s "$X7_S3L_L4A_S2"
+          test -s "$X7_S3L_L4A_SMT"
+      - name: Generate and verify eight source/XED/Z3 flag forms without manual opcode paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/x86_s3l_l4a_flags_recipe.py \
+            --worklist "$X7_S3L_L4A_WORKLIST" \
+            --generic-smt "$X7_S3L_L4A_SMT" \
+            --s2 "$X7_S3L_L4A_S2" \
+            --operation-ast "$X7_S3L_L4A_OP_AST" \
+            --intel-dir "$X7_S3L_L4A_INTEL_DIR" \
+            --report /tmp/x7-l5c/out/flags-recipes.json --check
+          python3 -m unittest -v \
+            test_x86_s3l_l4a_flags_recipe \
+            test_x86_s3l_l5b_regreg_source
+          python3 - <<'PY'
+          import json
+          r=json.load(open('/tmp/x7-l5c/out/flags-recipes.json'))
+          assert r['native_physical_recipe_count']==8
+          assert r['new_production_TypeId_admissions']==6
+          cmp=[row for row in r['native_physical_recipe_rows']
+               if row['iform']=='CMP_GPRv_GPRv_39']
+          assert len(cmp)==2 and {row['bits'] for row in cmp}=={32,64}
+          assert all(not row['c_defined_production'] for row in cmp)
+          print('X7_L5C_CMP_REGREG_PINNED',cmp)
+          PY
+      - name: Isolate offline native backend workspace
+        shell: bash
+        run: |
+          cd compiler
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          """)
+          PY
+      - name: Verify native source GP/GP CMP and older TEST with feature gating and fallbacks
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-native-form-validation x7-c-defined-64' \
+            --test x7_s3l_l5c_regcmp_typeid_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-native-form-validation x7-c-defined-64 x7-c-defined-bitwise' \
+            --test x7_s3l_l5b_regreg_typeid_native --offline
+          cargo test -p compiler-backend-x86 \
+            --test x7_s3l_l5c_regcmp_typeid_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 \
+            --no-default-features \
+            --test x7_s3l_l5c_regcmp_typeid_native --offline
+          cargo test -p compiler-backend-x86 \
+            --no-default-features \
+            --test x7_s3l_l5b_regreg_typeid_native --offline
+          cargo test -p compiler-backend-x86 \
+            --test x7_s3l_l4c_typeid_flags_native --offline
+          echo X7_L5C_TYPED_CMP_GAS_ELF_SIGNED_UNSIGNED_FALLBACK_PASS
+      - name: Archive original CMP source proof and TypeId candidate receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-s3l-l5c-original-Intel-XED-CMP-GP-native-validation
+          path: /tmp/x7-l5c/out/flags-recipes.json
+          if-no-files-found: ignore
