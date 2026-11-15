@@ -1,0 +1,134 @@
+name: Verify RV64 R1 TypeId CFG, PHI edges and QEMU loops
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-riscv-r1-cfg-qemu.yml']
+permissions:
+  contents: read
+jobs:
+  rv64-cfg:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ec2cb6abc5869a7a7ed49abe2cbc3a3bb29eb7da
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned source SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "ec2cb6abc5869a7a7ed49abe2cbc3a3bb29eb7da"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install RV64 GNU and QEMU reference tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y binutils-riscv64-linux-gnu qemu-user python3-yaml
+      - name: Isolate frontend-independent crates
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-riscv64"]
+          EOF
+          rm -f Cargo.lock
+      - name: Test CFG selection and checked UDB encoding
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-riscv64 --all-targets
+          cargo clippy -p compiler-backend-riscv64 --all-targets -- -D warnings
+          python3 tools/riscv_udb_rust_leaf_forms.py \
+            --catalog data/riscv_udb_r0_catalog.json \
+            --output crates/backend-riscv64/src/generated_encoding.rs --check
+      - name: Independently validate ELF machine bytes with GNU assembler
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for kind in branch same loop; do
+            cargo run -p compiler-backend-riscv64 --example rv64_leaf -- \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}.s" "$kind"
+            riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+              "/tmp/rv64_${kind}.s" -o "/tmp/rv64_${kind}_gas.o"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}_direct.bin"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}_gas.o" "/tmp/rv64_${kind}_gas.bin"
+            cmp "/tmp/rv64_${kind}_direct.bin" "/tmp/rv64_${kind}_gas.bin"
+            riscv64-linux-gnu-objdump -dr "/tmp/rv64_${kind}.o"
+          done
+      - name: Link and execute true/false, same-target and loop/backedge cases
+        run: |
+          set -euo pipefail
+          cat > /tmp/rv64_cfg_start.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            li a0, 7
+            li a1, 18
+            call rv64_branch_phi
+            li t0, 11
+            bne a0, t0, fail_1
+            li a0, 20
+            li a1, 6
+            call rv64_branch_phi
+            li t0, 26
+            bne a0, t0, fail_2
+            li a0, 7
+            li a1, 18
+            call rv64_same_target
+            li t0, -11
+            bne a0, t0, fail_3
+            li a0, 20
+            li a1, 6
+            call rv64_same_target
+            li t0, -14
+            bne a0, t0, fail_4
+            li a0, 5
+            li a1, 10
+            call rv64_loop_phi
+            li t0, 25
+            bne a0, t0, fail_5
+            li a0, 0
+            li a1, 10
+            call rv64_loop_phi
+            li t0, 10
+            bne a0, t0, fail_6
+            li a0, -3
+            li a1, 11
+            call rv64_loop_phi
+            li t0, 11
+            bne a0, t0, fail_7
+            li a0, 0
+            j exit
+          fail_1: li a0, 1
+            j exit
+          fail_2: li a0, 2
+            j exit
+          fail_3: li a0, 3
+            j exit
+          fail_4: li a0, 4
+            j exit
+          fail_5: li a0, 5
+            j exit
+          fail_6: li a0, 6
+            j exit
+          fail_7: li a0, 7
+          exit:
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+            /tmp/rv64_cfg_start.s -o /tmp/rv64_cfg_start.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax \
+            -e _start /tmp/rv64_cfg_start.o \
+            /tmp/rv64_branch.o /tmp/rv64_same.o /tmp/rv64_loop.o \
+            -o /tmp/rv64_cfg.elf
+          qemu-riscv64 /tmp/rv64_cfg.elf
+          echo "RV64 CFG QEMU: 7 control-flow/PHI cases passed"
