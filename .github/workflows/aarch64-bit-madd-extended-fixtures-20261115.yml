@@ -1,0 +1,50 @@
+name: AArch64 fixed TypeId bit MADD extended fixture validation
+on:
+  push:
+    branches: [verify/aarch64-bit-madd-extended-fixtures-20261115]
+    paths: ['.github/workflows/aarch64-bit-madd-extended-fixtures-20261115.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1da5bc1afbf57e4efd0d5a12085ece66ce9aacb6
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check exact pinned compiler source
+        run: test "$(git -C compiler rev-parse HEAD)" = "1da5bc1afbf57e4efd0d5a12085ece66ce9aacb6"
+      - name: Restrict workspace to native IR and AArch64 backend
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: aarch64-bit-madd-extended-fixed-typeid
+      - name: Install AArch64 GCC libc cross headers and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross binutils-aarch64-linux-gnu qemu-user
+      - name: Validate migrated machine selection and real C11 QEMU cross execution
+        working-directory: compiler
+        env:
+          COMPILER_REQUIRE_AARCH64_QEMU: "1"
+        run: |
+          cargo test -p compiler-backend-aarch64 --test bit_branch_native --test madd_msub_native --test extended_addsub_native -- --nocapture
+      - name: Verify adjacent native fixtures and strict tests Clippy
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend-aarch64 --test zero_branch_native --test logical_shifted_native
+          cargo test -p compiler-ir --test native_module_text_v3 --test native_fixture_text
+          cargo clippy -p compiler-backend-aarch64 --no-deps --test bit_branch_native --test madd_msub_native --test extended_addsub_native -- -D warnings
