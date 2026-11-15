@@ -1,0 +1,63 @@
+name: Review source-pinned x86 narrow shifts 689
+on:
+  push:
+    branches: [review/narrow-shift-689-b6ef500]
+    paths: ['.github/workflows/review-narrow-shifts-689.yml']
+  pull_request:
+    paths: ['.github/workflows/review-narrow-shifts-689.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout compiler-ci workflow
+        uses: actions/checkout@v4
+      - name: Checkout exact compiler review SHA
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b6ef5004d8171f6349055d7444744cd308bbc131
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source SHA
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "b6ef5004d8171f6349055d7444744cd308bbc131"
+          git show -s --format='%H %s' HEAD
+      - name: Use standalone compiler core workspace on runner
+        working-directory: compiler
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          """)
+          PY
+      - name: Cache Rust compiler core outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: review-narrow-shifts-689
+      - name: Run exhaustive signed and unsigned i8/i16 shift C11 reference via GAS and ELF
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --test review_narrow_shift_oracle -- --nocapture
+      - name: Preserve existing native/shared narrow ALU and cast oracles
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --test x7_shared_narrow_alu_casts -- --nocapture
+      - name: Run core independent generic integer semantics
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --lib native_int_semantics -- --nocapture
+          cargo test -p compiler-ir --test typed_integer_v2 -- --nocapture
+      - name: Compile x86 and AArch64 library tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 -p compiler-backend-aarch64 --lib --no-run
+      - name: Strict affected core Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-backend -p compiler-backend-x86 --lib -- -D warnings
