@@ -1,0 +1,52 @@
+name: AArch64 local and mixed address fixed TypeId v3 migration
+on:
+  push:
+    branches: [verify/aarch64-local-mixed-typeid-v3-20261115]
+    paths: ['.github/workflows/aarch64-local-mixed-typeid-v3-20261115.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: efad275eaf369b01dd745e78549a80b8f6d9072b
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "efad275eaf369b01dd745e78549a80b8f6d9072b"
+      - name: Isolate native workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: aarch64-local-mixed-fixed-typeid
+      - name: Export canonical original TypeId SSA modules
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend-aarch64 --test local_address_folding export_original_native_v3_for_migration -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test mixed_address_modes export_original_native_v3_for_migration -- --nocapture
+      - name: Install AArch64 cross compiler and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross binutils-aarch64-linux-gnu qemu-user
+      - name: Original AArch64 machine ABI and real C11 execution oracles
+        working-directory: compiler
+        env:
+          COMPILER_REQUIRE_AARCH64_QEMU: "1"
+        run: |
+          cargo test -p compiler-backend-aarch64 --test local_address_folding --test mixed_address_modes -- --nocapture
+      - name: Strict scoped Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-aarch64 --no-deps --test local_address_folding --test mixed_address_modes -- -D warnings
