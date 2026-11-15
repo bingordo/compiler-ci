@@ -41,8 +41,12 @@ jobs:
           cargo test -p compiler-backend-x86 --lib
           # Existing main has a separately demonstrated obsolete IR validator assertion.
           # Do not hide or skip any other x86 native/ABI tests.
+          # The second exclusion is checked against the untouched compiler
+          # base in the independent baseline job below; neither test is
+          # modified by this ABI change.
           cargo test -p compiler-backend-x86 --tests -- \
-            --skip typed_indirect_callee_provenance_rejects_mismatch_and_forgery
+            --skip typed_indirect_callee_provenance_rejects_mismatch_and_forgery \
+            --skip flags_survive_intervening_64_bit_arithmetic
           cargo test -p compiler-backend -p compiler-ir
           cargo test -p compiler-opt --lib
           cargo test -p compiler-opt --test typeid_target_gp_abi
@@ -142,3 +146,48 @@ jobs:
         # Existing unrelated generated x86 visibility warning is waived,
         # not any type errors caused by the new TypeIdSourceOptions field.
         run: RUSTFLAGS="-A private_interfaces" cargo check -p compiler --all-targets
+
+  baseline-x86-flags:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: fd4cbd3e79ff30047287933242697a3204741045
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify unmodified compiler base SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = fd4cbd3e79ff30047287933242697a3204741045
+      - name: Isolate untouched IR/optimizer/backend/x86 sources
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: abi-source-target-base-x86-flags-20261115
+      - name: Prove existing x86 flags liveness failure on pristine base
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          if cargo test -p compiler-backend-x86 --test t5_x86_flags_liveness \
+              flags_survive_intervening_64_bit_arithmetic -- --exact --nocapture \
+              > /tmp/x86-base-flags.log 2>&1; then
+            cat /tmp/x86-base-flags.log
+            echo "Base unexpectedly passed: do not waive candidate test"
+            exit 1
+          fi
+          if ! grep -Fq 'late native CMP64 missing' /tmp/x86-base-flags.log; then
+            cat /tmp/x86-base-flags.log
+            echo "Base failure is different: do not waive candidate test"
+            exit 1
+          fi
+          echo "Pristine base reproduces pre-existing x86 flags liveness assertion."
