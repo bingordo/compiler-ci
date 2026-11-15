@@ -1,0 +1,58 @@
+name: TypeId exact wide scalar local forwarding
+on:
+  push:
+    branches: [verify/typeid-wide-local-forward-20261115]
+    paths: ['.github/workflows/typeid-wide-local-forward-20261115.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  wide-local:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ae97fcc2a68be3945694b374fe824f795c3c6a15
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned source and public dependencies
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "ae97fcc2a68be3945694b374fe824f795c3c6a15"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - name: Focus native compiler/optimizer workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/driver"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-wide-local-forward
+      - name: Exact wide planner and optimizer unit/integration tests
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt wide_tests -- --nocapture
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test typed_local_memory
+          cargo clippy -p compiler-opt --lib -- -D warnings
+      - name: Source LTO executable ABI and runtime benchmark
+        working-directory: compiler
+        run: |
+          cargo test -p compiler --test lto_generated_abi_memory
+          cargo test -p compiler --test lto_generated_multitu
+          cargo build -p compiler --bin compiler
+          python3 tools/lto-runtime-bench.py --compiler ./target/debug/compiler --rounds 3 --iterations 350000 --json wide-forward-results.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: typeid-wide-forward-results
+          path: compiler/wide-forward-results.json
+          if-no-files-found: ignore
