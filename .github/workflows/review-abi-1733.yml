@@ -1,0 +1,59 @@
+name: Source-pinned review ABI 1733
+
+on:
+  push:
+    branches: [review/abi-1733-1bbcd79]
+    paths:
+      - '.github/workflows/review-abi-1733.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout compiler-ci workflow source
+        uses: actions/checkout@v4
+      - name: Checkout exact compiler review commit using read-only CI key
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1bbcd7933e7742491a753470a60501189a1d92be
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert source provenance
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "1bbcd7933e7742491a753470a60501189a1d92be"
+          git show -s --format='%H %s' HEAD
+      - name: Use standalone core workspace on runner only
+        working-directory: compiler
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          """)
+          PY
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: review-abi-1733
+      - name: Focused unused-external ABI positive and negative cases
+        working-directory: compiler
+        run: cargo test -p compiler-backend unused_external_abi_tests -- --nocapture
+      - name: Existing source-owned IR ABI fixtures
+        working-directory: compiler
+        run: cargo test -p compiler-ir --test typed_module_abi -- --nocapture
+      - name: Compile x86 and AArch64 scalar backend clients
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 -p compiler-backend-aarch64 --lib --no-run
+      - name: Strict core library Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend -p compiler-ir --lib -- -D warnings
