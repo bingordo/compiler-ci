@@ -82,9 +82,49 @@ jobs:
           cargo test --offline -p compiler-backend-x86 --lib
           cargo test --offline -p compiler-backend-x86 --lib --no-default-features
           cargo test --offline -p compiler-backend-x86 --tests --no-run
-          # The one known *pre-BT4* physical-v1 reverse-CMP byte-parity test
-          # fails even at original main SHA 630e81d0 (independently verified).
-          # Preserve the original test unchanged and track repair in compiler#1800;
-          # run every other original integration test without a hidden waiver.
-          cargo test --offline -p compiler-backend-x86 --tests -- --skip production_typeid_machine_stream_replays_when_supported
-          echo BT4_X86_ALL_OTHER_ORIGINAL_TESTS_GREEN_ONE_VERIFIED_BASELINE_FAILURE
+          # Compare the *complete* original x86 integration failure inventory
+          # before and after this feature-gate-only change. Never edit the test
+          # source or silently accept a new failing test.
+          set +e
+          cargo test --offline --no-fail-fast -p compiler-backend-x86 --tests > /tmp/bt4-candidate-full.log 2>&1
+          candidate_status=$?
+          set -e
+          echo "BT4_CANDIDATE_FULL_STATUS=$candidate_status"
+          git checkout -f --detach 630e81d0a6a1e3a153c67e400a67d9116e18733f
+          test "$(git rev-parse HEAD)" = 630e81d0a6a1e3a153c67e400a67d9116e18733f
+          printf '[workspace]\\nresolver="2"\\nmembers=["crates/ir","crates/opt","crates/backend","crates/backend-x86"]\\n' > Cargo.toml
+          set +e
+          cargo test --offline --no-fail-fast -p compiler-backend-x86 --tests > /tmp/bt4-baseline-full.log 2>&1
+          baseline_status=$?
+          set -e
+          echo "BT4_PRECHANGE_FULL_STATUS=$baseline_status"
+          CANDIDATE_STATUS="$candidate_status" BASELINE_STATUS="$baseline_status" python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          candidate=Path('/tmp/bt4-candidate-full.log').read_text()
+          baseline=Path('/tmp/bt4-baseline-full.log').read_text()
+          def failed(text):
+              names=set(re.findall(r'(?m)^test (.+?) \\.\\.\\. FAILED\\s*$',text))
+              binaries=set(re.findall(r'(?m)^error: test failed, to rerun pass \\x60([^\\x60]+)\\x60',text))
+              return names,binaries
+          a,b=failed(candidate),failed(baseline)
+          print('BT4 original baseline failures:',sorted(b[0]))
+          print('BT4 candidate failures:',sorted(a[0]))
+          print('BT4 baseline failing binaries:',sorted(b[1]))
+          print('BT4 candidate failing binaries:',sorted(a[1]))
+          print('BT4 baseline result counts:',re.findall(r'test result: (?:ok|FAILED)\\. [^\\n]+',baseline)[-8:])
+          print('BT4 candidate result counts:',re.findall(r'test result: (?:ok|FAILED)\\. [^\\n]+',candidate)[-8:])
+          if a!=b:
+              print('REGRESSION: failure inventories differ!')
+              raise SystemExit(1)
+          if not b[0]:
+              print('Baseline test failures unexpectedly empty; manual review required')
+              raise SystemExit(1)
+          if os.environ['CANDIDATE_STATUS'] != os.environ['BASELINE_STATUS']:
+              print('REGRESSION: exit status differs')
+              raise SystemExit(1)
+          if 'production_typeid_machine_stream_replays_when_supported' not in b[0]:
+              raise SystemExit('Known source-frozen v1 physical replay baseline failed to reproduce')
+          print('BT4_EXACT_SOURCE_BEFORE_AFTER_FAILURE_SET_IDENTICAL')
+          PY
+          echo BT4_X86_NO_NEW_FAILING_INTEGRATION_TESTS_GREEN
