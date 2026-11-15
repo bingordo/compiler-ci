@@ -1,0 +1,100 @@
+name: X7 S3.C pinned logical ALU semantics and native differential
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/x86-s3c-logic-source-native-validation.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+
+jobs:
+  x86-s3c-logic-source-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      COMPILER_SHA: 'f649018d1fa179d8820c51c8dd6c323ce28e3c8e'
+      INTEL_REV: '35eface1b7ee003a1cda95005ec5fd83de658a64'
+    steps:
+      - name: Checkout only exact compiler candidate (never run compiler Actions)
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f649018d1fa179d8820c51c8dd6c323ce28e3c8e
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+
+      - name: Confirm immutable source and retrieve pinned real Intel XML
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          mkdir -p /tmp/s3c-intel /tmp/s3c-native
+          for op in MOV ADD SUB AND OR XOR; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 45 \
+              "https://raw.githubusercontent.com/intel/SDM/${INTEL_REV}/data/instruction/${op}.xml" \
+              -o "/tmp/s3c-intel/${op}.xml"
+          done
+          python3 -m venv /tmp/x86-s3c-venv
+          /tmp/x86-s3c-venv/bin/python -m pip install 'z3-solver==4.13.4.0'
+
+      - name: Prove real Intel AND/OR/XOR source models, flags, mutations, determinism
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          export PYTHONPATH=tools
+          export X7_S3C_PINNED_LOGIC_XML_DIR=/tmp/s3c-intel
+          /tmp/x86-s3c-venv/bin/python -m compileall -q \
+            tools/x86_s3_logic_source_proof.py tools/test_x86_s3_logic_source_proof.py
+          /tmp/x86-s3c-venv/bin/python -m unittest -v test_x86_s3_logic_source_proof
+          /tmp/x86-s3c-venv/bin/python tools/x86_s3_logic_source_proof.py \
+            --xml-dir /tmp/s3c-intel --out /tmp/s3c-native/logic-source-smt.json
+          /tmp/x86-s3c-venv/bin/python tools/x86_s3_logic_source_proof.py \
+            --xml-dir /tmp/s3c-intel --out /tmp/s3c-native/logic-source-smt.json --check
+          /tmp/x86-s3c-venv/bin/python - <<'PY'
+          import json
+          p = json.load(open('/tmp/s3c-native/logic-source-smt.json'))
+          assert p['smt_unsat_total'] == 36
+          assert p['conditional_width_models'] == 6
+          assert p['undefined_flags_not_proved'] == ['AF']
+          assert p['newly_bulk_source_admitted_forms'] == 0
+          assert p['production_selection_eligible'] is False
+          print("X7_S3C_EXACT_PINNED_SOURCE_SMT_PASS checks=36 admitted=0")
+          PY
+
+      - name: Reverify independent 64-bit x86 REX.W physical byte and C11 oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          python3 tools/x86_g10_regen_physical_forms.py \
+            --xml-dir /tmp/s3c-intel --check
+          python3 tools/x86_g10_n20_rexw_native.py \
+            --xml-dir /tmp/s3c-intel --out-dir /tmp/s3c-native
+          cc -O2 -std=c11 -Wall -Wextra -Werror -fno-strict-aliasing \
+            tools/tests/x86_g10_n20_rexw_native.c \
+            /tmp/s3c-native/n20_rexw_forms.S -o /tmp/s3c-native/oracle
+          /tmp/s3c-native/oracle
+          python3 tools/x86_g10_n20_validate_bytes.py \
+            --binary /tmp/s3c-native/oracle \
+            --evidence /tmp/s3c-native/n20_rexw_evidence.json
+          echo X7_S3C_NATIVE_REXW_C11_PASS
+
+      - name: Verify real TypeId 64-bit post-RA GAS and ELF differential
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          """)
+          PY
+          cargo test -p compiler-backend-x86 --features x7-c-defined-64 \
+            --test x7_g10_n19_64_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --test x7_g10_n15_no_default_fallback --offline
+          echo X7_S3C_TYPEID_64_GAS_ELF_PASS
