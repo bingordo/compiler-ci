@@ -1,0 +1,56 @@
+# Ephemeral, immutable-source BT4 direct CMP/Jcc parity. Close PR unmerged.
+name: BT4 native direct compare branch and RFLAGS parity
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ir-bt4-direct-cmp-jcc-pr1676.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-direct-cmp:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_INCREMENTAL: '0'
+      SOURCE_SHA: 8a0819076f35c3dace3cd087231202cc99b750d9
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 8a0819076f35c3dace3cd087231202cc99b750d9
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and isolate core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-bt4-direct-cmp
+      - name: Original i32/i64 Jcc and two-RFLAGS-clobber shape/C oracles
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test typed_i32_compare_branch_native --test typed_i64_compare_branch_native --test t5_x86_flags_liveness -- --nocapture
+      - name: Nearby native CFG Bool select and branch regressions
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test native_typeid_direct --test typed_generated_cfg_native --test native_typeid_select_cmov --test native_typeid_fused_cmp_select --test typed_alias_calls_native --test x4_cfg_pressure_native --test native_typeid_call_liveness --test rbp_alloc_native
+      - name: Native x86/backend/IR all-target checks
+        working-directory: compiler
+        run: cargo check -p compiler-ir -p compiler-backend -p compiler-backend-x86 --all-targets
+      - name: Strict affected production and old-oracle lint
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-x86 --lib --test typed_i32_compare_branch_native --test typed_i64_compare_branch_native --test t5_x86_flags_liveness -- -D warnings
