@@ -1,0 +1,154 @@
+name: X7 S3.E pinned XED decoded GAS/literal byte evidence
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/x86-s3e-pinned-xed-native-decode.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  s3e-xed-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 33
+    env:
+      COMPILER_SHA: 'af32496054e09815c35ed4272577efed2c8a4eec'
+      INTEL_REV: 35eface1b7ee003a1cda95005ec5fd83de658a64
+      XED_REV: 0bcb6237345c5066726dcc08b3d87928df3b5b26
+      MBUILD_REV: 1b437e409221a2b5703b4d8896baa20d43e4ba1a
+    steps:
+      - name: Checkout exact compiler candidate (compiler Actions never run)
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: af32496054e09815c35ed4272577efed2c8a4eec
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+
+      - name: Download immutable successful S3.D Intel/XED source width artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3d-logic-xed-candidate-evidence
+          run-id: 43662715536
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3e-s3d
+
+      - name: Source pins, pinned Intel XML, build pinned XED decoder
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          test -s /tmp/x7-s3e-s3d/logic-xed-width-join.json
+          mkdir -p /tmp/x7-s3e-intel /tmp/x7-s3e-native32 /tmp/x7-s3e-native64 /tmp/x7-s3e-proof
+          for op in MOV ADD SUB AND OR XOR; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 45 \
+              "https://raw.githubusercontent.com/intel/SDM/${INTEL_REV}/data/instruction/${op}.xml" \
+              -o "/tmp/x7-s3e-intel/${op}.xml"
+          done
+          git clone --quiet --filter=blob:none https://github.com/intelxed/xed.git /tmp/xed
+          git -C /tmp/xed checkout --quiet "$XED_REV"
+          git clone --quiet --filter=blob:none https://github.com/intelxed/mbuild.git /tmp/mbuild
+          git -C /tmp/mbuild checkout --quiet "$MBUILD_REV"
+          test "$(git -C /tmp/xed rev-parse HEAD)" = "$XED_REV"
+          test "$(git -C /tmp/mbuild rev-parse HEAD)" = "$MBUILD_REV"
+          (cd /tmp/xed && ./mfile.py --no-encoder > /tmp/x7-s3e-proof/xed-build.log 2>&1)
+          test -s /tmp/xed/obj/libxed.a
+          cc -O2 -std=c11 -Wall -Wextra -Werror \
+            -I/tmp/xed/include/public/xed -I/tmp/xed/obj \
+            compiler/tools/tests/x86_s3e_xed_decode.c /tmp/xed/obj/libxed.a \
+            -o /tmp/x7-s3e-proof/xed-decode
+          /tmp/x7-s3e-proof/xed-decode AND_GPRv_MEMv 32 2344b708
+          /tmp/x7-s3e-proof/xed-decode AND_GPRv_MEMv 64 482344f708
+          echo X7_S3E_PINNED_LIBXED_BUILT
+
+      - name: Run exact Intel N1+N20 fixture generators and real C11/byte oracles
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          python3 tools/x86_g10_regen_physical_forms.py --xml-dir /tmp/x7-s3e-intel --check
+          python3 tools/x86_g10_native_iforms.py \
+            --xml-dir /tmp/x7-s3e-intel --out-dir /tmp/x7-s3e-native32
+          cc -O2 -std=c11 -Wall -Wextra -Werror -fno-strict-aliasing \
+            tools/tests/x86_g10_native_iforms.c /tmp/x7-s3e-native32/native_forms.S \
+            -o /tmp/x7-s3e-native32/oracle
+          /tmp/x7-s3e-native32/oracle
+          python3 tools/x86_g10_validate_native_bytes.py \
+            --binary /tmp/x7-s3e-native32/oracle \
+            --evidence /tmp/x7-s3e-native32/source_form_evidence.json
+          python3 tools/x86_g10_n20_rexw_native.py \
+            --xml-dir /tmp/x7-s3e-intel --out-dir /tmp/x7-s3e-native64
+          cc -O2 -std=c11 -Wall -Wextra -Werror -fno-strict-aliasing \
+            tools/tests/x86_g10_n20_rexw_native.c \
+            /tmp/x7-s3e-native64/n20_rexw_forms.S \
+            -o /tmp/x7-s3e-native64/oracle
+          /tmp/x7-s3e-native64/oracle
+          python3 tools/x86_g10_n20_validate_bytes.py \
+            --binary /tmp/x7-s3e-native64/oracle \
+            --evidence /tmp/x7-s3e-native64/n20_rexw_evidence.json
+          echo X7_S3E_NATIVE_GAS_BYTE_C11_PASS
+
+      - name: Decode 18 real ELF paths against canonical XED source candidates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          export PYTHONPATH=tools
+          python3 -m unittest -v \
+            test_x86_s3_logic_xed_width_join \
+            test_x86_s3e_logic_native_xed_evidence
+          python3 tools/x86_s3e_logic_native_xed_evidence.py \
+            --s3d /tmp/x7-s3e-s3d/logic-xed-width-join.json \
+            --native32 /tmp/x7-s3e-native32/source_form_evidence.json \
+            --native64 /tmp/x7-s3e-native64/n20_rexw_evidence.json \
+            --binary32 /tmp/x7-s3e-native32/oracle \
+            --binary64 /tmp/x7-s3e-native64/oracle \
+            --xed-decoder /tmp/x7-s3e-proof/xed-decode \
+            --out /tmp/x7-s3e-proof/exact-xed-native-encoding.json
+          python3 tools/x86_s3e_logic_native_xed_evidence.py \
+            --s3d /tmp/x7-s3e-s3d/logic-xed-width-join.json \
+            --native32 /tmp/x7-s3e-native32/source_form_evidence.json \
+            --native64 /tmp/x7-s3e-native64/n20_rexw_evidence.json \
+            --binary32 /tmp/x7-s3e-native32/oracle \
+            --binary64 /tmp/x7-s3e-native64/oracle \
+            --xed-decoder /tmp/x7-s3e-proof/xed-decode \
+            --out /tmp/x7-s3e-proof/exact-xed-native-encoding.json --check
+          python3 - <<'PY'
+          import json
+          r = json.load(open("/tmp/x7-s3e-proof/exact-xed-native-encoding.json"))
+          assert r["distinct_canonical_xed_source_candidates"] == 3
+          assert r["covered_op_width_pairs"] == 6
+          assert r["actual_gas_and_literal_elf_xed_decode_paths"] == 18
+          assert r["production_selection_eligible"] is False
+          assert r["newly_bulk_source_admitted_forms"] == 0
+          print("X7_S3E_NATIVE_XED_EVIDENCE_PASS decoded=18 admitted=0")
+          PY
+
+      - name: Independently rerun real 32/64-bit TypeId native GAS/direct ELF and opt-out
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          """)
+          PY
+          cargo test -p compiler-backend-x86 --features x7-c-defined-bitwise \
+            --test x7_g10_n16_bitwise_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-c-defined-64 \
+            --test x7_g10_n19_64_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --test x7_g10_n15_no_default_fallback --offline
+          echo X7_S3E_TYPEID_GAS_ELF_AND_FALLBACK_PASS
+
+      - name: Upload source/XED/actual ELF byte evidence; never an ISA-admission artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-s3e-pinned-xed-native-encoding-evidence
+          path: /tmp/x7-s3e-proof/exact-xed-native-encoding.json
+          if-no-files-found: error
