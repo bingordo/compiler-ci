@@ -1,0 +1,57 @@
+name: LTO target and symbol admission audit
+on:
+  push:
+    branches: [ci/lto-target-symbol-audit-20261115]
+    paths: [.github/workflows/lto-target-symbol-audit-20261115.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      SOURCE_SHA: c4c4560a0d2cb2ecff0c1625dea9fbe97098d49f
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c4c4560a0d2cb2ecff0c1625dea9fbe97098d49f
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source pin and isolate workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-lto-target-symbol
+      - name: LTO target, merger and symbol resolution focus
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for test in lto_target_symbol_admission lto_target_envelope lto_envelope_merge lto_function_resolution lto_global_resolution lto_merge lto_private_symbols lto_type_remap lto_apply_type_map; do
+            cargo test -p compiler-ir --test "$test"
+          done
+      - name: Complete IR regressions
+        working-directory: compiler
+        run: cargo test -p compiler-ir
+      - name: Optimizer and four target compilation
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --lib
+          cargo check -p compiler-backend-x86 -p compiler-backend-aarch64 -p compiler-backend-riscv64 -p compiler-backend-wasm --all-targets
+      - name: Strict IR lint
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir --all-targets -- -D warnings
