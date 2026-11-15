@@ -43,13 +43,13 @@ class GeneratedCDialectInventoryTests(unittest.TestCase):
             self.assertIn(
                 "C_SAMPLE_ATOMIC_HINT name=libcompiler_ir-0_1_0.rlib.c "
                 "atomic_qualifier=1 atomic_api=1 gnu_builtin=1 "
-                "gcc_required_for_native_build=yes",
+                "native_oracle=gcc",
                 proc.stdout,
             )
             self.assertIn(
                 "C_SAMPLE_ATOMIC_HINT name=libcompiler_backend_x86-0_1_0.rlib.c "
                 "atomic_qualifier=0 atomic_api=0 gnu_builtin=0 "
-                "gcc_required_for_native_build=yes",
+                "native_oracle=gcc",
                 proc.stdout,
             )
             selected = selection.read_text().splitlines()
