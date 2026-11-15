@@ -1,0 +1,60 @@
+name: AArch64 legacy PIC Backend deletion gate
+on:
+  push:
+    branches: [ci/aarch64-delete-legacy-pic-20261114]
+    paths: ['.github/workflows/aarch64-delete-legacy-pic.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 407dfe8e0278d4e8abc92ae8546332aad3c8a6f1
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source and isolate compiler core workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "407dfe8e0278d4e8abc92ae8546332aad3c8a6f1"
+          echo "Compiler source: 407dfe8e0278d4e8abc92ae8546332aad3c8a6f1" >> "$GITHUB_STEP_SUMMARY"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: aarch64-bt4-legacy-pic-delete
+      - name: All-target IR/backend/x86/AArch64 compile
+        working-directory: compiler
+        run: cargo check -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --all-targets
+      - name: AArch64 full existing unit and integration tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend-aarch64 -- --nocapture
+      - name: x86 existing backend and shared backend tests
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend -- --nocapture
+          cargo test -p compiler-backend-x86 -- --nocapture
+      - name: Strict production IR/opt/shared/AArch64 Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-aarch64 --lib -- -D warnings
+      - name: Actual AArch64 QEMU cross GCC tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user
+      - name: Source-owned AArch64 data/PIC/CFI executable oracles under QEMU
+        working-directory: compiler
+        env:
+          COMPILER_REQUIRE_AARCH64_QEMU: "1"
+        run: cargo test -p compiler-backend-aarch64 --test module_gas --test module_globals --test unwind_cfi -- --nocapture
+      - name: Record completed deletion gate
+        run: echo 'AArch64 legacy PIC deletion: core all-target, full backend regressions, strict production Clippy, and real AArch64 QEMU C11 PIC/CFI oracle PASS' >> "$GITHUB_STEP_SUMMARY"
