@@ -1,0 +1,58 @@
+name: AArch64 A3.6 pinned inherited source condition probe
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/aarch64-a36-condition-shape-probe.yml'
+permissions:
+  contents: read
+jobs:
+  inspect-aarchmrs-conditions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Inspect pinned Arm 2026-09 source condition ASTs
+        run: |
+          set -euo pipefail
+          curl -fLsS --retry 3 --connect-timeout 20 --max-time 240 \
+            'https://kernel.googlesource.com/pub/scm/linux/kernel/git/maz/AARCHMRS/+/1346b16d47619400448f3cb6d4f22d62d3b76848/Instructions.json?format=TEXT' \
+            -o /tmp/aarchmrs-instructions.b64
+          base64 -d /tmp/aarchmrs-instructions.b64 > /tmp/instructions.json
+          echo 'ef75f3ec02df1b9b9c0612f4ea259d6710ac3de686b097d8f9c83d1d97aa800a  /tmp/instructions.json' | sha256sum -c -
+          python3 - <<'PY'
+          import json,hashlib,collections
+          root=json.load(open('/tmp/instructions.json'))
+          want={'ADD_32_addsub_shift','ADD_64_addsub_shift',
+                'MADD_32A_dp_3src','AND_32_log_shift',
+                'SUB_64_addsub_shift','EOR_64_log_shift'}
+          types=collections.Counter()
+          found={}
+          seen=0
+          def visit(node,anc,level=0):
+              global seen
+              if not isinstance(node,dict): return
+              if level>15: raise RuntimeError('source AST unexpectedly deep')
+              condition=node.get('condition')
+              current=anc+([(node.get('name','?'),condition)] if condition is not None else [])
+              if node.get('_type')=='Instruction.Instruction':
+                  seen+=1
+                  for name,expr in current:
+                      typ=expr.get('_type','unknown') if isinstance(expr,dict) else type(expr).__name__
+                      types[typ]+=1
+                  if node.get('name') in want:
+                      found[node['name']]=current
+              for child in node.get('children',[]):
+                  visit(child,current,level+1)
+          for root_node in root['instructions']:
+              if root_node.get('name')=='A64': visit(root_node,[])
+          print('A36_A64_LEAF_COUNT',seen)
+          print('A36_CONDITION_TYPES',types.most_common(20))
+          print('A36_REVIEWED_CONDITION_COUNT',len(found))
+          for name,anc in sorted(found.items()):
+              print('A36_CONDITION_ENTRY',name,'ancestors',len(anc))
+              for owner,expr in anc:
+                  raw=json.dumps(expr,sort_keys=True,separators=(',',':'))
+                  print('A36_CONDITION_SHAPE',name,owner,
+                        'sha',hashlib.sha256(raw.encode()).hexdigest(),
+                        'size',len(raw),'expression',raw[:2400])
+          assert len(found)==len(want)
+          PY
