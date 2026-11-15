@@ -54,6 +54,13 @@ jobs:
           ref: 66a8d2420ffbd3838b6bca2c4954d1d28e6b88e8
           path: mini-c
           persist-credentials: false
+      - name: Checkout current Mini-C for generated-C compatibility audit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: 82ee7059c641beebf8d6b85aa6c9485ba7bbb31a
+          path: mini-c-compat
+          persist-credentials: false
       - name: Checkout pinned mrustc
         uses: actions/checkout@v4
         with:
@@ -691,6 +698,51 @@ jobs:
           gcc -no-pie "$out/harness.c" "$out/bootstrap_answer.o" -o "$out/harness"
           timeout 30s "$out/harness"
           echo "GCC-built compiler successfully compiled real Oberon and Mini-C source into ELF64; GCC-linked Mini-C program returned 42." >> "$GITHUB_STEP_SUMMARY"
+      - name: Inventory mrustc C dialect and probe Mini-C checker
+        if: always() && steps.driver-bootstrap.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Mini-C compatibility source: $(git -C mini-c-compat rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          selection="$RUNNER_TEMP/mrustc-c-selections.txt"
+          python3 bootstrap/probe-mrustc-c-dialect.py \
+            "$PWD/mrustc/output-compiler-bootstrap" "$selection" \
+            | tee "$RUNNER_TEMP/mrustc-c-features.log"
+          {
+            echo '### Actual mrustc-generated C feature inventory'
+            echo '```text'
+            cat "$RUNNER_TEMP/mrustc-c-features.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          timeout --signal=TERM --kill-after=10s 12m cargo build -q \
+            --manifest-path mini-c-compat/Cargo.toml -p mini-c \
+            --target-dir "$RUNNER_TEMP/mrustc-minic-target"
+          checker="$RUNNER_TEMP/mrustc-minic-target/debug/mini-c"
+          test -x "$checker"
+          checked=0
+          passed=0
+          while IFS= read -r file; do
+            ((checked+=1))
+            echo "Probing Mini-C check --cpp=cc on $file"
+            set +e
+            timeout --signal=TERM --kill-after=10s 90s "$checker" \
+              check --cpp=cc --max-errors=4 "$file" \
+              > "$RUNNER_TEMP/mrustc-minic-$checked.log" 2>&1
+            rc=$?
+            set -e
+            if (( rc == 0 )); then
+              ((passed+=1))
+              echo "Mini-C: $file PASSED syntax/semantics (no backend yet)"
+            else
+              echo "Mini-C: $file rejected (exit $rc); initial diagnostics:"
+              sed -n '1,8p' "$RUNNER_TEMP/mrustc-minic-$checked.log"
+            fi
+            echo "Mini-C checker: $file exit=$rc" >> "$GITHUB_STEP_SUMMARY"
+            sed -n '1,4p' "$RUNNER_TEMP/mrustc-minic-$checked.log" >> "$GITHUB_STEP_SUMMARY"
+          done < "$selection"
+          echo "Mini-C generated-C checks: $passed/$checked pass (diagnostic, non-gating; not native code generation)" >> "$GITHUB_STEP_SUMMARY"
+          test "$checked" -gt 0
       - name: Mark experiment outcome
         if: always()
         shell: bash
@@ -702,4 +754,4 @@ jobs:
           echo "Compiler crate outputs share a single per-run minicargo directory; no private compiler objects are uploaded to the public cache." >> "$GITHUB_STEP_SUMMARY"
           echo "mrustc build: $TOOLCHAIN_OUTCOME" >> "$GITHUB_STEP_SUMMARY"
           echo "Translation step: $TRANSLATE_OUTCOME; minicargo exit: ${PROBE_EXIT:-not reached}" >> "$GITHUB_STEP_SUMMARY"
-          echo "No Mini-C compilation or full bootstrap is claimed by this prototype." >> "$GITHUB_STEP_SUMMARY"
+          echo "Full driver GCC bootstrap and source-level checks are covered above; alternate C-compiler gap analysis is diagnostic-only." >> "$GITHUB_STEP_SUMMARY"
