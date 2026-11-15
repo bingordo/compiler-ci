@@ -61,10 +61,23 @@ jobs:
             mrustc/output-1.90.0
           key: mrustc-bootstrap-v1-${{ runner.os }}-ubuntu2404-rust190-${{ steps.mrustc-revision.outputs.sha }}
 
-      - name: Install mrustc build dependencies
+      - name: Install mrustc build dependencies when the toolchain needs building
+        shell: bash
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends build-essential zlib1g-dev pkg-config cmake curl python3 libssl-dev
+          set -euo pipefail
+          if [[ "${{ steps.mrustc-cache.outputs.cache-hit }}" == "true" ]] &&
+             [[ -x mrustc/bin/mrustc ]] &&
+             [[ -x mrustc/bin/minicargo ]] &&
+             [[ -f mrustc/output-1.90.0/libcore.rlib ]]; then
+            echo "Cached mrustc is complete; skipping apt install." >> "$GITHUB_STEP_SUMMARY"
+          else
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends build-essential zlib1g-dev pkg-config cmake curl python3 libssl-dev
+          fi
+          # GCC and Cargo are required even when mrustc itself came from cache.
+          command -v gcc
+          command -v cargo
+          command -v python3
 
       - name: Record reproducibility inputs and target crates
         shell: bash
@@ -132,9 +145,11 @@ jobs:
           # an assertion that the full Cargo workspace is supported.
           set +e
           # minicargo's positional argument is the crate DIRECTORY, not Cargo.toml.
-          # Keep probe output separate from the cached Rust standard-library tree.
+          # Share one fresh per-run directory across all compiler crate probes.
+          # minicargo can now reuse compiler-ir and other completed dependencies.
+          # Do not persist private generated C/rlibs in public Actions caches.
           timeout --signal=TERM --kill-after=10s 20m bin/minicargo \
-            -L output-1.90.0 -o output-compiler-ir \
+            -L output-1.90.0 -o output-compiler-bootstrap \
             ../compiler/crates/ir > "$RUNNER_TEMP/mrustc-probe.log" 2>&1
           rc=$?
           set -e
@@ -213,10 +228,11 @@ jobs:
           set -euo pipefail
           # compiler-opt depends on compiler-ir. minicargo must resolve and
           # compile the real local path dependency, not a synthetic stub.
+          # The shared output directory reuses compiler-ir from the prior step.
           find . -type f -name '*.c' -printf '%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/mrustc-opt-c-before.txt"
           set +e
           timeout --signal=TERM --kill-after=10s 30m bin/minicargo \
-            -L output-1.90.0 -o output-compiler-opt \
+            -L output-1.90.0 -o output-compiler-bootstrap \
             ../compiler/crates/opt > "$RUNNER_TEMP/mrustc-opt-probe.log" 2>&1
           rc=$?
           set -e
@@ -276,54 +292,14 @@ jobs:
           done
           ar rcs "$RUNNER_TEMP/mrustc-opt-gcc-objects/libcompiler-opt-probe.a" "$RUNNER_TEMP"/mrustc-opt-gcc-objects/*.o
           test -s "$RUNNER_TEMP/mrustc-opt-gcc-objects/libcompiler-opt-probe.a"
+          if grep -q 'BUILDING compiler-ir v' "$RUNNER_TEMP/mrustc-opt-probe.log"; then
+            echo "compiler-opt: compiler-ir dependency rebuilt in shared directory." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "compiler-opt: compiler-ir dependency reused from shared build." >> "$GITHUB_STEP_SUMMARY"
+          fi
           echo "compiler-opt: minicargo succeeded and GCC compiled $count new C units." >> "$GITHUB_STEP_SUMMARY"
           echo "This verifies native object compilation, not semantic correctness or a runnable compiler." >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Diagnose optimizer dev-dependency handling
-        if: always() && steps.optimizer.outcome == 'failure'
-        shell: bash
-        working-directory: mrustc
-        env:
-          RUSTC_VERSION: '1.90.0'
-          MRUSTC_TARGET_VER: '1.90'
-          OUTDIR_SUF: '-1.90.0'
-          PARLEVEL: '2'
-          CC: gcc
-        run: |
-          set -euo pipefail
-          manifest=../compiler/crates/opt/Cargo.toml
-          cp "$manifest" "$RUNNER_TEMP/compiler-opt-original.toml"
-          trap 'cp "$RUNNER_TEMP/compiler-opt-original.toml" "$manifest"' EXIT
-          # Diagnostic only: remove the dev-dependencies section in the CI
-          # checkout to test whether minicargo handles the x86/opt cycle.
-          python3 - "$manifest" <<'PY'
-          from pathlib import Path
-          import re, sys
-          path = Path(sys.argv[1])
-          original = path.read_text()
-          altered, count = re.subn(r'(?ms)^\[dev-dependencies\]\s*\n.*?(?=^\[|\Z)', '', original)
-          assert count == 1, 'Expected one dev-dependencies section'
-          path.write_text(altered)
-          PY
-          set +e
-          timeout --signal=TERM --kill-after=10s 12m bin/minicargo \
-            -L output-1.90.0 -o output-compiler-opt-no-dev \
-            ../compiler/crates/opt > "$RUNNER_TEMP/mrustc-opt-no-dev.log" 2>&1
-          rc=$?
-          set -e
-          echo "compiler-opt without dev-dependencies: minicargo exit $rc (diagnostic only)" >> "$GITHUB_STEP_SUMMARY"
-          echo "compiler-opt without dev-dependencies: minicargo exit $rc (diagnostic only)"
-          if (( rc != 0 )); then
-            echo "::group::Full compiler-opt diagnostic retry output (without dev-dependencies)"
-            cat "$RUNNER_TEMP/mrustc-opt-no-dev.log"
-            echo "::endgroup::"
-          fi
-          if (( rc == 0 )); then
-            echo "Likely blocker: minicargo handles the real dev-dependency graph differently from Cargo." >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "Optimizer still fails without dev-dependencies; preserve original failure status." >> "$GITHUB_STEP_SUMMARY"
-          fi
-          # Restore the exact original manifest before any other tests.
       - name: Translate compiler-backend and compile generated C with GCC
         if: always() && steps.translate.outcome == 'success'
         id: backend
@@ -342,7 +318,7 @@ jobs:
           find . -type f -name '*.c' -printf '%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/mrustc-backend-before.txt"
           set +e
           timeout --signal=TERM --kill-after=10s 30m bin/minicargo \
-            -L output-1.90.0 -o output-compiler-backend \
+            -L output-1.90.0 -o output-compiler-bootstrap \
             ../compiler/crates/backend > "$RUNNER_TEMP/mrustc-backend-probe.log" 2>&1
           rc=$?
           set -e
@@ -380,6 +356,11 @@ jobs:
           done
           ar rcs "$RUNNER_TEMP/mrustc-backend-gcc-objects/libcompiler-backend-probe.a" "$RUNNER_TEMP"/mrustc-backend-gcc-objects/*.o
           test -s "$RUNNER_TEMP/mrustc-backend-gcc-objects/libcompiler-backend-probe.a"
+          if grep -q 'BUILDING compiler-ir v' "$RUNNER_TEMP/mrustc-backend-probe.log"; then
+            echo "compiler-backend: compiler-ir dependency rebuilt." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "compiler-backend: compiler-ir dependency reused." >> "$GITHUB_STEP_SUMMARY"
+          fi
           echo "compiler-backend: GCC compiled $count generated C units into a static archive." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Translate AArch64 backend and compile generated C with host GCC
@@ -398,7 +379,7 @@ jobs:
           # library translated to C; this does not execute AArch64 code.
           find . -type f -name '*.c' -printf '%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/mrustc-aarch64-before.txt"
           timeout --signal=TERM --kill-after=10s 30m bin/minicargo \
-            -L output-1.90.0 -o output-compiler-backend-aarch64 \
+            -L output-1.90.0 -o output-compiler-bootstrap \
             ../compiler/crates/backend-aarch64 > "$RUNNER_TEMP/mrustc-aarch64-probe.log" 2>&1
           find . -type f -name '*.c' -printf '%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/mrustc-aarch64-after.txt"
           comm -13 "$RUNNER_TEMP/mrustc-aarch64-before.txt" "$RUNNER_TEMP/mrustc-aarch64-after.txt" > "$RUNNER_TEMP/mrustc-aarch64-new.txt"
@@ -432,10 +413,10 @@ jobs:
           (
             cd mrustc
             timeout --signal=TERM --kill-after=10s 25m bin/minicargo \
-              -L output-1.90.0 -o output-bootstrap-smoke \
+              -L output-1.90.0 -o output-compiler-bootstrap \
               "$fixture" > "$RUNNER_TEMP/bootstrap-mrustc.log" 2>&1
           )
-          mapfile -t executables < <(find mrustc/output-bootstrap-smoke \
+          mapfile -t executables < <(find mrustc/output-compiler-bootstrap \
             -maxdepth 2 -type f -executable -name '*smoke*' | LC_ALL=C sort)
           if (( ${#executables[@]} != 1 )); then
             echo "Expected one mrustc/GCC-linked smoke executable, got ${#executables[@]}" >> "$GITHUB_STEP_SUMMARY"
@@ -454,6 +435,7 @@ jobs:
           TRANSLATE_OUTCOME: ${{ steps.translate.outcome }}
           PROBE_EXIT: ${{ steps.translate.outputs.probe_exit }}
         run: |
+          echo "Compiler crate outputs share a single per-run minicargo directory; no private compiler objects are uploaded to the public cache." >> "$GITHUB_STEP_SUMMARY"
           echo "mrustc build: $TOOLCHAIN_OUTCOME" >> "$GITHUB_STEP_SUMMARY"
           echo "Translation step: $TRANSLATE_OUTCOME; minicargo exit: ${PROBE_EXIT:-not reached}" >> "$GITHUB_STEP_SUMMARY"
           echo "No Mini-C compilation or full bootstrap is claimed by this prototype." >> "$GITHUB_STEP_SUMMARY"
