@@ -1,0 +1,60 @@
+# Temporary, exact-source BT4 native callee-saved validation on compiler-ci.
+name: BT4 native TypeId RBP parity
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ir-bt4-native-rbp-pr1633.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-rbp:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      SOURCE_SHA: 1c6d060bc4912b7372e2c402fca6f4db0dbf37c7
+    steps:
+      - name: Fetch exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1c6d060bc4912b7372e2c402fca6f4db0dbf37c7
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and narrow workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-bt4-rbp-native
+      - name: Native RBP allocation, ABI, and final physical CFI
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test rbp_alloc_native --test callee_saved_native --test native_typeid_call_liveness --test typeid_real_physical_observer -- --nocapture
+          cargo test -p compiler-backend-x86 --test m4_6_source_unwind_native --test m4_6_unwind_native --test m4_6_unwind_shared_native -- --nocapture
+      - name: Native call, frame, division and pointer regressions
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test mixed_frame_native --test call_clobber_pressure_native --test fixed_clobber_interactions_native --test native_typeid_memory_calls --test native_typeid_direct --test native_typeid_function_signatures
+      - name: Broad default x86 test suites, excluding pre-existing unrelated S23 counters
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --tests -- --skip native_s23_profitability
+      - name: All-target build and strict affected lint
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets
+          cargo clippy -p compiler-backend-x86 --lib --test rbp_alloc_native --test native_typeid_call_liveness -- -D warnings
