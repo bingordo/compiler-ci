@@ -1,0 +1,49 @@
+name: ASM1-D3 data section cursor acceptance
+on:
+  push:
+    branches: [ci/asm1-d3-data-cursors]
+    paths: ['.github/workflows/asm1-d3-data-cursors.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  x86-data-cursors:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9bcf7eb47ff35cc4d9580b4002fc8a43f5c27008
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler source
+        run: test "$(git rev-parse HEAD)" = "9bcf7eb47ff35cc4d9580b4002fc8a43f5c27008"
+      - name: Limit workspace to compiler core
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: asm1-d3-data-cursors
+      - name: Verify assembler and shared ELF layout against GNU as
+        run: |
+          set -euo pipefail
+          python3 tools/regen_x86_att_forms.py --check
+          python3 -m unittest discover -s tools -p test_regen_x86_att_forms.py -v
+          cargo check -p compiler-backend-x86 --all-targets
+          cargo test -p compiler-backend-x86 --test att_section_cursor -- --nocapture
+          for suite in att_mid_labels att_aliases att_asm att_module att_module_strings \
+            m4_global_data_only_native m4_global_definitions_native \
+            m4_global_pointer_relocations_native m4_global_external_native \
+            m4_global_branch_relax_native machine_text_v1; do
+            cargo test -p compiler-backend-x86 --test "$suite"
+          done
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend --lib
+          cargo clippy -p compiler-backend-x86 --lib --test att_section_cursor --test att_mid_labels --test att_aliases --test att_module -- -D warnings -A unused_variables -A clippy::suspicious_assignment_formatting
+          echo 'ASM1_D3_DATA_SECTION_CURSORS status=PASS' >> "$GITHUB_STEP_SUMMARY"
