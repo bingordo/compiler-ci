@@ -1,0 +1,47 @@
+name: LTO adjacent sidecar discovery and native fallback
+on:
+  push:
+    branches: [verify/lto-auto-sidecar-discovery-20261114]
+    paths: ['.github/workflows/lto-auto-sidecar-discovery-20261114.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  auto-sidecar:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: fa58c31958dc147107f81d118ab63488beb1def3
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and public frontend dependencies
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "fa58c31958dc147107f81d118ab63488beb1def3"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - name: Focus driver workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/driver"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: lto-auto-sidecar
+      - name: Check mixed-link, coemit and sidecar executable regressions
+        working-directory: compiler
+        run: |
+          cargo test -p compiler --test lto_mixed_link -- --nocapture
+          cargo test -p compiler --test lto_coemit
+          cargo test -p compiler --test lto_source_sidecar
+      - name: Strict mixed-link lint
+        working-directory: compiler
+        run: cargo clippy -p compiler --test lto_mixed_link -- -D warnings
