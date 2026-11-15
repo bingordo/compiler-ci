@@ -1,0 +1,220 @@
+name: RV64 R2 i32 logical sign-extension closure GAS QEMU
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-riscv-r2-logic32-qemu.yml']
+permissions:
+  contents: read
+jobs:
+  logic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 113cadabe7d2a6087262ea35eaa03f12e5bb30b0
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require exact compiler source revision
+        run: test "$(git -C compiler rev-parse HEAD)" = "113cadabe7d2a6087262ea35eaa03f12e5bb30b0"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Restrict workspace to the native TypeId backend
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-riscv64"]
+          EOF
+          rm -f Cargo.lock
+      - name: Rust, Clippy, exact UDB and source-admission gates
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib
+          cargo test -p compiler-backend-riscv64 --all-targets
+          cargo clippy -p compiler-backend-riscv64 --all-targets -- -D warnings
+          python3 tools/regen_riscv_native_selector_rules.py --check
+          python3 -m unittest discover -s tools -p test_riscv_native_selector_rules.py -v
+          python3 tools/riscv_udb_rust_leaf_forms.py \
+            --catalog data/riscv_udb_r0_catalog.json \
+            --output crates/backend-riscv64/src/generated_encoding.rs --check
+      - name: Install independent RISC-V GAS, objdump, linker and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu qemu-user
+      - name: Direct ELF vs independent GNU GAS bytes and opcode disassembly
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for kind in and32 or32 xor32; do
+            cargo run -p compiler-backend-riscv64 --example rv64_leaf -- \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}.s" "${kind}"
+            grep -qE "^[[:space:]]+${kind%32} x[0-9]+, x[0-9]+, x[0-9]+$" "/tmp/rv64_${kind}.s"
+            riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+              "/tmp/rv64_${kind}.s" -o "/tmp/rv64_${kind}_gas.o"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}_direct.bin"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}_gas.o" "/tmp/rv64_${kind}_gas.bin"
+            cmp "/tmp/rv64_${kind}_direct.bin" "/tmp/rv64_${kind}_gas.bin"
+            riscv64-linux-gnu-objdump -dr "/tmp/rv64_${kind}.o" | grep -w "${kind%32}"
+          done
+      - name: Execute 16 LP64 i32 bitwise boundary cases under QEMU
+        run: |
+          set -euo pipefail
+          cat > /tmp/rv64_logic32_start.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            mv s0, sp
+            li a0, -1
+            li a1, -2147483648
+            call rv64_and32_leaf
+            li t0, -2147483648
+            bne a0, t0, fail1
+            bne sp, s0, fail_sp
+            li a0, 2147483647
+            li a1, -2147483648
+            call rv64_and32_leaf
+            li t0, 0
+            bne a0, t0, fail2
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 1515870810
+            call rv64_and32_leaf
+            li t0, 1515870810
+            bne a0, t0, fail3
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, 1
+            call rv64_and32_leaf
+            li t0, 0
+            bne a0, t0, fail4
+            bne sp, s0, fail_sp
+            li a0, -2
+            li a1, -1
+            call rv64_and32_leaf
+            li t0, -2
+            bne a0, t0, fail5
+            bne sp, s0, fail_sp
+            li a0, 2147483647
+            li a1, -2147483648
+            call rv64_or32_leaf
+            li t0, -1
+            bne a0, t0, fail6
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, 1
+            call rv64_or32_leaf
+            li t0, -2147483647
+            bne a0, t0, fail7
+            bne sp, s0, fail_sp
+            li a0, 0
+            li a1, 2147483647
+            call rv64_or32_leaf
+            li t0, 2147483647
+            bne a0, t0, fail8
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, 0
+            call rv64_or32_leaf
+            li t0, -2147483648
+            bne a0, t0, fail9
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 0
+            call rv64_or32_leaf
+            li t0, -1
+            bne a0, t0, fail10
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 2147483647
+            call rv64_xor32_leaf
+            li t0, -2147483648
+            bne a0, t0, fail11
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, -2147483648
+            call rv64_xor32_leaf
+            li t0, 0
+            bne a0, t0, fail12
+            bne sp, s0, fail_sp
+            li a0, 1431655765
+            li a1, -1431655766
+            call rv64_xor32_leaf
+            li t0, -1
+            bne a0, t0, fail13
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, -1
+            call rv64_xor32_leaf
+            li t0, 0
+            bne a0, t0, fail14
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, 1
+            call rv64_xor32_leaf
+            li t0, -2147483647
+            bne a0, t0, fail15
+            bne sp, s0, fail_sp
+            li a0, 0
+            li a1, -1
+            call rv64_xor32_leaf
+            li t0, -1
+            bne a0, t0, fail16
+            bne sp, s0, fail_sp
+            li a0, 0
+            j exit
+          fail1: li a0, 1
+            j exit
+          fail2: li a0, 2
+            j exit
+          fail3: li a0, 3
+            j exit
+          fail4: li a0, 4
+            j exit
+          fail5: li a0, 5
+            j exit
+          fail6: li a0, 6
+            j exit
+          fail7: li a0, 7
+            j exit
+          fail8: li a0, 8
+            j exit
+          fail9: li a0, 9
+            j exit
+          fail10: li a0, 10
+            j exit
+          fail11: li a0, 11
+            j exit
+          fail12: li a0, 12
+            j exit
+          fail13: li a0, 13
+            j exit
+          fail14: li a0, 14
+            j exit
+          fail15: li a0, 15
+            j exit
+          fail16: li a0, 16
+            j exit
+          fail_sp: li a0, 17
+          exit:
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+            /tmp/rv64_logic32_start.s -o /tmp/rv64_logic32_start.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax \
+            -e _start /tmp/rv64_logic32_start.o \
+            /tmp/rv64_and32.o /tmp/rv64_or32.o /tmp/rv64_xor32.o \
+            -o /tmp/rv64_logic32.elf
+          timeout 15s qemu-riscv64 /tmp/rv64_logic32.elf
+          echo "16 native TypeId i32 logical QEMU boundary cases passed"
