@@ -1,0 +1,74 @@
+# W8: TypeId wasm32 checked source uses true ILP32 Mini-C target at frontend.
+name: Wasm W8 checked Mini-C frontend integration
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/wasm-w8-compiler-source.yml'
+  workflow_dispatch:
+    inputs:
+      compiler_sha:
+        description: 'Exact compiler commit'
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  frontend-wasm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler and pinned Mini-C checker
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.compiler_sha || '9001102feca3647af11dca2c59b2043329e54c9f' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source pin and isolate checker, Wasm and native backends
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "${{ inputs.compiler_sha || '9001102feca3647af11dca2c59b2043329e54c9f' }}"
+          grep -F '76e9734673ee916d03c1517d422592adf44c2a1a' compiler/crates/driver/Cargo.toml
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86","crates/backend-aarch64","crates/backend-riscv64","crates/backend-wasm","crates/driver"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - name: Independent Node WebAssembly execution engine
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Cache checked Mini-C and backend builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: wasm-w8-minic-target-source
+      - name: Recheck real C source -> WebAssembly, native x86 ELF and GCC differential
+        working-directory: compiler
+        run: cargo test -p compiler --test wasm32_minic_source -- --nocapture
+      - name: Regress full W0-W6d Wasm backend
+        working-directory: compiler
+        run: cargo test -p compiler-backend-wasm --tests -- --nocapture
+      - name: Regress driver unit tests and shared native backend
+        working-directory: compiler
+        run: |
+          cargo test -p compiler --bin compiler -- --nocapture
+          cargo test -p compiler-backend --lib
+      - name: Check standalone native Mini-C TypeId adapter against updated checker API
+        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib
+      - name: Strict standalone Wasm backend Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-wasm --all-targets -- -D warnings
+      - name: Strict driver Clippy except existing unrelated native wrapper categories
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler --bin compiler --test wasm32_minic_source -- \
+            -D warnings -A dead_code -A clippy::too_many_arguments
