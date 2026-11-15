@@ -1,0 +1,57 @@
+name: BT4 x86 mixed-frame native TypeId PR1538 pinned
+
+on:
+  pull_request:
+    paths: ['.github/workflows/bt4-mixed-frame-pr1538.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-pinned-x86:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout exact proposed compiler revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 065ae8b8ce342da171029e2735ba0d9dad7d5dbf
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source commit and isolate compiler-owned workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git -C compiler rev-parse HEAD)"
+          test "$actual" = "065ae8b8ce342da171029e2735ba0d9dad7d5dbf"
+          echo "BT4 compiler SHA: $actual" >> "$GITHUB_STEP_SUMMARY"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-bt4-x86-mixed-frame
+      - name: Check and execute original x86 mixed-frame independent C11 oracle
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test mixed_frame_native -- --nocapture
+      - name: Run shared IR and backend regression suites
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check --workspace --all-targets
+          cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+      - name: Strict compiler-owned all-target Clippy
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
+      - name: Record result
+        run: echo 'BT4 mixed frame: source-owned TypeId C11 ELF/GAS framed/frameless + core suites + strict Clippy PASS' >> "$GITHUB_STEP_SUMMARY"
