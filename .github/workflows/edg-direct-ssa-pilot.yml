@@ -48,7 +48,8 @@ jobs:
           repository: bingordo/compiler
           # PR #1823 merged; validate the production compiler main branch.
           # Compiler PR #1841 is merged; keep the normal production checkout.
-          ref: edg/cxx5-dynamic-startup-source-audit-20261115
+          # Source-pinned executable C++ dynamic scalar candidate.
+          ref: c07578d796b14acee370382eeb571a6d6fb57c82
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -779,7 +780,7 @@ jobs:
             test ! -e bad_printf.o
           )
 
-      - name: EDG C++5 dynamic scalar startup provenance and strict no ELF
+      - name: EDG C++5 native scalar dynamic init-array vs G++, class negative
         working-directory: compiler
         run: |
           set -euo pipefail
@@ -790,17 +791,29 @@ jobs:
             cd ../edgcpp/build/gcc-release
             source environment.sh
             binary="../../../compiler/tools/edg-driver/target/debug/compiler-edg-driver"
-            for source in edg_native_cxx5_dynamic_scalar.cpp edg_native_cxx5_header_effectful.cpp edg_native_cxx5_global_trace.cpp; do
+            if ! "$binary" native_dynamic_scalar.o --c++17 --dump-edg-global-provenance edg_native_cxx5_dynamic_scalar.cpp >edg_dynamic_positive.log 2>&1; then
+              cat edg_dynamic_positive.log
+              exit 1
+            fi
+            test "$(od -An -tx1 -N4 native_dynamic_scalar.o | tr -d '[:space:]')" = 7f454c46
+            readelf -SW native_dynamic_scalar.o | grep -F .bss
+            readelf -SW native_dynamic_scalar.o | grep -F .init_array
+            readelf -rW native_dynamic_scalar.o | grep -F .rela.init_array
+            nm -g --defined-only native_dynamic_scalar.o | grep -Eq '[[:space:]]edg_dynamic_scalar$'
+            g++ -std=c++17 -O2 -Wall -Wextra -Werror edg_native_cxx5_dynamic_scalar.cpp -o gxx_dynamic_scalar
+            g++ -std=c++17 -O2 -Wall -Wextra -Werror native_dynamic_scalar.o -o native_dynamic_scalar
+            ./gxx_dynamic_scalar
+            ./native_dynamic_scalar
+            grep -E 'EDG_GLOBAL_PROVENANCE|EDG_CXX5_INIT_CENSUS|EDG_CXX5_REAL_GLOBAL|EDG_CXX5_INIT_LOWERED|EDG_STARTUP_BODY|EDG_CXX5_SOURCE_CLOSURE' edg_dynamic_positive.log
+            for source in edg_native_cxx5_header_effectful.cpp edg_native_cxx5_global_trace.cpp; do
               rm -f edg_dynamic_probe.o
               if "$binary" edg_dynamic_probe.o --c++17 --dump-edg-global-provenance "$source" >edg_dynamic_probe.log 2>&1; then
-                echo "Unsafe dynamic initialization unexpectedly compiled: $source"
+                echo "Unsupported class-global initialization unexpectedly compiled: $source"
                 exit 1
               fi
               test ! -e edg_dynamic_probe.o
-              grep -E 'EDG_GLOBAL_PROVENANCE|EDG_CXX5_INIT_CENSUS|EDG_CXX5_REAL_GLOBAL|EDG_CXX5_INIT_LOWERED|EDG_FILE_SCOPE_SCHEDULER|EDG_GENERATED_ROUTINE|EDG_STARTUP_BODY|STARTUP_STMT|STARTUP_EXPR|STARTUP_CALLSITE|STARTUP_REF|EDG_CXX5_SOURCE_CLOSURE|EDG -> compiler-ir rejected' edg_dynamic_probe.log | tail -n 300
+              grep -E 'EDG_GLOBAL_PROVENANCE|EDG_CXX5_INIT_CENSUS|EDG_CXX5_REAL_GLOBAL|EDG_CXX5_INIT_LOWERED|EDG_STARTUP_BODY|STARTUP_REF|EDG_CXX5_SOURCE_CLOSURE|EDG -> compiler-ir rejected' edg_dynamic_probe.log | tail -n 100
             done
-            g++ -std=c++17 -O2 -Wall -Wextra -Werror edg_native_cxx5_dynamic_scalar.cpp -o gxx_dynamic_scalar
-            ./gxx_dynamic_scalar
             g++ -std=c++17 -O2 -Wall -Wextra -Werror edg_native_cxx5_global_trace.cpp edg_native_cxx5_global_trace_driver.cpp -o gxx_global_trace
             test "$(./gxx_global_trace)" = '123'
           )
