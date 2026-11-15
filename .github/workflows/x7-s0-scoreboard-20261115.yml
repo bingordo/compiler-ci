@@ -1,0 +1,86 @@
+name: X7 S0 exact-source stage-separated evidence scoreboard
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/x7-s0-scoreboard-20261115.yml'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  original-source-x7-s0-scoreboard:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      SOURCE_SHA: e04bdecb788c0e7d97dd2758f15a7f4384f516e6
+      PYTHONPATH: compiler/tools
+      X7_S0_S2: /tmp/x7-s0/s2/join-1.json
+      X7_S0_OP_AST: /tmp/x7-s0/smt/operations.json
+      X7_S0_SMT: /tmp/x7-s0/smt/semantics-z3.json
+    steps:
+      - name: Checkout exact compiler source (compiler Actions disabled)
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e04bdecb788c0e7d97dd2758f15a7f4384f516e6
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Load immutable pinned source/XED candidate join
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s2-pinned-intel-xed-variant-join
+          run-id: 43635408689
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s0/s2
+      - name: Load independent original operation and Z3 semantic certificates
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3l-l2b-l3a-9-ops-generic-helper-smt-source-evidence
+          run-id: 43687620382
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s0/smt
+      - name: Deterministic original-source stage-separated scoreboard
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          mkdir -p /tmp/x7-s0/out
+          python3 -m py_compile compiler/tools/x86_x7_s0_scoreboard.py compiler/tools/test_x86_x7_s0_scoreboard.py
+          python3 -m unittest -v test_x86_x7_s0_scoreboard test_x86_gp_recipes test_x86_scalar_bin_forms
+          python3 compiler/tools/x86_x7_s0_scoreboard.py \
+            --source-revision "$SOURCE_SHA" \
+            --s2 "$X7_S0_S2" \
+            --operation-ast "$X7_S0_OP_AST" \
+            --generic-smt "$X7_S0_SMT" \
+            --report /tmp/x7-s0/out/evidence.json
+          python3 compiler/tools/x86_x7_s0_scoreboard.py \
+            --source-revision "$SOURCE_SHA" \
+            --s2 "$X7_S0_S2" \
+            --operation-ast "$X7_S0_OP_AST" \
+            --generic-smt "$X7_S0_SMT" \
+            --report /tmp/x7-s0/out/evidence.json --check
+          python3 - <<'PY'
+          import json
+          p=json.load(open('/tmp/x7-s0/out/evidence.json'))
+          assert p['compact_physical_generator']['all_physical_gp_recipe_rows']==55
+          assert p['compact_physical_generator']['alu_family_expanded_signatures']==27
+          assert p['source_gp_write']['default_production_form_widths_declared']==10
+          assert p['source_flags_only']['default_production_form_widths_declared']==8
+          assert p['pinned_s2_xed_iform_cohort']['source_iforms']==200
+          assert p['pinned_nine_operation_semantic_cohort']['semantic_width_certificates']==18
+          assert p['unmodified_real_programs']['actually_selected_forms'] is None
+          assert p['aggregate_supported_isa_form_count'] is None
+          print("X7_S0_STAGE_SEPARATED_SOURCE_EVIDENCE_PASS",
+                "selector_rules",p['generic_selector_rule_catalog']['rule_rows'],
+                "original_iforms",p['pinned_s2_xed_iform_cohort']['source_iforms'],
+                "gp_source_production_rows",p['source_gp_write']['default_production_form_widths_declared'])
+          PY
+      - name: Preserve source fingerprints and honest unknown coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-s0-stage-separated-source-coverage-not-program-selections
+          path: /tmp/x7-s0/out/evidence.json
+          if-no-files-found: ignore
