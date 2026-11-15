@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 32
     env:
-      SOURCE_SHA: '216d2450d27b929747df3f61fbde7c40f1b98260'
+      SOURCE_SHA: 'e6fbe566daa8b52e8349ff23f2b33b70706a15e0'
       PYTHONPATH: compiler/tools
       INTEL_DIRECTORY: /tmp/x7-s3l-l3c/intel
       S2_WORKLIST: /tmp/x7-s3l-l3c/s2/join-1.json
@@ -22,12 +22,17 @@ jobs:
       X7_S3L_L3C_SMT: /tmp/x7-s3l-l3c/proven/semantics-z3.json
       X7_S3L_L3C_S2: /tmp/x7-s3l-l3c/s2/join-1.json
       X7_S3L_L3C_REPORT: /tmp/x7-s3l-l3c/out/original-source-xed-iforms.json
+      X7_S3L_S3F: /tmp/x7-s3l-l3c/s3f/source-xed-effects.json
+      X7_S3L_S3G: /tmp/x7-s3l-l3c/s3g/real-selector-decisions.json
+      X7_S3L_S3H: /tmp/x7-s3l-l3c/s3h/native-i64-source-decisions.json
+      X7_S3L_S3J: /tmp/x7-s3l-l3c/s3j/add-sub-source-proof.json
+      X7_S3L_S3K: /tmp/x7-s3l-l3c/s3k/source-cmp-flags-admission.json
     steps:
       - name: Checkout exact compiler commit without compiler Actions
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 216d2450d27b929747df3f61fbde7c40f1b98260
+          ref: e6fbe566daa8b52e8349ff23f2b33b70706a15e0
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -84,9 +89,120 @@ jobs:
           set -euo pipefail
           python3 -m unittest -v test_x86_s3l_generic_iform_xed_join
           echo X7_S3L_L3C_WHOLE_CORPUS_AND_MUTATIONS_PASS
+      - name: Import historical pinned source-iform and actual selector evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3f-source-xed-flag-effect-no-admission
+          run-id: 43667287999
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3l-l3c/s3f
+      - uses: actions/download-artifact@v4
+        with:
+          name: x7-s3g-actual-selector-decision-evidence
+          run-id: 43670305205
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3l-l3c/s3g
+      - uses: actions/download-artifact@v4
+        with:
+          name: x7-s3h-native-typeid-i64-fusion-source-decisions
+          run-id: 43675286039
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3l-l3c/s3h
+      - uses: actions/download-artifact@v4
+        with:
+          name: x7-s3j-add-sub-source-ir-proof
+          run-id: 43682964277
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3l-l3c/s3j
+      - uses: actions/download-artifact@v4
+        with:
+          name: x7-s3k-flags-only-cmp-source-native-evidence
+          run-id: 43684448812
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3l-l3c/s3k
+      - name: Production batch generator now requires the generic source/XED worklist
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/x86_s3l_batch_admission.py \
+            --s3f "$X7_S3L_S3F" --s3g "$X7_S3L_S3G" \
+            --s3h "$X7_S3L_S3H" --s3j "$X7_S3L_S3J" \
+            --s3k "$X7_S3L_S3K" \
+            --operation-ast "$OPERATION_AST" \
+            --helper-ast /tmp/x7-s3l-l3c/proven/helpers.json \
+            --generic-smt "$GENERIC_SMT" \
+            --generic-iform-xed "$X7_S3L_L3C_REPORT" \
+            --out /tmp/x7-s3l-l3c/out/production-source-admission.json
+          git -C compiler diff --exit-code -- \
+            crates/backend-x86/src/generated_x7_s3l_batch_admissions.rs
+          python3 compiler/tools/x86_s3l_batch_admission.py \
+            --s3f "$X7_S3L_S3F" --s3g "$X7_S3L_S3G" \
+            --s3h "$X7_S3L_S3H" --s3j "$X7_S3L_S3J" \
+            --s3k "$X7_S3L_S3K" \
+            --operation-ast "$OPERATION_AST" \
+            --helper-ast /tmp/x7-s3l-l3c/proven/helpers.json \
+            --generic-smt "$GENERIC_SMT" \
+            --generic-iform-xed "$X7_S3L_L3C_REPORT" \
+            --out /tmp/x7-s3l-l3c/out/production-source-admission.json --check
+          echo X7_S3L_L3C_PRODUCTION_GENERIC_XED_GATE_PASS
+      - name: Real production source/XED proof gates reject mutations
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest -v \
+            test_x86_s3l_batch_admission \
+            test_x86_s3l_l3b_generic_proof_gate \
+            test_x86_s3l_l3c_production_iform_gate
+          python3 - <<'PY'
+          import json,os
+          r=json.load(open(os.environ["X7_S3L_L3C_REPORT"]))
+          for x in r["form_records"]:
+              if x["status"].startswith("source_XED_memory_read_candidate"):
+                  print("X7_S3L_L3C_CANDIDATE",x["intel_iform"],x["encoding_opcode"])
+              elif x["intel_iform"].startswith("TEST_MEMv"):
+                  print("X7_S3L_L3C_TEST_BLOCKER",x["intel_iform"],x["reason"])
+          PY
+          echo X7_S3L_L3C_PRODUCTION_MALFORMED_SOURCE_XED_FAIL_CLOSED_PASS
+      - name: Isolate backend-only offline Rust workspace
+        shell: bash
+        run: |
+          cd compiler
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          """)
+          PY
+      - name: Confirm native selector and direct GAS/ELF behavior unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-native-form-validation x7-c-defined-64 x7-c-defined-bitwise' \
+            --lib x7_native_form_bridge --offline
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-native-form-validation x7-c-defined-64 x7-c-defined-bitwise' \
+            --lib x7_late_selector --offline
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-native-form-validation x7-c-defined-64 x7-c-defined-bitwise' \
+            --test x7_s3k_cmp_native --offline
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-native-form-validation x7-c-defined-64 x7-c-defined-bitwise' \
+            --test x7_s3j_arithmetic_ir_admission --offline
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --features x7-native-form-validation \
+            --test x7_s3k_cmp_native --offline
+          echo X7_S3L_L3C_NO_RUNTIME_SELECTOR_REGRESSION_PASS
       - name: Archive full source iform-XED proof candidate diagnostics
         uses: actions/upload-artifact@v4
         with:
-          name: x7-s3l-l3c-nine-operation-all-iform-xed-source-worklist
-          path: /tmp/x7-s3l-l3c/out/original-source-xed-iforms.json
+          name: x7-s3l-l3c-source-XED-gated-production-admission
+          path: /tmp/x7-s3l-l3c/out/
           if-no-files-found: error
