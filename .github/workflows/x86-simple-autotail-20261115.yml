@@ -1,0 +1,61 @@
+name: x86 direct return-call tail jump generated differential
+on:
+  push:
+    branches: [verify/x86-simple-autotail-20261115]
+    paths: ['.github/workflows/x86-simple-autotail-20261115.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  tail:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 6e863be6cfaa6a0137b6ec0642a7af8baf574f46
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source SHA and public git dependencies
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "6e863be6cfaa6a0137b6ec0642a7af8baf574f46"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - name: Isolate active native compiler workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/driver"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x86-simple-autotail
+      - name: x86 emitter frame unwind and direct ELF unit regression
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend-x86 --lib
+          cargo clippy -p compiler-backend-x86 --lib -- -D warnings
+      - name: Generated 12-case tail-call machine form and GCC native/LTO differential
+        working-directory: compiler
+        run: |
+          cargo test -p compiler --test lto_generated_tailcall -- --nocapture
+          cargo clippy -p compiler --test lto_generated_tailcall -- -D warnings
+      - name: Existing ABI, object metadata and six-TU code-size runtime acceptance
+        working-directory: compiler
+        run: |
+          cargo test -p compiler --test lto_fnptr_stack_abi
+          cargo test -p compiler --test lto_generated_multitu
+          cargo test -p compiler --test lto_ordered_build
+          python3 tools/lto-runtime-bench.py --compiler ./target/debug/compiler --rounds 3 --iterations 350000 --json simple-tail-runtime-results.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x86-simple-tail-runtime-results
+          path: compiler/simple-tail-runtime-results.json
+          if-no-files-found: ignore
