@@ -1,0 +1,66 @@
+name: Review exact source TypeId CFG memory callback ordering 689
+on:
+  push:
+    branches: [review/memory-callback-689]
+    paths: ['.github/workflows/review-memory-callback-689.yml']
+  pull_request:
+    paths: ['.github/workflows/review-memory-callback-689.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 28
+    steps:
+      - name: Checkout compiler-ci temporary workflow
+        uses: actions/checkout@v4
+      - name: Checkout exact compiler review source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: fbe0955719ae5d48ed6263758841327d8b0bd760
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert compiler source pinned
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "fbe0955719ae5d48ed6263758841327d8b0bd760"
+          git show -s --format='%H %s' HEAD
+      - name: Isolate compiler core workspace on runner only
+        working-directory: compiler
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          """)
+          PY
+      - name: Cache Rust core builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: review-memory-callback-689
+      - name: Execute independent C11 callback read/write and call ordering oracle in 8 x86 binaries
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test review_memory_callback_order -- --nocapture
+      - name: Preserve prior native TypeId physical memory oracle
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test memory_native -- --nocapture
+      - name: Preserve independent CFG memory and external call effect oracle
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test memory_execution_oracle -- --nocapture
+      - name: Preserve native DSE and global forwarding regressions
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_dse -- --nocapture
+          cargo test -p compiler-opt --test typed_global_memory -- --nocapture
+      - name: Strict core and focused-test Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --lib -- -D warnings
+          cargo clippy -p compiler-opt --test review_memory_callback_order -- -D warnings
