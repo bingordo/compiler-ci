@@ -1,0 +1,54 @@
+name: Mixed LTO sidecar admission and ELF runtime audit
+on:
+  push:
+    branches: [ci/lto-dangling-sidecar-acceptance-20261115]
+    paths: [.github/workflows/lto-dangling-sidecar-acceptance-20261115.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  mixed-lto:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: cce8c7cb38e989ef0b2e058f9a6aab1ba515db9d
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: cce8c7cb38e989ef0b2e058f9a6aab1ba515db9d
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source SHA and toolchain
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          rustc --version
+          cargo --version
+          gcc --version | head -n 1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: mixed-lto-sidecar-admission
+      - name: Targeted dangling symlink and true absence regression
+        working-directory: compiler
+        run: cargo test -p compiler --test lto_mixed_link dangling_sidecar_is_invalid_but_absent_sidecar_permits_all_native_fallback -- --nocapture
+      - name: Complete mixed native/LTO runtime link suite
+        working-directory: compiler
+        run: cargo test -p compiler --test lto_mixed_link -- --test-threads=2
+      - name: Source sidecar and ELF object integration checks
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test lto_coemit -- --test-threads=2
+          cargo test -p compiler --test lto_source_sidecar -- --test-threads=2
+          cargo test -p compiler --test lto_fnptr_stack_abi -- --test-threads=2
+      - name: Driver all-target compile and strict binary lint
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler --all-targets
+          cargo clippy -p compiler --bin compiler -- -D warnings
