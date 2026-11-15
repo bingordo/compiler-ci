@@ -1,0 +1,107 @@
+name: RV64 R1 stack spills and frame ABI under QEMU
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-riscv-r1-spills-qemu.yml']
+permissions:
+  contents: read
+jobs:
+  frame-spills:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e86a0a8e7e08f058794b08652057f9bd8ef9f6fc
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require exact source SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "e86a0a8e7e08f058794b08652057f9bd8ef9f6fc"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Build frontend-independent workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-riscv64"]
+          EOF
+          rm -f Cargo.lock
+      - name: Run target ABI, spill tests, Clippy and pinned UDB forms
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-riscv64 --all-targets
+          cargo clippy -p compiler-backend-riscv64 --all-targets -- -D warnings
+          python3 tools/riscv_udb_rust_leaf_forms.py \
+            --catalog data/riscv_udb_r0_catalog.json \
+            --output crates/backend-riscv64/src/generated_encoding.rs --check
+      - name: Install independent RV64 GNU binutils and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y binutils-riscv64-linux-gnu qemu-user
+      - name: Emit pressure objects and independently compare machine bytes
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for kind in spillsum spillbranch spillelse; do
+            cargo run -p compiler-backend-riscv64 --example rv64_leaf -- \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}.s" "$kind"
+            grep -E '^(    (ld|sd|addi x2))' "/tmp/rv64_${kind}.s"
+            riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+              "/tmp/rv64_${kind}.s" -o "/tmp/rv64_${kind}_gas.o"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}_direct.bin"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}_gas.o" "/tmp/rv64_${kind}_gas.bin"
+            cmp "/tmp/rv64_${kind}_direct.bin" "/tmp/rv64_${kind}_gas.bin"
+            riscv64-linux-gnu-readelf -h "/tmp/rv64_${kind}.o"
+          done
+      - name: Check 64-bit results, both CFG returns and LP64 stack preservation
+        run: |
+          set -euo pipefail
+          cat > /tmp/rv64_pressure_start.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .global _start
+          _start:
+            mv s0, sp
+            call rv64_spillsum
+            li t0, 1176
+            bne a0, t0, failed_sum
+            bne sp, s0, failed_stack
+            call rv64_spillbranch
+            li t0, 820
+            bne a0, t0, failed_true
+            bne sp, s0, failed_stack
+            call rv64_spillelse
+            li t0, 1
+            bne a0, t0, failed_false
+            bne sp, s0, failed_stack
+            li a0, 0
+            j finish
+          failed_sum: li a0, 1
+            j finish
+          failed_true: li a0, 2
+            j finish
+          failed_false: li a0, 3
+            j finish
+          failed_stack: li a0, 4
+          finish:
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+            /tmp/rv64_pressure_start.s -o /tmp/rv64_pressure_start.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax \
+            -e _start /tmp/rv64_pressure_start.o \
+            /tmp/rv64_spillsum.o /tmp/rv64_spillbranch.o /tmp/rv64_spillelse.o \
+            -o /tmp/rv64_pressure.elf
+          timeout 15s qemu-riscv64 /tmp/rv64_pressure.elf
+          echo "RV64 stack frames: 3 pressure/CFG cases and SP restoration passed"
