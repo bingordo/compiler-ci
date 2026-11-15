@@ -1,0 +1,64 @@
+# Temporary source-pinned BT4 experimental inliner release-isolation check.
+name: BT4 legacy inline preview release isolation
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ir-bt4-historical-inliner-pr1718.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inliner-cutover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_INCREMENTAL: '0'
+      SOURCE_SHA: d5f545fc318864d783f4fe7025f3bf4d00318148
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d5f545fc318864d783f4fe7025f3bf4d00318148
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify candidate and isolate core backend workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: bt4-legacy-inline-preview
+      - name: Native TypeId x86 and ARM release without historic feature
+        working-directory: compiler
+        run: cargo check -p compiler-backend-x86 -p compiler-backend-aarch64 --release --lib
+      - name: Strict release library Clippy, unrelated X7 visibility warning exempted
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-x86 --lib --release -- -D warnings -A private_interfaces
+      - name: Historical feature explicitly re-enables preview in release
+        working-directory: compiler
+        run: cargo check -p compiler-backend-x86 --lib --release --features historical-function-oracle
+      - name: Original default debug all-target compilation
+        working-directory: compiler
+        run: cargo check -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --all-targets
+      - name: Original historical inliner exact ELF size and target callback tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test inliner_target_cost -- --nocapture
+          cargo test -p compiler-backend-x86 --lib inliner_cost::tests -- --nocapture
+      - name: Production TypeId inliner source C and ELF GAS checks
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typed_inline_leaf_native --test typed_inline_postopt_native_trial
+      - name: Adjacent preserved native and historical original oracles
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --test typed_alias_calls_native --test t5_x86_semantics --test native_typeid_direct
