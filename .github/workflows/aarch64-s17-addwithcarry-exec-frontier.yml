@@ -72,3 +72,70 @@ jobs:
               print('S17_ORIGINAL_XML_SECTIONS',containing[:20])
               assert len(headers)==1, 'source declaration not unique'
           PY
+
+  execute-original-helper:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    container:
+      image: ocaml/opam:alpine-3.21-ocaml-5.2
+      options: --user root
+    env:
+      OPAMROOT: /home/opam/.opam
+      OPAMROOTISOK: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: herd/herdtools7
+          ref: cfc4f56c522ec0d701acaf5a23139b47e8711299
+          path: herd
+          persist-credentials: false
+      - name: Build pinned upstream ASLRef
+        shell: sh
+        run: |
+          set -eu
+          apk add --no-cache bash python3 curl coreutils git gmp-dev pkgconf
+          opam install -y dune menhir zarith
+          (cd herd && opam exec -- dune build -p aslref --profile release)
+          ./herd/_build/default/asllib/aslref.exe --version | grep -Fx 'aslref version 1.0-EAC2'
+      - name: Run exact Arm published AddWithCarry code in ASLRef
+        shell: sh
+        run: |
+          set -eu
+          curl -fLsS --retry 3 --connect-timeout 20 --max-time 240 --max-filesize 200000000 -o /tmp/arm2026.tar.gz https://developer.arm.com/-/cdn-downloads/permalink/Exploration-Tools-A64-ISA/ISA_A64/ISA_A64_xml_A_profile-2026-09.tar.gz
+          echo '44cfb89c763c7eea8e59de0ad2221e3c012e6aa77899bd7f1c3e1f24537191d7  /tmp/arm2026.tar.gz' | sha256sum -c -
+          python3 - <<'PY'
+          import hashlib,tarfile,xml.etree.ElementTree as ET
+          root='ISA_A64_xml_A_profile-2026-09/'
+          with tarfile.open('/tmp/arm2026.tar.gz','r:gz') as tar:
+              xml=tar.extractfile(root+'shared_pseudocode.xml').read()
+          matches=[]
+          for ps in ET.fromstring(xml).iter('ps'):
+              if ps.get('name')=='shared/functions/integer/AddWithCarry':
+                  matches.append(''.join(ps.itertext()))
+          assert len(matches)==1
+          original=matches[0]
+          assert len(original)==683
+          assert hashlib.sha256(original.encode()).hexdigest()=='1e80df3bc60c0393805a5c93aab8aeca6a3428e22fe2dc1d8c484f8f969e5129'
+          assert original.count('func AddWithCarry')==1
+          def literal(bits,value):
+              return "'"+format(value,'0'+str(bits)+'b')+"'"
+          cases=[
+              (32,0,0,0,0,4),
+              (32,(1<<32)-1,0,1,0,6),
+              (64,0,0,0,0,4),
+              (64,1<<63,1<<63,0,0,7),
+              (64,(1<<64)-1,0,1,0,6),
+          ]
+          lines=['func main() => integer','begin']
+          for i,(bits,a,b,carry,result,nzcv) in enumerate(cases):
+              lines.append('    let (r'+str(i)+',f'+str(i)+') = AddWithCarry{'+str(bits)+'}('+
+                           literal(bits,a)+', '+literal(bits,b)+', '+literal(1,carry)+');')
+              lines.append('    assert r'+str(i)+' == '+literal(bits,result)+';')
+              lines.append('    assert f'+str(i)+' == '+literal(4,nzcv)+';')
+          lines+=['    return 0;','end;','']
+          open('/tmp/addwithcarry-original.asl','w').write(original+'\n'+'\n'.join(lines))
+          print('ORIGINAL_ARM_HELPER_ASL_RUN',len(cases),'source_section_sha256',
+                hashlib.sha256(original.encode()).hexdigest(), 'original_helper_unmodified=true')
+          PY
+          ./herd/_build/default/asllib/aslref.exe --version-eac1 --type-check-strict -1 /tmp/addwithcarry-original.asl
+          echo 'SOURCE_EXECUTED_ASLREF_ADDWITHCARRY_CARRY_NZCV_PASS'
