@@ -658,6 +658,39 @@ jobs:
           timeout 30s "$executable" --help > "$RUNNER_TEMP/mrustc-driver-help.txt"
           grep -q 'Usage: compiler' "$RUNNER_TEMP/mrustc-driver-help.txt"
           echo "Real compiler driver built by mrustc→C→GCC and --help succeeded." >> "$GITHUB_STEP_SUMMARY"
+      - name: Compile real Oberon and Mini-C sources with GCC-built compiler
+        if: always() && steps.driver-bootstrap.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          driver="$PWD/mrustc/output-compiler-bootstrap/compiler"
+          test -x "$driver"
+          out="$RUNNER_TEMP/bootstrap-driver-source"
+          mkdir -p "$out"
+          # First exercise the real Oberon frontend and x86 direct ELF backend.
+          timeout 60s "$driver" compiler/examples/Math.mod --language oberon \
+            --target x86_64 --emit obj -o "$out/Math.o"
+          test -s "$out/Math.o"
+          readelf -h "$out/Math.o" | grep -q 'ELF64'
+          readelf -h "$out/Math.o" | grep -q 'Advanced Micro Devices X86-64'
+          nm -g "$out/Math.o"
+          # Then compile a checked Mini-C function and execute the emitted
+          # x86-64 ELF object linked into a separate C harness using GCC.
+          cat > "$out/bootstrap_answer.c" <<'C'
+          int bootstrap_answer(void) { return 6 * 7; }
+          C
+          timeout 60s "$driver" "$out/bootstrap_answer.c" --language mini-c \
+            --target x86_64 --emit obj -o "$out/bootstrap_answer.o"
+          test -s "$out/bootstrap_answer.o"
+          readelf -h "$out/bootstrap_answer.o" | grep -q 'ELF64'
+          nm -g "$out/bootstrap_answer.o" | grep -q bootstrap_answer
+          cat > "$out/harness.c" <<'C'
+          extern int bootstrap_answer(void);
+          int main(void) { return bootstrap_answer() == 42 ? 0 : 1; }
+          C
+          gcc -no-pie "$out/harness.c" "$out/bootstrap_answer.o" -o "$out/harness"
+          timeout 30s "$out/harness"
+          echo "GCC-built compiler successfully compiled real Oberon and Mini-C source into ELF64; GCC-linked Mini-C program returned 42." >> "$GITHUB_STEP_SUMMARY"
       - name: Mark experiment outcome
         if: always()
         shell: bash
