@@ -617,12 +617,40 @@ jobs:
           chmod +x "$binary"
           echo "$(dirname "$binary")" >> "$GITHUB_PATH"
           "$binary" -version
+      # Permanent AL-05.P3 proof and independent reference gates.
+      - name: Check independent strict C11 AL-05.P3 bounded oracle
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cc -std=c11 -O2 -Wall -Wextra -Werror \
+            compiler/crates/opt/tests/oracles/al05_parameterized_loop.c \
+            -o "$RUNNER_TEMP/al05-parametric-c11"
+          "$RUNNER_TEMP/al05-parametric-c11" | tee "$RUNNER_TEMP/al05-parametric-c11.log"
+          grep -Fx 'AL05_PARAMETERIZED_C11 cases=1458 large_bounds=486 families=2 mutants=6 verdict=PASS' \
+            "$RUNNER_TEMP/al05-parametric-c11.log"
+
+      - name: Permanent AL-05.P3 changed TypeId CSE induction and SAT controls
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test alive_lite \
+            al05_parameterized_scope_and_unknown_controls -- --nocapture
+          cargo test -p compiler-opt --test alive_lite \
+            al05_parameterized_changed_cse_and_sat_mutants -- --ignored --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/al05-parametric-z3.log"
+          grep -F 'AL05_PARAMETERIZED proofs=4 changed_cse=4 sat_mutants=12 coefficients=2 signed_bound=all_i32 solver=Z3 verdict=PROVEN' \
+            "$RUNNER_TEMP/al05-parametric-z3.log"
+
       - name: Execute actual Alive-lite proof tests
         if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
         shell: bash
         env:
           ALIVE_LITE_FAILURE_DIR: ${{ runner.temp }}/alive-lite-failures
           AL05_REPLAY_DIR: ${{ github.workspace }}/alive-lite-al05-replay
+          AL05_P3_REPLAY_DIR: ${{ github.workspace }}/alive-lite-al05-p3-replay
           AL05_SOURCE_SHA: ${{ steps.source.outputs.sha }}
         run: |
           set -euo pipefail
@@ -1016,6 +1044,23 @@ jobs:
           grep -E "AL05_SCOPE_MANIFEST files=8 source_sha=${{ steps.source.outputs.sha }} scope_sha256=[0-9a-f]{64} normative_fs1=false verdict=PASS" \
             alive-lite-al05-semantic-manifest.log
 
+      - name: Permanent AL-05.P3 versioned v3 archive and read-only Z3
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
+        shell: bash
+        working-directory: compiler
+        env:
+          AL05_SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          AL05_P3_REPLAY_INPUT_DIR: ${{ github.workspace }}/alive-lite-al05-p3-replay
+        run: |
+          set -euo pipefail
+          test "$(find "$AL05_P3_REPLAY_INPUT_DIR" -maxdepth 1 -type f -name '*.replay' | wc -l)" -eq 4
+          timeout --signal=TERM --kill-after=15s 4m \
+            cargo test -p compiler-opt --test alive_lite \
+              al05_parameterized_replay_v3_read_only_z3 -- --ignored --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/al05-p3-read-only.log"
+          grep -E "AL05_P3_READ_ONLY proofs=4 files=4 sha=$AL05_SOURCE_SHA contract=al05-closed-i32-parametric-cse-loop-v3 verdict=PROVEN" \
+            "$RUNNER_TEMP/al05-p3-read-only.log"
+
       - name: Enforce permanent AL-03 concrete and Z3 proof manifest
         if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
         shell: bash
@@ -1057,6 +1102,7 @@ jobs:
             alive-lite-typeid-source-proofs.jsonl
             alive-lite-al03-manifest.json
             alive-lite-al05-replay/*.replay
+            alive-lite-al05-p3-replay/*.replay
             alive-lite-al05-semantic-manifest.json
             alive-lite-al05-semantic-manifest.log
             alive-lite-al05-replay-summary.log
