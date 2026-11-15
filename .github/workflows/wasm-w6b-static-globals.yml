@@ -1,0 +1,68 @@
+# W6b wasm32 static objects and C11 native LP64 differential.
+name: Wasm W6b static data
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/wasm-w6b-static-globals.yml'
+  workflow_dispatch:
+    inputs:
+      compiler_sha:
+        description: 'Exact compiler source commit'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  wasm-w6b:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout exact compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.compiler_sha || '41ec67e7b05b0d4b37dc2273a74926cd723ab02f' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin source and isolate credential-free backend Rust workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "${{ inputs.compiler_sha || '41ec67e7b05b0d4b37dc2273a74926cd723ab02f' }}"
+          echo "Compiler source: $(git -C compiler rev-parse HEAD)"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+          cc --version | head -1
+      - name: Install independent Node WebAssembly execution runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: wasm-w6b-static-global-memory
+      - name: Run W0-W6b Wasm module tests and native ELF differential
+        working-directory: compiler
+        run: cargo test -p compiler-backend-wasm --tests -- --nocapture
+      - name: Check shared native backend library
+        working-directory: compiler
+        run: cargo test -p compiler-backend --lib
+      - name: Verify x86, AArch64, RISC-V native backend library
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 -p compiler-backend-aarch64 -p compiler-backend-riscv64 --lib
+      - name: Native x86 integration tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --tests
+      - name: Strict Wasm and shared backend all-target Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-wasm -p compiler-backend --all-targets -- -D warnings
