@@ -58,7 +58,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/mini-c
-          ref: 82ee7059c641beebf8d6b85aa6c9485ba7bbb31a
+          ref: bb9c11f38c66f1f5f58b5f9e3d7dd54c2640b64e
           path: mini-c-compat
           persist-credentials: false
       - name: Checkout pinned mrustc
@@ -716,7 +716,7 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           timeout --signal=TERM --kill-after=10s 12m cargo build -q \
-            --manifest-path mini-c-compat/Cargo.toml -p mini-c \
+            --manifest-path mini-c-compat/Cargo.toml -p mini-c --features internal-cpp \
             --target-dir "$RUNNER_TEMP/mrustc-minic-target"
           checker="$RUNNER_TEMP/mrustc-minic-target/debug/mini-c"
           test -x "$checker"
@@ -744,43 +744,62 @@ jobs:
           echo "Mini-C generated-C checks: $passed/$checked pass (diagnostic, non-gating; not native code generation)" >> "$GITHUB_STEP_SUMMARY"
           test "$checked" -gt 0
 
-          # The existing GCC-preprocessed probe above is the independent
-          # baseline. Exercise Mini-C's OWN default C99 preprocessor on the
-          # same actual mrustc-produced sources without changing generated C.
-          # Its current 16 MiB source/output budgets do not admit the large
-          # 50+ MB compiler-IR and x86 library units. Do not raise safety
-          # budgets or call skipped units successful just for this probe.
-          internal_checked=0
-          internal_passed=0
-          internal_skipped=0
+          # Probe the CURRENT opt-in streaming checker (128 MiB guarded
+          # source/output budgets), including real 53–70 MiB C units.
+          # GCC still compiles every generated C file into object code;
+          # syntax-only Mini-C results are non-gating and NOT native builds.
+          # In particular, C11 atomics are not yet supported in Mini-C
+          # despite their use in mrustc-generated C. Never silently drop
+          # qualifiers or treat a parser-only success as object acceptance.
+          stream_checked=0
+          stream_passed=0
+          stream_skipped=0
+          stream_failed=0
           while IFS= read -r file; do
             bytes=$(stat -c %s "$file")
-            if (( bytes > 16 * 1024 * 1024 )); then
-              ((internal_skipped+=1))
-              echo "Mini-C internal CPP: SKIP source-size-limit bytes=$bytes path=$file"
-              echo "Mini-C internal CPP: skipped source >16 MiB bytes=$bytes path=$file" >> "$GITHUB_STEP_SUMMARY"
+            if (( bytes > 128 * 1024 * 1024 )); then
+              ((stream_skipped+=1))
+              echo "Mini-C streaming CPP: SKIP source exceeds 128 MiB byte ceiling"
+              echo "Mini-C stream: skipped source >128 MiB" >> "$GITHUB_STEP_SUMMARY"
               continue
             fi
-            ((internal_checked+=1))
-            echo "Probing Mini-C check --cpp=internal on $file (bytes=$bytes)"
+            ((stream_checked+=1))
+            echo "Probing Mini-C check --cpp=internal-stream source_bytes=$bytes"
             set +e
-            timeout --signal=TERM --kill-after=10s 90s "$checker" \
-              check --cpp=internal --max-errors=4 "$file" \
-              > "$RUNNER_TEMP/mrustc-minic-internal-$internal_checked.log" 2>&1
+            timeout --signal=TERM --kill-after=10s 90s \
+              /usr/bin/time -f 'Stream checker elapsed=%e s; peak RSS=%M KiB' \
+              -o "$RUNNER_TEMP/mrustc-minic-stream-$stream_checked.time" \
+              "$checker" check --cpp=internal-stream --max-errors=4 "$file" \
+              > "$RUNNER_TEMP/mrustc-minic-stream-$stream_checked.out" 2>&1
             rc=$?
             set -e
             if (( rc == 0 )); then
-              ((internal_passed+=1))
-              echo "Mini-C internal CPP: PASSED checker $file (not native code generation)"
+              ((stream_passed+=1))
+              echo "Mini-C stream: syntax/sema accepted; no native object emitted"
             else
-              echo "Mini-C internal CPP: REJECTED or timed out exit=$rc $file; first diagnostics:"
-              sed -n '1,8p' "$RUNNER_TEMP/mrustc-minic-internal-$internal_checked.log"
+              ((stream_failed+=1))
+              echo "Mini-C stream: rejected/failed rc=$rc, first diagnostic follows:"
+              # Extract only parser diagnostic codes and short messages;
+              # never copy private generated source text or paths into logs.
+              python3 - "$RUNNER_TEMP/mrustc-minic-stream-$stream_checked.out" <<'PY'
+          import pathlib, re, sys
+          output = pathlib.Path(sys.argv[1]).read_text(errors="replace")
+          codes = re.findall(r"error\[([A-Z][0-9]{4})\]:\s*([^\n]*)", output)
+          if codes:
+              for code, msg in codes[:4]:
+                  print(f"{code}: {msg[:160]}")
+          else:
+              print(f"No structured Mini-C error, diagnostic bytes={len(output)}")
+          PY
             fi
-            echo "Mini-C internal CPP checker: bytes=$bytes exit=$rc path=$file" >> "$GITHUB_STEP_SUMMARY"
-            sed -n '1,4p' "$RUNNER_TEMP/mrustc-minic-internal-$internal_checked.log" >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "Mini-C streaming CPP checker: input_bytes=$bytes exit=$rc (non-gating)"
+              cat "$RUNNER_TEMP/mrustc-minic-stream-$stream_checked.time" 2>/dev/null || :
+            } >> "$GITHUB_STEP_SUMMARY"
           done < "$selection"
-          echo "Mini-C internal CPP generated-C checks: $internal_passed/$internal_checked pass; $internal_skipped skipped due to >16 MiB source limit (diagnostic only)" >> "$GITHUB_STEP_SUMMARY"
-          echo "The internal path is not equivalent to GCC preprocessing until token and runtime oracles establish parity." >> "$GITHUB_STEP_SUMMARY"
+          echo "Mini-C streamed C units: passed=$stream_passed rejected=$stream_failed skipped=$stream_skipped of $((stream_checked + stream_skipped)) (diagnostic only)" >> "$GITHUB_STEP_SUMMARY"
+          echo "GCC remains the authoritative compiler for all generated C units, including those requiring C11 atomics." >> "$GITHUB_STEP_SUMMARY"
+          echo "No object-code or atomic backend coverage is inferred from this source-language probe." >> "$GITHUB_STEP_SUMMARY"
       - name: Checkout pinned EDG callable frontend source for C compatibility audit
         if: always() && steps.driver-bootstrap.outcome == 'success'
         uses: actions/checkout@v4
