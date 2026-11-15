@@ -1,0 +1,50 @@
+name: ASM1-D6 unowned section symbol acceptance
+on:
+  push:
+    branches: [ci/asm1-d6-unowned-symbols]
+    paths: ['.github/workflows/asm1-d6-unowned-symbols.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  unowned-symbols:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7f229ca88bfa806901c264ae1b62e29a5f27f4d5
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source pin
+        run: test "$(git rev-parse HEAD)" = "7f229ca88bfa806901c264ae1b62e29a5f27f4d5"
+      - name: Restrict workspace to compiler core
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: asm1-d6-unowned-symbols
+      - name: Test unowned symbols and ELF/GAS regressions
+        run: |
+          set -euo pipefail
+          python3 tools/regen_x86_att_forms.py --check
+          python3 -m unittest discover -s tools -p test_regen_x86_att_forms.py -v
+          cargo check -p compiler-backend-x86 --all-targets
+          cargo test -p compiler-backend-x86 --test att_unowned_symbols -- --nocapture
+          for suite in att_data_differences att_asm att_module att_module_strings \
+            att_aliases att_mid_labels att_section_cursor att_text_alignment \
+            m4_global_data_only_native m4_global_definitions_native \
+            m4_global_pointer_relocations_native m4_global_external_native \
+            m4_global_branch_relax_native machine_text_v1; do
+            cargo test -p compiler-backend-x86 --test "$suite"
+          done
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend --lib
+          cargo clippy -p compiler-backend-x86 --lib --test att_unowned_symbols --test att_data_differences --test att_module -- -D warnings -A unused_variables -A clippy::suspicious_assignment_formatting
+          echo 'ASM1_D6_UNOWNED_SYMBOLS status=PASS' >> "$GITHUB_STEP_SUMMARY"
