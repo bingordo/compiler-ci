@@ -24,7 +24,7 @@ jobs:
       run:
         shell: edg-container-exec "bash -eo pipefail {0}"
     env:
-      COMPILER_SHA: 8743d7e4c8d3f42fcc070291b4670877e1f5e761
+      COMPILER_SHA: 8269367dba0bcbfe21ff85b2394735c90a8919fb
       EDG_SOURCE_SHA: b195677be8b9b56c8337afad6be8064d21a54082
       EDG_BRIDGE_SHA: 127d2796e4ea2b9c2722a867d005c175adcea1ba
       EDG_RELEASE_TAG: edgcpfe-v2026.11.14-upstream-177765bb7731
@@ -41,7 +41,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 8743d7e4c8d3f42fcc070291b4670877e1f5e761
+          ref: 8269367dba0bcbfe21ff85b2394735c90a8919fb
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -270,6 +270,51 @@ jobs:
             test ! -e "$kind.o"
             grep -Fq 'EDG -> compiler-ir rejected source:' "$kind.log"
             echo "EDG_BASE_REF_NATIVE gate=${kind}_base_no_partial_elf result=pass" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Validate C++ bool local normalized TypeId SSA and reject unsupported Boolean ABI
+        working-directory: edgcpp/build/gcc-release
+        run: |
+          set -euo pipefail
+          source ./environment.sh
+          driver="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          fixtures="$GITHUB_WORKSPACE/compiler/tools/edg-driver/tests/fixtures"
+          work="$RUNNER_TEMP/edg-cxx-bool-local"
+          mkdir -p "$work"
+          cd "$work"
+          cp "$fixtures/edg_native_cxx5_bool_local.cpp" bool.cpp
+          g++ -std=c++17 -Wall -Wextra -Werror bool.cpp -o oracle
+          timeout 15s ./oracle >oracle.out 2>oracle.err
+          version="$(g++ -dumpfullversion -dumpversion)"
+          IFS=. read -r major minor patch <<<"$version"
+          gnu_number=$((10#$major*10000+10#${minor:-0}*100+10#${patch:-0}))
+          "$driver" native.o --typeid-native --g++ --c++17 --no_strict_gnu \
+            --gnu_version "$gnu_number" bool.cpp >native.compile.log 2>&1 || {
+              tail -n 120 native.compile.log >&2
+              test ! -e native.o
+              exit 1
+            }
+          test "$(od -An -tx1 -N4 native.o | tr -d '[:space:]')" = 7f454c46
+          g++ native.o -o native
+          timeout 15s ./native >native.out 2>native.err
+          test "$(sha256sum oracle.out | cut -d' ' -f1)" = "$(sha256sum native.out | cut -d' ' -f1)"
+          test "$(sha256sum oracle.err | cut -d' ' -f1)" = "$(sha256sum native.err | cut -d' ' -f1)"
+          echo 'EDG_BOOL_NATIVE gate=source_bool_local_gxx_parity result=pass' | tee -a "$GITHUB_STEP_SUMMARY"
+          for case in formal result volatile; do
+            source="$fixtures/edg_native_cxx5_bool_${case}_reject.cpp"
+            g++ -std=c++17 -Wall -Wextra -Werror -fsyntax-only "$source"
+            rm -f "$case.o"
+            set +e
+            "$driver" "$case.o" --typeid-native --g++ --c++17 --no_strict_gnu \
+              --gnu_version "$gnu_number" "$source" >"$case.log" 2>&1
+            status=$?
+            set -e
+            if test "$status" -eq 0; then
+              echo "::error::Unsupported C++ bool $case emitted ELF"
+              exit 1
+            fi
+            test ! -e "$case.o"
+            grep -Fq 'EDG -> compiler-ir rejected source:' "$case.log"
+            echo "EDG_BOOL_NATIVE gate=${case}_no_partial_elf result=pass" | tee -a "$GITHUB_STEP_SUMMARY"
           done
       - name: Verify hook-free EDG source initialized integer as real ELF storage
         working-directory: edgcpp/build/gcc-release
