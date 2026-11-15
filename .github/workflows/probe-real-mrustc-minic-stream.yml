@@ -1,0 +1,165 @@
+name: Probe real mrustc C with Mini-C internal stream
+on:
+  push:
+    branches: [ci/probe-real-mrustc-minic-stream]
+    paths:
+      - '.github/workflows/probe-real-mrustc-minic-stream.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  real-c:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 85
+    steps:
+      - name: Checkout compiler-ci source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout private compiler with existing read-only key
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: main
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+
+      - name: Checkout actual mrustc generator
+        uses: actions/checkout@v4
+        with:
+          repository: thepowersgang/mrustc
+          ref: master
+          path: mrustc
+          persist-credentials: false
+
+      - name: Checkout current Mini-C streaming checker
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: 019500298efe685f431148ab3acc867e7ab73ca2
+          path: mini-c
+          persist-credentials: false
+
+      - name: Identify reproducible mrustc revision
+        id: mrustc-revision
+        run: echo "sha=$(git -C mrustc rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore mrustc toolchain from prior successful bootstrap
+        id: mrustc-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            mrustc/bin
+            mrustc/output-1.90.0
+          key: mrustc-bootstrap-v1-${{ runner.os }}-ubuntu2404-rust190-${{ steps.mrustc-revision.outputs.sha }}
+
+      - name: Build toolchain only if cache is missing
+        working-directory: mrustc
+        env:
+          RUSTC_VERSION: '1.90.0'
+          MRUSTC_TARGET_VER: '1.90'
+          OUTDIR_SUF: '-1.90.0'
+          PARLEVEL: '2'
+        run: |
+          set -euo pipefail
+          if [[ -x bin/mrustc && -x bin/minicargo && -f output-1.90.0/libcore.rlib ]]; then
+            echo 'mrustc cache hit: using previous generated C toolchain.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends build-essential zlib1g-dev pkg-config cmake curl python3 libssl-dev
+            timeout --signal=TERM --kill-after=10s 20m make -j2
+            timeout --signal=TERM --kill-after=10s 10m make RUSTCSRC
+            timeout --signal=TERM --kill-after=10s 55m make -f minicargo.mk LIBS
+          fi
+          test -f output-1.90.0/libcore.rlib
+          test -x bin/minicargo
+
+      - name: Build current Mini-C streaming checker
+        working-directory: mini-c
+        run: |
+          set -euo pipefail
+          cargo build -q -p mini-c --features internal-cpp
+          echo "Mini-C $(git rev-parse --short=12 HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Generate actual compiler-ir C using mrustc
+        working-directory: mrustc
+        env:
+          RUSTC_VERSION: '1.90.0'
+          MRUSTC_TARGET_VER: '1.90'
+          OUTDIR_SUF: '-1.90.0'
+          PARLEVEL: '2'
+          CC: gcc
+        run: |
+          set -euo pipefail
+          echo "mrustc $(git rev-parse --short=12 HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          echo "compiler $(git -C ../compiler rev-parse --short=12 HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          set +e
+          timeout --signal=TERM --kill-after=10s 25m bin/minicargo \
+            -L output-1.90.0 -o output-compiler-bootstrap \
+            ../compiler/crates/ir > "$RUNNER_TEMP/real-ir-mrustc.log" 2>&1
+          rc=$?
+          set -e
+          if (( rc != 0 )); then
+            echo "mrustc compiler-ir translation failed, exit=$rc" >> "$GITHUB_STEP_SUMMARY"
+            exit "$rc"
+          fi
+          find output-compiler-bootstrap -maxdepth 1 -type f -name 'libcompiler_ir*.c' \
+            -printf '%s %p\n' | sort -nr > "$RUNNER_TEMP/real-ir-c-candidates.txt"
+          test -s "$RUNNER_TEMP/real-ir-c-candidates.txt"
+          source=$(head -1 "$RUNNER_TEMP/real-ir-c-candidates.txt" | cut -d' ' -f2-)
+          test -f "$source"
+          realpath "$source" > "$RUNNER_TEMP/real-ir-c-path.txt"
+          echo "Actual mrustc compiler-ir generated C bytes: $(stat -c %s "$source")" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Independently validate actual generated C with GCC
+        run: |
+          set -euo pipefail
+          source=$(cat "$RUNNER_TEMP/real-ir-c-path.txt")
+          timeout --signal=TERM --kill-after=10s 480s \
+            /usr/bin/time -f 'GCC elapsed=%e seconds; peak RSS=%M KiB' \
+            -o "$RUNNER_TEMP/real-ir-gcc-metrics.txt" \
+            gcc -std=gnu11 -O0 -fsyntax-only "$source" \
+            > "$RUNNER_TEMP/real-ir-gcc.stdout" 2> "$RUNNER_TEMP/real-ir-gcc.stderr"
+          cat "$RUNNER_TEMP/real-ir-gcc-metrics.txt" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check actual compiler-ir C using bounded internal CPP to parser
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          source=$(cat "$RUNNER_TEMP/real-ir-c-path.txt")
+          set +e
+          timeout --signal=TERM --kill-after=10s 540s \
+            /usr/bin/time -f 'Mini-C elapsed=%e seconds; peak RSS=%M KiB' \
+            -o "$RUNNER_TEMP/real-ir-minic-metrics.txt" \
+            mini-c/target/debug/mini-c check --cpp=internal-stream --max-errors=4 "$source" \
+            > "$RUNNER_TEMP/real-ir-minic.stdout" 2> "$RUNNER_TEMP/real-ir-minic.stderr"
+          rc=$?
+          set -e
+          {
+            echo "### Real mrustc-generated compiler-ir C: Mini-C direct stream"
+            echo "Checker exit: $rc (zero means accepted; nonzero means failed)"
+            if [[ -f "$RUNNER_TEMP/real-ir-minic-metrics.txt" ]]; then
+              cat "$RUNNER_TEMP/real-ir-minic-metrics.txt"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY'
+          from pathlib import Path
+          import os,re
+          error = Path(os.environ["RUNNER_TEMP"]) / "real-ir-minic.stderr"
+          text = error.read_text(errors="replace")
+          diagnostics = re.findall(r'error\[([A-Z0-9]+)\]:\s*([^\n]*)', text)
+          out = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          with out.open("a") as f:
+              print("First diagnostic codes and messages (without source lines):", file=f)
+              for code, message in diagnostics[:4]:
+                  print(f"- {code}: {message[:160]}", file=f)
+              if not diagnostics:
+                  print(f"- No structured diagnostics, output bytes={len(text)}", file=f)
+          PY
+          # This is a real acceptance gate, unlike the previous diagnostic-only
+          # probe. A failing checker makes the workflow red, not a false green.
+          exit "$rc"
