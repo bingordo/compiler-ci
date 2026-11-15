@@ -1,0 +1,36 @@
+name: AArch64 S16 pinned original ADC ADCS source effect identity
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-aarch64-a32-s16-source-effects.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  pinned-original-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 051f9356dc377b8baf5ab521585f537fa121683c
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact revision, Python and original Arm source
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 051f9356dc377b8baf5ab521585f537fa121683c
+          python3 -m unittest discover -s compiler/tools -p 'test_aarch64*.py' -v
+          curl -fLsS --retry 3 --connect-timeout 20 --max-time 240 --max-filesize 200000000 -o /tmp/arm2026.tar.gz https://developer.arm.com/-/cdn-downloads/permalink/Exploration-Tools-A64-ISA/ISA_A64/ISA_A64_xml_A_profile-2026-09.tar.gz
+          echo "44cfb89c763c7eea8e59de0ad2221e3c012e6aa77899bd7f1c3e1f24537191d7  /tmp/arm2026.tar.gz" | sha256sum -c -
+          python3 compiler/tools/aarch64_a32_full_source_catalog.py --isa-xml-archive /tmp/arm2026.tar.gz --out /tmp/arm-source-index.json
+          python3 compiler/tools/aarch64_a32_adc_source_effects.py --catalog /tmp/arm-source-index.json --archive /tmp/arm2026.tar.gz --out /tmp/adc-effects.json
+          python3 - <<'PY'
+          import json
+          data=json.load(open('/tmp/adc-effects.json'))
+          assert [row['operation'] for row in data['rows']] == ['ADC','ADCS']
+          assert all(not data[name] for name in ('typed_ast_execution_verified','helper_semantics_verified','semantic_equivalence_proven','selection_eligible'))
+          print("PINNED_A64_SOURCE_EFFECTS",[(x['operation_id'],x['effects']) for x in data['rows']])
+          PY
