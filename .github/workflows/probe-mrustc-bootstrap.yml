@@ -743,6 +743,44 @@ jobs:
           done < "$selection"
           echo "Mini-C generated-C checks: $passed/$checked pass (diagnostic, non-gating; not native code generation)" >> "$GITHUB_STEP_SUMMARY"
           test "$checked" -gt 0
+
+          # The existing GCC-preprocessed probe above is the independent
+          # baseline. Exercise Mini-C's OWN default C99 preprocessor on the
+          # same actual mrustc-produced sources without changing generated C.
+          # Its current 16 MiB source/output budgets do not admit the large
+          # 50+ MB compiler-IR and x86 library units. Do not raise safety
+          # budgets or call skipped units successful just for this probe.
+          internal_checked=0
+          internal_passed=0
+          internal_skipped=0
+          while IFS= read -r file; do
+            bytes=$(stat -c %s "$file")
+            if (( bytes > 16 * 1024 * 1024 )); then
+              ((internal_skipped+=1))
+              echo "Mini-C internal CPP: SKIP source-size-limit bytes=$bytes path=$file"
+              echo "Mini-C internal CPP: skipped source >16 MiB bytes=$bytes path=$file" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            ((internal_checked+=1))
+            echo "Probing Mini-C check --cpp=internal on $file (bytes=$bytes)"
+            set +e
+            timeout --signal=TERM --kill-after=10s 90s "$checker" \
+              check --cpp=internal --max-errors=4 "$file" \
+              > "$RUNNER_TEMP/mrustc-minic-internal-$internal_checked.log" 2>&1
+            rc=$?
+            set -e
+            if (( rc == 0 )); then
+              ((internal_passed+=1))
+              echo "Mini-C internal CPP: PASSED checker $file (not native code generation)"
+            else
+              echo "Mini-C internal CPP: REJECTED or timed out exit=$rc $file; first diagnostics:"
+              sed -n '1,8p' "$RUNNER_TEMP/mrustc-minic-internal-$internal_checked.log"
+            fi
+            echo "Mini-C internal CPP checker: bytes=$bytes exit=$rc path=$file" >> "$GITHUB_STEP_SUMMARY"
+            sed -n '1,4p' "$RUNNER_TEMP/mrustc-minic-internal-$internal_checked.log" >> "$GITHUB_STEP_SUMMARY"
+          done < "$selection"
+          echo "Mini-C internal CPP generated-C checks: $internal_passed/$internal_checked pass; $internal_skipped skipped due to >16 MiB source limit (diagnostic only)" >> "$GITHUB_STEP_SUMMARY"
+          echo "The internal path is not equivalent to GCC preprocessing until token and runtime oracles establish parity." >> "$GITHUB_STEP_SUMMARY"
       - name: Checkout pinned EDG callable frontend source for C compatibility audit
         if: always() && steps.driver-bootstrap.outcome == 'success'
         uses: actions/checkout@v4
