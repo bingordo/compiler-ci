@@ -1,0 +1,56 @@
+# Temporary exact-source TypeId if-conversion quality parity.
+name: BT4 remaining TypeId nested/dead/CT05f CMOV parity
+on:
+  pull_request:
+    paths: ['.github/workflows/ir-bt4-remaining-cmov-pr1736.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-cmov:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_INCREMENTAL: '0'
+      SOURCE_SHA: e6f10323fab1a38020c747e571218db2e2b91414
+    steps:
+      - name: Checkout exact compiler commit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e6f10323fab1a38020c747e571218db2e2b91414
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and narrow workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: bt4-typeid-nested-cmov
+      - name: Original remaining nested/dead/CT05f TypeId physical and C oracles
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test if_conversion_typeid_remaining -- --nocapture
+      - name: Existing native CMOV, flag, predicate and pressure oracles
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test if_conversion_typeid_multimerge --test if_conversion_typeid_x86 --test typed_if_conversion_native
+          cargo test -p compiler-backend-x86 --test native_typeid_select_cmov
+      - name: Original historical three-oracle independent reference
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test if_conversion_native
+      - name: All-target compilation of core backends and optimizer
+        working-directory: compiler
+        run: cargo check -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --all-targets
+      - name: Strict new native CMOV oracle Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt --test if_conversion_typeid_remaining -- -D warnings -A private_interfaces
