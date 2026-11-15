@@ -1,0 +1,144 @@
+name: X7 S3.L L5b original Intel XED GP-GP flag-only source validation
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/x86-s3l-l5b-gpreg-validate.yml'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  register-only-source-flags:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: '3e9e77a767446348bdd23c0e6bab601c43f88633'
+      PYTHONPATH: compiler/tools
+      X7_S3L_L4A_WORKLIST: /tmp/x7-s3l-l5b/source/original-source-xed-iforms.json
+      X7_S3L_L4A_SMT: /tmp/x7-s3l-l5b/smt/semantics-z3.json
+      X7_S3L_L4A_S2: /tmp/x7-s3l-l5b/s2/join-1.json
+      X7_S3L_L4A_OP_AST: /tmp/x7-s3l-l5b/smt/operations.json
+      X7_S3L_L4A_INTEL_DIR: /tmp/x7-s3l-l5b/intel
+    steps:
+      - name: Checkout exact compiler source without compiler Actions
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 3e9e77a767446348bdd23c0e6bab601c43f88633
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Original independent S2 pinned XED/Intel all-iform join
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s2-pinned-intel-xed-variant-join
+          run-id: 43635408689
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3l-l5b/s2
+      - name: Original previous 200-form memory-source worklist and SHA
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3l-l3c-source-XED-gated-production-admission
+          run-id: 43728544711
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3l-l5b/source
+      - name: Independent 9-operation Intel AST and SMT Z3 result/flag proofs
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3l-l2b-l3a-9-ops-generic-helper-smt-source-evidence
+          run-id: 43687620382
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3l-l5b/smt
+      - name: Download and verify exact pinned Intel TEST original XML
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          mkdir -p "$X7_S3L_L4A_INTEL_DIR" /tmp/x7-s3l-l5b/out
+          curl --fail --silent --show-error --location --retry 2 --max-time 50 \
+            "https://raw.githubusercontent.com/intel/SDM/35eface1b7ee003a1cda95005ec5fd83de658a64/data/instruction/TEST.xml" \
+            -o "$X7_S3L_L4A_INTEL_DIR/TEST.xml"
+          test -s "$X7_S3L_L4A_S2"
+          test -s "$X7_S3L_L4A_OP_AST"
+      - name: Generate exact original Intel/XED/SMT gated GP-GP recipes and reject mutations
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/x86_s3l_l4a_flags_recipe.py \
+            --worklist "$X7_S3L_L4A_WORKLIST" \
+            --generic-smt "$X7_S3L_L4A_SMT" \
+            --s2 "$X7_S3L_L4A_S2" \
+            --operation-ast "$X7_S3L_L4A_OP_AST" \
+            --intel-dir "$X7_S3L_L4A_INTEL_DIR" \
+            --report /tmp/x7-s3l-l5b/out/physical-recipes.json
+          git -C compiler diff --exit-code -- \
+            crates/backend-x86/src/generated_x7_s3l_l4a_flags_only_recipes.rs
+          python3 compiler/tools/x86_s3l_l4a_flags_recipe.py \
+            --worklist "$X7_S3L_L4A_WORKLIST" \
+            --generic-smt "$X7_S3L_L4A_SMT" \
+            --s2 "$X7_S3L_L4A_S2" \
+            --operation-ast "$X7_S3L_L4A_OP_AST" \
+            --intel-dir "$X7_S3L_L4A_INTEL_DIR" \
+            --report /tmp/x7-s3l-l5b/out/physical-recipes.json --check
+          python3 -m unittest -v test_x86_s3l_l4a_flags_recipe
+          python3 - <<'PY'
+          import json
+          r=json.load(open('/tmp/x7-s3l-l5b/out/physical-recipes.json'))
+          print("X7_S3L_L5B_SOURCE_REGREG_COUNT",r["native_physical_recipe_count"],
+                "production",r["new_production_TypeId_admissions"])
+          assert r["native_physical_recipe_count"]==6
+          assert r["new_production_TypeId_admissions"]==4
+          for x in r["native_physical_recipe_rows"]:
+              if x["source_operand_shape"]=="gp_gp":
+                  assert not x["c_defined_production"]
+                  print("X7_S3L_L5B_TEST_GPR_REG_SOURCE",
+                        x["iform"],x["bits"],x["intel_iform_sha256"],
+                        x["xed_variant_id"])
+          PY
+          echo X7_S3L_L5B_ORIGINAL_SOURCE_XED_MODRM3_Z3_PROOF_PASS
+      - name: Isolate offline backend Rust workspace
+        shell: bash
+        run: |
+          cd compiler
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          """)
+          PY
+      - name: Validate new real TypeId GP-only source selections GAS and direct ELF
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-native-form-validation x7-c-defined-64 x7-c-defined-bitwise' \
+            --test x7_s3l_l5b_regreg_typeid_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-native-form-validation x7-c-defined-64 x7-c-defined-bitwise' \
+            --test x7_s3l_l4c_typeid_flags_native --offline
+          echo X7_S3L_L5B_REAL_TYPEID_GP_GP_NATIVE_GAS_ELF_C11_PASS
+      - name: Ensure default does not silently activate new unreviewed form
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 \
+            --test x7_s3l_l5b_regreg_typeid_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --test x7_s3l_l5b_regreg_typeid_native --offline
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --features x7-c-defined-source-flags \
+            --test x7_s3l_l5b_regreg_typeid_native --offline
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --test x7_g10_n15_no_default_fallback --offline
+          echo X7_S3L_L5B_UNADMITTED_REGISTER_GP_NO_DEFAULT_PASS
+      - name: Archive new independently pinned XED reg-reg source proof
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-s3l-l5b-two-new-register-test-physical-native-validation
+          path: /tmp/x7-s3l-l5b/out/physical-recipes.json
+          if-no-files-found: error
