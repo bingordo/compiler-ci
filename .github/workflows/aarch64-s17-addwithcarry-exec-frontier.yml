@@ -1,0 +1,74 @@
+name: AArch64 S17 authentic AddWithCarry ASL execution frontier
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/aarch64-s17-addwithcarry-exec-frontier.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  original-helper:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d0824fcf3050b59dbf0fb8efca4608f6c66ce92e
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: herd/herdtools7
+          ref: cfc4f56c522ec0d701acaf5a23139b47e8711299
+          path: herd
+          sparse-checkout: |
+            herd/libdir/asl-pseudocode/bundler.py
+          persist-credentials: false
+      - name: Discover exact original helper declaration and dependencies
+        run: |
+          set -euo pipefail
+          curl -fLsS --retry 3 --connect-timeout 20 --max-time 240 --max-filesize 200000000 -o /tmp/arm2026.tar.gz https://developer.arm.com/-/cdn-downloads/permalink/Exploration-Tools-A64-ISA/ISA_A64/ISA_A64_xml_A_profile-2026-09.tar.gz
+          echo "44cfb89c763c7eea8e59de0ad2221e3c012e6aa77899bd7f1c3e1f24537191d7  /tmp/arm2026.tar.gz" | sha256sum -c -
+          python3 - <<'PY'
+          import sys, re, hashlib, tarfile, tempfile
+          from pathlib import Path
+          from argparse import Namespace
+          import xml.etree.ElementTree as ET
+          sys.path.insert(0,'compiler/tools')
+          from aarch64_a32_aslref_compat import load_bundler
+          from aarch64_a32_asl_source_links import ROOT
+          bundle=load_bundler(Path('herd/herd/libdir/asl-pseudocode/bundler.py'))
+          with tempfile.TemporaryDirectory() as tmp:
+              folder=Path(tmp)
+              with tarfile.open('/tmp/arm2026.tar.gz','r:gz') as tar:
+                  item=tar.getmember(ROOT+'shared_pseudocode.xml')
+                  raw=tar.extractfile(item).read()
+              (folder/'shared_pseudocode.xml').write_bytes(raw)
+              target=folder/'shared.asl'
+              bundle.make_shared_pseudocode(Namespace(i_files=[folder/'shared_pseudocode.xml'],o_dir=target))
+              src=target.read_text()
+              lines=src.splitlines()
+              headers=[(i,line.strip()) for i,line in enumerate(lines) if re.search(r'\\b(?:func|procedure)\\s+AddWithCarry\\b',line)]
+              calls=[i for i,line in enumerate(lines) if 'AddWithCarry' in line]
+              print('S17_ORIGINAL_SOURCE',len(raw),hashlib.sha256(raw).hexdigest(),len(src),hashlib.sha256(src.encode()).hexdigest())
+              print('S17_HELPER_DECLARATIONS',len(headers),'source_occurrences',len(calls))
+              for index,line in headers:
+                  print('S17_HELPER_SIGNATURE', 'line',index,'length',len(line),'sha',hashlib.sha256(line.encode()).hexdigest(),
+                        'generic',bool(re.search(r'\\{N\\}',line)), 'tuple_result', 'bits(4)' in line,
+                        'arity3',line.count(',')>=2, 'return_arrow','=>' in line)
+                  nearby='\\n'.join(lines[index:index+110])
+                  print('S17_HELPER_BODY_SHAPE','AddWithCarry_selfcalls',nearby.count('AddWithCarry'),
+                        'UInt',nearby.count('UInt('),'SInt',nearby.count('SInt('),
+                        'IsZero',nearby.count('IsZero('),'return',len(re.findall(r'\\breturn\\b',nearby)),
+                        'ends',len(re.findall(r'\\bend\\s*;',nearby)))
+              xml=ET.fromstring(raw)
+              containing=[]
+              for ps in xml.iter('ps'):
+                  txt=''.join(ps.itertext())
+                  if re.search(r'\\bAddWithCarry\\b',txt):
+                      containing.append((ps.get('name'),ps.get('secttype'),len(txt),hashlib.sha256(txt.encode()).hexdigest(),len(re.findall(r'\\bAddWithCarry\\b',txt))))
+              print('S17_ORIGINAL_XML_SECTIONS',containing[:20])
+              assert len(headers)==1, 'source declaration not unique'
+          PY
