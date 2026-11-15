@@ -80,4 +80,4 @@ for p in selected[:4]:
           f"atomic_qualifier={counts['atomic_qualifier']} "
           f"atomic_api={counts['atomic_api']} "
           f"gnu_builtin={counts['gnu_builtin']} "
-          "gcc_required_for_native_build=yes")
+          "native_oracle=gcc")
