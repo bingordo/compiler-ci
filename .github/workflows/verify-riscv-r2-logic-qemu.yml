@@ -1,0 +1,149 @@
+name: RV64 R2 reviewed logical AND OR XOR with GNU GAS and QEMU
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-riscv-r2-logic-qemu.yml']
+permissions:
+  contents: read
+jobs:
+  logic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c44fe15d8de31b538f982333c38306f3405d1e14
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require exact compiler source revision
+        run: test "$(git -C compiler rev-parse HEAD)" = "c44fe15d8de31b538f982333c38306f3405d1e14"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Restrict workspace to the native TypeId backend
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-riscv64"]
+          EOF
+          rm -f Cargo.lock
+      - name: Rust, Clippy, exact UDB and source-admission gates
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib
+          cargo test -p compiler-backend-riscv64 --all-targets
+          cargo clippy -p compiler-backend-riscv64 --all-targets -- -D warnings
+          python3 tools/regen_riscv_native_selector_rules.py --check
+          python3 -m unittest discover -s tools -p test_riscv_native_selector_rules.py -v
+          python3 tools/riscv_udb_rust_leaf_forms.py \
+            --catalog data/riscv_udb_r0_catalog.json \
+            --output crates/backend-riscv64/src/generated_encoding.rs --check
+      - name: Install independent RISC-V GAS, objdump, linker and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu qemu-user
+      - name: Direct ELF vs independent GNU GAS bytes and opcode disassembly
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for kind in and or xor; do
+            cargo run -p compiler-backend-riscv64 --example rv64_leaf -- \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}.s" "${kind}"
+            grep -qE "^[[:space:]]+${kind} x[0-9]+, x[0-9]+, x[0-9]+$" "/tmp/rv64_${kind}.s"
+            riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+              "/tmp/rv64_${kind}.s" -o "/tmp/rv64_${kind}_gas.o"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}_direct.bin"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}_gas.o" "/tmp/rv64_${kind}_gas.bin"
+            cmp "/tmp/rv64_${kind}_direct.bin" "/tmp/rv64_${kind}_gas.bin"
+            riscv64-linux-gnu-objdump -dr "/tmp/rv64_${kind}.o" | grep -w "${kind}"
+          done
+      - name: Execute eight RV64I bitwise cases with LP64 stack preservation
+        run: |
+          set -euo pipefail
+          cat > /tmp/rv64_logic_start.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            mv s0, sp
+            li a0, -1
+            li a1, -256
+            call rv64_and_leaf
+            li t0, -256
+            bne a0, t0, fail1
+            bne sp, s0, fail_sp
+            li a0, 0xf0f0f0f0f0f0f0f0
+            li a1, 0x0f0f0f0f0f0f0f0f
+            call rv64_and_leaf
+            bnez a0, fail2
+            li a0, 0xf0
+            li a1, 0x0f
+            call rv64_or_leaf
+            li t0, 255
+            bne a0, t0, fail3
+            bne sp, s0, fail_sp
+            li a0, 0x8000000000000000
+            li a1, 1
+            call rv64_or_leaf
+            li t0, 0x8000000000000001
+            bne a0, t0, fail4
+            li a0, 0x55
+            li a1, 0xaa
+            call rv64_xor_leaf
+            li t0, 255
+            bne a0, t0, fail5
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 0x7fffffffffffffff
+            call rv64_xor_leaf
+            li t0, 0x8000000000000000
+            bne a0, t0, fail6
+            li a0, 0
+            li a1, 0x123456789abcdef0
+            call rv64_or_leaf
+            li t0, 0x123456789abcdef0
+            bne a0, t0, fail7
+            li a0, 0x123456789abcdef0
+            li a1, 0x123456789abcdef0
+            call rv64_xor_leaf
+            bnez a0, fail8
+            li a0, 0
+            j exit
+          fail1: li a0, 1
+            j exit
+          fail2: li a0, 2
+            j exit
+          fail3: li a0, 3
+            j exit
+          fail4: li a0, 4
+            j exit
+          fail5: li a0, 5
+            j exit
+          fail6: li a0, 6
+            j exit
+          fail7: li a0, 7
+            j exit
+          fail8: li a0, 8
+            j exit
+          fail_sp: li a0, 9
+          exit:
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+            /tmp/rv64_logic_start.s -o /tmp/rv64_logic_start.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax \
+            -e _start /tmp/rv64_logic_start.o \
+            /tmp/rv64_and.o /tmp/rv64_or.o /tmp/rv64_xor.o \
+            -o /tmp/rv64_logic.elf
+          timeout 15s qemu-riscv64 /tmp/rv64_logic.elf
+          echo "RV64I TypeId logical operations: eight QEMU cases passed"
