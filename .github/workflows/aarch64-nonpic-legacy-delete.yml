@@ -1,0 +1,72 @@
+name: AArch64 production legacy Backend retirement gate
+on:
+  push:
+    branches: [ci/aarch64-nonpic-legacy-delete-20261114]
+    paths: ['.github/workflows/aarch64-nonpic-legacy-delete.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 749f0a0374c6e51a13767285c5586e601700d060
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and isolate compiler core workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "749f0a0374c6e51a13767285c5586e601700d060"
+          echo "Exact source SHA 749f0a0374c6e51a13767285c5586e601700d060" >> "$GITHUB_STEP_SUMMARY"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          if grep -Eq '^impl Backend for AArch64(Pic)?[[:space:]]*\{' compiler/crates/backend-aarch64/src/lib.rs; then
+            echo 'Production legacy Backend impl unexpectedly remains'
+            exit 1
+          fi
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: aarch64-legacy-backend-bt4-delete
+      - name: IR/backend/x86/AArch64 all-target check plus optimizer library
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-ir -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --all-targets
+          cargo check -p compiler-opt --lib
+          cargo check -p compiler-backend-aarch64 --release --lib
+      - name: Complete original AArch64 unit and integration tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend-aarch64 -- --nocapture
+      - name: Strict production IR/opt/shared/AArch64 library Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-aarch64 --lib -- -D warnings
+      - name: Install independent C11/QEMU/GDB validation tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user gdb
+      - name: Original AArch64 PIC/globals/CFI C11 runtime under QEMU
+        working-directory: compiler
+        env:
+          COMPILER_REQUIRE_AARCH64_QEMU: "1"
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-aarch64 --test module_gas --test module_globals --test unwind_cfi -- --nocapture
+      - name: Complete shared backend plus x86 existing backend tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend -- --nocapture
+          cargo test -p compiler-backend-x86 -- --skip s2342_native_x86_baseline_and_optimized_elf_gas_c11_oracle --skip native_s2334_additive_pair_cancellation_gas_elf
+      - name: Record verified production legacy removal
+        run: |
+          echo 'AArch64 old Backend trait implementation absent from production; backend all-target, release, legacy offline byte oracles, full AArch64 + shared/x86 with two known S23 exclusions, strict Clippy, actual QEMU C11/PIC/CFI PASS' >> "$GITHUB_STEP_SUMMARY"
