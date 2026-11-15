@@ -1,0 +1,134 @@
+name: X7 S3.K CMP flags-only source admission and native execution
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/x86-s3k-cmp-flags-admission.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  s3k-cmp:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 32
+    env:
+      SOURCE_SHA: 'c0f292328190810492b1821c7b58d7e703178f60'
+      PYTHONPATH: compiler/tools
+      X7_S3K_CMP_XML: /tmp/x7-s3k-pinned/CMP.xml
+      X7_S3K_S2: /tmp/x7-s3k-s2/join-1.json
+      X7_S3K_S3J: /tmp/x7-s3k-s3j/add-sub-source-proof.json
+      X7_S3K_REPORT: /tmp/x7-s3k-proof/source-cmp-flags-admission.json
+    steps:
+      - name: Checkout exact compiler source (never run compiler Actions)
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c0f292328190810492b1821c7b58d7e703178f60
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Download complete exact pinned original Intel XED candidate join
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s2-pinned-intel-xed-variant-join
+          run-id: 43635408689
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3k-s2
+      - name: Download independently proven pinned Intel ADD/SUB helper and 68 SMT certificates
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3j-add-sub-source-ir-proof
+          run-id: 43682964277
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3k-s3j
+      - name: Obtain original Intel CMP.xml and pin source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          mkdir -p /tmp/x7-s3k-pinned /tmp/x7-s3k-proof
+          test -s "$X7_S3K_S2"
+          test -s "$X7_S3K_S3J"
+          curl --fail --silent --show-error --location --retry 2 --max-time 45 \
+            'https://raw.githubusercontent.com/intel/SDM/35eface1b7ee003a1cda95005ec5fd83de658a64/data/instruction/CMP.xml' \
+            -o "$X7_S3K_CMP_XML"
+      - name: Reproduce source-proven flags-only CMP 32/64 generated Rust tables
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/x86_s3k_cmp_source_admission.py \
+            --intel-cmp-xml "$X7_S3K_CMP_XML" \
+            --s2 "$X7_S3K_S2" --s3j "$X7_S3K_S3J" \
+            --out "$X7_S3K_REPORT" 
+          git -C compiler diff --exit-code -- \
+            crates/backend-x86/src/generated_x7_s3k_cmp_physical_forms.rs \
+            crates/backend-x86/src/generated_x7_s3k_cmp_ir_admissions.rs
+          python3 compiler/tools/x86_s3k_cmp_source_admission.py \
+            --intel-cmp-xml "$X7_S3K_CMP_XML" \
+            --s2 "$X7_S3K_S2" --s3j "$X7_S3K_S3J" \
+            --out "$X7_S3K_REPORT" --check
+          echo X7_S3K_EXACT_SOURCE_GENERATOR_PASS
+      - name: Test original Intel CMP source/XED/flags/width and negative mutation cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest -v test_x86_s3k_cmp_source_admission
+          echo X7_S3K_INTEL_SOURCE_AND_XED_MUTATIONS_PASS
+      - name: Isolate offline backend-only Rust workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          """)
+          PY
+      - name: Real generic physical DAG matcher and reviewed source-form compiler-IR gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-native-form-validation x7-c-defined-64 x7-c-defined-bitwise' \
+            --lib dag_match::physical_window_tests --offline
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-native-form-validation x7-c-defined-64 x7-c-defined-bitwise' \
+            --lib x7_native_form_bridge --offline
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-native-form-validation x7-c-defined-64 x7-c-defined-bitwise' \
+            --lib x7_late_selector --offline
+      - name: Actual CMP flags EQ signed LESS unsigned BELOW native GAS and direct ELF
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-native-form-validation x7-c-defined-64 x7-c-defined-bitwise' \
+            --test x7_s3k_cmp_native --offline -- --nocapture
+          echo X7_S3K_GAS_DIRECT_ELF_NATIVE_FLAGS_PASS
+      - name: Exact no-default 32-bit fallback and existing ADD/SUB source gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --features x7-native-form-validation \
+            --test x7_s3k_cmp_native --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --features x7-native-form-validation \
+            --lib x7_late_selector --offline
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-native-form-validation x7-c-defined-64 x7-c-defined-bitwise' \
+            --test x7_s3j_arithmetic_ir_admission --offline
+          echo X7_S3K_NO_DEFAULT_AND_PREVIOUS_10_FORM_REGRESSION_PASS
+      - name: Archive original Intel CMP source proof and native validation marker
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-s3k-flags-only-cmp-source-native-evidence
+          path: /tmp/x7-s3k-proof/
+          if-no-files-found: error
