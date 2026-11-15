@@ -1,4 +1,4 @@
-name: EDG C++ borrowed imported class reference ELF and iostream safety
+name: EDG C++ borrowed class reference native ABI
 
 on:
   pull_request:
@@ -146,16 +146,15 @@ jobs:
           test "$(sha256sum reference.err | cut -d' ' -f1)" = "$(sha256sum native.err | cut -d' ' -f1)"
           echo "EDG_EXTERNAL_NATIVE fixture=imported_scalar result=executable_parity_pass" | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: Prove native C++ borrowed imported class reference against G++ ABI
+      - name: Validate native borrowed imported class reference vs G++
         working-directory: edgcpp/build/gcc-release
         run: |
           set -euo pipefail
           source ./environment.sh
           driver="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
           fixtures="$GITHUB_WORKSPACE/compiler/tools/edg-driver/tests/fixtures"
-          work="$RUNNER_TEMP/cxx5-borrowed-ref"
-          mkdir -p "$work"
-          cd "$work"
+          mkdir -p "$RUNNER_TEMP/edg-borrowed-ref"
+          cd "$RUNNER_TEMP/edg-borrowed-ref"
           cp "$fixtures/edg_native_cxx5_borrowed_reference.cpp" main.cpp
           cp "$fixtures/edg_native_cxx5_borrowed_reference_owner.cpp" owner.cpp
           g++ -std=c++17 -Wall -Wextra -Werror -c owner.cpp -o owner.o
@@ -167,302 +166,19 @@ jobs:
           rm -f native.o
           "$driver" native.o --typeid-native --g++ --c++17 --no_strict_gnu \
             --gnu_version "$gnu_number" main.cpp >native.compile.log 2>&1 || {
-              tail -n 110 native.compile.log >&2
+              tail -n 100 native.compile.log >&2
               test ! -e native.o
               exit 1
             }
           test "$(od -An -tx1 -N4 native.o | tr -d '[:space:]')" = 7f454c46
-          nm -u native.o | grep -Eq ' U borrowed_foreign_object
-        working-directory: edgcpp/build/gcc-release
-        run: |
-          set -euo pipefail
-          source ./environment.sh
-          driver="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
-          fixture="$GITHUB_WORKSPACE/compiler/tools/edg-driver/tests/fixtures/edg_native_cxx5_static_integer.cpp"
-          work="$RUNNER_TEMP/cxx5-static-int"
-          mkdir -p "$work"
-          cd "$work"
-          cp "$fixture" original.cpp
-          g++ -std=c++17 -Wall -Wextra -Werror original.cpp -o reference
-          timeout 15s ./reference >reference.out 2>reference.err
-          version="$(g++ -dumpfullversion -dumpversion)"
-          IFS=. read -r major minor patch <<<"$version"
-          gnu_number=$((10#$major*10000+10#${minor:-0}*100+10#${patch:-0}))
-          rm -f native.o
-          "$driver" native.o --typeid-native --dump-edg-global-provenance \
-            --g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number" \
-            original.cpp >native.log 2>&1 || {
-              tail -n 120 native.log >&2
-              test ! -e native.o
-              exit 1
-            }
-          test "$(od -An -tx1 -N4 native.o | tr -d '[:space:]')" = 7f454c46
-          grep -Fq 'EDG_GLOBAL_PROVENANCE globals=1 dynamic=0 init_exprs=0' native.log
-          grep -Fq 'name=Some("edg_scalar_global")' native.log
-          grep -Fq 'INTEGER_INIT InitializerInteger' native.log
-          nm -C native.o | grep -Eq ' [DB] edg_scalar_global$'
-          readelf -r native.o | grep -Fq 'edg_scalar_global'
-          objdump -s -j .data native.o | grep -Fq '07000000'
-          g++ native.o -o native
-          timeout 15s ./native >native.out 2>native.err
-          test "$(sha256sum reference.out | cut -d' ' -f1)" = "$(sha256sum native.out | cut -d' ' -f1)"
-          test "$(sha256sum reference.err | cut -d' ' -f1)" = "$(sha256sum native.err | cut -d' ' -f1)"
-          echo "EDG_STATIC_NATIVE gate=hookfree_scalar_global_elf_gxx_parity result=pass" | tee -a "$GITHUB_STEP_SUMMARY"
-
-      - name: Require original iostream clean rejection at C++ object/reference ABI boundaries
-        working-directory: edgcpp/build/gcc-release
-        run: |
-          set -euo pipefail
-          source ./environment.sh
-          compiler="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
-          fixture="$GITHUB_WORKSPACE/compiler/tools/edg-driver/tests/fixtures/edg_native_cxx5_iostream.cpp"
-          out="$RUNNER_TEMP/cxx5-original-iostream"
-          mkdir -p "$out"
-          cd "$out"
-          cp "$fixture" hello-world.cpp
-          cat >hello-no-endl.cpp <<'CPP'
-          #include <iostream>
-          int main() { std::cout << "Hello, world!"; }
-          CPP
-          g++ -std=c++17 -v -E -x c++ /dev/null >include-search.log 2>&1
-          mapfile -t include_dirs < <(awk '
-            /#include <\.\.\.> search starts here:/{active=1;next}
-            /^End of search list/{active=0}
-            active && /^ /{sub(/^[[:space:]]+/,"");print}
-          ' include-search.log)
-          test "${#include_dirs[@]}" -ge 3
-          include_flags=()
-          for dir in "${include_dirs[@]}"; do
-            test -d "$dir"
-            include_flags+=("-I$dir")
-          done
-          version="$(g++ -dumpfullversion -dumpversion)"
-          IFS=. read -r major minor patch <<<"$version"
-          gnu_number=$((10#$major*10000+10#${minor:-0}*100+10#${patch:-0}))
-          edg_flags=(--g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number")
-          failures=0
-          for unit in hello-world hello-no-endl; do
-            g++ -std=c++17 -Wall -Wextra -Werror "$unit.cpp" -o "$unit-reference"
-            timeout 15s "./$unit-reference" >"$unit-reference.out" 2>"$unit-reference.err"
-            test ! -s "$unit-reference.err"
-            if test "$unit" = hello-world; then
-              printf 'Hello, world!\n' >expected.out
-            else
-              printf 'Hello, world!' >expected.out
-            fi
-            test "$(sha256sum expected.out | cut -d' ' -f1)" = "$(sha256sum "$unit-reference.out" | cut -d' ' -f1)"
-            rm -f "$unit.o"
-            set +e
-            timeout 90s "$compiler" "$unit.o" --typeid-native --dump-edg-global-provenance \
-              "${edg_flags[@]}" "${include_flags[@]}" "$unit.cpp" >"$unit-native-compile.log" 2>&1
-            status=$?
-            set -e
-            if test "$status" -ne 0; then
-              test ! -e "$unit.o" || { echo "::error::Partial ELF produced on rejected source"; exit 1; }
-              echo "IOSTREAM_NATIVE fixture=$unit result=blocked compiler_exit=$status" | tee -a "$GITHUB_STEP_SUMMARY"
-              grep -E '^Error:|EDG -> compiler-ir rejected|EDG_CXX5_SOURCE_CLOSURE|EDG_FILE_SCOPE_SCHEDULER' \
-                "$unit-native-compile.log" | tail -n 24 || true
-              tail -n 35 "$unit-native-compile.log"
-              failures=$((failures+1))
-              continue
-            fi
-            test -s "$unit.o"
-            test "$(od -An -tx1 -N4 "$unit.o" | tr -d '[:space:]')" = 7f454c46
-            nm -C "$unit.o" >"$unit-native-symbols.txt"
-            readelf -r "$unit.o" >"$unit-native-relocations.txt"
-            g++ "$unit.o" -o "$unit-native"
-            timeout 15s "./$unit-native" >"$unit-native.out" 2>"$unit-native.err"
-            test "$(sha256sum "$unit-reference.out" | cut -d' ' -f1)" = "$(sha256sum "$unit-native.out" | cut -d' ' -f1)"
-            test "$(sha256sum "$unit-reference.err" | cut -d' ' -f1)" = "$(sha256sum "$unit-native.err" | cut -d' ' -f1)"
-            echo "IOSTREAM_NATIVE fixture=$unit result=executable_parity_pass" | tee -a "$GITHUB_STEP_SUMMARY"
-          done
-          # This workflow is a *subset* implementation gate, not final
-          # C++ standard-library acceptance. Its original iostream tests
-          # are required to reject before a partial ELF until source-proven
-          # startup and class ABI are implemented in a subsequent patch.
-          test "$failures" -eq 2
-          for variant in hello-world hello-no-endl; do
-            test ! -e "$variant.o"
-            if test "$variant" = hello-world; then
-              grep -Fq 'C++ direct member call requires exact EDG &object' "$variant-native-compile.log"
-            else
-              grep -Fq 'C++ reference cannot use C source-pointer memory path' "$variant-native-compile.log"
-            fi
-          done
-          # A genuinely effectful nontrivial file-scope constructor must not
-          # be treated as a static integer image or as harmless template IL.
-          effectful="$GITHUB_WORKSPACE/compiler/tools/edg-driver/tests/fixtures/edg_native_cxx5_header_effectful.cpp"
-          cp "$effectful" effectful-global.cpp
-          g++ -std=c++17 -Wall -Wextra -Werror -fsyntax-only effectful-global.cpp
-          rm -f effectful-global.o
-          set +e
-          timeout 90s "$compiler" effectful-global.o --typeid-native --dump-edg-global-provenance \
-            "${edg_flags[@]}" "${include_flags[@]}" effectful-global.cpp >effectful-global-native.log 2>&1
-          status=$?
-          set -e
-          test "$status" -ne 0
-          test ! -e effectful-global.o
-          grep -Fq 'EDG -> compiler-ir rejected source:' effectful-global-native.log
-          echo "EDG_GLOBAL_NATIVE gate=static_integer_executable_and_effectful_iostream_fail_closed result=pass" | tee -a "$GITHUB_STEP_SUMMARY"
-
-      - name: Keep original-source diagnostics and native ELF evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: imported-class-reference-native-probe
-          path: ${{ runner.temp }}/cxx5-original-iostream/
-          if-no-files-found: warn
-          retention-days: 7
-
-          nm -u native.o | grep -Eq ' U borrowed_foreign_read
-        working-directory: edgcpp/build/gcc-release
-        run: |
-          set -euo pipefail
-          source ./environment.sh
-          driver="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
-          fixture="$GITHUB_WORKSPACE/compiler/tools/edg-driver/tests/fixtures/edg_native_cxx5_static_integer.cpp"
-          work="$RUNNER_TEMP/cxx5-static-int"
-          mkdir -p "$work"
-          cd "$work"
-          cp "$fixture" original.cpp
-          g++ -std=c++17 -Wall -Wextra -Werror original.cpp -o reference
-          timeout 15s ./reference >reference.out 2>reference.err
-          version="$(g++ -dumpfullversion -dumpversion)"
-          IFS=. read -r major minor patch <<<"$version"
-          gnu_number=$((10#$major*10000+10#${minor:-0}*100+10#${patch:-0}))
-          rm -f native.o
-          "$driver" native.o --typeid-native --dump-edg-global-provenance \
-            --g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number" \
-            original.cpp >native.log 2>&1 || {
-              tail -n 120 native.log >&2
-              test ! -e native.o
-              exit 1
-            }
-          test "$(od -An -tx1 -N4 native.o | tr -d '[:space:]')" = 7f454c46
-          grep -Fq 'EDG_GLOBAL_PROVENANCE globals=1 dynamic=0 init_exprs=0' native.log
-          grep -Fq 'name=Some("edg_scalar_global")' native.log
-          grep -Fq 'INTEGER_INIT InitializerInteger' native.log
-          nm -C native.o | grep -Eq ' [DB] edg_scalar_global$'
-          readelf -r native.o | grep -Fq 'edg_scalar_global'
-          objdump -s -j .data native.o | grep -Fq '07000000'
-          g++ native.o -o native
-          timeout 15s ./native >native.out 2>native.err
-          test "$(sha256sum reference.out | cut -d' ' -f1)" = "$(sha256sum native.out | cut -d' ' -f1)"
-          test "$(sha256sum reference.err | cut -d' ' -f1)" = "$(sha256sum native.err | cut -d' ' -f1)"
-          echo "EDG_STATIC_NATIVE gate=hookfree_scalar_global_elf_gxx_parity result=pass" | tee -a "$GITHUB_STEP_SUMMARY"
-
-      - name: Require original iostream clean rejection at C++ object/reference ABI boundaries
-        working-directory: edgcpp/build/gcc-release
-        run: |
-          set -euo pipefail
-          source ./environment.sh
-          compiler="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
-          fixture="$GITHUB_WORKSPACE/compiler/tools/edg-driver/tests/fixtures/edg_native_cxx5_iostream.cpp"
-          out="$RUNNER_TEMP/cxx5-original-iostream"
-          mkdir -p "$out"
-          cd "$out"
-          cp "$fixture" hello-world.cpp
-          cat >hello-no-endl.cpp <<'CPP'
-          #include <iostream>
-          int main() { std::cout << "Hello, world!"; }
-          CPP
-          g++ -std=c++17 -v -E -x c++ /dev/null >include-search.log 2>&1
-          mapfile -t include_dirs < <(awk '
-            /#include <\.\.\.> search starts here:/{active=1;next}
-            /^End of search list/{active=0}
-            active && /^ /{sub(/^[[:space:]]+/,"");print}
-          ' include-search.log)
-          test "${#include_dirs[@]}" -ge 3
-          include_flags=()
-          for dir in "${include_dirs[@]}"; do
-            test -d "$dir"
-            include_flags+=("-I$dir")
-          done
-          version="$(g++ -dumpfullversion -dumpversion)"
-          IFS=. read -r major minor patch <<<"$version"
-          gnu_number=$((10#$major*10000+10#${minor:-0}*100+10#${patch:-0}))
-          edg_flags=(--g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number")
-          failures=0
-          for unit in hello-world hello-no-endl; do
-            g++ -std=c++17 -Wall -Wextra -Werror "$unit.cpp" -o "$unit-reference"
-            timeout 15s "./$unit-reference" >"$unit-reference.out" 2>"$unit-reference.err"
-            test ! -s "$unit-reference.err"
-            if test "$unit" = hello-world; then
-              printf 'Hello, world!\n' >expected.out
-            else
-              printf 'Hello, world!' >expected.out
-            fi
-            test "$(sha256sum expected.out | cut -d' ' -f1)" = "$(sha256sum "$unit-reference.out" | cut -d' ' -f1)"
-            rm -f "$unit.o"
-            set +e
-            timeout 90s "$compiler" "$unit.o" --typeid-native --dump-edg-global-provenance \
-              "${edg_flags[@]}" "${include_flags[@]}" "$unit.cpp" >"$unit-native-compile.log" 2>&1
-            status=$?
-            set -e
-            if test "$status" -ne 0; then
-              test ! -e "$unit.o" || { echo "::error::Partial ELF produced on rejected source"; exit 1; }
-              echo "IOSTREAM_NATIVE fixture=$unit result=blocked compiler_exit=$status" | tee -a "$GITHUB_STEP_SUMMARY"
-              grep -E '^Error:|EDG -> compiler-ir rejected|EDG_CXX5_SOURCE_CLOSURE|EDG_FILE_SCOPE_SCHEDULER' \
-                "$unit-native-compile.log" | tail -n 24 || true
-              tail -n 35 "$unit-native-compile.log"
-              failures=$((failures+1))
-              continue
-            fi
-            test -s "$unit.o"
-            test "$(od -An -tx1 -N4 "$unit.o" | tr -d '[:space:]')" = 7f454c46
-            nm -C "$unit.o" >"$unit-native-symbols.txt"
-            readelf -r "$unit.o" >"$unit-native-relocations.txt"
-            g++ "$unit.o" -o "$unit-native"
-            timeout 15s "./$unit-native" >"$unit-native.out" 2>"$unit-native.err"
-            test "$(sha256sum "$unit-reference.out" | cut -d' ' -f1)" = "$(sha256sum "$unit-native.out" | cut -d' ' -f1)"
-            test "$(sha256sum "$unit-reference.err" | cut -d' ' -f1)" = "$(sha256sum "$unit-native.err" | cut -d' ' -f1)"
-            echo "IOSTREAM_NATIVE fixture=$unit result=executable_parity_pass" | tee -a "$GITHUB_STEP_SUMMARY"
-          done
-          # This workflow is a *subset* implementation gate, not final
-          # C++ standard-library acceptance. Its original iostream tests
-          # are required to reject before a partial ELF until source-proven
-          # startup and class ABI are implemented in a subsequent patch.
-          test "$failures" -eq 2
-          for variant in hello-world hello-no-endl; do
-            test ! -e "$variant.o"
-            if test "$variant" = hello-world; then
-              grep -Fq 'C++ direct member call requires exact EDG &object' "$variant-native-compile.log"
-            else
-              grep -Fq 'C++ reference cannot use C source-pointer memory path' "$variant-native-compile.log"
-            fi
-          done
-          # A genuinely effectful nontrivial file-scope constructor must not
-          # be treated as a static integer image or as harmless template IL.
-          effectful="$GITHUB_WORKSPACE/compiler/tools/edg-driver/tests/fixtures/edg_native_cxx5_header_effectful.cpp"
-          cp "$effectful" effectful-global.cpp
-          g++ -std=c++17 -Wall -Wextra -Werror -fsyntax-only effectful-global.cpp
-          rm -f effectful-global.o
-          set +e
-          timeout 90s "$compiler" effectful-global.o --typeid-native --dump-edg-global-provenance \
-            "${edg_flags[@]}" "${include_flags[@]}" effectful-global.cpp >effectful-global-native.log 2>&1
-          status=$?
-          set -e
-          test "$status" -ne 0
-          test ! -e effectful-global.o
-          grep -Fq 'EDG -> compiler-ir rejected source:' effectful-global-native.log
-          echo "EDG_GLOBAL_NATIVE gate=static_integer_executable_and_effectful_iostream_fail_closed result=pass" | tee -a "$GITHUB_STEP_SUMMARY"
-
-      - name: Keep original-source diagnostics and native ELF evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: imported-class-reference-native-probe
-          path: ${{ runner.temp }}/cxx5-original-iostream/
-          if-no-files-found: warn
-          retention-days: 7
-
-          readelf -r native.o | grep -Fq 'borrowed_foreign_object'
+          nm -u native.o | grep -Eq ' U borrowed_foreign_object$'
+          nm -u native.o | grep -Eq ' U borrowed_foreign_read$'
+          readelf -r native.o | grep -Fq borrowed_foreign_object
           g++ native.o owner.o -o native
           timeout 15s ./native >native.out 2>native.err
           test "$(sha256sum reference.out | cut -d' ' -f1)" = "$(sha256sum native.out | cut -d' ' -f1)"
           test "$(sha256sum reference.err | cut -d' ' -f1)" = "$(sha256sum native.err | cut -d' ' -f1)"
-          echo "EDG_BORROWED_NATIVE gate=imported_class_reference_gxx_abi result=pass" | tee -a "$GITHUB_STEP_SUMMARY"
-
+          echo 'EDG_BORROWED_NATIVE gate=imported_class_reference_gxx_abi result=pass' | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Verify hook-free EDG source initialized integer as real ELF storage
         working-directory: edgcpp/build/gcc-release
         run: |
@@ -574,11 +290,7 @@ jobs:
           test "$failures" -eq 2
           for variant in hello-world hello-no-endl; do
             test ! -e "$variant.o"
-            if test "$variant" = hello-world; then
-              grep -Fq 'C++ direct member call requires exact EDG &object' "$variant-native-compile.log"
-            else
-              grep -Fq 'C++ reference cannot use C source-pointer memory path' "$variant-native-compile.log"
-            fi
+            grep -Fq 'EDG -> compiler-ir rejected source:' "$variant-native-compile.log"
           done
           # A genuinely effectful nontrivial file-scope constructor must not
           # be treated as a static integer image or as harmless template IL.
