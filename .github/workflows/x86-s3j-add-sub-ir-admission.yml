@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     env:
-      SOURCE_SHA: 'f33893d94f4f44dd9da57d6524c62248ec0a07cd'
+      SOURCE_SHA: '4b14e0d464956f41fc7a827292aca4cafbda1063'
       INTEL_REV: '35eface1b7ee003a1cda95005ec5fd83de658a64'
       PYTHONPATH: compiler/tools
     steps:
@@ -20,7 +20,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: f33893d94f4f44dd9da57d6524c62248ec0a07cd
+          ref: 4b14e0d464956f41fc7a827292aca4cafbda1063
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -40,6 +40,22 @@ jobs:
           repository: bingordo/compiler-ci
           github-token: ${{ github.token }}
           path: /tmp/x7-s3j-s3f
+      - name: Retrieve previously observed postalloc source decisions S3.G
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3g-actual-selector-decision-evidence
+          run-id: 43670305205
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3j-s3g
+      - name: Retrieve native TypeId I64 source decisions S3.H
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3h-native-typeid-i64-fusion-source-decisions
+          run-id: 43675286039
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3j-s3h
       - name: Download exact original Intel ADD/SUB and arithmetic helper definition
         shell: bash
         run: |
@@ -71,6 +87,90 @@ jobs:
             --definitions-gz /tmp/x7-s3j-intel/definitions.xml.gz \
             --s2 /tmp/x7-s3j-s2/join-1.json \
             --out /tmp/x7-s3j-evidence/add-sub-source-proof.json --check
+      - name: Reproduce exact generated 10-form IR admission from S3.F/G/H/J proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in \
+              /tmp/x7-s3j-s3f/source-xed-effects.json \
+              /tmp/x7-s3j-s3g/real-selector-decisions.json \
+              /tmp/x7-s3j-s3h/native-i64-source-decisions.json; do
+            test -s "$file"
+          done
+          /tmp/x7-s3j-venv/bin/python compiler/tools/x86_s3i_compiler_ir_admission.py \
+            --s3f /tmp/x7-s3j-s3f/source-xed-effects.json \
+            --s3g /tmp/x7-s3j-s3g/real-selector-decisions.json \
+            --s3h /tmp/x7-s3j-s3h/native-i64-source-decisions.json \
+            --s3j /tmp/x7-s3j-evidence/add-sub-source-proof.json \
+            --check
+          echo X7_S3J_SOURCE_TO_RUST_ADMISSION_REGEN_GREEN
+
+      - name: Run genuine source/arith negative mutation tests
+        shell: bash
+        env:
+          X7_S3J_INTEL_DIR: /tmp/x7-s3j-intel
+          X7_S3J_PROOF_FILE: /tmp/x7-s3j-evidence/add-sub-source-proof.json
+          X7_S3J_S2_FILE: /tmp/x7-s3j-s2/join-1.json
+        run: |
+          set -euo pipefail
+          /tmp/x7-s3j-venv/bin/python -m unittest -v \
+            test_x86_s3i_compiler_ir_admission \
+            test_x86_s3j_arithmetic_source_proof
+          echo X7_S3J_SOURCE_NEGATIVE_MUTATIONS_GREEN
+
+      - name: Prepare isolated backend crates for offline Rust validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("Cargo.toml").write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          """)
+          PY
+          cargo --version
+      - name: Test real ADD/SUB generated form gate with source mutations and selection
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-c-defined-64 x7-c-defined-bitwise x7-native-form-validation' \
+            --lib x7_native_form_bridge --offline
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-c-defined-64 x7-c-defined-bitwise x7-native-form-validation' \
+            --lib x7_late_selector --offline
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-c-defined-64 x7-c-defined-bitwise x7-native-form-validation' \
+            --test x7_s3j_arithmetic_ir_admission --offline -- --nocapture
+      - name: Check no-default-feature fallback and ordinary native TypeId unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --features x7-native-form-validation \
+            --test x7_s3j_arithmetic_ir_admission --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --test x7_g10_n15_no_default_fallback --offline
+      - name: Differential native compiler TypeId and 32/64 GAS/direct ELF executions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-c-defined-64 x7-c-defined-bitwise' \
+            --lib native_typeid::reviewed_i64_source_tests --offline
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-c-defined-64 x7-c-defined-bitwise' \
+            --test x7_g10_n19_64_native --offline
+          cargo test -p compiler-backend-x86 \
+            --features 'x7-c-defined-64 x7-c-defined-bitwise' \
+            --test x7_g10_n16_bitwise_native --offline
+          echo X7_S3J_NATIVE_GAS_ELF_FALLBACK_GREEN
+
       - name: Upload source-bound arithmetic proof
         uses: actions/upload-artifact@v4
         with:
