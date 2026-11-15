@@ -1,0 +1,107 @@
+name: X7 S3.D source-pinned logic/XED width candidates
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/x86-s3d-logic-xed-width-validation.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  s3d-exact-source-xed-join:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 24
+    env:
+      COMPILER_SHA: 'c55e2cab6168e87cf3b8f7067d99b5f792ec50e3'
+      INTEL_REV: 35eface1b7ee003a1cda95005ec5fd83de658a64
+    steps:
+      - name: Checkout pinned compiler source without triggering compiler Actions
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c55e2cab6168e87cf3b8f7067d99b5f792ec50e3
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+
+      - name: Retrieve exactly the previously verified pinned full S2 Intel/XED report
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s2-pinned-intel-xed-variant-join
+          run-id: 43635408689
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3d-s2
+
+      - name: Verify exact sources, fetch original pinned Intel XML and prepare SMT
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          test -s /tmp/x7-s3d-s2/join-1.json
+          mkdir -p /tmp/x7-s3d-intel /tmp/x7-s3d-out
+          for op in AND OR XOR; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 45 \
+              "https://raw.githubusercontent.com/intel/SDM/${INTEL_REV}/data/instruction/${op}.xml" \
+              -o "/tmp/x7-s3d-intel/${op}.xml"
+          done
+          python3 -m venv /tmp/x7-s3d-venv
+          /tmp/x7-s3d-venv/bin/python -m pip install 'z3-solver==4.13.4.0'
+
+      - name: Reprove S3.C real Intel logic and all negative width/XED mutations
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          export PYTHONPATH=tools
+          export X7_S3C_PINNED_LOGIC_XML_DIR=/tmp/x7-s3d-intel
+          /tmp/x7-s3d-venv/bin/python -m unittest -v \
+            test_x86_s3_logic_source_proof \
+            test_x86_s3_logic_xed_width_join
+          /tmp/x7-s3d-venv/bin/python tools/x86_s3_logic_source_proof.py \
+            --xml-dir /tmp/x7-s3d-intel \
+            --out /tmp/x7-s3d-out/logic-source-smt.json
+          /tmp/x7-s3d-venv/bin/python tools/x86_s3_logic_source_proof.py \
+            --xml-dir /tmp/x7-s3d-intel \
+            --out /tmp/x7-s3d-out/logic-source-smt.json --check
+
+      - name: Crosslink exact Intel/XED canonical variants with width-specific proofs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          /tmp/x7-s3d-venv/bin/python tools/x86_s3_logic_xed_width_join.py \
+            --logic /tmp/x7-s3d-out/logic-source-smt.json \
+            --joined /tmp/x7-s3d-s2/join-1.json \
+            --out /tmp/x7-s3d-out/logic-xed-width-join.json
+          /tmp/x7-s3d-venv/bin/python tools/x86_s3_logic_xed_width_join.py \
+            --logic /tmp/x7-s3d-out/logic-source-smt.json \
+            --joined /tmp/x7-s3d-s2/join-1.json \
+            --out /tmp/x7-s3d-out/logic-xed-width-join.json --check
+          python3 - <<'PY'
+          import json
+          r = json.load(open("/tmp/x7-s3d-out/logic-xed-width-join.json"))
+          assert r["source_operations"] == 3
+          assert r["conditional_width_models"] == 6
+          assert r["newly_bulk_source_admitted_forms"] == 0
+          assert r["production_selection_eligible"] is False
+          for op in r["operations"]:
+              print("S3D_S2_EXACT_FORM", op["operation"],
+                    op["intel_iform_sha256"][:16],
+                    "join", op["xed_join_status"])
+              for width in op["widths"]:
+                  print("S3D_WIDTH_CANDIDATE", op["operation"], width["width_bits"],
+                        "possible", width["canonical_xed_candidate_count"],
+                        "fixed_id", width["unique_fixed_REX_W_candidate_id_unproved"] or "unknown")
+          print("X7_S3D_EXACT_PINNED_XED_JOIN_PASS admitted=0")
+          PY
+
+      - name: Archive reproducible actual SHA-linked evidence (not ISA admission)
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-s3d-logic-xed-candidate-evidence
+          path: |
+            /tmp/x7-s3d-out/logic-source-smt.json
+            /tmp/x7-s3d-out/logic-xed-width-join.json
+          if-no-files-found: error
