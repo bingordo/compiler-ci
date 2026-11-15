@@ -1,0 +1,68 @@
+name: AArch64 A3.6 pinned original AARCHMRS condition AST survey
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/aarch64-a36-condition-shapes.yml'
+permissions:
+  contents: read
+jobs:
+  survey:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Download exact original AARCHMRS encoding source
+        run: |
+          set -euo pipefail
+          curl -fLsS --retry 3 --connect-timeout 20 --max-time 240 \
+            'https://kernel.googlesource.com/pub/scm/linux/kernel/git/maz/AARCHMRS/+/1346b16d47619400448f3cb6d4f22d62d3b76848/Instructions.json?format=TEXT' \
+            -o /tmp/arm-instructions.b64
+          base64 -d /tmp/arm-instructions.b64 > /tmp/arm-instructions.json
+          echo 'ef75f3ec02df1b9b9c0612f4ea259d6710ac3de686b097d8f9c83d1d97aa800a  /tmp/arm-instructions.json' | sha256sum -c -
+      - name: Inspect original conditions without opcode-specific interpretations
+        run: |
+          python3 - <<'PY'
+          import collections,hashlib,json
+          x=json.load(open('/tmp/arm-instructions.json'))
+          kinds=collections.Counter()
+          samples={}
+          byname={}
+          counts=collections.Counter()
+          leaves=[]
+          def scan(n,path,conditions):
+              if not isinstance(n,dict):return
+              typ=n.get('_type')
+              if typ not in ('Instruction.InstructionSet','Instruction.InstructionGroup','Instruction.Instruction'):
+                  return
+              name=n.get('name','?')
+              here=path+'/'+str(name)
+              cond=n.get('condition')
+              if cond is not None:
+                  counts['nodes_with_guard']+=1
+                  def ast_walk(v,depth=0):
+                      if depth>16:return
+                      if isinstance(v,dict):
+                          name=v.get('_type',type(v).__name__)
+                          kinds[str(name)]+=1
+                          samples.setdefault(str(name),sorted(v.keys()))
+                          byname.setdefault(str(name),str(v)[:500])
+                          for k,c in v.items():
+                              if k not in ('_type',):ast_walk(c,depth+1)
+                      elif isinstance(v,list):
+                          for sub in v[:60]:ast_walk(sub,depth+1)
+                  ast_walk(cond)
+                  conditions=conditions+(cond,)
+              if typ=='Instruction.Instruction':
+                  counts['leaves']+=1
+                  if conditions and len(leaves)<20:
+                      leaves.append((here,len(conditions),[(str(c)[:500]) for c in conditions]))
+              for child in n.get('children',[]):
+                  scan(child,here,conditions)
+          for root in x['instructions']:
+              if root.get('name')=='A64':
+                  scan(root,'',())
+          print('A36_ORIGINAL_GUARD_AST_KINDS',kinds.most_common(35))
+          print('A36_ORIGINAL_GUARD_AST_FIELDS',list(samples.items())[:40])
+          print('A36_ORIGINAL_GUARD_AST_SAMPLES',list(byname.items())[:18])
+          print('A36_ORIGINAL_GUARD_LEAF_SAMPLES',leaves[:12])
+          print('A36_ORIGINAL_GUARD_COUNTS',dict(counts))
+          PY
