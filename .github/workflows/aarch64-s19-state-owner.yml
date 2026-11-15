@@ -1,0 +1,66 @@
+name: AArch64 S19 original X PSTATE source-owner frontier
+on:
+  pull_request:
+    paths: ['.github/workflows/aarch64-s19-state-owner.yml']
+permissions:
+  contents: read
+jobs:
+  source-owners:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 4c0e0bf872a00294a7d4b07fa583a023c5a8aa18
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: herd/herdtools7
+          ref: cfc4f56c522ec0d701acaf5a23139b47e8711299
+          path: herd
+          sparse-checkout: |
+            herd/libdir/asl-pseudocode/bundler.py
+          persist-credentials: false
+      - name: Identify unchanged authoritative state declarations and owner sections
+        run: |
+          set -euo pipefail
+          curl -fLsS --retry 3 --connect-timeout 20 --max-time 240 --max-filesize 200000000 -o /tmp/arm2026.tar.gz https://developer.arm.com/-/cdn-downloads/permalink/Exploration-Tools-A64-ISA/ISA_A64/ISA_A64_xml_A_profile-2026-09.tar.gz
+          echo '44cfb89c763c7eea8e59de0ad2221e3c012e6aa77899bd7f1c3e1f24537191d7  /tmp/arm2026.tar.gz' | sha256sum -c -
+          python3 - <<'PY'
+          import sys, hashlib, re, tarfile, tempfile, xml.etree.ElementTree as ET
+          from pathlib import Path
+          from argparse import Namespace
+          sys.path.insert(0,'compiler/tools')
+          from aarch64_a32_aslref_compat import load_bundler
+          from aarch64_a32_asl_source_links import ROOT
+          b=load_bundler(Path('herd/herd/libdir/asl-pseudocode/bundler.py'))
+          with tempfile.TemporaryDirectory() as td, tarfile.open('/tmp/arm2026.tar.gz','r:gz') as tar:
+              folder=Path(td)
+              raw=tar.extractfile(ROOT+'shared_pseudocode.xml').read()
+              (folder/'shared_pseudocode.xml').write_bytes(raw)
+              shared=folder/'shared.asl'
+              b.make_shared_pseudocode(Namespace(i_files=[folder/'shared_pseudocode.xml'],o_dir=shared))
+              contents=shared.read_text()
+              for n in ('X','PSTATE','PSTATE.C','read_register','write_register'):
+                  match=[(i,l.strip()) for i,l in enumerate(contents.splitlines()) if re.search(r'\b'+re.escape(n)+r'\b',l)]
+                  heads=[(i,l) for i,l in match if re.match(r'^(?:var |let |constant |config |func |getter |setter |type |record |impdef |readonly |array |bits\()',l)]
+                  print('S19_SHARED_SYMBOL',n,'occurrences',len(match),'declaration_hints',[(i,hashlib.sha256(l.encode()).hexdigest(),len(l)) for i,l in heads[:12]])
+              xml=ET.fromstring(raw)
+              for token in ('X','PSTATE','AArch64','Registers'):
+                  rows=[]
+                  for ps in xml.iter('ps'):
+                      name=ps.get('name','')
+                      if token.lower() in name.lower():
+                          text=''.join(ps.itertext())
+                          rows.append((name,len(text),hashlib.sha256(text.encode()).hexdigest()))
+                  print('S19_PUBLISHED_SECTIONS',token,'count',len(rows),'first',rows[:25])
+              for op in ('adc','adcs'):
+                  path=folder/(op+'.xml')
+                  path.write_bytes(tar.extractfile(ROOT+op+'.xml').read())
+                  asl=b.one_instruction_to_string(path)
+                  for tok in ('X','PSTATE','R','AddWithCarry'):
+                      print('S19_INSTR_USE',op,tok,'count',len(re.findall(r'\b'+tok+r'\b',asl)))
+          PY
