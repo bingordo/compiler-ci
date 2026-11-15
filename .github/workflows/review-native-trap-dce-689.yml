@@ -1,0 +1,62 @@
+name: Source-pinned native integer optimizer DCE/trap review 689
+on:
+  push:
+    branches: [review/native-trap-dce-689]
+    paths: ['.github/workflows/review-native-trap-dce-689.yml']
+  pull_request:
+    paths: ['.github/workflows/review-native-trap-dce-689.yml']
+permissions:
+  contents: read
+jobs:
+  native-integer-review:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout temporary compiler-ci configuration
+        uses: actions/checkout@v4
+      - name: Checkout exact reviewed compiler commit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 4d614100149785109b80bc3cd0fb1ef5b7ccc110
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Prove compiler source was pinned
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "4d614100149785109b80bc3cd0fb1ef5b7ccc110"
+          git show -s --format='%H %s' HEAD
+      - name: Isolate compiler core workspace on CI runner
+        working-directory: compiler
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          """)
+          PY
+      - name: Cache isolated compiler core
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: review-native-trap-dce-689
+      - name: Execute exact-width reference semantics and unused-trap DCE differential
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test review_native_trap_dce_oracle -- --nocapture
+      - name: Preserve existing source-generated 5-width algebra oracle
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test generated_native_integer_algebra -- --nocapture
+      - name: Preserve existing compiler optimizer divide-effect regressions
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test division_effects -- --nocapture
+      - name: Preserve independent IR scalar semantics
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-ir --lib native_int_semantics -- --nocapture
+          cargo test -p compiler-ir --test typed_integer_v2 -- --nocapture
+      - name: Strict Clippy for optimizer and IR
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt --lib --tests -- -D warnings
