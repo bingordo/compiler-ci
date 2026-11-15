@@ -1,0 +1,84 @@
+name: A64 A3.7 G3 original predicate operand schema probe
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/aarch64-a37-g3-source-schema.yml'
+permissions:
+  contents: read
+jobs:
+  source-schema:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Fetch exact original AARCHMRS encoding source
+        run: |
+          set -euo pipefail
+          curl -fLsS --retry 3 --connect-timeout 20 --max-time 240 \
+            'https://kernel.googlesource.com/pub/scm/linux/kernel/git/maz/AARCHMRS/+/1346b16d47619400448f3cb6d4f22d62d3b76848/Instructions.json?format=TEXT' \
+            -o /tmp/arm-instructions.b64
+          base64 -d /tmp/arm-instructions.b64 > /tmp/arm-instructions.json
+          echo 'ef75f3ec02df1b9b9c0612f4ea259d6710ac3de686b097d8f9c83d1d97aa800a  /tmp/arm-instructions.json' | sha256sum -c -
+      - name: Census source equality/set predicate schemas and encoding fields
+        run: |
+          python3 - <<'PY'
+          import collections, json
+          source=json.load(open('/tmp/arm-instructions.json'))
+          operators=collections.Counter()
+          forms=collections.Counter()
+          literal_shapes=collections.Counter()
+          idents=collections.Counter()
+          examples={}
+          field_shapes=collections.Counter()
+          def walk_condition(obj):
+              if isinstance(obj,dict):
+                  typ=obj.get('_type')
+                  if typ=='AST.BinaryOp':
+                      op=obj.get('op')
+                      operators[str(op)]+=1
+                      if op in ('==','!=','IN'):
+                          lhs=obj.get('left',{})
+                          rhs=obj.get('right',{})
+                          kl=lhs.get('_type') if isinstance(lhs,dict) else type(lhs).__name__
+                          kr=rhs.get('_type') if isinstance(rhs,dict) else type(rhs).__name__
+                          label=(op,kl,kr)
+                          forms[label]+=1
+                          def brief(n):
+                              if not isinstance(n,dict):return type(n).__name__
+                              typ=n.get('_type')
+                              if typ=='AST.Identifier':
+                                  val=n.get('value')
+                                  if isinstance(val,str):idents[val]+=1
+                                  return ('id',val)
+                              if typ=='Values.Value':
+                                  v=n.get('value')
+                                  literal_shapes[(type(v).__name__,len(v) if isinstance(v,str) else -1)]+=1
+                                  return ('value',v)
+                              if typ=='AST.Set':
+                                  return ('set',tuple(brief(e) for e in n.get('values',[])[:8]))
+                              return typ
+                          examples.setdefault(label,(brief(lhs),brief(rhs)))
+                  for v in obj.values():walk_condition(v)
+              elif isinstance(obj,list):
+                  for v in obj:walk_condition(v)
+          def walk_node(n):
+              if not isinstance(n,dict):return
+              typ=n.get('_type')
+              if typ not in ('Instruction.InstructionSet','Instruction.InstructionGroup','Instruction.Instruction'):return
+              cond=n.get('condition')
+              if cond is not None:walk_condition(cond)
+              enc=n.get('encoding',{})
+              if isinstance(enc,dict):
+                  for part in enc.get('values',[]):
+                      if isinstance(part,dict) and part.get('_type')=='Instruction.Encodeset.Field':
+                          ran=part.get('range',{})
+                          field_shapes[(part.get('name'),ran.get('start'),ran.get('width'))]+=1
+              for child in n.get('children',[]):walk_node(child)
+          for r in source['instructions']:
+              if r.get('name')=='A64':walk_node(r)
+          print('G3_SOURCE_PRED_OPS',operators)
+          print('G3_SOURCE_COMPARISON_TYPES',forms)
+          print('G3_SOURCE_COMPARISON_EXAMPLES',list(sorted(examples.items(),key=lambda x:str(x[0])))[:25])
+          print('G3_SOURCE_PRED_IDENTIFIERS',idents.most_common(35))
+          print('G3_SOURCE_LITERAL_SHAPES',literal_shapes.most_common(25))
+          print('G3_SOURCE_PRED_FIELD_BINDINGS',[(k,v) for k,v in field_shapes.most_common(65)])
+          PY
