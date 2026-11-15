@@ -1,0 +1,65 @@
+name: Source-pinned TypeId byte PHI and indirect callback review 689
+on:
+  push:
+    branches: [review/byte-phi-indirect-689]
+    paths: ['.github/workflows/review-byte-phi-indirect-689.yml']
+  pull_request:
+    paths: ['.github/workflows/review-byte-phi-indirect-689.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout compiler-ci
+        uses: actions/checkout@v4
+      - name: Checkout exact reviewed compiler commit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f599146b3acb7b9a8f26fd3d384daa689f0e79e3
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert reviewed source SHA
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "f599146b3acb7b9a8f26fd3d384daa689f0e79e3"
+      - name: Isolate core Rust workspace on CI runner only
+        working-directory: compiler
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          """)
+          PY
+      - name: Cache Rust core
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: review-byte-phi-indirect-689
+      - name: Run physical pointer-PHI overlap and indirect-call C11 oracle
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test review_byte_phi_indirect_memory -- --nocapture
+      - name: Preserve partial-byte and pointer-PHI forwarding tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_global_memory -- --nocapture
+          cargo test -p compiler-opt --test memory_execution_oracle -- --nocapture
+      - name: Preserve native indirect ABI and memory regression
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test native_typeid_indexed_indirect -- --nocapture
+          cargo test -p compiler-opt --test review_memory_callback_order -- --nocapture
+      - name: Strict Clippy on affected code and new test
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --lib -- -D warnings
+          cargo clippy -p compiler-opt --test review_byte_phi_indirect_memory -- -D warnings
