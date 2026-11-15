@@ -1,0 +1,54 @@
+# Existing x86 SSE machine SSA acceptance, independently of staged FP TypeId.
+# Temporary, source-pinned compiler-ci workflow; never merge to main.
+name: FP-3 x86 XMM machine baseline for TypeId bridge
+on:
+  push:
+    branches: [ci/fp1-x86-machine-baseline-20261115]
+    paths: [.github/workflows/fp1-x86-machine-baseline-20261115.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  x86-fp:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SOURCE_SHA: 0f4c527bb3f70d4906b73101b55c62a1ae628b4b
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact current-main compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 0f4c527bb3f70d4906b73101b55c62a1ae628b4b
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Source pin and isolated FP-machine workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: fp1-machine-abi-baseline
+      - name: Native XMM machine SSA and GP/FP ABI execution
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib float_machine_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test m4_7_xmm_bank -- --nocapture
+          cargo test -p compiler-backend-x86 --test m4_7_xmm_frame_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test m4_7_scalar_sse_stream_native -- --nocapture
+      - name: Backend all-target compilation
+        working-directory: compiler
+        run: cargo check -p compiler-backend-x86 --all-targets
+      - name: Backend library strict Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-x86 --lib -- -D warnings
