@@ -1,0 +1,54 @@
+# Ephemeral source-pinned M4.8 native symbols and DSO acceptance.
+name: BT4 audited native symbol attributes and DSO parity
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ir-bt4-native-symbol-attrs-pr1683.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-symbols:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_INCREMENTAL: '0'
+      SOURCE_SHA: 0902ed1460beaa4a340c06159b62731a0a314ee7
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 0902ed1460beaa4a340c06159b62731a0a314ee7
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and isolate core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-bt4-m48-native-attrs
+      - name: Original M4.8 ELF/GAS weak hidden protected and DSO oracles
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --test m4_8_checked_symbol_attributes_native -- --nocapture
+      - name: Adjacent native globals data PIC and ABI regression oracles
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test m4_global_definitions_native --test m4_global_external_native --test m4_relro_linkage_native --test m4_global_pointer_relocations_native --test typed_alias_calls_native --test native_typeid_direct
+      - name: Check IR/backend/x86 all-targets
+        working-directory: compiler
+        run: cargo check -p compiler-ir -p compiler-backend -p compiler-backend-x86 --all-targets
+      - name: Strict original symbol attribute test lint
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-x86 --test m4_8_checked_symbol_attributes_native -- -D warnings
