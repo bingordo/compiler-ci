@@ -1,0 +1,120 @@
+name: S23.50l default generated TypeId rules and CLI opt-out
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-50l-default-generated-optout.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  default-generated-mode:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler candidate (Actions only on compiler-ci)
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 520ff5b502991dd9822ded1ed842d015d7f046bf
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check source pin and configure public Cargo Git dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 520ff5b502991dd9822ded1ed842d015d7f046bf
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          mkdir -p results
+          rustc --version
+          python3 --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: s23-50l-default-on
+      - name: Test native default-on and explicit opt-out
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test native_default_generated_flags -- --nocapture
+          cargo test -p compiler-opt --test native_s2350_two_op_factoring -- --nocapture
+          cargo clippy -p compiler-opt --test native_default_generated_flags -- -D warnings
+          cargo check -p compiler-opt --no-default-features
+      - name: Build real production driver, check CLI help
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release -p compiler --bin compiler
+          target/release/compiler --help | tee "$GITHUB_WORKSPACE/results/help.txt"
+          grep -- '--no-generated-rewrites' "$GITHUB_WORKSPACE/results/help.txt"
+          grep -- '--generated-rewrites' "$GITHUB_WORKSPACE/results/help.txt"
+      - name: Compare real x86 objects and execute GCC oracle in three modes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > results/factor.c <<'EOF'
+          int factor(int x, int y, int z) {
+            return (x & y) | (x & z);
+          }
+          EOF
+          cat > results/oracle.c <<'EOF'
+          extern int factor(int, int, int);
+          int main(void) {
+            for (int a = -11; a <= 11; a++)
+              for (int b = -13; b <= 13; b++)
+                for (int c = -9; c <= 9; c++)
+                  if (factor(a,b,c) != ((a & b) | (a & c)))
+                    return 1;
+            return 0;
+          }
+          EOF
+          for mode in default enabled disabled; do
+            case "$mode" in
+              default) flag="" ;;
+              enabled) flag="--generated-rewrites" ;;
+              disabled) flag="--no-generated-rewrites" ;;
+            esac
+            compiler/target/release/compiler results/factor.c \
+              --language mini-c --target x86_64 --emit obj \
+              $flag -o "results/$mode.o"
+            gcc -O0 results/oracle.c "results/$mode.o" -o "results/$mode.exe"
+            "results/$mode.exe"
+          done
+          cmp results/default.o results/enabled.o
+          if compiler/target/release/compiler results/factor.c --language mini-c \
+             --generated-rewrites --no-generated-rewrites --emit obj \
+             -o results/conflict.o >results/conflict.stdout 2>results/conflict.stderr; then
+            echo "conflicting rewrite flags unexpectedly accepted"
+            exit 1
+          fi
+          grep 'choose at most one generated-rewrites flag' results/conflict.stderr
+          echo "S2350L_MODES default=passed on=passed off=passed conflict=rejected"
+      - name: Verify dump and AArch64 object paths honor both rewrite modes
+        shell: bash
+        run: |
+          set -euo pipefail
+          for mode in default disabled; do
+            flag=""
+            if test "$mode" = disabled; then flag="--no-generated-rewrites"; fi
+            compiler/target/release/compiler results/factor.c \
+              --language mini-c --target x86_64 --emit obj $flag \
+              --dump-ir "results/$mode-stages" -o "results/dump-$mode.o"
+            cmp "results/$mode.o" "results/dump-$mode.o"
+            compiler/target/release/compiler results/factor.c \
+              --language mini-c --target aarch64 --emit obj $flag \
+              -o "results/aarch-$mode.o"
+          done
+          file results/aarch-default.o results/aarch-disabled.o
+      - name: Preserve pinned smoke and CLI artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s23-50l-default-and-optout-evidence
+          path: results/
+          if-no-files-found: warn
+          retention-days: 14
