@@ -1,0 +1,123 @@
+name: One-off typed algebra PR1663 exact-parent tests and ABBA
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/review-typed-algebra-pr1663.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 0929bfb09cba6e67ed2f9ab19c1640770f90b747
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm immutable compiler head
+        run: test "$(git -C compiler rev-parse HEAD)" = "0929bfb09cba6e67ed2f9ab19c1640770f90b747"
+      - name: Core-only workspace for independent CI
+        shell: bash
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: review-algebra-1663
+      - name: Focused exact-noop and zero-removal algebra regressions
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typed_algebra -- --nocapture
+      - name: IR and optimizer crate tests
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt
+      - name: Strict Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt --all-targets -- -D warnings
+      - name: Prepare exact-parent release benchmark
+        shell: bash
+        run: |
+          git clone --no-checkout compiler parent
+          git -C parent checkout 5502ed733d996cf896a796273dd97a1a86616401
+          test "$(git -C parent rev-parse HEAD)" = "5502ed733d996cf896a796273dd97a1a86616401"
+          cat > parent/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f parent/Cargo.lock
+          for dir in parent compiler; do
+            mkdir -p "$dir/crates/opt/examples"
+            cat > "$dir/crates/opt/examples/review_typed_algebra.rs" <<'EOF'
+          use compiler_ir::native_module_text_v3::read_native_module_text_v3;
+          use compiler_opt::typed_algebra::simplify_typed;
+          use std::{env,hint::black_box,time::Instant};
+          fn main() {
+              let mode=env::args().nth(1).expect("mode");
+              let src=include_str!("../tests/fixtures/typed_algebra_cross_block_v3.ir");
+              let fixture=read_native_module_text_v3(src).unwrap();
+              let mut prepared=fixture.clone();
+              assert_eq!(simplify_typed(&mut prepared).unwrap(),0);
+              let mut samples=Vec::new();
+              for _ in 0..500 {
+                  let start=Instant::now();
+                  match mode.as_str() {
+                      "noop" => {
+                          assert_eq!(simplify_typed(&mut prepared).unwrap(),0);
+                          black_box(&prepared);
+                      },
+                      "rewrite" => {
+                          let mut m=fixture.clone();
+                          assert_eq!(simplify_typed(&mut m).unwrap(),0);
+                          assert_ne!(m,fixture);
+                          black_box(m);
+                      },
+                      _ => panic!("unknown mode"),
+                  }
+                  samples.push(start.elapsed().as_nanos());
+              }
+              samples.sort_unstable();
+              println!("{} {}",mode,samples[samples.len()/2]);
+          }
+          EOF
+          done
+      - name: Build exact-parent and candidate release benchmark
+        shell: bash
+        run: |
+          (cd parent && cargo build -p compiler-opt --release --example review_typed_algebra)
+          (cd compiler && cargo build -p compiler-opt --release --example review_typed_algebra)
+      - name: Run same-runner exact-parent ABBA both no-op and rewrite
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > /tmp/algebra_abba.txt
+          for mode in noop rewrite; do
+            for round in 1 2 3 4 5; do
+              for side in parent compiler compiler parent; do
+                printf '%s %s %s ' "$mode" "$round" "$side" >> /tmp/algebra_abba.txt
+                "$side/target/release/examples/review_typed_algebra" "$mode" >> /tmp/algebra_abba.txt
+              done
+            done
+          done
+          cat /tmp/algebra_abba.txt
+          python3 - <<'PY'
+          from collections import defaultdict
+          from statistics import median
+          groups=defaultdict(list)
+          for line in open("/tmp/algebra_abba.txt"):
+              case,round,side,reported,ns=line.split()
+              assert case==reported
+              groups[case,side].append(int(ns))
+          for case in ("noop","rewrite"):
+              a=median(groups[case,"parent"])
+              b=median(groups[case,"compiler"])
+              print("CT11_ALGEBRA_ABBA",case,"parent_ns",a,"candidate_ns",b,"speedup",round(a/b,4))
+          PY
