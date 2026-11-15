@@ -1,0 +1,59 @@
+# TEMP source-pinned FP TypeId staging acceptance. Never merge into compiler-ci main.
+name: TEMP TypeId FP eight XMM argument oracle
+on:
+  push:
+    branches: [ci/fp-typeid-mixed-eight-xmm-20261115]
+    paths: [.github/workflows/fp-typeid-mixed-eight-xmm-20261115.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fp-typeid-abi:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      SOURCE_SHA: ff032f3f050e301470dacf1e53659b0bf24ac08d
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler FP source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ff032f3f050e301470dacf1e53659b0bf24ac08d
+          path: compiler
+          ssh-key: \${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and limit workspace to shared native crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: fp-typeid-eight-xmm-20261115
+      - name: New eight-XMM mixed F32/F64 ABI integration test
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --lib typeid_scalar_fp_mixed_eight_xmm_argument_oracle -- --nocapture
+      - name: Existing staged TypeId FP XMM executable and rejection tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --lib typeid_scalar_fp -- --nocapture
+      - name: TypeId FP semantics and codec regression
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test native_fp_scalar_reference
+          cargo test -p compiler-ir --test native_fp_opcode_roundtrip
+      - name: Backend all-target compatibility
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-backend-x86 -p compiler-backend-aarch64 -p compiler-backend-riscv64 -p compiler-backend-wasm --all-targets
+          cargo clippy -p compiler-ir --all-targets -- -D warnings
