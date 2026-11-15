@@ -146,15 +146,28 @@ for kind in alignment linkage abi naked control_globals weak_function section_fu
   fixture="/workspace/bootstrap/fixtures/edg-gnu-attributes/${kind}.c"
   output="/audit-tmp/edg-gnu-${kind}.o"
   rm -f "$output"
+  # Only public source fixtures get EDG symbol/global details in CI logs.
+  provenance_args=()
+  if [[ "$kind" == scalar_global || "$kind" == weak_scalar_global ]]; then
+    provenance_args=(--dump-edg-global-provenance)
+  fi
   set +e
   (
     cd /workspace/edgcpp/build/gcc-release
     timeout --signal=TERM --kill-after=10s 90s \
-      "$native" "$output" --gcc --c11 --no_strict_gnu --gnu_version "$gnu_number" "$fixture"
+      "$native" "$output" ${provenance_args[@]} --gcc --c11 --no_strict_gnu --gnu_version "$gnu_number" "$fixture"
   ) > "/audit-tmp/edg-gnu-${kind}-native.log" 2>&1
   kind_rc=$?
   set -e
   echo "EDG_GNU_ATTR_NATIVE_${kind^^}_EXIT=$kind_rc"
+  if [[ "$kind" == scalar_global || "$kind" == weak_scalar_global ]]; then
+    # Report exact EDG source facts without guessing that absence of an
+    # attribute record implies the attribute was not present in source.
+    # Keep output tightly bounded even for these public fixtures.
+    grep -E '^(EDG_GLOBAL_PROVENANCE|GLOBAL id=|  VARIABLE_INIT|  INTEGER_INIT)' \
+      "/audit-tmp/edg-gnu-${kind}-native.log" | head -n 12 |
+      sed "s/^/EDG_C_SCALAR_PROVENANCE_${kind^^} /" || true
+  fi
   if (( kind_rc != 0 )); then
     # This is a public source fixture, so a short structured rejection
     # message is safe. Do not apply this to the private real-C logs.
