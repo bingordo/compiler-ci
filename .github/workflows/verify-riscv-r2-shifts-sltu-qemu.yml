@@ -1,0 +1,198 @@
+name: RV64 R2 variable shifts and unsigned compare GNU GAS QEMU
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-riscv-r2-shifts-sltu-qemu.yml']
+permissions:
+  contents: read
+jobs:
+  shifts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c62393aa4e138913edbf51351b0c2e5c82e35215
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "c62393aa4e138913edbf51351b0c2e5c82e35215"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Isolate TypeId native backend workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-riscv64"]
+          EOF
+          rm -f Cargo.lock
+      - name: Rust tests strict Clippy and proof-gated UDB generation
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib
+          cargo test -p compiler-backend-riscv64 --all-targets
+          cargo clippy -p compiler-backend-riscv64 --all-targets -- -D warnings
+          python3 tools/regen_riscv_native_selector_rules.py --check
+          python3 -m unittest discover -s tools -p test_riscv_native_selector_rules.py -v
+          python3 tools/riscv_udb_rust_leaf_forms.py \
+            --catalog data/riscv_udb_r0_catalog.json \
+            --output crates/backend-riscv64/src/generated_encoding.rs --check
+      - name: Install independent GNU RISC-V toolchain and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu qemu-user
+      - name: Seven TypeId ELF vs GAS and objdump oracle comparisons
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for kind in sll sllw srl srlw sra sraw sltu; do
+            cargo run -p compiler-backend-riscv64 --example rv64_leaf -- \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}.s" "${kind}"
+            grep -qE "^[[:space:]]+${kind} x[0-9]+, x[0-9]+, x[0-9]+$" "/tmp/rv64_${kind}.s"
+            riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+              "/tmp/rv64_${kind}.s" -o "/tmp/rv64_${kind}_gas.o"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}_direct.bin"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}_gas.o" "/tmp/rv64_${kind}_gas.bin"
+            cmp "/tmp/rv64_${kind}_direct.bin" "/tmp/rv64_${kind}_gas.bin"
+            riscv64-linux-gnu-objdump -dr "/tmp/rv64_${kind}.o" | grep -w "${kind}"
+          done
+      - name: Execute modulo-width and unsigned-order TypeId cases under QEMU
+        run: |
+          set -euo pipefail
+          cat > /tmp/rv64_shift_start.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            mv s0, sp
+            li a0, 1
+            li a1, 63
+            call rv64_sll_leaf
+            li t0, 0x8000000000000000
+            bne a0, t0, fail1
+            li a0, 1
+            li a1, 64
+            call rv64_sll_leaf
+            li t0, 1
+            bne a0, t0, fail2
+            li a0, 1
+            li a1, 65
+            call rv64_sll_leaf
+            li t0, 2
+            bne a0, t0, fail3
+            li a0, 0x8000000000000000
+            li a1, 63
+            call rv64_srl_leaf
+            li t0, 1
+            bne a0, t0, fail4
+            li a0, 0x8000000000000000
+            li a1, 64
+            call rv64_srl_leaf
+            li t0, 0x8000000000000000
+            bne a0, t0, fail5
+            li a0, 0x8000000000000000
+            li a1, 63
+            call rv64_sra_leaf
+            li t0, -1
+            bne a0, t0, fail6
+            li a0, 0x8000000000000000
+            li a1, 64
+            call rv64_sra_leaf
+            li t0, 0x8000000000000000
+            bne a0, t0, fail7
+            li a0, 1
+            li a1, 31
+            call rv64_sllw_leaf
+            li t0, -2147483648
+            bne a0, t0, fail8
+            li a0, 1
+            li a1, 32
+            call rv64_sllw_leaf
+            li t0, 1
+            bne a0, t0, fail9
+            li a0, -1
+            li a1, 1
+            call rv64_srlw_leaf
+            li t0, 2147483647
+            bne a0, t0, fail10
+            li a0, -1
+            li a1, 32
+            call rv64_srlw_leaf
+            li t0, -1
+            bne a0, t0, fail11
+            li a0, -2147483648
+            li a1, 31
+            call rv64_sraw_leaf
+            li t0, -1
+            bne a0, t0, fail12
+            li a0, -2147483648
+            li a1, 33
+            call rv64_sraw_leaf
+            li t0, -1073741824
+            bne a0, t0, fail13
+            li a0, -1
+            li a1, 1
+            call rv64_ltu_branch
+            bnez a0, fail14
+            li a0, 1
+            li a1, -1
+            call rv64_ltu_branch
+            li t0, -2
+            bne a0, t0, fail15
+            bne sp, s0, fail_sp
+            li a0, 0
+            j exit
+          fail1: li a0, 1
+            j exit
+          fail2: li a0, 2
+            j exit
+          fail3: li a0, 3
+            j exit
+          fail4: li a0, 4
+            j exit
+          fail5: li a0, 5
+            j exit
+          fail6: li a0, 6
+            j exit
+          fail7: li a0, 7
+            j exit
+          fail8: li a0, 8
+            j exit
+          fail9: li a0, 9
+            j exit
+          fail10: li a0, 10
+            j exit
+          fail11: li a0, 11
+            j exit
+          fail12: li a0, 12
+            j exit
+          fail13: li a0, 13
+            j exit
+          fail14: li a0, 14
+            j exit
+          fail15: li a0, 15
+            j exit
+          fail_sp: li a0, 16
+          exit:
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+            /tmp/rv64_shift_start.s -o /tmp/rv64_shift_start.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax \
+            -e _start /tmp/rv64_shift_start.o \
+            /tmp/rv64_sll.o /tmp/rv64_sllw.o /tmp/rv64_srl.o \
+            /tmp/rv64_srlw.o /tmp/rv64_sra.o /tmp/rv64_sraw.o \
+            /tmp/rv64_sltu.o -o /tmp/rv64_shift.elf
+          timeout 15s qemu-riscv64 /tmp/rv64_shift.elf
+          echo "15 RV64I TypeId variable shift and unsigned comparison QEMU cases passed"
