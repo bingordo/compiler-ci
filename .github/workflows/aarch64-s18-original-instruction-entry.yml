@@ -1,0 +1,67 @@
+name: AArch64 S18 original ADC ADCS executable-entry frontier
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/aarch64-s18-original-instruction-entry.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  original-entry:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a4915464dad8896564eb63d02319dcac8464ef19
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: herd/herdtools7
+          ref: cfc4f56c522ec0d701acaf5a23139b47e8711299
+          path: herd
+          sparse-checkout: |
+            herd/libdir/asl-pseudocode/bundler.py
+          persist-credentials: false
+      - name: Audit original Arm instruction executable entry points
+        run: |
+          set -euo pipefail
+          curl -fLsS --retry 3 --connect-timeout 20 --max-time 240 --max-filesize 200000000 -o /tmp/arm2026.tar.gz https://developer.arm.com/-/cdn-downloads/permalink/Exploration-Tools-A64-ISA/ISA_A64/ISA_A64_xml_A_profile-2026-09.tar.gz
+          echo '44cfb89c763c7eea8e59de0ad2221e3c012e6aa77899bd7f1c3e1f24537191d7  /tmp/arm2026.tar.gz' | sha256sum -c -
+          python3 compiler/tools/aarch64_a32_full_source_catalog.py --isa-xml-archive /tmp/arm2026.tar.gz --out /tmp/catalog.json
+          python3 - <<'PY'
+          import sys, json, re, hashlib, tempfile, tarfile
+          from pathlib import Path
+          sys.path.insert(0,'compiler/tools')
+          from aarch64_a32_aslref_compat import load_bundler
+          from aarch64_a32_asl_source_links import ROOT, verify_xml
+          from aarch64_a32_full_source_catalog import validate_catalog
+          index=validate_catalog(json.load(open('/tmp/catalog.json')))
+          bundle=load_bundler(Path('herd/herd/libdir/asl-pseudocode/bundler.py'))
+          with tarfile.open('/tmp/arm2026.tar.gz','r:gz') as archive, tempfile.TemporaryDirectory() as td:
+              for op in ('ADC','ADCS'):
+                  entry=index[op]
+                  raw=archive.extractfile(ROOT+entry['xml_path']).read()
+                  verify_xml(raw,entry)
+                  path=Path(td)/entry['xml_path']
+                  path.write_bytes(raw)
+                  asl=bundle.one_instruction_to_string(path)
+                  headers=[s.strip() for s in asl.splitlines()
+                           if re.match(r'\s*(?:func|procedure)\s+',s)]
+                  keywords=['AddWithCarry','PSTATE.C','PSTATE.<N,Z,C,V>','X[d]','bits(64)','bits(32)']
+                  print('S18_ORIGINAL_INSTRUCTION',op,entry['operation_id'],entry['xml_sha256'],
+                        'bundled_sha256',hashlib.sha256(asl.encode()).hexdigest(),
+                        'bytes',len(asl.encode()), 'function_count',len(headers))
+                  for j,s in enumerate(headers):
+                      print('S18_ORIGINAL_ENTRY',op,j,'signature_sha256',hashlib.sha256(s.encode()).hexdigest(),
+                            'signature_length',len(s),'prefix',s[:65],
+                            'params',s.count(','),'arrow', '=>' in s)
+                  print('S18_ORIGINAL_REFERENCES',op,
+                        {name:asl.count(name) for name in keywords},
+                        'getter',len(re.findall(r'\b(?:getter|setter)\b',asl)),
+                        'assignments',asl.count(' = '),
+                        'file_lines',len(asl.splitlines()))
+          PY
