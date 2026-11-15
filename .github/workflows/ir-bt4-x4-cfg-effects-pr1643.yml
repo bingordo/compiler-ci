@@ -1,0 +1,54 @@
+# Temporary compiler-ci exact-source BT4 X4 test and quality gate.
+name: BT4 original X4 CFG and effect TypeId oracles
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ir-bt4-x4-cfg-effects-pr1643.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-x4:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_INCREMENTAL: '0'
+      SOURCE_SHA: 7af5033cad2ccd635968b784f000c23b2c68d799
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7af5033cad2ccd635968b784f000c23b2c68d799
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin SHA and isolate core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-bt4-x4-native
+      - name: Original X4 generated-shape, CFG, pressure and effect C oracles
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --test x4_cfg_pressure_native --test x4_effects_native -- --nocapture
+      - name: Adjacent CTZ, phi, call pressure, RBP and effect native regressions
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test native_typeid_call_liveness --test call_clobber_pressure_native --test rbp_alloc_native --test native_typeid_direct --test mixed_frame_native --test x4_generated_dag_native
+      - name: All-target affected crates
+        working-directory: compiler
+        run: cargo check -p compiler-ir -p compiler-backend -p compiler-backend-x86 --all-targets
+      - name: Strict Clippy for migrated original tests
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-x86 --test x4_cfg_pressure_native --test x4_effects_native -- -D warnings
