@@ -4,6 +4,9 @@ on:
     branches: [ci/standalone-edg-gnu-attribute-probe]
     paths:
       - '.github/workflows/probe-edg-gnu-attributes.yml'
+      - 'bootstrap/run-mrustc-edg-gap.sh'
+      - 'bootstrap/edg_parse_probe.rs'
+      - 'bootstrap/fixtures/edg-gnu-attributes/**'
   workflow_dispatch:
 
 permissions:
@@ -63,11 +66,11 @@ jobs:
           {
             echo "### Public GNU attribute oracles (EDG vs GCC; native TypeId separately)"
             echo "EDG probe infrastructure exit: $rc"
-            grep -E '^(EDG_GNU_ATTR_PARSE_[A-Z_]+_EXIT|EDG_C_(PARSE|TYPEID)_EXIT|EDG_C_PARSE_CLASS|EDG_C_SAMPLE_BYTES|EDG_PROBE_RESULT)' "$RUNNER_TEMP/edg-attributes-audit.log" || true
+            grep -E '^(EDG_GNU_ATTR_(PARSE|NATIVE)_[A-Z_]+_(EXIT|OBJECT)|EDG_C_(PARSE|TYPEID)_EXIT|EDG_C_PARSE_CLASS|EDG_C_SAMPLE_BYTES|EDG_PROBE_RESULT)' "$RUNNER_TEMP/edg-attributes-audit.log" || true
             echo "GCC syntax-only accepted all four fixture groups; EDG parser/native return statuses above are separate evidence."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "EDG diagnostic result markers:"
-          grep -E '^(EDG_GNU_ATTR_PARSE_[A-Z_]+_EXIT|EDG_C_(PARSE|TYPEID)_EXIT|EDG_C_PARSE_CLASS|EDG_PROBE_RESULT)' "$RUNNER_TEMP/edg-attributes-audit.log" || true
+          grep -E '^(EDG_GNU_ATTR_(PARSE|NATIVE)_[A-Z_]+_(EXIT|OBJECT)|EDG_C_(PARSE|TYPEID)_EXIT|EDG_C_PARSE_CLASS|EDG_PROBE_RESULT)' "$RUNNER_TEMP/edg-attributes-audit.log" || true
           if (( rc != 0 )); then
             echo "::error::EDG fixture preflight or toolchain failed before completing probe"
             tail -n 20 "$RUNNER_TEMP/edg-attributes-audit.log"
@@ -80,3 +83,37 @@ jobs:
             }
           done
           grep -q '^EDG_C_PARSE_EXIT=' "$RUNNER_TEMP/edg-attributes-audit.log"
+          echo "Native ELF validation (diagnostic; parser acceptance is not native support):"
+          if [[ -s "$RUNNER_TEMP/edg-gnu-linkage.o" ]]; then
+            weak=0
+            section=0
+            readelf -W -s "$RUNNER_TEMP/edg-gnu-linkage.o" | grep -Eq 'WEAK.*attribute_weak' && weak=1 || :
+            readelf -W -S "$RUNNER_TEMP/edg-gnu-linkage.o" | grep -qF '.data.edg_attr_probe' && section=1 || :
+            echo "EDG_GNU_ATTR_LINKAGE_ELF weak=$weak section=$section"
+          else
+            echo "EDG_GNU_ATTR_LINKAGE_ELF object_not_emitted"
+          fi
+          cat > "$RUNNER_TEMP/attribute-harness.c" <<'C'
+          extern int attribute_layout(void);
+          extern int attribute_abi(void);
+          #if defined(TEST_LAYOUT)
+          int main(void) { return attribute_layout() == 5 ? 0 : 1; }
+          #else
+          int main(void) { return attribute_abi() == 7 ? 0 : 1; }
+          #endif
+          C
+          for kind in alignment abi; do
+            if [[ -s "$RUNNER_TEMP/edg-gnu-$kind.o" ]]; then
+              args=()
+              if [[ "$kind" == alignment ]]; then args=(-DTEST_LAYOUT); fi
+              if gcc -no-pie "${args[@]}" "$RUNNER_TEMP/attribute-harness.c" \
+                   "$RUNNER_TEMP/edg-gnu-$kind.o" -o "$RUNNER_TEMP/edg-$kind-exe" &&
+                 timeout 10s "$RUNNER_TEMP/edg-$kind-exe"; then
+                echo "EDG_GNU_ATTR_NATIVE_RUNTIME_${kind^^}=pass"
+              else
+                echo "EDG_GNU_ATTR_NATIVE_RUNTIME_${kind^^}=fail"
+              fi
+            else
+              echo "EDG_GNU_ATTR_NATIVE_RUNTIME_${kind^^}=object_not_emitted"
+            fi
+          done
