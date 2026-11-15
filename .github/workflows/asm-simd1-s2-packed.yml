@@ -1,0 +1,127 @@
+name: ASM SIMD1 S2 generated packed SSE differential
+on:
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/asm-simd1-s2-packed.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  feature:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 3a0f445431de50b0fb849374ce002d056faed415
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact feature SHA
+        run: test "$(git rev-parse HEAD)" = "3a0f445431de50b0fb849374ce002d056faed415"
+      - name: Restrict workspace to compiler core
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: asm-simd1-s2-feature
+      - name: Run generated SSE catalog, GAS/objdump differential and regression gates
+        run: |
+          set -euo pipefail
+          as --version | head -n1
+          objdump --version | head -n1
+          objcopy --version | head -n1
+          python3 tools/regen_x86_sse_packed_forms.py --check
+          python3 -m unittest discover -s tools -p test_regen_x86_sse_packed_forms.py -v
+          python3 tools/regen_x86_att_forms.py --check
+          cargo check -p compiler-backend-x86 --all-targets
+          cargo test -p compiler-backend-x86 --test att_sse_packed -- --list | tee /tmp/asm-simd1-s2-tests
+          grep -qF 'every_generated_packed_sse_form_enters_shared_physical_encoder: test' /tmp/asm-simd1-s2-tests
+          grep -qF 'generated_invalid_xmm_bank_and_operand_mutations_fail_closed: test' /tmp/asm-simd1-s2-tests
+          grep -qF 'generated_packed_sse_bytes_and_objdump_agree_with_gnu_as: test' /tmp/asm-simd1-s2-tests
+          cargo test -p compiler-backend-x86 --test att_sse_packed -- --nocapture
+          cargo test -p compiler-backend-x86 --lib sse_packed -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_sse_scalar -- --nocapture
+          cargo test -p compiler-backend-x86 --lib generated_form_tests -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_asm
+          cargo test -p compiler-backend-x86 --test att_module
+          cargo clippy -p compiler-backend-x86 --lib --test att_sse_packed -- -D warnings -A private_interfaces -A unused_variables -A clippy::suspicious_assignment_formatting
+          echo 'ASM_SIMD1_S2_FEATURE status=PASS' >> "$GITHUB_STEP_SUMMARY"
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5e31cfd831f05bb935c9f1901b81dc292d0848f4
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 3a0f445431de50b0fb849374ce002d056faed415
+          path: feature
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Simulate main integration and fail closed on stale/shallow checkout
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "5e31cfd831f05bb935c9f1901b81dc292d0848f4"
+          test "$(git -C feature rev-parse HEAD)" = "3a0f445431de50b0fb849374ce002d056faed415"
+          cd compiler
+          git config user.name compiler-ci
+          git config user.email compiler-ci@example.invalid
+          git fetch ../feature HEAD
+          test "$(git rev-parse FETCH_HEAD)" = "3a0f445431de50b0fb849374ce002d056faed415"
+          git merge --no-commit --no-ff FETCH_HEAD
+          test "$(git rev-parse MERGE_HEAD)" = "3a0f445431de50b0fb849374ce002d056faed415"
+          test -f crates/backend-x86/src/generated_sse_packed_forms.rs
+          grep -q 'parse_generated_packed_sse' crates/backend-x86/src/att_asm.rs
+          git diff --check
+          git diff --cached --check
+          echo 'ASM_SIMD1_S2_MERGE main=5e31cfd831f05bb935c9f1901b81dc292d0848f4 feature=3a0f445431de50b0fb849374ce002d056faed415' >> "$GITHUB_STEP_SUMMARY"
+      - name: Restrict workspace to compiler core
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: asm-simd1-s2-integration
+      - name: Run generated SSE catalog, GAS/objdump differential and regression gates
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          as --version | head -n1
+          objdump --version | head -n1
+          objcopy --version | head -n1
+          python3 tools/regen_x86_sse_packed_forms.py --check
+          python3 -m unittest discover -s tools -p test_regen_x86_sse_packed_forms.py -v
+          python3 tools/regen_x86_att_forms.py --check
+          cargo check -p compiler-backend-x86 --all-targets
+          cargo test -p compiler-backend-x86 --test att_sse_packed -- --list | tee /tmp/asm-simd1-s2-tests
+          grep -qF 'every_generated_packed_sse_form_enters_shared_physical_encoder: test' /tmp/asm-simd1-s2-tests
+          grep -qF 'generated_invalid_xmm_bank_and_operand_mutations_fail_closed: test' /tmp/asm-simd1-s2-tests
+          grep -qF 'generated_packed_sse_bytes_and_objdump_agree_with_gnu_as: test' /tmp/asm-simd1-s2-tests
+          cargo test -p compiler-backend-x86 --test att_sse_packed -- --nocapture
+          cargo test -p compiler-backend-x86 --lib sse_packed -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_sse_scalar -- --nocapture
+          cargo test -p compiler-backend-x86 --lib generated_form_tests -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_asm
+          cargo test -p compiler-backend-x86 --test att_module
+          cargo clippy -p compiler-backend-x86 --lib --test att_sse_packed -- -D warnings -A private_interfaces -A unused_variables -A clippy::suspicious_assignment_formatting
+          echo 'ASM_SIMD1_S2_INTEGRATION status=PASS' >> "$GITHUB_STEP_SUMMARY"
