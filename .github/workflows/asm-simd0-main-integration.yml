@@ -1,0 +1,76 @@
+name: ASM SIMD0 current-main integration
+on:
+  push:
+    branches: [ci/asm-simd0-scalar-20261115]
+    paths: ['.github/workflows/asm-simd0-main-integration.yml']
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/asm-simd0-main-integration.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  main:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: fd4cbd3e79ff30047287933242697a3204741045
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1a13bc1bdeb04a2d9688b719c8386ddcc9c0143d
+          path: feature
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Verify pinned source and exact simulated merge
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "fd4cbd3e79ff30047287933242697a3204741045"
+          test "$(git -C feature rev-parse HEAD)" = "1a13bc1bdeb04a2d9688b719c8386ddcc9c0143d"
+          cd compiler
+          git config user.email compiler-ci@example.invalid
+          git config user.name compiler-ci
+          git fetch ../feature HEAD
+          test "$(git rev-parse FETCH_HEAD)" = "1a13bc1bdeb04a2d9688b719c8386ddcc9c0143d"
+          git merge --no-commit --no-ff FETCH_HEAD
+          test "$(git rev-parse MERGE_HEAD)" = "1a13bc1bdeb04a2d9688b719c8386ddcc9c0143d"
+          grep -q 'parse_existing_sse' crates/backend-x86/src/att_asm.rs
+          test -e crates/backend-x86/tests/att_sse_scalar.rs
+          git diff --check
+          git diff --cached --check
+          echo 'ASM_SIMD0_MERGE main=fd4cbd3e79ff30047287933242697a3204741045 feature=1a13bc1bdeb04a2d9688b719c8386ddcc9c0143d' >> "$GITHUB_STEP_SUMMARY"
+      - name: Restrict compiler workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: asm-simd0-main-integration
+      - name: Test SSE parser, shared encoder and GNU as on merged main
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-backend-x86 --all-targets
+          cargo test -p compiler-backend-x86 --test att_sse_scalar -- --list | tee /tmp/asm-simd0-main-tests
+          grep -qF 'scalar_sse_enters_existing_physical_program_and_elf_writer: test' /tmp/asm-simd0-main-tests
+          grep -qF 'scalar_sse_encoding_agrees_with_independent_gnu_as: test' /tmp/asm-simd0-main-tests
+          cargo test -p compiler-backend-x86 --test att_sse_scalar -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_asm
+          cargo test -p compiler-backend-x86 --test att_module
+          cargo test -p compiler-backend-x86 --lib sse_scalar
+          cargo clippy -p compiler-backend-x86 --lib --test att_sse_scalar -- -D warnings -A unused_variables -A clippy::suspicious_assignment_formatting
+          echo 'ASM_SIMD0_MAIN_INTEGRATION status=PASS' >> "$GITHUB_STEP_SUMMARY"
