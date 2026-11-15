@@ -300,6 +300,62 @@ jobs:
           echo "compiler-opt: minicargo succeeded and GCC compiled $count new C units." >> "$GITHUB_STEP_SUMMARY"
           echo "This verifies native object compilation, not semantic correctness or a runnable compiler." >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Compare native and GCC-linked compiler-opt executable behavior
+        if: always() && steps.optimizer.outcome == 'success'
+        shell: bash
+        env:
+          RUSTC_VERSION: '1.90.0'
+          MRUSTC_TARGET_VER: '1.90'
+          OUTDIR_SUF: '-1.90.0'
+          PARLEVEL: '2'
+          CC: gcc
+        run: |
+          set -euo pipefail
+          fixture="$PWD/bootstrap/mrustc-opt-smoke"
+          timeout --signal=TERM --kill-after=10s 15m cargo run --quiet \
+            --manifest-path "$fixture/Cargo.toml" \
+            --target-dir "$RUNNER_TEMP/bootstrap-opt-host-target" \
+            > "$RUNNER_TEMP/bootstrap-opt-host.out"
+          echo "Host rustc optimizer oracle completed:"
+          cat "$RUNNER_TEMP/bootstrap-opt-host.out"
+          (
+            cd mrustc
+            # Reuse the already compiled compiler-ir and compiler-opt crates.
+            timeout --signal=TERM --kill-after=10s 20m bin/minicargo \
+              -L output-1.90.0 -o output-compiler-bootstrap \
+              "$fixture" > "$RUNNER_TEMP/bootstrap-opt-mrustc.log" 2>&1 || {
+                echo "::group::Full compiler-opt executable translation log"
+                cat "$RUNNER_TEMP/bootstrap-opt-mrustc.log"
+                echo "::endgroup::"
+                exit 1
+              }
+          )
+          echo "mrustc/minicargo optimizer oracle build completed:"
+          tail -n 20 "$RUNNER_TEMP/bootstrap-opt-mrustc.log"
+          echo "Executable candidates in the shared output directory:"
+          find mrustc/output-compiler-bootstrap -maxdepth 2 -type f -executable -printf '%p\n' | LC_ALL=C sort
+          mapfile -t executables < <(find mrustc/output-compiler-bootstrap \
+            -maxdepth 2 -type f -executable -name '*opt-smoke*' | LC_ALL=C sort)
+          if (( ${#executables[@]} != 1 )); then
+            echo "::error::Expected one compiler-opt GCC-linked executable, found ${#executables[@]}"
+            echo "Expected one compiler-opt GCC-linked executable, found ${#executables[@]}" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          if ! timeout 30s "${executables[0]}" > "$RUNNER_TEMP/bootstrap-opt-mrustc.out"; then
+            echo "::error::mrustc/GCC optimizer executable terminated unsuccessfully"
+            exit 1
+          fi
+          echo "mrustc/GCC optimizer oracle output:"
+          cat "$RUNNER_TEMP/bootstrap-opt-mrustc.out"
+          if ! diff -u "$RUNNER_TEMP/bootstrap-opt-host.out" "$RUNNER_TEMP/bootstrap-opt-mrustc.out"; then
+            echo "::error::Native rustc and mrustc/GCC optimizer results differ"
+            exit 1
+          fi
+          if ! grep -q '^compiler-opt-smoke:' "$RUNNER_TEMP/bootstrap-opt-mrustc.out"; then
+            echo "::error::Optimizer executable printed no expected checksum line"
+            exit 1
+          fi
+          echo "Executable compiler-opt oracle passed: GCC-linked mrustc output equals host rustc on wrapping arithmetic constant folding." >> "$GITHUB_STEP_SUMMARY"
       - name: Translate compiler-backend and compile generated C with GCC
         if: always() && steps.translate.outcome == 'success'
         id: backend
@@ -473,44 +529,6 @@ jobs:
           grep -q '^compiler-ir-smoke:' "$RUNNER_TEMP/bootstrap-mrustc.out"
           echo "Executable GCC oracle passed: mrustc output equals rustc output on compiler-ir integer semantics." >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Compare native and GCC-linked compiler-opt executable behavior
-        if: always() && steps.optimizer.outcome == 'success'
-        shell: bash
-        env:
-          RUSTC_VERSION: '1.90.0'
-          MRUSTC_TARGET_VER: '1.90'
-          OUTDIR_SUF: '-1.90.0'
-          PARLEVEL: '2'
-          CC: gcc
-        run: |
-          set -euo pipefail
-          fixture="$PWD/bootstrap/mrustc-opt-smoke"
-          timeout --signal=TERM --kill-after=10s 15m cargo run --quiet \
-            --manifest-path "$fixture/Cargo.toml" \
-            --target-dir "$RUNNER_TEMP/bootstrap-opt-host-target" \
-            > "$RUNNER_TEMP/bootstrap-opt-host.out"
-          (
-            cd mrustc
-            # Reuse the already compiled compiler-ir and compiler-opt crates.
-            timeout --signal=TERM --kill-after=10s 20m bin/minicargo \
-              -L output-1.90.0 -o output-compiler-bootstrap \
-              "$fixture" > "$RUNNER_TEMP/bootstrap-opt-mrustc.log" 2>&1 || {
-                echo "::group::Full compiler-opt executable translation log"
-                cat "$RUNNER_TEMP/bootstrap-opt-mrustc.log"
-                echo "::endgroup::"
-                exit 1
-              }
-          )
-          mapfile -t executables < <(find mrustc/output-compiler-bootstrap \
-            -maxdepth 2 -type f -executable -name '*opt-smoke*' | LC_ALL=C sort)
-          if (( ${#executables[@]} != 1 )); then
-            echo "Expected one compiler-opt GCC-linked executable, found ${#executables[@]}" >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          timeout 30s "${executables[0]}" > "$RUNNER_TEMP/bootstrap-opt-mrustc.out"
-          diff -u "$RUNNER_TEMP/bootstrap-opt-host.out" "$RUNNER_TEMP/bootstrap-opt-mrustc.out"
-          grep -q '^compiler-opt-smoke:' "$RUNNER_TEMP/bootstrap-opt-mrustc.out"
-          echo "Executable compiler-opt oracle passed: GCC-linked mrustc output equals host rustc on wrapping arithmetic constant folding." >> "$GITHUB_STEP_SUMMARY"
       - name: Compare x86 objects from rustc and mrustc GCC then execute native code
         if: always() && steps.backend-x86.outcome == 'success'
         shell: bash
