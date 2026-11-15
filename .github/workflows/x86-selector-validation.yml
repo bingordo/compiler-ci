@@ -7,6 +7,9 @@ on:
         required: false
         default: 'main'
         type: string
+  pull_request:
+    paths:
+      - '.github/workflows/x86-selector-validation.yml'
   schedule:
     - cron: '7,22,37,52 * * * *'
   push:
@@ -55,8 +58,10 @@ jobs:
         if: steps.validated.outputs.cache-hit != 'true'
         working-directory: compiler
         run: |
-          # The generator's Python tests and tooling live on the experimental
-          # pattern branch; main currently has no test_x86_*.py tests.
+          # tests/ loads tools/ modules via importlib; ensure sibling imports
+          # (e.g. validate_x86_costs -> import_uops_info) are resolvable.
+          export PYTHONPATH="$PWD/tools${PYTHONPATH:+:$PYTHONPATH}"
+          # Discover x86 tests on main and preserve existing tool checks.
           if compgen -G 'tests/test_x86_*.py' > /dev/null; then
             python3 -m unittest discover -s tests -p 'test_x86_*.py' -v
           fi
@@ -82,13 +87,17 @@ jobs:
           # Use an isolated temporary workspace containing only the backend's
           # local dependency closure; never edit the checked-out source.
           mkdir -p "$RUNNER_TEMP/x86-workspace/crates"
-          for crate in ir opt backend backend-x86; do
+          for crate in ir opt backend backend-x86 backend-aarch64; do
             cp -a "crates/$crate" "$RUNNER_TEMP/x86-workspace/crates/$crate"
           done
+          # The optimizer build script reads its audited generator under
+          # workspace-root tools/, and native tests load root fixtures.
+          cp -a tools tests data "$RUNNER_TEMP/x86-workspace/"
           cat > "$RUNNER_TEMP/x86-workspace/Cargo.toml" <<'EOF'
           [workspace]
           resolver = "2"
-          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86",
+                     "crates/backend-aarch64"]
           EOF
           cargo test --manifest-path "$RUNNER_TEMP/x86-workspace/Cargo.toml" -p compiler-backend-x86 \
             -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/x86-all-backend-tests.log"
@@ -125,7 +134,7 @@ jobs:
           if not re.search(r'test scalar_division_traps_for_zero_divisors_and_signed_min_overflow \.\.\.',log):
               raise SystemExit('Native division trap regression test did not run')
           records=re.findall(
-              r'T5_X86_DIV_TRAP_FORMAT mode=(\w+) format=(\w+) cases=(\d+) status=PASS',log
+              r'T5_X86_TYPEID_DIV_TRAP_FORMAT mode=(\w+) format=(\w+) cases=(\d+) status=PASS',log
           )
           expected={(mode,fmt) for mode in ('framed','frameless') for fmt in ('gas','elf')}
           if len(records)!=4 or {(m,f) for m,f,_ in records} != expected:
