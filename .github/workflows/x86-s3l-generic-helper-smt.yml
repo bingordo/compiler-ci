@@ -1,0 +1,96 @@
+name: X7 S3.L L2b L3a original Intel helper AST and generic SMT
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/x86-s3l-generic-helper-smt.yml'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  generic-helper-and-smt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 38
+    env:
+      SOURCE_SHA: 'b6cf16f75e6f27cfec7b71bcea279e221097832a'
+      PYTHONPATH: compiler/tools
+      X7_S3L_ISL_DIRECTORY: /tmp/x7-s3l-original/ops
+      X7_S3L_HELPERS_GZIP: /tmp/x7-s3l-original/definitions.xml.gz
+      X7_S3L_OPERATION_AST: /tmp/x7-s3l-proof/operations.json
+      X7_S3L_HELPER_AST: /tmp/x7-s3l-proof/helpers.json
+      X7_S3L_HELPER_AST_REPORT: /tmp/x7-s3l-proof/helpers.json
+      X7_S3L_SMT_REPORT: /tmp/x7-s3l-proof/semantics-z3.json
+    steps:
+      - name: Checkout exact compiler commit without compiler Actions
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b6cf16f75e6f27cfec7b71bcea279e221097832a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Fetch exact original Intel SDM nine operations and full compressed helpers
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          mkdir -p "$X7_S3L_ISL_DIRECTORY" /tmp/x7-s3l-proof
+          for op in ADD SUB CMP AND OR XOR TEST ADC SBB; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 50 \
+              "https://raw.githubusercontent.com/intel/SDM/35eface1b7ee003a1cda95005ec5fd83de658a64/data/instruction/${op}.xml" \
+              -o "$X7_S3L_ISL_DIRECTORY/${op}.xml"
+          done
+          curl --fail --silent --show-error --location --retry 2 --max-time 50 \
+            "https://raw.githubusercontent.com/intel/SDM/35eface1b7ee003a1cda95005ec5fd83de658a64/data/definitions.xml.gz" \
+            -o "$X7_S3L_HELPERS_GZIP"
+          echo 'c5607c5774d45e2300410e519a65c7d48981afc55a50c4219ee9e6b2eb1f301e  /tmp/x7-s3l-original/definitions.xml.gz' | sha256sum -c -
+      - name: Normalize nine original Intel operations through one typed AST
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/x86_s3l_isl_operation_ast.py \
+            --intel-dir "$X7_S3L_ISL_DIRECTORY" \
+            --operations 'ADD,SUB,CMP,AND,OR,XOR,TEST,ADC,SBB' \
+            --out "$X7_S3L_OPERATION_AST"
+      - name: Parse original Intel Add and Subtract helper source with shared AST
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/x86_s3l_isl_helper_ast.py \
+            --definitions-gz "$X7_S3L_HELPERS_GZIP" \
+            --helpers 'Add,Subtract' --out "$X7_S3L_HELPER_AST"
+          python3 compiler/tools/x86_s3l_isl_helper_ast.py \
+            --definitions-gz "$X7_S3L_HELPERS_GZIP" \
+            --helpers 'Subtract,Add' --out "$X7_S3L_HELPER_AST" --check
+          python3 -m unittest -v test_x86_s3l_isl_helper_ast
+          echo X7_S3L_HELPER_AST_GENERIC_PINNED_SOURCE_PASS
+      - name: Install pinned SMT engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/x7-s3l-z3
+          /tmp/x7-s3l-z3/bin/python -m pip install --disable-pip-version-check 'z3-solver==4.13.4.0'
+      - name: Discharge generic source-helper and defined-flag equivalence SMT obligations
+        shell: bash
+        run: |
+          set -euo pipefail
+          /tmp/x7-s3l-z3/bin/python compiler/tools/x86_s3l_generic_ast_smt.py \
+            --operation-ast "$X7_S3L_OPERATION_AST" \
+            --helper-ast "$X7_S3L_HELPER_AST" \
+            --out "$X7_S3L_SMT_REPORT"
+          /tmp/x7-s3l-z3/bin/python compiler/tools/x86_s3l_generic_ast_smt.py \
+            --operation-ast "$X7_S3L_OPERATION_AST" \
+            --helper-ast "$X7_S3L_HELPER_AST" \
+            --out "$X7_S3L_SMT_REPORT" --check
+          echo X7_S3L_GENERIC_ISL_32_64_SOURCE_SMT_PASS
+      - name: Test helper and operation mutations that must produce counterexamples
+        shell: bash
+        run: |
+          set -euo pipefail
+          /tmp/x7-s3l-z3/bin/python -m unittest -v test_x86_s3l_generic_ast_smt
+          echo X7_S3L_GENERIC_ISL_SMT_NEGATIVE_MUTATIONS_PASS
+      - name: Archive exact normalized source and semantic Z3 proof records
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-s3l-l2b-l3a-9-ops-generic-helper-smt-source-evidence
+          path: /tmp/x7-s3l-proof/
+          if-no-files-found: error
