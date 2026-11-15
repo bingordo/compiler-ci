@@ -1,0 +1,59 @@
+name: TypeId 64 bit local mem2reg CFG promotion
+on:
+  push:
+    branches: [verify/typeid-wide-mem2reg-20261115]
+    paths: ['.github/workflows/typeid-wide-mem2reg-20261115.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  wide-mem2reg:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 3a35e46cb60c7a0728b86611578cd8f645b798b6
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm pinned source and public Git deps
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "3a35e46cb60c7a0728b86611578cd8f645b798b6"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - name: Isolate active TypeId native compiler workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/driver"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-wide-mem2reg
+      - name: Typed wide promotion and optimizer library
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test typed_mem2reg -- --nocapture
+          cargo test -p compiler-opt --test typed_local_memory
+          cargo clippy -p compiler-opt --lib -- -D warnings
+      - name: Native/LTO differential executable and runtime
+        working-directory: compiler
+        run: |
+          cargo test -p compiler --test lto_generated_abi_memory
+          cargo test -p compiler --test lto_fnptr_stack_abi
+          cargo test -p compiler --test lto_ordered_build
+          cargo build -p compiler --bin compiler
+          python3 tools/lto-runtime-bench.py --compiler ./target/debug/compiler --rounds 3 --iterations 350000 --json wide-mem2reg-runtime.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wide-mem2reg-runtime
+          path: compiler/wide-mem2reg-runtime.json
+          if-no-files-found: ignore
