@@ -1,0 +1,660 @@
+name: RV64 R2 memoized bounded additive DAG search and GNU QEMU
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-riscv-r2-memoized-dag-qemu.yml']
+permissions:
+  contents: read
+jobs:
+  calls:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 63d11e7eca944e61cda09b1645039ac5a98951cb
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require exact compiler source revision
+        run: test "$(git -C compiler rev-parse HEAD)" = "63d11e7eca944e61cda09b1645039ac5a98951cb"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Isolate TypeId-native compiler crates
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-riscv64"]
+          EOF
+          rm -f Cargo.lock
+      - name: Rust, Clippy and checked UDB regeneration
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib
+          cargo test -p compiler-backend-riscv64 --all-targets
+          cargo clippy -p compiler-backend-riscv64 --all-targets -- -D warnings
+          python3 tools/regen_riscv_native_selector_rules.py --check
+          python3 -m unittest discover -s tools -p test_riscv_native_selector_rules.py -v
+          python3 tools/riscv_udb_rust_leaf_forms.py \
+            --catalog data/riscv_udb_r0_catalog.json \
+            --output crates/backend-riscv64/src/generated_encoding.rs --check
+      - name: Install independent GCC, binutils and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu qemu-user
+      - name: Compare four CALL_PLT ELF objects to GNU GAS
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for kind in call64 callswap callzero call32; do
+            cargo run -p compiler-backend-riscv64 --example rv64_leaf -- \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}.s" "$kind"
+            riscv64-linux-gnu-readelf -Wr "/tmp/rv64_${kind}.o" \
+              | grep R_RISCV_CALL_PLT
+            riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+              "/tmp/rv64_${kind}.s" -o "/tmp/rv64_${kind}_gas.o"
+            riscv64-linux-gnu-readelf -Wr "/tmp/rv64_${kind}_gas.o" \
+              | grep R_RISCV_CALL_PLT
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}_direct.bin"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}_gas.o" "/tmp/rv64_${kind}_gas.bin"
+            cmp "/tmp/rv64_${kind}_direct.bin" "/tmp/rv64_${kind}_gas.bin"
+          done
+      - name: GCC LP64 C callees linked with our ELF objects under QEMU
+        run: |
+          set -euo pipefail
+          cat > /tmp/rv64_callee.c <<'EOF'
+          __attribute__((noinline))
+          long gcc_add_bias(long a, long b) { return a + b + 17; }
+          __attribute__((noinline))
+          long gcc_sub64(long a, long b) { return a - b; }
+          __attribute__((noinline))
+          long gcc_answer(void) { return 0x123456789abcdefL; }
+          __attribute__((noinline))
+          int gcc_sub32(int a, int b) { return a - b; }
+          EOF
+          cat > /tmp/rv64_start.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            mv s0, sp
+            li a0, 7
+            li a1, 18
+            call rv64_call64
+            li t0, 42
+            bne a0, t0, fail1
+            bne sp, s0, fail_sp
+            li a0, 7
+            li a1, 18
+            call rv64_callswap
+            li t0, 11
+            bne a0, t0, fail2
+            bne sp, s0, fail_sp
+            call rv64_call_zero
+            li t0, 0x123456789abcdef
+            bne a0, t0, fail3
+            bne sp, s0, fail_sp
+            li a0, 7
+            li a1, 18
+            call rv64_call_i32
+            li t0, 11
+            bne a0, t0, fail4
+            bne sp, s0, fail_sp
+            li a0, 0
+            j exit
+          fail1: li a0, 1
+            j exit
+          fail2: li a0, 2
+            j exit
+          fail3: li a0, 3
+            j exit
+          fail4: li a0, 4
+            j exit
+          fail_sp: li a0, 5
+          exit:
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-gcc -O2 -march=rv64i -mabi=lp64 \
+            -ffreestanding -fno-pic -fno-pie -fno-stack-protector \
+            -c /tmp/rv64_callee.c -o /tmp/rv64_callee.o
+          riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+            /tmp/rv64_start.s -o /tmp/rv64_start.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax \
+            -e _start /tmp/rv64_start.o \
+            /tmp/rv64_call64.o /tmp/rv64_callswap.o \
+            /tmp/rv64_callzero.o /tmp/rv64_call32.o \
+            /tmp/rv64_callee.o -o /tmp/rv64_call.elf
+          timeout 15s qemu-riscv64 /tmp/rv64_call.elf
+          echo "RV64 TypeId -> GCC: four external call cases passed"
+      - name: Independently validate ELF machine bytes with GNU assembler
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for kind in branch same loop; do
+            cargo run -p compiler-backend-riscv64 --example rv64_leaf -- \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}.s" "$kind"
+            riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+              "/tmp/rv64_${kind}.s" -o "/tmp/rv64_${kind}_gas.o"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}_direct.bin"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}_gas.o" "/tmp/rv64_${kind}_gas.bin"
+            cmp "/tmp/rv64_${kind}_direct.bin" "/tmp/rv64_${kind}_gas.bin"
+            riscv64-linux-gnu-objdump -dr "/tmp/rv64_${kind}.o"
+          done
+      - name: Link and execute true/false, same-target and loop/backedge cases
+        run: |
+          set -euo pipefail
+          cat > /tmp/rv64_cfg_start.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            li a0, 7
+            li a1, 18
+            call rv64_branch_phi
+            li t0, 11
+            bne a0, t0, fail_1
+            li a0, 20
+            li a1, 6
+            call rv64_branch_phi
+            li t0, 26
+            bne a0, t0, fail_2
+            li a0, 7
+            li a1, 18
+            call rv64_same_target
+            li t0, -11
+            bne a0, t0, fail_3
+            li a0, 20
+            li a1, 6
+            call rv64_same_target
+            li t0, -14
+            bne a0, t0, fail_4
+            li a0, 5
+            li a1, 10
+            call rv64_loop_phi
+            li t0, 25
+            bne a0, t0, fail_5
+            li a0, 0
+            li a1, 10
+            call rv64_loop_phi
+            li t0, 10
+            bne a0, t0, fail_6
+            li a0, -3
+            li a1, 11
+            call rv64_loop_phi
+            li t0, 11
+            bne a0, t0, fail_7
+            li a0, 0
+            j exit
+          fail_1: li a0, 1
+            j exit
+          fail_2: li a0, 2
+            j exit
+          fail_3: li a0, 3
+            j exit
+          fail_4: li a0, 4
+            j exit
+          fail_5: li a0, 5
+            j exit
+          fail_6: li a0, 6
+            j exit
+          fail_7: li a0, 7
+          exit:
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+            /tmp/rv64_cfg_start.s -o /tmp/rv64_cfg_start.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax \
+            -e _start /tmp/rv64_cfg_start.o \
+            /tmp/rv64_branch.o /tmp/rv64_same.o /tmp/rv64_loop.o \
+            -o /tmp/rv64_cfg.elf
+          timeout 15s qemu-riscv64 /tmp/rv64_cfg.elf
+          echo "RV64 CFG QEMU: 7 control-flow/PHI cases passed"
+
+      - name: Validate 8 direct ELF folded/fallback objects against GNU GAS
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for kind in addi_pos addi_neg addi_left addi_hi addi_lo addi_over addi_shared addi_phi; do
+            cargo run -p compiler-backend-riscv64 --example rv64_leaf -- \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}.s" "$kind"
+            riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+              "/tmp/rv64_${kind}.s" -o "/tmp/rv64_${kind}_gas.o"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}_direct.bin"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}_gas.o" "/tmp/rv64_${kind}_gas.bin"
+            cmp "/tmp/rv64_${kind}_direct.bin" "/tmp/rv64_${kind}_gas.bin"
+          done
+          for kind in addi_pos addi_neg addi_left addi_hi addi_lo; do
+            if grep -qE '^[[:space:]]+add x[0-9]+' "/tmp/rv64_${kind}.s"; then
+              echo "unfused register ADD in ${kind}"; exit 1
+            fi
+          done
+          for kind in addi_over addi_shared addi_phi; do
+            grep -qE '^[[:space:]]+add x[0-9]+' "/tmp/rv64_${kind}.s"
+          done
+      - name: Run 9 signed boundary, commuted and PHI edge oracles under QEMU
+        run: |
+          set -euo pipefail
+          cat > /tmp/rv64_addi_start.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            li a0, 7
+            call rv64_addi_pos
+            li t0, 44
+            bne a0, t0, fail1
+            li a0, 7
+            call rv64_addi_neg
+            li t0, -10
+            bne a0, t0, fail2
+            li a0, 7
+            call rv64_addi_left
+            li t0, 44
+            bne a0, t0, fail3
+            li a0, 7
+            call rv64_addi_hi
+            li t0, 2054
+            bne a0, t0, fail4
+            li a0, 7
+            call rv64_addi_lo
+            li t0, -2041
+            bne a0, t0, fail5
+            li a0, 7
+            call rv64_addi_over
+            li t0, 2055
+            bne a0, t0, fail6
+            li a0, 7
+            call rv64_addi_shared
+            li t0, 81
+            bne a0, t0, fail7
+            li a0, 7
+            li a1, 18
+            call rv64_addi_phi
+            li t0, 29
+            bne a0, t0, fail8
+            li a0, 20
+            li a1, 6
+            call rv64_addi_phi
+            li t0, 42
+            bne a0, t0, fail9
+            li a0, 0
+            j exit
+          fail1: li a0, 1
+            j exit
+          fail2: li a0, 2
+            j exit
+          fail3: li a0, 3
+            j exit
+          fail4: li a0, 4
+            j exit
+          fail5: li a0, 5
+            j exit
+          fail6: li a0, 6
+            j exit
+          fail7: li a0, 7
+            j exit
+          fail8: li a0, 8
+            j exit
+          fail9: li a0, 9
+          exit:
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+            /tmp/rv64_addi_start.s -o /tmp/rv64_addi_start.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax \
+            -e _start /tmp/rv64_addi_start.o \
+            /tmp/rv64_addi_pos.o /tmp/rv64_addi_neg.o \
+            /tmp/rv64_addi_left.o /tmp/rv64_addi_hi.o /tmp/rv64_addi_lo.o \
+            /tmp/rv64_addi_over.o /tmp/rv64_addi_shared.o /tmp/rv64_addi_phi.o \
+            -o /tmp/rv64_addi.elf
+          timeout 15s qemu-riscv64 /tmp/rv64_addi.elf
+          echo "RV64 R2 ADDI DAG: 9 signed/CFG cases passed"
+
+      - name: Verify eight multi-level source SSA objects against independent GNU GAS
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for kind in chain_two chain_four chain_cancel chain_neg chain_over chain_under chain_shared chain_phi; do
+            cargo run -p compiler-backend-riscv64 --example rv64_leaf -- \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}.s" "$kind"
+            riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+              "/tmp/rv64_${kind}.s" -o "/tmp/rv64_${kind}_gas.o"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}_direct.bin"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}_gas.o" "/tmp/rv64_${kind}_gas.bin"
+            cmp "/tmp/rv64_${kind}_direct.bin" "/tmp/rv64_${kind}_gas.bin"
+          done
+          grep -qE '^[[:space:]]+addi x[0-9]+, x[0-9]+, 30$' /tmp/rv64_chain_two.s
+          grep -qE '^[[:space:]]+addi x[0-9]+, x[0-9]+, 100$' /tmp/rv64_chain_four.s
+          grep -qE '^[[:space:]]+addi x[0-9]+, x[0-9]+, -1$' /tmp/rv64_chain_cancel.s
+          grep -qE '^[[:space:]]+addi x[0-9]+, x[0-9]+, -42$' /tmp/rv64_chain_neg.s
+          grep -qE '^[[:space:]]+addi x[0-9]+, x[0-9]+, 2000$' /tmp/rv64_chain_over.s
+          grep -qE '^[[:space:]]+addi x[0-9]+, x[0-9]+, 100$' /tmp/rv64_chain_over.s
+          grep -qE '^[[:space:]]+addi x[0-9]+, x[0-9]+, -2048$' /tmp/rv64_chain_under.s
+          grep -qE '^[[:space:]]+addi x[0-9]+, x[0-9]+, -1$' /tmp/rv64_chain_under.s
+          grep -qE '^[[:space:]]+addi x[0-9]+, x[0-9]+, 37$' /tmp/rv64_chain_shared.s
+          grep -qE '^[[:space:]]+addi x[0-9]+, x[0-9]+, 5$' /tmp/rv64_chain_shared.s
+          grep -qE '^[[:space:]]+addi x[0-9]+, x[0-9]+, 11$' /tmp/rv64_chain_phi.s
+          grep -qE '^[[:space:]]+addi x[0-9]+, x[0-9]+, 7$' /tmp/rv64_chain_phi.s
+      - name: Execute deep chains, i64 wrapping, shared intermediates and both PHI arms
+        run: |
+          set -euo pipefail
+          cat > /tmp/rv64_chains_start.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            li a0, 7
+            call rv64_chain_two
+            li t0, 37
+            bne a0, t0, fail1
+            li a0, 7
+            call rv64_chain_four
+            li t0, 107
+            bne a0, t0, fail2
+            li a0, 0x7fffffffffffffff
+            call rv64_chain_four
+            li t0, 0x8000000000000063
+            bne a0, t0, fail3
+            li a0, 7
+            call rv64_chain_cancel
+            li t0, 6
+            bne a0, t0, fail4
+            li a0, 7
+            call rv64_chain_neg
+            li t0, -35
+            bne a0, t0, fail5
+            li a0, 7
+            call rv64_chain_over
+            li t0, 2107
+            bne a0, t0, fail6
+            li a0, 7
+            call rv64_chain_under
+            li t0, -2042
+            bne a0, t0, fail7
+            li a0, 7
+            call rv64_chain_shared
+            li t0, 93
+            bne a0, t0, fail8
+            li a0, 7
+            li a1, 18
+            call rv64_chain_phi
+            li t0, 7
+            bne a0, t0, fail9
+            li a0, 20
+            li a1, 6
+            call rv64_chain_phi
+            li t0, -7
+            bne a0, t0, fail10
+            li a0, 0
+            j exit
+          fail1: li a0, 1
+            j exit
+          fail2: li a0, 2
+            j exit
+          fail3: li a0, 3
+            j exit
+          fail4: li a0, 4
+            j exit
+          fail5: li a0, 5
+            j exit
+          fail6: li a0, 6
+            j exit
+          fail7: li a0, 7
+            j exit
+          fail8: li a0, 8
+            j exit
+          fail9: li a0, 9
+            j exit
+          fail10: li a0, 10
+          exit:
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+            /tmp/rv64_chains_start.s -o /tmp/rv64_chains_start.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax \
+            -e _start /tmp/rv64_chains_start.o \
+            /tmp/rv64_chain_two.o /tmp/rv64_chain_four.o \
+            /tmp/rv64_chain_cancel.o /tmp/rv64_chain_neg.o \
+            /tmp/rv64_chain_over.o /tmp/rv64_chain_under.o \
+            /tmp/rv64_chain_shared.o /tmp/rv64_chain_phi.o \
+            -o /tmp/rv64_chains.elf
+          timeout 15s qemu-riscv64 /tmp/rv64_chains.elf
+          echo "RV64 R2 multi-level ADDI chains: 10 arithmetic/CFG cases passed"
+
+      - name: Check seven branching SSA DAG ELF objects against independently assembled GNU GAS
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for kind in tree_merge tree_cancel tree_negative tree_over tree_under tree_shared tree_phi; do
+            cargo run -p compiler-backend-riscv64 --example rv64_leaf -- \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}.s" "$kind"
+            riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+              "/tmp/rv64_${kind}.s" -o "/tmp/rv64_${kind}_gas.o"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}_direct.bin"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}_gas.o" "/tmp/rv64_${kind}_gas.bin"
+            cmp "/tmp/rv64_${kind}_direct.bin" "/tmp/rv64_${kind}_gas.bin"
+          done
+          grep -qE '^[[:space:]]+addi x[0-9]+, x[0-9]+, 30$' /tmp/rv64_tree_merge.s
+          grep -qE '^[[:space:]]+addi x[0-9]+, x[0-9]+, -42$' /tmp/rv64_tree_negative.s
+          if grep -qE '^[[:space:]]+addi x[0-9]+, x[0-9]+, (2047|-2047)$' /tmp/rv64_tree_cancel.s; then
+            echo "cancellation candidate not selected"; exit 1
+          fi
+          for kind in tree_over tree_under tree_shared tree_phi; do
+            test "$(grep -Ec '^[[:space:]]+addi x[0-9]+, x[0-9]+, ' /tmp/rv64_${kind}.s)" -ge 2
+          done
+      - name: Execute 9 selected and fallback branching DAG LP64 cases under QEMU
+        run: |
+          set -euo pipefail
+          cat > /tmp/rv64_trees_start.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            li a0, 7
+            li a1, 18
+            call rv64_tree_merge
+            li t0, 55
+            bne a0, t0, fail1
+            li a0, 0x7fffffffffffffff
+            li a1, 1
+            call rv64_tree_merge
+            li t0, 0x800000000000001e
+            bne a0, t0, fail2
+            li a0, 7
+            li a1, 18
+            call rv64_tree_cancel
+            li t0, 25
+            bne a0, t0, fail3
+            li a0, 7
+            li a1, 18
+            call rv64_tree_negative
+            li t0, -17
+            bne a0, t0, fail4
+            li a0, 7
+            li a1, 18
+            call rv64_tree_over
+            li t0, 2125
+            bne a0, t0, fail5
+            li a0, 7
+            li a1, 18
+            call rv64_tree_under
+            li t0, -2024
+            bne a0, t0, fail6
+            li a0, 7
+            li a1, 18
+            call rv64_tree_shared
+            li t0, 72
+            bne a0, t0, fail7
+            li a0, 7
+            li a1, 18
+            call rv64_tree_phi
+            li t0, 38
+            bne a0, t0, fail8
+            li a0, 20
+            li a1, 6
+            call rv64_tree_phi
+            li t0, -26
+            bne a0, t0, fail9
+            li a0, 0
+            j exit
+          fail1: li a0, 1
+            j exit
+          fail2: li a0, 2
+            j exit
+          fail3: li a0, 3
+            j exit
+          fail4: li a0, 4
+            j exit
+          fail5: li a0, 5
+            j exit
+          fail6: li a0, 6
+            j exit
+          fail7: li a0, 7
+            j exit
+          fail8: li a0, 8
+            j exit
+          fail9: li a0, 9
+          exit:
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+            /tmp/rv64_trees_start.s -o /tmp/rv64_trees_start.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax \
+            -e _start /tmp/rv64_trees_start.o \
+            /tmp/rv64_tree_merge.o /tmp/rv64_tree_cancel.o \
+            /tmp/rv64_tree_negative.o /tmp/rv64_tree_over.o \
+            /tmp/rv64_tree_under.o /tmp/rv64_tree_shared.o \
+            /tmp/rv64_tree_phi.o -o /tmp/rv64_trees.elf
+          timeout 15s qemu-riscv64 /tmp/rv64_trees.elf
+          echo "RV64 R2 bounded DAG: 9 overlapping cost/CFG cases passed"
+
+      - name: Compare six recursive DAG TypeId ELF streams with independent GNU GAS
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for kind in memo_four memo_negative memo_cancel memo_over memo_shared memo_phi; do
+            cargo run -p compiler-backend-riscv64 --example rv64_leaf -- \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}.s" "$kind"
+            riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+              "/tmp/rv64_${kind}.s" -o "/tmp/rv64_${kind}_gas.o"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}_direct.bin"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}_gas.o" "/tmp/rv64_${kind}_gas.bin"
+            cmp "/tmp/rv64_${kind}_direct.bin" "/tmp/rv64_${kind}_gas.bin"
+          done
+          grep -qE '^[[:space:]]+addi x[0-9]+, x[0-9]+, 48$' /tmp/rv64_memo_four.s
+          grep -qE '^[[:space:]]+addi x[0-9]+, x[0-9]+, -100$' /tmp/rv64_memo_negative.s
+          if grep -qE '^[[:space:]]+addi x[0-9]+, x[0-9]+, (2047|-2048)$' /tmp/rv64_memo_cancel.s; then
+            echo "memoized cancellation was not selected"; exit 1
+          fi
+          grep -qE '^[[:space:]]+addi x[0-9]+, x[0-9]+, 2000$' /tmp/rv64_memo_over.s
+          grep -qE '^[[:space:]]+addi x[0-9]+, x[0-9]+, 100$' /tmp/rv64_memo_over.s
+          grep -qE '^[[:space:]]+addi x[0-9]+, x[0-9]+, 18$' /tmp/rv64_memo_shared.s
+          grep -qE '^[[:space:]]+addi x[0-9]+, x[0-9]+, 18$' /tmp/rv64_memo_phi.s
+      - name: Execute recursive depth, live sharing, overflow and both PHI arms on QEMU
+        run: |
+          set -euo pipefail
+          cat > /tmp/rv64_memo_start.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            li a0, 7
+            li a1, 18
+            call rv64_memo_four
+            li t0, 98
+            bne a0, t0, fail1
+            li a0, 0x7fffffffffffffff
+            li a1, 1
+            call rv64_memo_four
+            li t0, 48
+            bne a0, t0, fail2
+            li a0, 7
+            li a1, 18
+            call rv64_memo_negative
+            li t0, -50
+            bne a0, t0, fail3
+            li a0, 7
+            li a1, 18
+            call rv64_memo_cancel
+            li t0, 50
+            bne a0, t0, fail4
+            li a0, 7
+            li a1, 18
+            call rv64_memo_over
+            li t0, 2185
+            bne a0, t0, fail5
+            li a0, 7
+            li a1, 18
+            call rv64_memo_shared
+            li t0, 141
+            bne a0, t0, fail6
+            li a0, 7
+            li a1, 18
+            call rv64_memo_phi
+            li t0, 55
+            bne a0, t0, fail7
+            li a0, 20
+            li a1, 6
+            call rv64_memo_phi
+            li t0, -56
+            bne a0, t0, fail8
+            li a0, 0
+            j exit
+          fail1: li a0, 1
+            j exit
+          fail2: li a0, 2
+            j exit
+          fail3: li a0, 3
+            j exit
+          fail4: li a0, 4
+            j exit
+          fail5: li a0, 5
+            j exit
+          fail6: li a0, 6
+            j exit
+          fail7: li a0, 7
+            j exit
+          fail8: li a0, 8
+          exit:
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+            /tmp/rv64_memo_start.s -o /tmp/rv64_memo_start.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax \
+            -e _start /tmp/rv64_memo_start.o \
+            /tmp/rv64_memo_four.o /tmp/rv64_memo_negative.o \
+            /tmp/rv64_memo_cancel.o /tmp/rv64_memo_over.o \
+            /tmp/rv64_memo_shared.o /tmp/rv64_memo_phi.o \
+            -o /tmp/rv64_memo.elf
+          timeout 15s qemu-riscv64 /tmp/rv64_memo.elf
+          echo "RV64 R2 memoized DAG: eight depth/SSA/CFG cases passed"
