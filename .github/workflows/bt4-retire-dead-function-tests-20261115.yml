@@ -1,0 +1,66 @@
+name: BT4 retire dead Function selector and inliner regression suites
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/bt4-retire-dead-function-tests-20261115.yml'
+permissions:
+  contents: read
+jobs:
+  bt4-dead-regressions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ec441e1bfe33513b421a1dc57b2856216a5fe67d
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Permanent BT4 policy guard and synthetic negative reintroduction
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = ec441e1bfe33513b421a1dc57b2856216a5fe67d
+          cd compiler
+          python3 tools/check_bt4_backend_boundary.py
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess, sys
+          path=Path("crates/backend-x86/tests/unit/machine.rs")
+          assert not path.exists()
+          path.write_text("// deliberately resurrect obsolete Function selector test\n")
+          try:
+              result=subprocess.run([sys.executable,"tools/check_bt4_backend_boundary.py"],capture_output=True,text=True)
+              assert result.returncode != 0, "BT4 guard incorrectly accepted old Function test"
+              assert "retired old-Function-only source/test file resurrected" in result.stderr, result.stderr
+          finally:
+              path.unlink()
+          print("BT4_OLD_FUNCTION_TEST_MUTANT_REJECTED")
+          PY
+          python3 tools/check_bt4_backend_boundary.py
+      - name: Minimal source-pinned x86 core workspace
+        shell: bash
+        run: |
+          printf '[workspace]\nresolver = "2"\nmembers = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]\n' > compiler/Cargo.toml
+      - name: Normal TypeId lib and historical opt-in compilation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo check --offline -p compiler-backend-x86
+          cargo check --offline --release -p compiler-backend-x86
+          cargo check --offline -p compiler-backend-x86 --features historical-function-oracle
+          cargo test --offline -p compiler-backend-x86 --lib
+          cargo test --offline -p compiler-backend-x86 --lib --no-default-features
+      - name: Keep all production integration binaries and executable native code checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test --offline -p compiler-backend-x86 --tests --no-run
+          cargo test --offline -p compiler-backend-x86 --test bt4_x86_historical_scalar_native
+          cargo test --offline -p compiler-backend-x86 --test bt4_x86_historical_arity_phi_native
+          cargo test --offline -p compiler-backend-x86 --test native_typeid_direct
+          cargo test --offline -p compiler-backend-x86 --test typeid_physical_control_replay -- --skip production_typeid_machine_stream_replays_when_supported
+          echo BT4_DEAD_FUNCTION_ONLY_REGRESSIONS_RETIRED_NATIVE_GREEN
