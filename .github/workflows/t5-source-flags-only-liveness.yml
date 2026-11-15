@@ -1,0 +1,49 @@
+name: Validate T5 late CMP64 source-flags-only liveness
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/t5-source-flags-only-liveness.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  x86-physical-flags:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact compiler T5 source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c97cc348685293cbd470039d44248babfb64436a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check exact source pin and isolate native workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "c97cc348685293cbd470039d44248babfb64436a"
+          mkdir -p x86-workspace/crates
+          for crate in ir opt backend backend-x86 backend-aarch64; do
+            cp -a "compiler/crates/$crate" "x86-workspace/crates/$crate"
+          done
+          cp -a compiler/tools compiler/tests compiler/data x86-workspace/
+          cat > x86-workspace/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: x86-workspace -> target
+          key: t5-native-source-flags
+      - name: Verify full 10 predicate x 81 value x 4 format native/GCC liveness oracle
+        working-directory: x86-workspace
+        run: |
+          cargo test -p compiler-backend-x86 --test t5_x86_flags_liveness -- --nocapture
+      - name: Verify generated source-only flag admission and physical x86 regression
+        working-directory: x86-workspace
+        run: |
+          cargo test -p compiler-backend-x86 --lib native_typeid -- --nocapture
+          cargo test -p compiler-backend-x86 --test native_typeid_function_signatures -- --nocapture
