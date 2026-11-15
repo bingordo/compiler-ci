@@ -1,0 +1,109 @@
+name: ASM SIMD1 shared register-bank acceptance
+on:
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/asm-simd1-register-banks.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  feature:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 142b58e344ea827557a955a5989a47ffb5132b93
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify feature pin
+        run: test "$(git rev-parse HEAD)" = "142b58e344ea827557a955a5989a47ffb5132b93"
+      - name: Core workspace
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: asm-simd1-register-banks-feature
+      - name: Test shared registers, SSE and generated GAS/objdump forms
+        run: |
+          set -euo pipefail
+          python3 tools/regen_x86_att_forms.py --check
+          cargo check -p compiler-backend-x86 --all-targets
+          cargo test -p compiler-backend-x86 --lib isa_registers -- --nocapture
+          cargo test -p compiler-backend-x86 --lib sse_scalar -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_sse_scalar -- --nocapture
+          cargo test -p compiler-backend-x86 --lib generated_form_tests -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_asm
+          cargo test -p compiler-backend-x86 --test att_module
+          cargo clippy -p compiler-backend-x86 --lib --test att_sse_scalar -- -D warnings -A private_interfaces -A unused_variables -A clippy::suspicious_assignment_formatting
+          echo "ASM_SIMD1_FEATURE source=142b58e344ea827557a955a5989a47ffb5132b93 status=PASS" >> "$GITHUB_STEP_SUMMARY"
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c37791afa8186ab22d926cd713b67963ccca7a31
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 142b58e344ea827557a955a5989a47ffb5132b93
+          path: feature
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Simulate checked main merge
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "c37791afa8186ab22d926cd713b67963ccca7a31"
+          test "$(git -C feature rev-parse HEAD)" = "142b58e344ea827557a955a5989a47ffb5132b93"
+          cd compiler
+          git config user.name compiler-ci
+          git config user.email compiler-ci@example.invalid
+          git fetch ../feature HEAD
+          test "$(git rev-parse FETCH_HEAD)" = "142b58e344ea827557a955a5989a47ffb5132b93"
+          git merge --no-commit --no-ff FETCH_HEAD
+          test "$(git rev-parse MERGE_HEAD)" = "142b58e344ea827557a955a5989a47ffb5132b93"
+          test -f crates/backend-x86/src/isa_registers.rs
+          grep -q 'RegisterId::legacy_xmm' crates/backend-x86/src/sse_scalar.rs
+          git diff --check
+          git diff --cached --check
+          echo "ASM_SIMD1_MERGE main=c37791afa8186ab22d926cd713b67963ccca7a31 feature=142b58e344ea827557a955a5989a47ffb5132b93" >> "$GITHUB_STEP_SUMMARY"
+      - name: Core workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: asm-simd1-register-banks-integration
+      - name: Test combined x86 assembler and encoder
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/regen_x86_att_forms.py --check
+          cargo check -p compiler-backend-x86 --all-targets
+          cargo test -p compiler-backend-x86 --lib isa_registers -- --nocapture
+          cargo test -p compiler-backend-x86 --lib sse_scalar -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_sse_scalar -- --nocapture
+          cargo test -p compiler-backend-x86 --lib generated_form_tests -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_asm
+          cargo test -p compiler-backend-x86 --test att_module
+          cargo clippy -p compiler-backend-x86 --lib --test att_sse_scalar -- -D warnings -A private_interfaces -A unused_variables -A clippy::suspicious_assignment_formatting
+          echo "ASM_SIMD1_INTEGRATION status=PASS" >> "$GITHUB_STEP_SUMMARY"
