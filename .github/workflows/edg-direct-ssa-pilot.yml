@@ -49,7 +49,7 @@ jobs:
           # PR #1823 merged; validate the production compiler main branch.
           # Compiler PR #1841 is merged; keep the normal production checkout.
           # Source-pinned executable C++ dynamic scalar candidate.
-          ref: 243b1b0d69ad9964e3e6f1ab8d7efc5154e8f6db
+          ref: e77435c13104e051943f40e27d5a20f70fb9f7fc
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -786,6 +786,7 @@ jobs:
           set -euo pipefail
           cp tools/edg-driver/tests/fixtures/edg_native_cxx5_dynamic_scalar.cpp ../edgcpp/build/gcc-release/
           cp tools/edg-driver/tests/fixtures/edg_native_cxx5_dynamic_external*.cpp ../edgcpp/build/gcc-release/
+          cp tools/edg-driver/tests/fixtures/edg_native_cxx5_dynamic_order*.cpp ../edgcpp/build/gcc-release/
           cp tools/edg-driver/tests/fixtures/edg_native_cxx5_header_effectful.cpp ../edgcpp/build/gcc-release/
           cp tools/edg-driver/tests/fixtures/edg_native_cxx5_global_trace*.cpp ../edgcpp/build/gcc-release/
           (
@@ -814,8 +815,38 @@ jobs:
             nm -g --defined-only native_dynamic_external.o | grep -Eq '[[:space:]]edg_dynamic_external$'
             g++ -std=c++17 -O2 -Wall -Wextra -Werror edg_native_cxx5_dynamic_external.cpp edg_native_cxx5_dynamic_external_driver.cpp -o gxx_dynamic_external
             g++ -std=c++17 -O2 -Wall -Wextra -Werror native_dynamic_external.o edg_native_cxx5_dynamic_external_driver.cpp -o native_dynamic_external
-            test "$(./gxx_dynamic_external)" = '12'
-            test "$(./native_dynamic_external)" = '12'
+            ./gxx_dynamic_external >gxx_dynamic_external.out
+            ./native_dynamic_external >native_dynamic_external.out
+            test "$(cat gxx_dynamic_external.out)" = '12'
+            test "$(cat native_dynamic_external.out)" = '12'
+            # EDG source records one ordered lowered startup for two dynamic
+            # objects. Do not synthesize multiple init-array entries or fold
+            # the original external function call side effects into bytes.
+            if ! "$binary" native_dynamic_order.o --c++17 edg_native_cxx5_dynamic_order.cpp >edg_dynamic_order.log 2>&1; then
+              cat edg_dynamic_order.log
+              exit 1
+            fi
+            readelf -SW native_dynamic_order.o | grep -F .init_array
+            readelf -rW native_dynamic_order.o | grep -F .rela.init_array
+            test "$(nm -g --defined-only native_dynamic_order.o | grep -Ec '[[:space:]]edg_(first|second)_dynamic$')" = 2
+            g++ -std=c++17 -O2 -Wall -Wextra -Werror edg_native_cxx5_dynamic_order.cpp edg_native_cxx5_dynamic_order_driver.cpp -o gxx_dynamic_order
+            g++ -std=c++17 -O2 -Wall -Wextra -Werror native_dynamic_order.o edg_native_cxx5_dynamic_order_driver.cpp -o native_dynamic_order
+            ./gxx_dynamic_order >gxx_dynamic_order.out
+            ./native_dynamic_order >native_dynamic_order.out
+            test "$(cat gxx_dynamic_order.out)" = '123'
+            test "$(cat native_dynamic_order.out)" = '123'
+            # Both explicit source optimizer modes must preserve the native
+            # startup root despite its TU-local linker visibility.
+            for mode in leaves cfg; do
+              if ! "$binary" "native_dynamic_order_$mode.o" --c++17 "--typeid-inline=$mode" edg_native_cxx5_dynamic_order.cpp >"edg_dynamic_order_$mode.log" 2>&1; then
+                cat "edg_dynamic_order_$mode.log"
+                exit 1
+              fi
+              readelf -SW "native_dynamic_order_$mode.o" | grep -F .init_array
+              g++ -std=c++17 -O2 -Wall -Wextra -Werror "native_dynamic_order_$mode.o" edg_native_cxx5_dynamic_order_driver.cpp -o "native_dynamic_order_$mode"
+              "./native_dynamic_order_$mode" >"native_dynamic_order_$mode.out"
+              test "$(cat "native_dynamic_order_$mode.out")" = '123'
+            done
             grep -E 'EDG_GLOBAL_PROVENANCE|EDG_CXX5_INIT_CENSUS|EDG_CXX5_REAL_GLOBAL|EDG_CXX5_INIT_LOWERED|EDG_STARTUP_BODY|EDG_CXX5_SOURCE_CLOSURE' edg_dynamic_positive.log
             for source in edg_native_cxx5_header_effectful.cpp edg_native_cxx5_global_trace.cpp; do
               rm -f edg_dynamic_probe.o
