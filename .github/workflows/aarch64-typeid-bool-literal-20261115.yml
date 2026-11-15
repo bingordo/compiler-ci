@@ -1,0 +1,66 @@
+# Temporary AArch64 TypeId Bool literal source-pinned acceptance. Do not merge.
+name: AArch64 TypeId Bool literal native acceptance
+on:
+  push:
+    branches: [ci/aarch64-typeid-bool-literal-20261115]
+    paths: [.github/workflows/aarch64-typeid-bool-literal-20261115.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  aarch64-bool:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      SOURCE_SHA: 62653d81a4883a65f11e61d17472543abda7df61
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler SHA
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 62653d81a4883a65f11e61d17472543abda7df61
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source SHA and isolate test workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: aarch64-bool-typeid-20261115
+      - name: Source-exact AArch64 selection unit test and object parity
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-aarch64 --lib typed_bool_constants_select_w32_without_coercion_or_out_of_range_bits
+          cargo test -p compiler-backend-aarch64 --test typeid_bool_literal_native -- --nocapture
+      - name: Install native-independent AArch64 C11 oracle tools
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gcc-aarch64-linux-gnu qemu-user
+          command -v aarch64-linux-gnu-gcc
+          command -v qemu-aarch64
+      - name: Execute nonPIC/PIC direct ELF and GAS C11 differential via QEMU
+        working-directory: compiler
+        env:
+          COMPILER_REQUIRE_AARCH64_QEMU: '1'
+        run: cargo test -p compiler-backend-aarch64 --test typeid_bool_literal_native -- --nocapture
+      - name: AArch64 backend compile and IR regression
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-backend-aarch64 --all-targets
+          cargo test -p compiler-ir
+      - name: Strict AArch64 library Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
