@@ -1,0 +1,127 @@
+name: ASM SIMD1 S3 generated VEX as objdump acceptance
+on:
+  push:
+    branches: [ci/asm-simd1-s3-vex-20261115]
+    paths: ['.github/workflows/asm-simd1-s3-vex.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  feature:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e7958f9fed85529bee489e39f8033612a40f2905
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify feature pin
+        run: test "$(git rev-parse HEAD)" = "e7958f9fed85529bee489e39f8033612a40f2905"
+      - name: Restrict workspace
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: asm-simd1-s3-vex-feature
+      - name: Validate generated VEX, GNU as and objdump
+        run: |
+          set -euo pipefail
+          as --version | head -n1
+          objdump --version | head -n1
+          python3 tools/regen_x86_sse_packed_forms.py --check
+          python3 tools/regen_x86_sse_vex_forms.py --check
+          python3 -m unittest discover -s tools -p test_regen_x86_sse_vex_forms.py -v
+          cargo check -p compiler-backend-x86 --all-targets
+          cargo test -p compiler-backend-x86 --test att_sse_vex -- --list | tee /tmp/vex-listed-tests
+          grep -qF 'all_generated_vex_forms_enter_production_physical_encoder: test' /tmp/vex-listed-tests
+          grep -qF 'all_generated_vex_forms_reject_invalid_vector_and_memory_operands: test' /tmp/vex-listed-tests
+          grep -qF 'generated_vex_encoding_and_objdump_match_gnu_as: test' /tmp/vex-listed-tests
+          cargo test -p compiler-backend-x86 --test att_sse_vex -- --nocapture
+          cargo test -p compiler-backend-x86 --lib sse_vex -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_sse_packed -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_sse_scalar -- --nocapture
+          cargo test -p compiler-backend-x86 --lib generated_form_tests -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_asm
+          cargo test -p compiler-backend-x86 --test att_module
+          cargo clippy -p compiler-backend-x86 --lib --test att_sse_vex -- -D warnings -A private_interfaces -A unused_variables -A clippy::suspicious_assignment_formatting
+          echo 'ASM_SIMD1_S3_FEATURE source=e7958f9fed85529bee489e39f8033612a40f2905 status=PASS' >> "$GITHUB_STEP_SUMMARY"
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: cf8bcd6a02d51ebee2e030dc3f96e8d637c60fa3
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e7958f9fed85529bee489e39f8033612a40f2905
+          path: feature
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Simulate and assert exact main merge
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "cf8bcd6a02d51ebee2e030dc3f96e8d637c60fa3"
+          test "$(git -C feature rev-parse HEAD)" = "e7958f9fed85529bee489e39f8033612a40f2905"
+          cd compiler
+          git config user.name compiler-ci
+          git config user.email compiler-ci@example.invalid
+          git fetch ../feature HEAD
+          test "$(git rev-parse FETCH_HEAD)" = "e7958f9fed85529bee489e39f8033612a40f2905"
+          git merge --no-commit --no-ff FETCH_HEAD
+          test "$(git rev-parse MERGE_HEAD)" = "e7958f9fed85529bee489e39f8033612a40f2905"
+          grep -q 'pub mod sse_vex' crates/backend-x86/src/lib.rs
+          grep -q 'pub(crate) fn encode_vex' crates/backend-x86/src/binary.rs
+          git diff --check
+          git diff --cached --check
+          echo 'ASM_SIMD1_S3_MERGE main=cf8bcd6a02d51ebee2e030dc3f96e8d637c60fa3 feature=e7958f9fed85529bee489e39f8033612a40f2905' >> "$GITHUB_STEP_SUMMARY"
+      - name: Restrict workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: asm-simd1-s3-vex-integration
+      - name: Validate merged VEX with GNU as and objdump
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          as --version | head -n1
+          objdump --version | head -n1
+          python3 tools/regen_x86_sse_packed_forms.py --check
+          python3 tools/regen_x86_sse_vex_forms.py --check
+          python3 -m unittest discover -s tools -p test_regen_x86_sse_vex_forms.py -v
+          cargo check -p compiler-backend-x86 --all-targets
+          cargo test -p compiler-backend-x86 --test att_sse_vex -- --list | tee /tmp/vex-listed-tests
+          grep -qF 'all_generated_vex_forms_enter_production_physical_encoder: test' /tmp/vex-listed-tests
+          grep -qF 'all_generated_vex_forms_reject_invalid_vector_and_memory_operands: test' /tmp/vex-listed-tests
+          grep -qF 'generated_vex_encoding_and_objdump_match_gnu_as: test' /tmp/vex-listed-tests
+          cargo test -p compiler-backend-x86 --test att_sse_vex -- --nocapture
+          cargo test -p compiler-backend-x86 --lib sse_vex -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_sse_packed -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_sse_scalar -- --nocapture
+          cargo test -p compiler-backend-x86 --lib generated_form_tests -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_asm
+          cargo test -p compiler-backend-x86 --test att_module
+          cargo clippy -p compiler-backend-x86 --lib --test att_sse_vex -- -D warnings -A private_interfaces -A unused_variables -A clippy::suspicious_assignment_formatting
+          echo 'ASM_SIMD1_S3_INTEGRATION status=PASS' >> "$GITHUB_STEP_SUMMARY"
