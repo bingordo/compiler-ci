@@ -1,0 +1,55 @@
+name: ABI x86 target-owned GP return placement (compiler #1735)
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-abi-x86-gp-return-20261115.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  abi-x86:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 3128baf78e8cfc97b1587dc4bbdea6e96516becd
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact candidate SHA
+        working-directory: compiler
+        run: |
+          test "$(git rev-parse HEAD)" = 3128baf78e8cfc97b1587dc4bbdea6e96516becd
+      - name: Restrict workspace to original core crates
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x86-abi-gp-return-20261115
+      - name: Install native debugging oracle used by existing backend tests
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gdb
+      - name: x86 staged, scalar and native GP return ABI regression tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend-x86 --tests
+          cargo test -p compiler-ir -p compiler-backend
+      - name: Check x86 Clippy (existing unrelated baseline lints excepted)
+        working-directory: compiler
+        # Existing branch baseline emits these in x7 form tooling/tests, not in
+        # the ABI patch. Keep all other warnings fatal.
+        run: |
+          cargo clippy -p compiler-backend-x86 --all-targets -- \
+            -D warnings \
+            -A clippy::suspicious_assignment_formatting \
+            -A unused_variables \
+            -A clippy::too_many_arguments
