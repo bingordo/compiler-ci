@@ -1,0 +1,413 @@
+name: RV64 R2 i32 signed unsigned less-than GAS QEMU
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-riscv-r2-compare32-qemu.yml']
+permissions:
+  contents: read
+jobs:
+  logic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 79889ffb07ed3d05053c7154378c05a64f6d5eb0
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require exact compiler source revision
+        run: test "$(git -C compiler rev-parse HEAD)" = "79889ffb07ed3d05053c7154378c05a64f6d5eb0"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Restrict workspace to the native TypeId backend
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-riscv64"]
+          EOF
+          rm -f Cargo.lock
+      - name: Rust, Clippy, exact UDB and source-admission gates
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib
+          cargo test -p compiler-backend-riscv64 --all-targets
+          cargo clippy -p compiler-backend-riscv64 --all-targets -- -D warnings
+          python3 tools/regen_riscv_native_selector_rules.py --check
+          python3 -m unittest discover -s tools -p test_riscv_native_selector_rules.py -v
+          python3 tools/riscv_udb_rust_leaf_forms.py \
+            --catalog data/riscv_udb_r0_catalog.json \
+            --output crates/backend-riscv64/src/generated_encoding.rs --check
+      - name: Install independent RISC-V GAS, objdump, linker and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu qemu-user
+      - name: Direct ELF vs independent GNU GAS bytes and opcode disassembly
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for kind in lts32 ltu32; do
+            case "$kind" in lts32) op=slt ;; ltu32) op=sltu ;; esac
+            cargo run -p compiler-backend-riscv64 --example rv64_leaf -- \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}.s" "${kind}"
+            grep -qE "^[[:space:]]+${op} x[0-9]+, x[0-9]+, x[0-9]+$" "/tmp/rv64_${kind}.s"
+            riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+              "/tmp/rv64_${kind}.s" -o "/tmp/rv64_${kind}_gas.o"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}_direct.bin"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}_gas.o" "/tmp/rv64_${kind}_gas.bin"
+            cmp "/tmp/rv64_${kind}_direct.bin" "/tmp/rv64_${kind}_gas.bin"
+            riscv64-linux-gnu-objdump -dr "/tmp/rv64_${kind}.o" | grep -w "${op}"
+          done
+      - name: Execute 40 LP64 i32 signed unsigned comparison CFG cases under QEMU
+        run: |
+          set -euo pipefail
+          cat > /tmp/rv64_cmp32_start.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            mv s0, sp
+            li a0, -1
+            li a1, 1
+            call rv64_lts32_branch
+            li t0, 2
+            bne a0, t0, fail1
+            bne sp, s0, fail_sp
+            li a0, 1
+            li a1, -1
+            call rv64_lts32_branch
+            li t0, 0
+            bne a0, t0, fail2
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 2
+            call rv64_lts32_branch
+            li t0, 3
+            bne a0, t0, fail3
+            bne sp, s0, fail_sp
+            li a0, 2
+            li a1, -1
+            call rv64_lts32_branch
+            li t0, 1
+            bne a0, t0, fail4
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, 0
+            call rv64_lts32_branch
+            li t0, -2147483648
+            bne a0, t0, fail5
+            bne sp, s0, fail_sp
+            li a0, 0
+            li a1, -2147483648
+            call rv64_lts32_branch
+            li t0, -2147483648
+            bne a0, t0, fail6
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, 2147483647
+            call rv64_lts32_branch
+            li t0, -1
+            bne a0, t0, fail7
+            bne sp, s0, fail_sp
+            li a0, 2147483647
+            li a1, -2147483648
+            call rv64_lts32_branch
+            li t0, -1
+            bne a0, t0, fail8
+            bne sp, s0, fail_sp
+            li a0, 2147483647
+            li a1, 2147483647
+            call rv64_lts32_branch
+            li t0, -2
+            bne a0, t0, fail9
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, -1
+            call rv64_lts32_branch
+            li t0, -2
+            bne a0, t0, fail10
+            bne sp, s0, fail_sp
+            li a0, 0
+            li a1, 0
+            call rv64_lts32_branch
+            li t0, 0
+            bne a0, t0, fail11
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, -2147483647
+            call rv64_lts32_branch
+            li t0, 1
+            bne a0, t0, fail12
+            bne sp, s0, fail_sp
+            li a0, -2147483647
+            li a1, -2147483648
+            call rv64_lts32_branch
+            li t0, 1
+            bne a0, t0, fail13
+            bne sp, s0, fail_sp
+            li a0, 2147483647
+            li a1, 1
+            call rv64_lts32_branch
+            li t0, -2147483648
+            bne a0, t0, fail14
+            bne sp, s0, fail_sp
+            li a0, 1
+            li a1, 2147483647
+            call rv64_lts32_branch
+            li t0, 2147483646
+            bne a0, t0, fail15
+            bne sp, s0, fail_sp
+            li a0, -2
+            li a1, 0
+            call rv64_lts32_branch
+            li t0, 2
+            bne a0, t0, fail16
+            bne sp, s0, fail_sp
+            li a0, -2
+            li a1, -1
+            call rv64_lts32_branch
+            li t0, 1
+            bne a0, t0, fail17
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, -1
+            call rv64_lts32_branch
+            li t0, 2147483647
+            bne a0, t0, fail18
+            bne sp, s0, fail_sp
+            li a0, 0
+            li a1, 1
+            call rv64_lts32_branch
+            li t0, 1
+            bne a0, t0, fail19
+            bne sp, s0, fail_sp
+            li a0, 1
+            li a1, 0
+            call rv64_lts32_branch
+            li t0, 1
+            bne a0, t0, fail20
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 1
+            call rv64_ltu32_branch
+            li t0, 0
+            bne a0, t0, fail21
+            bne sp, s0, fail_sp
+            li a0, 1
+            li a1, -1
+            call rv64_ltu32_branch
+            li t0, -2
+            bne a0, t0, fail22
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 2
+            call rv64_ltu32_branch
+            li t0, 1
+            bne a0, t0, fail23
+            bne sp, s0, fail_sp
+            li a0, 2
+            li a1, -1
+            call rv64_ltu32_branch
+            li t0, -3
+            bne a0, t0, fail24
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, 0
+            call rv64_ltu32_branch
+            li t0, -2147483648
+            bne a0, t0, fail25
+            bne sp, s0, fail_sp
+            li a0, 0
+            li a1, -2147483648
+            call rv64_ltu32_branch
+            li t0, -2147483648
+            bne a0, t0, fail26
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, 2147483647
+            call rv64_ltu32_branch
+            li t0, -1
+            bne a0, t0, fail27
+            bne sp, s0, fail_sp
+            li a0, 2147483647
+            li a1, -2147483648
+            call rv64_ltu32_branch
+            li t0, 1
+            bne a0, t0, fail28
+            bne sp, s0, fail_sp
+            li a0, 2147483647
+            li a1, 2147483647
+            call rv64_ltu32_branch
+            li t0, -2
+            bne a0, t0, fail29
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, -1
+            call rv64_ltu32_branch
+            li t0, -2
+            bne a0, t0, fail30
+            bne sp, s0, fail_sp
+            li a0, 0
+            li a1, 0
+            call rv64_ltu32_branch
+            li t0, 0
+            bne a0, t0, fail31
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, -2147483647
+            call rv64_ltu32_branch
+            li t0, 1
+            bne a0, t0, fail32
+            bne sp, s0, fail_sp
+            li a0, -2147483647
+            li a1, -2147483648
+            call rv64_ltu32_branch
+            li t0, 1
+            bne a0, t0, fail33
+            bne sp, s0, fail_sp
+            li a0, 2147483647
+            li a1, 1
+            call rv64_ltu32_branch
+            li t0, -2147483648
+            bne a0, t0, fail34
+            bne sp, s0, fail_sp
+            li a0, 1
+            li a1, 2147483647
+            call rv64_ltu32_branch
+            li t0, 2147483646
+            bne a0, t0, fail35
+            bne sp, s0, fail_sp
+            li a0, -2
+            li a1, 0
+            call rv64_ltu32_branch
+            li t0, -2
+            bne a0, t0, fail36
+            bne sp, s0, fail_sp
+            li a0, -2
+            li a1, -1
+            call rv64_ltu32_branch
+            li t0, 1
+            bne a0, t0, fail37
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, -1
+            call rv64_ltu32_branch
+            li t0, 2147483647
+            bne a0, t0, fail38
+            bne sp, s0, fail_sp
+            li a0, 0
+            li a1, 1
+            call rv64_ltu32_branch
+            li t0, 1
+            bne a0, t0, fail39
+            bne sp, s0, fail_sp
+            li a0, 1
+            li a1, 0
+            call rv64_ltu32_branch
+            li t0, 1
+            bne a0, t0, fail40
+            bne sp, s0, fail_sp
+            li a0, 0
+            j exit
+          fail1: li a0, 1
+            j exit
+          fail2: li a0, 2
+            j exit
+          fail3: li a0, 3
+            j exit
+          fail4: li a0, 4
+            j exit
+          fail5: li a0, 5
+            j exit
+          fail6: li a0, 6
+            j exit
+          fail7: li a0, 7
+            j exit
+          fail8: li a0, 8
+            j exit
+          fail9: li a0, 9
+            j exit
+          fail10: li a0, 10
+            j exit
+          fail11: li a0, 11
+            j exit
+          fail12: li a0, 12
+            j exit
+          fail13: li a0, 13
+            j exit
+          fail14: li a0, 14
+            j exit
+          fail15: li a0, 15
+            j exit
+          fail16: li a0, 16
+            j exit
+          fail17: li a0, 17
+            j exit
+          fail18: li a0, 18
+            j exit
+          fail19: li a0, 19
+            j exit
+          fail20: li a0, 20
+            j exit
+          fail21: li a0, 21
+            j exit
+          fail22: li a0, 22
+            j exit
+          fail23: li a0, 23
+            j exit
+          fail24: li a0, 24
+            j exit
+          fail25: li a0, 25
+            j exit
+          fail26: li a0, 26
+            j exit
+          fail27: li a0, 27
+            j exit
+          fail28: li a0, 28
+            j exit
+          fail29: li a0, 29
+            j exit
+          fail30: li a0, 30
+            j exit
+          fail31: li a0, 31
+            j exit
+          fail32: li a0, 32
+            j exit
+          fail33: li a0, 33
+            j exit
+          fail34: li a0, 34
+            j exit
+          fail35: li a0, 35
+            j exit
+          fail36: li a0, 36
+            j exit
+          fail37: li a0, 37
+            j exit
+          fail38: li a0, 38
+            j exit
+          fail39: li a0, 39
+            j exit
+          fail40: li a0, 40
+            j exit
+          fail_sp: li a0, 41
+          exit:
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+            /tmp/rv64_cmp32_start.s -o /tmp/rv64_cmp32_start.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax \
+            -e _start /tmp/rv64_cmp32_start.o \
+            /tmp/rv64_lts32.o /tmp/rv64_ltu32.o \
+            -o /tmp/rv64_cmp32.elf
+          timeout 15s qemu-riscv64 /tmp/rv64_cmp32.elf
+          echo "40 RV64I i32 compare CFG/PHI signed unsigned QEMU cases passed"
