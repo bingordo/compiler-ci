@@ -1,0 +1,52 @@
+name: AArch64 double indexed and scaled v3 fixture migration
+on:
+  push:
+    branches: [verify/aarch64-double-index-scaled-fixtures-20261115]
+    paths: ['.github/workflows/aarch64-double-index-scaled-fixtures-20261115.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f879ca99614b8fb46607701eb8508ba11ab1c19d
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source
+        run: test "$(git -C compiler rev-parse HEAD)" = "f879ca99614b8fb46607701eb8508ba11ab1c19d"
+      - name: Isolate native workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: aarch64-double-index-scaled-fixed-typeid
+      - name: Export original TypeId modules using authoritative writer
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend-aarch64 --test double_index_native export_exact_native_v3_original -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test indexed_scales export_exact_native_v3_original -- --nocapture
+      - name: Install AArch64 cross tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross binutils-aarch64-linux-gnu qemu-user
+      - name: Run original C11 QEMU and machine quality oracles
+        working-directory: compiler
+        env:
+          COMPILER_REQUIRE_AARCH64_QEMU: "1"
+        run: |
+          cargo test -p compiler-backend-aarch64 --test double_index_native --test indexed_scales -- --nocapture
+      - name: Strict scoped lint
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-aarch64 --no-deps --test double_index_native --test indexed_scales -- -D warnings
