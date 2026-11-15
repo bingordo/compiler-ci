@@ -300,51 +300,6 @@ jobs:
           echo "compiler-opt: minicargo succeeded and GCC compiled $count new C units." >> "$GITHUB_STEP_SUMMARY"
           echo "This verifies native object compilation, not semantic correctness or a runnable compiler." >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Diagnose optimizer dev-dependency handling
-        if: always() && steps.optimizer.outcome == 'failure'
-        shell: bash
-        working-directory: mrustc
-        env:
-          RUSTC_VERSION: '1.90.0'
-          MRUSTC_TARGET_VER: '1.90'
-          OUTDIR_SUF: '-1.90.0'
-          PARLEVEL: '2'
-          CC: gcc
-        run: |
-          set -euo pipefail
-          manifest=../compiler/crates/opt/Cargo.toml
-          cp "$manifest" "$RUNNER_TEMP/compiler-opt-original.toml"
-          trap 'cp "$RUNNER_TEMP/compiler-opt-original.toml" "$manifest"' EXIT
-          # Diagnostic only: remove the dev-dependencies section in the CI
-          # checkout to test whether minicargo handles the x86/opt cycle.
-          python3 - "$manifest" <<'PY'
-          from pathlib import Path
-          import re, sys
-          path = Path(sys.argv[1])
-          original = path.read_text()
-          altered, count = re.subn(r'(?ms)^\[dev-dependencies\]\s*\n.*?(?=^\[|\Z)', '', original)
-          assert count == 1, 'Expected one dev-dependencies section'
-          path.write_text(altered)
-          PY
-          set +e
-          timeout --signal=TERM --kill-after=10s 12m bin/minicargo \
-            -L output-1.90.0 -o output-compiler-opt-no-dev \
-            ../compiler/crates/opt > "$RUNNER_TEMP/mrustc-opt-no-dev.log" 2>&1
-          rc=$?
-          set -e
-          echo "compiler-opt without dev-dependencies: minicargo exit $rc (diagnostic only)" >> "$GITHUB_STEP_SUMMARY"
-          echo "compiler-opt without dev-dependencies: minicargo exit $rc (diagnostic only)"
-          if (( rc != 0 )); then
-            echo "::group::Full compiler-opt diagnostic retry output (without dev-dependencies)"
-            cat "$RUNNER_TEMP/mrustc-opt-no-dev.log"
-            echo "::endgroup::"
-          fi
-          if (( rc == 0 )); then
-            echo "Likely blocker: minicargo handles the real dev-dependency graph differently from Cargo." >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "Optimizer still fails without dev-dependencies; preserve original failure status." >> "$GITHUB_STEP_SUMMARY"
-          fi
-          # Restore the exact original manifest before any other tests.
       - name: Translate compiler-backend and compile generated C with GCC
         if: always() && steps.translate.outcome == 'success'
         id: backend
@@ -480,6 +435,7 @@ jobs:
           TRANSLATE_OUTCOME: ${{ steps.translate.outcome }}
           PROBE_EXIT: ${{ steps.translate.outputs.probe_exit }}
         run: |
+          echo "Compiler crate outputs share a single per-run minicargo directory; no private compiler objects are uploaded to the public cache." >> "$GITHUB_STEP_SUMMARY"
           echo "mrustc build: $TOOLCHAIN_OUTCOME" >> "$GITHUB_STEP_SUMMARY"
           echo "Translation step: $TRANSLATE_OUTCOME; minicargo exit: ${PROBE_EXIT:-not reached}" >> "$GITHUB_STEP_SUMMARY"
           echo "No Mini-C compilation or full bootstrap is claimed by this prototype." >> "$GITHUB_STEP_SUMMARY"
