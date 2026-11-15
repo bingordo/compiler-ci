@@ -65,10 +65,41 @@ for dir in "${gcc_includes[@]}"; do
   if [[ -d "$dir" ]]; then include_args+=("-I$dir"); fi
 done
 echo "EDG_C_AUDIT builtin_include_dirs=${#include_args[@]}"
+# The public EDG parse example dumps every node and should not be used
+# with 50+ MiB of private generated source. Build a pinned bridge with a
+# separate tiny public compiler-ci entry point that emits bounded counters.
+test ! -e edgcpp-rust/examples/ci_edg_parse_probe.rs
+cp bootstrap/edg_parse_probe.rs edgcpp-rust/examples/ci_edg_parse_probe.rs
 timeout --signal=TERM --kill-after=10s 20m cargo build --quiet \
-  --manifest-path edgcpp-rust/Cargo.toml --example parse
-parser=/workspace/edgcpp-rust/target/debug/examples/parse
+  --manifest-path edgcpp-rust/Cargo.toml --example ci_edg_parse_probe
+parser=/workspace/edgcpp-rust/target/debug/examples/ci_edg_parse_probe
 test -x "$parser"
+ulimit -c 0
+
+# Baseline: these public C fixtures independently isolate GNU layout,
+# linkage, calling-convention, and naked attributes. GCC is the dialect
+# oracle; EDG acceptance is a different, parser-only result.
+for kind in alignment linkage abi naked; do
+  fixture="/workspace/bootstrap/fixtures/edg-gnu-attributes/${kind}.c"
+  test -s "$fixture"
+  gcc -std=gnu11 -fsyntax-only "$fixture"
+  set +e
+  (
+    cd /workspace/edgcpp/build/gcc-release
+    timeout --signal=TERM --kill-after=10s 45s \
+      "$parser" --gcc --c11 --no_strict_gnu --gnu_version "$gnu_number" "${include_args[@]}" "$fixture"
+  ) > "/audit-tmp/edg-gnu-${kind}.log" 2>&1
+  fixture_rc=$?
+  set -e
+  echo "EDG_GNU_ATTR_PARSE_${kind^^}_EXIT=$fixture_rc"
+  # Fixture source is public, but preserve the bounded log policy anyway.
+  grep -m 1 '^EDG_PROBE_RESULT ' "/audit-tmp/edg-gnu-${kind}.log" || true
+done
+
+# Probe a SMALL real generated TU first; previously we attempted the 53.6
+# MiB compiler-ir output and EDG segfaulted (139) before TypeId lowering.
+# Keep private source lines, symbols and EDG's enormous raw IL dump off logs.
+echo "EDG_C_SAMPLE_BYTES=$(stat -c %s "$AUDIT_SOURCE")"
 set +e
 (
   cd /workspace/edgcpp/build/gcc-release
@@ -78,9 +109,31 @@ set +e
 parse_rc=$?
 set -e
 echo "EDG_C_PARSE_EXIT=$parse_rc"
-echo "EDG parse initial/trailing diagnostic output:"
-grep -Ei 'error|unsupported|warning|fatal|undefined|unrecognized' /audit-tmp/edg-generated-c-parse.log | head -n 12 || true
-tail -n 8 /audit-tmp/edg-generated-c-parse.log || true
+grep -m 1 '^EDG_PROBE_RESULT ' /audit-tmp/edg-generated-c-parse.log || true
+if (( parse_rc >= 128 )); then
+  echo "EDG_C_PARSE_CLASS=process_signal_or_crash"
+elif (( parse_rc != 0 )); then
+  echo "EDG_C_PARSE_CLASS=frontend_or_bridge_rejection"
+else
+  echo "EDG_C_PARSE_CLASS=accepted"
+fi
+
+# Keep the previous large-input crash as an independently reported scaling
+# gate, separate from any successful small-input syntax/ABI result.
+if [[ -n "${AUDIT_LARGE_SOURCE:-}" && -s "$AUDIT_LARGE_SOURCE" &&
+      "$AUDIT_LARGE_SOURCE" != "$AUDIT_SOURCE" ]]; then
+  echo "EDG_C_LARGE_BYTES=$(stat -c %s "$AUDIT_LARGE_SOURCE")"
+  set +e
+  (
+    cd /workspace/edgcpp/build/gcc-release
+    timeout --signal=TERM --kill-after=10s 90s \
+      "$parser" --gcc --c11 --no_strict_gnu --gnu_version "$gnu_number" "${include_args[@]}" "$AUDIT_LARGE_SOURCE"
+  ) > /audit-tmp/edg-large-c-parse.log 2>&1
+  large_rc=$?
+  set -e
+  echo "EDG_C_LARGE_PARSE_EXIT=$large_rc"
+  grep -m 1 '^EDG_PROBE_RESULT ' /audit-tmp/edg-large-c-parse.log || true
+fi
 
 if (( parse_rc != 0 )); then
   echo "EDG_C_TYPEID_EXIT=not_run_parser_failed"
@@ -102,10 +155,16 @@ set +e
 native_rc=$?
 set -e
 echo "EDG_C_TYPEID_EXIT=$native_rc"
-echo "EDG native TypeId first error/diagnostics:"
-grep -Ei 'error|unsupported|reject|failed|not implemented|invalid' \
-  /audit-tmp/edg-generated-c-native.log | head -n 15 || true
-tail -n 10 /audit-tmp/edg-generated-c-native.log || true
+# Native compiler diagnostics may contain private generated source lines:
+# expose only exit status and a bounded error-category count.
+python3 - /audit-tmp/edg-generated-c-native.log <<'PY'
+from pathlib import Path
+import re, sys
+data = Path(sys.argv[1]).read_text(errors="replace")
+print("EDG_C_TYPEID_DIAGNOSTIC_COUNTS "
+      + " ".join(f"{word}={len(re.findall(re.escape(word), data, re.I))}"
+                 for word in ("error", "unsupported", "reject", "invalid", "panic")))
+PY
 if (( native_rc == 0 )); then
   test -s /audit-tmp/mrustc-edg-native.o
   file /audit-tmp/mrustc-edg-native.o

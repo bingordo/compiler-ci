@@ -831,24 +831,39 @@ jobs:
             python3 bootstrap/probe-mrustc-c-dialect.py \
               "$PWD/mrustc/output-compiler-bootstrap" "$selection"
           fi
-          source=$(sed -n '1p' "$selection")
-          test -f "$source"
-          case "$source" in "$PWD"/*) ;; *) echo "invalid C sample path: $source"; exit 1;; esac
+          # Parse a small real mrustc TU first, not the 53+ MiB
+          # compiler-ir library that previously segfaulted in EDG.
+          # Keep the original large representative as a separate scale gate.
+          source=$(python3 - "$PWD/mrustc/output-compiler-bootstrap" <<'PY'
+          from pathlib import Path
+          import sys
+          files = [p for p in Path(sys.argv[1]).rglob("*.c") if p.is_file() and p.stat().st_size > 0]
+          if not files:
+              raise SystemExit("no real generated C files")
+          print(min(files, key=lambda p: (p.stat().st_size, str(p))))
+          PY
+          )
+          large_source=$(sed -n '1p' "$selection")
+          test -f "$source" && test -f "$large_source"
+          case "$source" in "$PWD"/*) ;; *) echo "invalid small C sample path"; exit 1;; esac
+          case "$large_source" in "$PWD"/*) ;; *) echo "invalid large C sample path"; exit 1;; esac
           relative="${source#"$PWD"/}"
-          echo "EDG generated-C audit input: $relative" >> "$GITHUB_STEP_SUMMARY"
+          large_relative="${large_source#"$PWD"/}"
+          echo "EDG generated-C audit small bytes=$(stat -c %s "$source") large bytes=$(stat -c %s "$large_source")" >> "$GITHUB_STEP_SUMMARY"
           set +e
           timeout --signal=TERM --kill-after=20s 30m docker run --rm \
             --entrypoint /bin/bash \
             -v "$PWD:/workspace" \
             -v "$RUNNER_TEMP:/audit-tmp" \
             -e "AUDIT_SOURCE=/workspace/$relative" \
+            -e "AUDIT_LARGE_SOURCE=/workspace/$large_relative" \
             ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8 \
             -euo pipefail /workspace/bootstrap/run-mrustc-edg-gap.sh \
             > "$RUNNER_TEMP/mrustc-edg-audit.log" 2>&1
           rc=$?
           set -e
           echo "EDG audit runner exit=$rc (diagnostic only)" | tee -a "$GITHUB_STEP_SUMMARY"
-          grep -E '^EDG_C_(PARSE|TYPEID)_EXIT=' "$RUNNER_TEMP/mrustc-edg-audit.log" | tee -a "$GITHUB_STEP_SUMMARY" || true
+          grep -E '^(EDG_GNU_ATTR_PARSE_[A-Z_]+_EXIT|EDG_C_(PARSE|TYPEID|LARGE_PARSE)_EXIT|EDG_C_PARSE_CLASS|EDG_C_SAMPLE_BYTES|EDG_C_LARGE_BYTES)=' "$RUNNER_TEMP/mrustc-edg-audit.log" | tee -a "$GITHUB_STEP_SUMMARY" || true
           if ! grep -q '^EDG_C_PARSE_EXIT=' "$RUNNER_TEMP/mrustc-edg-audit.log"; then
             echo 'EDG generated-C audit did not reach the parser (preflight/toolchain failure); no attribute/ABI compatibility result.' | tee -a "$GITHUB_STEP_SUMMARY"
           fi
