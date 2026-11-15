@@ -1,0 +1,146 @@
+name: RV64 R1 LP64 callee-saved preservation under QEMU
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-riscv-r1-callee-save-qemu.yml']
+permissions:
+  contents: read
+jobs:
+  frame-spills:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ad66707df723467de74f9f3d7ba386f488db626d
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require exact source SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "ad66707df723467de74f9f3d7ba386f488db626d"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Build frontend-independent workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-riscv64"]
+          EOF
+          rm -f Cargo.lock
+      - name: Run target ABI, spill tests, Clippy and pinned UDB forms
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-riscv64 --all-targets
+          cargo clippy -p compiler-backend-riscv64 --all-targets -- -D warnings
+          python3 tools/riscv_udb_rust_leaf_forms.py \
+            --catalog data/riscv_udb_r0_catalog.json \
+            --output crates/backend-riscv64/src/generated_encoding.rs --check
+      - name: Install independent RV64 GNU binutils and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y binutils-riscv64-linux-gnu qemu-user
+      - name: Generate saved-register and pressure objects with independent byte parity
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for kind in saveonly spillsum spillbranch spillelse; do
+            cargo run -p compiler-backend-riscv64 --example rv64_leaf -- \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}.s" "$kind"
+            riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+              "/tmp/rv64_${kind}.s" -o "/tmp/rv64_${kind}_gas.o"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}_direct.bin"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}_gas.o" "/tmp/rv64_${kind}_gas.bin"
+            cmp "/tmp/rv64_${kind}_direct.bin" "/tmp/rv64_${kind}_gas.bin"
+            riscv64-linux-gnu-readelf -h "/tmp/rv64_${kind}.o"
+          done
+      - name: Verify LP64 saved GP register sentinels and SP across all generated calls
+        run: |
+          set -euo pipefail
+          cat > /tmp/rv64_saved_start.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .global _start
+          _start:
+            mv s0, sp
+            li s1, 0x101
+            li s2, 0x102
+            li s3, 0x103
+            li s4, 0x104
+            li s5, 0x105
+            li s6, 0x106
+            li s7, 0x107
+            li s8, 0x108
+            li s9, 0x109
+            li s10, 0x10a
+            li s11, 0x10b
+            call rv64_saveonly
+            li t0, 136
+            bne a0, t0, failed_result
+            call check_saved
+            call rv64_spillsum
+            li t0, 1176
+            bne a0, t0, failed_result
+            call check_saved
+            call rv64_spillbranch
+            li t0, 820
+            bne a0, t0, failed_result
+            call check_saved
+            call rv64_spillelse
+            li t0, 1
+            bne a0, t0, failed_result
+            call check_saved
+            li a0, 0
+            j finish
+          failed_result:
+            li a0, 1
+            j finish
+          failed_saved:
+            li a0, 2
+            j finish
+          check_saved:
+            bne sp, s0, failed_saved
+            li t0, 0x101
+            bne s1, t0, failed_saved
+            li t0, 0x102
+            bne s2, t0, failed_saved
+            li t0, 0x103
+            bne s3, t0, failed_saved
+            li t0, 0x104
+            bne s4, t0, failed_saved
+            li t0, 0x105
+            bne s5, t0, failed_saved
+            li t0, 0x106
+            bne s6, t0, failed_saved
+            li t0, 0x107
+            bne s7, t0, failed_saved
+            li t0, 0x108
+            bne s8, t0, failed_saved
+            li t0, 0x109
+            bne s9, t0, failed_saved
+            li t0, 0x10a
+            bne s10, t0, failed_saved
+            li t0, 0x10b
+            bne s11, t0, failed_saved
+            ret
+          finish:
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+            /tmp/rv64_saved_start.s -o /tmp/rv64_saved_start.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax \
+            -e _start /tmp/rv64_saved_start.o \
+            /tmp/rv64_saveonly.o /tmp/rv64_spillsum.o \
+            /tmp/rv64_spillbranch.o /tmp/rv64_spillelse.o \
+            -o /tmp/rv64_saved.elf
+          timeout 15s qemu-riscv64 /tmp/rv64_saved.elf
+          echo "RV64 LP64 saved registers: 4 functions, all 12 s-regs and SP preserved"
