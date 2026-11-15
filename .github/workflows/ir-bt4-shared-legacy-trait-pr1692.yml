@@ -1,0 +1,59 @@
+# Temporary exact-source acceptance for BT4 shared-trait removal.
+name: BT4 shared Backend trait removal and historic x86 oracles
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ir-bt4-shared-legacy-trait-pr1692.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  bt4:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_INCREMENTAL: '0'
+      SOURCE_SHA: 7dd8cf1cf08b927a86b8a84a093071d8390fe12e
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7dd8cf1cf08b927a86b8a84a093071d8390fe12e
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and isolate core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: bt4-rehome-historical-backend
+      - name: Affected IR backend x86 ARM all-target source check
+        working-directory: compiler
+        run: cargo check -p compiler-ir -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --all-targets
+      - name: Native TypeId and original historical scalar/ABI/SMT oracles
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test t5_x86_semantics --test x7_g10_native_memory_oracle --test typed_generated_cfg_native --test typed_alias_calls_native --test typed_i64_compare_branch_native --test m4_8_checked_symbol_attributes_native
+      - name: Historical x86 unit machine and allocator oracles
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --lib
+      - name: X7 opt-in source-review and selected physical controls
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation,x7-c-defined-64 --test x7_g10_late_selector_native --test x7_g10_n10_ssa_adjacency_census --test x7_g10_n11_cfg_spill_probe --test x7_g10_n12_c_defined_native --test x7_g10_n14_sub_native --test x7_g10_n16_bitwise_native --test x7_g10_n19_64_native --test x7_g10_n20_cfg_pressure_64_native
+      - name: Strict new contract and integration lint (ignore pre-existing X7 visibility only)
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend -p compiler-backend-x86 --lib --tests -- -D warnings -A private_interfaces
