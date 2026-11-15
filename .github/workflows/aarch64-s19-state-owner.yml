@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 83f60a5eddc1745745af73b1fe1f7f7d7dc788d9
+          ref: 2292ef335a8941d9c0f4fa7f6c4648c0cc7d3909
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -30,8 +30,10 @@ jobs:
           curl -fLsS --retry 3 --connect-timeout 20 --max-time 240 --max-filesize 200000000 -o /tmp/arm2026.tar.gz https://developer.arm.com/-/cdn-downloads/permalink/Exploration-Tools-A64-ISA/ISA_A64/ISA_A64_xml_A_profile-2026-09.tar.gz
           echo '44cfb89c763c7eea8e59de0ad2221e3c012e6aa77899bd7f1c3e1f24537191d7  /tmp/arm2026.tar.gz' | sha256sum -c -
           git -C compiler rev-parse HEAD | tee /tmp/s19-compiler-head
-          grep -Fx 83f60a5eddc1745745af73b1fe1f7f7d7dc788d9 /tmp/s19-compiler-head
+          grep -Fx 2292ef335a8941d9c0f4fa7f6c4648c0cc7d3909 /tmp/s19-compiler-head
           python3 -m unittest discover -s compiler/tools -p 'test_aarch64_a32_source_state_owners.py' -v
+          python3 -m unittest discover -s compiler/tools -p 'test_aarch64_a32_original_register_bank.py' -v
+          python3 compiler/tools/aarch64_a32_original_register_bank.py --archive /tmp/arm2026.tar.gz --out /tmp/s20-bank-evidence.json
           python3 compiler/tools/aarch64_a32_source_state_owners.py --archive /tmp/arm2026.tar.gz --out /tmp/s19-owner-evidence.json
           python3 - <<'PY'
           import json
@@ -126,7 +128,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 83f60a5eddc1745745af73b1fe1f7f7d7dc788d9
+          ref: 2292ef335a8941d9c0f4fa7f6c4648c0cc7d3909
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -134,7 +136,7 @@ jobs:
         shell: sh
         run: |
           set -eu
-          test "$(git -C compiler rev-parse HEAD)" = 83f60a5eddc1745745af73b1fe1f7f7d7dc788d9
+          test "$(git -C compiler rev-parse HEAD)" = 2292ef335a8941d9c0f4fa7f6c4648c0cc7d3909
           curl -fLsS --retry 3 --connect-timeout 20 --max-time 240 --max-filesize 200000000 -o /tmp/arm2026.tar.gz https://developer.arm.com/-/cdn-downloads/permalink/Exploration-Tools-A64-ISA/ISA_A64/ISA_A64_xml_A_profile-2026-09.tar.gz
           echo '44cfb89c763c7eea8e59de0ad2221e3c012e6aa77899bd7f1c3e1f24537191d7  /tmp/arm2026.tar.gz' | sha256sum -c -
           python3 - <<'PY'
@@ -143,6 +145,7 @@ jobs:
           sys.path.insert(0,'compiler/tools')
           from aarch64_a32_addwithcarry_asl_runtime import published_addwithcarry
           from aarch64_a32_source_state_owners import pinned_state_sources,state_candidate
+          from aarch64_a32_original_register_bank import original_register_bank,register_state_candidate
           from aarch64_a32_adc_full_instruction_frontier import INSTRUCTIONS,valid_entry,probe_program
           from aarch64_a32_aslref_compat import load_bundler
           from aarch64_a32_asl_source_links import ROOT
@@ -151,6 +154,7 @@ jobs:
           archive=Path('/tmp/arm2026.tar.gz')
           sources=pinned_state_sources(archive)
           state=state_candidate(sources)
+          extended_state=register_state_candidate(sources,original_register_bank(archive))
           helper=published_addwithcarry(archive)
           bundler=load_bundler(Path('herd/herd/libdir/asl-pseudocode/bundler.py'))
           exe=str(Path('herd/_build/default/asllib/aslref.exe').resolve())
@@ -165,9 +169,9 @@ jobs:
                   assert hashlib.sha256(raw).hexdigest()==pin['xml_sha256']
                   assert hashlib.sha256(instruction.encode()).hexdigest()==pin['bundled_sha256']
                   outcomes=[]
-                  for has_state in (False,True):
-                      script=(state+'\n' if has_state else '') + probe_program(helper,instruction,pin['entry'])
-                      inp=folder/(op.lower()+('_with_state' if has_state else '_baseline')+'.asl')
+                  for label,preamble in (('baseline',''),('owners',state),('owners_and_bank',extended_state)):
+                      script=(preamble+'\n' if preamble else '') + probe_program(helper,instruction,pin['entry'])
+                      inp=folder/(op.lower()+'_'+label+'.asl')
                       inp.write_text(script)
                       r=subprocess.run([exe,'--version-eac1','--type-check-strict','--no-exec','-1',inp.name],cwd=folder,capture_output=True,timeout=70)
                       diag=r.stderr.decode('utf8','replace')
@@ -180,9 +184,9 @@ jobs:
                       # Error lines only, bounded: never export Arm source.
                       error_lines=[line.strip() for line in diag.splitlines()
                                    if re.search(r'undefined|unbound|type error|exception|error:',line,re.I)]
-                      print('S20_UNRESOLVED_ORIGINAL',op,'state',has_state,
+                      print('S20_UNRESOLVED_ORIGINAL',op,'state',label,
                             'errors',[line[:250] for line in error_lines[:4]])
-                      outcomes.append((has_state,r.returncode,kinds,len(r.stderr)))
+                      outcomes.append((label,r.returncode,kinds,len(r.stderr)))
                   print('S20_ORIGINAL_TYPED_OWNER_DIFFERENTIAL',op,outcomes)
-                  assert len(outcomes)==2 and outcomes[0][1]!=0
+                  assert len(outcomes)==3 and outcomes[0][1]!=0
           PY
