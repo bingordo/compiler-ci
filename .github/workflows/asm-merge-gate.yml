@@ -1,0 +1,61 @@
+name: ASM merge gate on current main
+on:
+  push:
+    branches: [ci/asm-merge-gate]
+    paths: ['.github/workflows/asm-merge-gate.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  x86-integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout exact main
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 4068abbc60416a98b7a1ea3b6e3e368b6800c00b
+          fetch-depth: 0
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact assembler PR head locally
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 05d6849fe080d39f59b51741caa3664b19b8904c
+          path: review-head
+          fetch-depth: 0
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Simulate exact merge without writing compiler main
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "4068abbc60416a98b7a1ea3b6e3e368b6800c00b"
+          test "$(git -C review-head rev-parse HEAD)" = "05d6849fe080d39f59b51741caa3664b19b8904c"
+          git fetch --no-tags ./review-head "05d6849fe080d39f59b51741caa3664b19b8904c"
+          git merge --no-commit --no-ff FETCH_HEAD
+          git diff --cached --check
+          echo "Merged feature 05d6849fe080d39f59b51741caa3664b19b8904c onto main 4068abbc60416a98b7a1ea3b6e3e368b6800c00b" >> "$GITHUB_STEP_SUMMARY"
+          git status --short | head -60
+          rm -rf review-head
+      - name: Restrict to compiler core workspace
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: asm-merge-gate
+      - name: Test integrated x86 backend and assembler
+        run: |
+          set -euo pipefail
+          python3 tools/regen_x86_att_forms.py --check
+          python3 -m unittest discover -s tools -p 'test_regen_x86_att_forms.py' -v
+          cargo check -p compiler-backend-x86 --all-targets
+          cargo test -p compiler-backend-x86
+          cargo clippy -p compiler-backend-x86 --all-targets -- -D warnings
+          echo 'ASM_MAIN_MERGE_GATE status=PASS' >> "$GITHUB_STEP_SUMMARY"
