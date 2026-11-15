@@ -1,0 +1,92 @@
+name: RV64 LP64 interoperability with independently compiled GCC caller
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-riscv-r1-gcc-caller.yml']
+permissions:
+  contents: read
+jobs:
+  gcc-caller:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ca6de6d39da52885ad13f089d033e65009fb80ee
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check exact merged compiler revision
+        run: test "$(git -C compiler rev-parse HEAD)" = "ca6de6d39da52885ad13f089d033e65009fb80ee"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install GNU RV64 cross compiler and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu qemu-user
+      - name: Prepare lightweight TypeId Rust workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-riscv64"]
+          EOF
+          rm -f Cargo.lock
+      - name: Produce compiler-generated ELF objects called by GCC
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for kind in add i32add saveonly spillsum spillbranch spillelse; do
+            cargo run -p compiler-backend-riscv64 --example rv64_leaf -- \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}.s" "$kind"
+            riscv64-linux-gnu-readelf -h "/tmp/rv64_${kind}.o" | grep 'Machine:.*RISC-V'
+          done
+      - name: Compile an independent LP64 C ABI caller and execute without libc
+        run: |
+          set -euo pipefail
+          cat > /tmp/rv64_gcc_caller.c <<'EOF'
+          extern long rv64_add_leaf(long a, long b);
+          extern int rv64_i32_add(int a, int b);
+          extern long rv64_saveonly(void);
+          extern long rv64_spillsum(void);
+          extern long rv64_spillbranch(void);
+          extern long rv64_spillelse(void);
+          __attribute__((noinline))
+          long gcc_check(void) {
+            volatile long guard = 0x13572468L;
+            if (rv64_add_leaf(0x100000000L, 123) != 0x10000007bL) return 1;
+            if (rv64_i32_add(2147483647, 1) != (-2147483647 - 1)) return 2;
+            if (rv64_saveonly() != 136) return 3;
+            if (rv64_spillsum() != 1176) return 4;
+            if (rv64_spillbranch() != 820) return 5;
+            if (rv64_spillelse() != 1) return 6;
+            if (guard != 0x13572468L) return 7;
+            return 0;
+          }
+          EOF
+          cat > /tmp/rv64_gcc_start.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .global _start
+          _start:
+            call gcc_check
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-gcc -O2 -march=rv64i -mabi=lp64 \
+            -ffreestanding -fno-pic -fno-pie -fno-stack-protector \
+            -c /tmp/rv64_gcc_caller.c -o /tmp/rv64_gcc_caller.o
+          riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+            /tmp/rv64_gcc_start.s -o /tmp/rv64_gcc_start.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax \
+            -e _start /tmp/rv64_gcc_start.o /tmp/rv64_gcc_caller.o \
+            /tmp/rv64_add.o /tmp/rv64_i32add.o \
+            /tmp/rv64_saveonly.o /tmp/rv64_spillsum.o \
+            /tmp/rv64_spillbranch.o /tmp/rv64_spillelse.o \
+            -o /tmp/rv64_gcc_interop.elf
+          riscv64-linux-gnu-readelf -h /tmp/rv64_gcc_interop.elf
+          timeout 15s qemu-riscv64 /tmp/rv64_gcc_interop.elf
+          echo "GCC RV64 LP64 C caller: all 6 independent compiler calls passed"
