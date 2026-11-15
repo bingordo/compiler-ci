@@ -1,0 +1,64 @@
+# Temporary, source-pinned acceptance for native TypeId FP arithmetic.
+# CI stays in compiler-ci; never merge this workflow.
+name: FP RNE scalar vector TypeId arithmetic PR1635
+on:
+  push:
+    branches: [ci/fp-typeid-arith-pr1635-20261115]
+    paths: [.github/workflows/fp-typeid-arith-pr1635.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fp-arithmetic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      SOURCE_SHA: 4c4db5388bf474ad67ca6d673f19332a29c568ed
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 4c4db5388bf474ad67ca6d673f19332a29c568ed
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source SHA and isolate core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: fp-typeid-arith-pr1635
+      - name: Focused FP TypeId semantic and opcode roundtrip tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test native_fp_vector_semantics
+          cargo test -p compiler-ir --test native_fp_opcode_roundtrip
+          cargo test -p compiler-ir --lib native_binary_v1::opcode_tests
+      - name: All TypeId IR tests
+        working-directory: compiler
+        run: cargo test -p compiler-ir
+      - name: Build optimizer library and all backend crates
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --lib
+          cargo check -p compiler-backend-x86 -p compiler-backend-aarch64 -p compiler-backend-riscv64 -p compiler-backend-wasm --all-targets
+      - name: Strict Clippy for IR and optimizer library
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir --all-targets -- -D warnings
+          cargo clippy -p compiler-opt --lib -- -D warnings
