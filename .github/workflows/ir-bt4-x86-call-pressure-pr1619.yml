@@ -1,0 +1,52 @@
+# Source-pinned BT4 call/allocator ABI acceptance on compiler-ci only.
+name: BT4 x86 call-clobber TypeId ABI
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ir-bt4-x86-call-pressure-pr1619.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-call-pressure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      SOURCE_SHA: 458e74e1f67602bb61819add088bd2e393290c9b
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Check out exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 458e74e1f67602bb61819add088bd2e393290c9b
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and isolate core crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-bt4-x86-calls
+      - name: Original wide-live C11/ELF/GAS oracle
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --test call_clobber_pressure_native -- --nocapture
+      - name: Adjacent native ABI regressions and all-target compile
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-ir -p compiler-backend -p compiler-backend-x86 --all-targets
+          cargo test -p compiler-backend-x86 --test mixed_frame_native --test rbp_alloc_native --test native_typeid_function_signatures
+      - name: Strict Clippy on migrated call-pressure test
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-x86 --test call_clobber_pressure_native -- -D warnings
