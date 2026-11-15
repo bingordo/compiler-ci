@@ -1,0 +1,67 @@
+# Temporary cross-consumer IR review acceptance. Never merge into compiler-ci main.
+name: IR cross-consumer audit and docs 20261115
+on:
+  push:
+    branches: [ci/ir-cross-consumer-audit-20261115]
+    paths: [.github/workflows/ir-cross-consumer-audit-20261115.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  ir-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      SOURCE_SHA: 4261ddeed70ae3d3ebea8be371deab3ebd1b8fda
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout reviewed compiler source and documentation
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 4261ddeed70ae3d3ebea8be371deab3ebd1b8fda
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned SHA and prepare isolated workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          python3 --version
+          rustc --version
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-audit-20261115
+      - name: Documentation links and checker unit tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/check_doc_links.py
+          python3 -m unittest discover -s tools -p 'test_check_doc_links.py' -v
+      - name: Full compiler-ir unit and integration suite
+        working-directory: compiler
+        run: cargo test -p compiler-ir
+      - name: Targeted current TypeId generator/fuzzer tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typeid_fuzz_bias
+          cargo test -p compiler-opt --test typeid_fuzz_interactions
+          cargo test -p compiler-opt --test typeid_fuzz_pass_registry
+      - name: Optimizer library and all backend all-target checks
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --lib
+          cargo check -p compiler-backend-x86 -p compiler-backend-aarch64 -p compiler-backend-riscv64 -p compiler-backend-wasm --all-targets
+      - name: Strict IR lint
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir --all-targets -- -D warnings
