@@ -31,8 +31,8 @@ fn main() {
             compiler_ir::verify(&function).expect("valid initial SSA");
             assert_eq!(fold_constants(&mut function).expect("fold_constants"), 1);
             compiler_ir::verify(&function).expect("valid optimized SSA");
-            match function.blocks[0].instructions[2].op {
-                Op::ConstI32(actual) => assert_eq!(actual, expected),
+            match &function.blocks[0].instructions[2].op {
+                Op::ConstI32(actual) => assert_eq!(*actual, expected),
                 _ => panic!("the arithmetic instruction was not folded"),
             }
             checksum = checksum.wrapping_mul(16777619).wrapping_add(expected as u32 as u64);
