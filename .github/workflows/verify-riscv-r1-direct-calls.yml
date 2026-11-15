@@ -1,0 +1,135 @@
+name: RV64 TypeId calls into GCC via ELF CALL_PLT
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-riscv-r1-direct-calls.yml']
+permissions:
+  contents: read
+jobs:
+  calls:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 96fe6d092a830dc0ae8dbec15ab640dee89f3bda
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require exact compiler source revision
+        run: test "$(git -C compiler rev-parse HEAD)" = "96fe6d092a830dc0ae8dbec15ab640dee89f3bda"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Isolate TypeId-native compiler crates
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-riscv64"]
+          EOF
+          rm -f Cargo.lock
+      - name: Rust, Clippy and checked UDB regeneration
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-riscv64 --all-targets
+          cargo clippy -p compiler-backend-riscv64 --all-targets -- -D warnings
+          python3 tools/riscv_udb_rust_leaf_forms.py \
+            --catalog data/riscv_udb_r0_catalog.json \
+            --output crates/backend-riscv64/src/generated_encoding.rs --check
+      - name: Install independent GCC, binutils and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu qemu-user
+      - name: Compare four CALL_PLT ELF objects to GNU GAS
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for kind in call64 callswap callzero call32; do
+            cargo run -p compiler-backend-riscv64 --example rv64_leaf -- \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}.s" "$kind"
+            riscv64-linux-gnu-readelf -Wr "/tmp/rv64_${kind}.o" \
+              | grep R_RISCV_CALL_PLT
+            riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+              "/tmp/rv64_${kind}.s" -o "/tmp/rv64_${kind}_gas.o"
+            riscv64-linux-gnu-readelf -Wr "/tmp/rv64_${kind}_gas.o" \
+              | grep R_RISCV_CALL_PLT
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}_direct.bin"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}_gas.o" "/tmp/rv64_${kind}_gas.bin"
+            cmp "/tmp/rv64_${kind}_direct.bin" "/tmp/rv64_${kind}_gas.bin"
+          done
+      - name: GCC LP64 C callees linked with our ELF objects under QEMU
+        run: |
+          set -euo pipefail
+          cat > /tmp/rv64_callee.c <<'EOF'
+          __attribute__((noinline))
+          long gcc_add_bias(long a, long b) { return a + b + 17; }
+          __attribute__((noinline))
+          long gcc_sub64(long a, long b) { return a - b; }
+          __attribute__((noinline))
+          long gcc_answer(void) { return 0x123456789abcdefL; }
+          __attribute__((noinline))
+          int gcc_sub32(int a, int b) { return a - b; }
+          EOF
+          cat > /tmp/rv64_start.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            mv s0, sp
+            li a0, 7
+            li a1, 18
+            call rv64_call64
+            li t0, 42
+            bne a0, t0, fail1
+            bne sp, s0, fail_sp
+            li a0, 7
+            li a1, 18
+            call rv64_callswap
+            li t0, 11
+            bne a0, t0, fail2
+            bne sp, s0, fail_sp
+            call rv64_call_zero
+            li t0, 0x123456789abcdef
+            bne a0, t0, fail3
+            bne sp, s0, fail_sp
+            li a0, 7
+            li a1, 18
+            call rv64_call_i32
+            li t0, 11
+            bne a0, t0, fail4
+            bne sp, s0, fail_sp
+            li a0, 0
+            j exit
+          fail1: li a0, 1
+            j exit
+          fail2: li a0, 2
+            j exit
+          fail3: li a0, 3
+            j exit
+          fail4: li a0, 4
+            j exit
+          fail_sp: li a0, 5
+          exit:
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-gcc -O2 -march=rv64i -mabi=lp64 \
+            -ffreestanding -fno-pic -fno-pie -fno-stack-protector \
+            -c /tmp/rv64_callee.c -o /tmp/rv64_callee.o
+          riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+            /tmp/rv64_start.s -o /tmp/rv64_start.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax \
+            -e _start /tmp/rv64_start.o \
+            /tmp/rv64_call64.o /tmp/rv64_callswap.o \
+            /tmp/rv64_callzero.o /tmp/rv64_call32.o \
+            /tmp/rv64_callee.o -o /tmp/rv64_call.elf
+          timeout 15s qemu-riscv64 /tmp/rv64_call.elf
+          echo "RV64 TypeId -> GCC: four external call cases passed"
