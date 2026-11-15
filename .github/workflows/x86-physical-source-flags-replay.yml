@@ -1,0 +1,51 @@
+name: Validate exact TypeId source flags physical replay and GCC oracle
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/x86-physical-source-flags-replay.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  x86-physical-flags:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact compiler T5 source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e90a998e91adfd93b2ccf871730772538609f014
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check exact source pin and isolate native workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "e90a998e91adfd93b2ccf871730772538609f014"
+          mkdir -p x86-workspace/crates
+          for crate in ir opt backend backend-x86 backend-aarch64; do
+            cp -a "compiler/crates/$crate" "x86-workspace/crates/$crate"
+          done
+          cp -a compiler/tools compiler/tests compiler/data x86-workspace/
+          cat > x86-workspace/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: x86-workspace -> target
+          key: x86-physical-replay
+      - name: Verify exact generated physical replay byte parity and rejection
+        working-directory: x86-workspace
+        run: |
+          cargo test -p compiler-backend-x86 --test typeid_physical_control_replay -- --nocapture
+          cargo test -p compiler-backend-x86 --test typed_i64_compare_branch_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test typed_i32_compare_branch_native -- --nocapture
+      - name: Verify generated source-only flag admission and physical x86 regression
+        working-directory: x86-workspace
+        run: |
+          cargo test -p compiler-backend-x86 --lib native_typeid -- --nocapture
+          cargo test -p compiler-backend-x86 --test native_typeid_function_signatures -- --nocapture
