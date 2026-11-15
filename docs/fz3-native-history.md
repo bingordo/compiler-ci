@@ -84,6 +84,30 @@ unexpected traps, as well as different defined results, are eligible.
 Every genuine mismatch is reduced through verifier-gated TypeId ddmin while
 requiring the same reference/native fingerprint after each mutation.
 
+### Native trap coverage evidence
+
+A zero-mismatch campaign does not by itself show that trapping code
+actually executed. The test-only campaign now emits `trap_coverage.tsv`
+with source-reference-confirmed `defined`, `zero_sigfpe`, and
+`overflow_sigfpe` counts, separately for the signed `DivS` and `RemS`
+recipes, each optimizer policy, and both native sinks. These counters are
+recorded **only after actual native execution**, and use the independent
+original TypeId reference to check the expected semantic case.
+
+For a complete 240-evaluation nightly run, the 16 signed
+recipe/policy/sink combinations must each observe exactly one defined
+result, one divide-by-zero trap and one signed-overflow trap. The new
+`tools/fz3_trap_coverage.py` checker rejects missing columns or rows,
+duplicate modes/sinks, counts inflated or absent, injected reports, wrong
+compiler SHA, odd seed parity, truncation, and a reduced evaluation budget.
+The nightly workflow requires this check to succeed **before opening bug
+issues or publishing the durable history**. This adds no native invocations
+and preserves the existing 240-case cost and v1/v2 fingerprint schemas.
+
+A `SIGFPE` reference outcome is evidence of testing the intended input;
+it is not itself proof that a particular optimization is correct or that
+all machine instructions were exercised.
+
 ### Persistent v2 acceptance and replay
 
 The **compiler-ci-only** steps run after normal v1 report validation.
