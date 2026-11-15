@@ -1,0 +1,69 @@
+name: Source-pinned review ABI 1730
+
+on:
+  push:
+    branches: [review/abi-1730-e26187]
+    paths: ['.github/workflows/review-abi-1730.yml']
+  pull_request:
+    paths: ['.github/workflows/review-abi-1730.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 24
+    steps:
+      - name: Checkout compiler-ci source
+        uses: actions/checkout@v4
+      - name: Checkout immutable compiler source using read-only CI key
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e26187aaec32ca490c8742d284b852563588dace
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source SHA
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "e26187aaec32ca490c8742d284b852563588dace"
+          git show -s --format='%H %s' HEAD
+      - name: Use standalone compiler core workspace only on runner
+        working-directory: compiler
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          """)
+          PY
+      - name: Cache Rust compiler core outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: review-abi-1730
+      - name: TypeId ABI and opcode admission regressions
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test typed_module_abi -- --nocapture
+          cargo test -p compiler-ir --test typed_opcode_types -- --nocapture
+      - name: Shared scalar and wasm32 variance regression
+        working-directory: compiler
+        run: cargo test -p compiler-backend unused_external_abi_tests -- --nocapture
+      - name: x86 GAS and direct ELF regressions
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --test review_unused_external_abi -- --nocapture
+      - name: AArch64 GAS and direct ELF regressions
+        working-directory: compiler
+        run: cargo test -p compiler-backend-aarch64 --test review_unused_external_abi -- --nocapture
+      - name: Compile x86 and AArch64 backend libraries
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 -p compiler-backend-aarch64 --lib --no-run
+      - name: Strict core library Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --lib -- -D warnings
