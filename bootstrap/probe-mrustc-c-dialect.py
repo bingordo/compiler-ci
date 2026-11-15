@@ -70,8 +70,28 @@ for label in ("compiler_ir", "compiler_opt", "compiler_backend_x86", "compiler")
             selected.append(candidate)
 if not selected:
     selected = sorted(sources, key=lambda p: (sizes[p], str(p)))[:3]
-selection_file.write_text("".join(str(p) + "\n" for p in selected[:4]))
-for p in selected[:4]:
+
+# The first selected family units are often atomic-dependent, blocking
+# Mini-C in <stdatomic.h> before we can observe any independent C syntax
+# gap. Add up to two SMALL samples containing no raw _Atomic, atomic_* or
+# GNU atomic builtins, so the non-atomic path is exercised as well.
+# This is only a lexical hint, not proof that a macro expansion/header
+# cannot introduce an atomic operation.
+atomic_free = sorted(
+    (
+        path for path in sources
+        if all(count == 0 for count in atomic_per_file[path].values())
+        and path not in selected
+    ),
+    key=lambda path: (sizes[path], str(path)),
+)[:2]
+for candidate in atomic_free:
+    if candidate not in selected:
+        selected.append(candidate)
+
+print(f"C_DIALECT atomic_free_extra_samples={len(atomic_free)}")
+selection_file.write_text("".join(str(p) + "\n" for p in selected))
+for p in selected:
     print(f"C_SAMPLE path={p} bytes={sizes[p]}")
     counts = atomic_per_file[p]
     # This is a conservative raw-source inventory. Macro expansion and
