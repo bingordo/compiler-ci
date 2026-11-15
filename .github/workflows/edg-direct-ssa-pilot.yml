@@ -94,6 +94,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/edgcpp-rust
+          # PR #259 is merged; test the production edgcpp-rust default branch.
           ref: cranelift-codegen
           path: edg-rust
           persist-credentials: false
@@ -107,6 +108,35 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           rustup toolchain install "$RUST_TOOLCHAIN_VERSION" --profile minimal
           rustup default "$RUST_TOOLCHAIN_VERSION"
+
+      - name: EDG C++ reference-formation source provenance gate (rust PR 259)
+        working-directory: edg-rust
+        env:
+          EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+          EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+          EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+          EDGCPP_EDG_REVISION: ${{ env.EDG_SOURCE_SHA }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          g++ -std=c++17 -Wall -Wextra -Werror \
+            tests/fixtures/cxx_reference_formation.cpp \
+            -o /tmp/cxx-reference-formation-oracle
+          /tmp/cxx-reference-formation-oracle
+          cargo build --example reference_formation
+          cp tests/fixtures/cxx_reference_formation.cpp ../edgcpp/build/gcc-release/
+          (
+            cd ../edgcpp/build/gcc-release
+            source environment.sh
+            if ! ../../../edg-rust/target/debug/examples/reference_formation \
+              --c++17 cxx_reference_formation.cpp >cxx-reference-formation.log 2>&1; then
+              cat cxx-reference-formation.log
+              exit 1
+            fi
+            cat cxx-reference-formation.log
+            grep -Eq '^EDG_CXX_REFERENCE_FORMATION reference_to=[0-9]+ address_of=[0-9]+ calls=2 reference_formal=true pointer_formal=true$' \
+              cxx-reference-formation.log
+          )
 
       - name: Verify TypeId-native SysV GP variadic ABI acceptance and rejection
         working-directory: compiler
@@ -150,9 +180,13 @@ jobs:
           # require the old redundant standalone value-flow invocation.
           grep -Fq 'module.validate_module_abi()?' "$source"
           grep -Fq 'module.validate_sysv_gp_variadic_abi()?' "$source"
-          grep -Fq 'native_gp!=legacy_gp' "$source"
+          # The old comparison with legacy GP ABI was removed with legacy
+          # lowering. Source-declared variadics now take the TypeId ABI gate.
+          grep -Fq 'if module.externals.iter().any(|e|e.signature.variadic)' "$source"
           grep -Fq 'let module=lower_edg_to_typeid(il,globals)?' "$source"
-          grep -Fq 'fn legacy_x86_compatibility' "$source"
+          # Production EDG codegen now targets the TypeId x86 backend directly.
+          grep -Fq 'pub fn emit_edg_typeid_object(il:&Il)' "$source"
+          grep -Fq 'X86_64.emit_typeid_object(&module)' "$source"
           if grep -Fq 'blocks:Vec<Block>,' "$source"; then
             echo "EDG source frontend regressed to legacy SSA block ownership"
             exit 1
@@ -240,7 +274,32 @@ jobs:
             gcc -std=c11 -O2 -Wall -Wextra -Werror edg_cfg_native.o edg_native_cfg_driver.c -o compiler_edg_cfg
             ./gcc_edg_cfg
             ./compiler_edg_cfg
-            for source in edg_native_cfg_bad_uninit_if.c edg_native_cfg_bad_uninit_loop.c edg_native_cfg_bad_shadow_uninit.c edg_native_cfg_bad_condition_effect.c edg_native_cfg_bad_do.c edg_native_cfg_bad_goto.c edg_native_cfg_bad_volatile.c; do
+            # The side-effecting condition is supported by current compiler main.
+            # Keep it as a positive executable GCC differential rather than
+            # silently allowing the old "bad" fixture to stop testing semantics.
+            if ! "$binary" edg_cfg_effect.o --c11 edg_native_cfg_bad_condition_effect.c >edg_cfg_effect.log 2>&1; then
+              cat edg_cfg_effect.log
+              exit 1
+            fi
+            printf '%s\n' '#include <stdio.h>' 'int edg_cfg_bad_condition_effect(int,int);' 'int main(void) {' 'const int xs[]={0,0,1,1,1,-3,2};' 'const int ys[]={0,7,0,5,-2,3,-4};' 'const int want[]={0,0,0,6,-1,4,-3};' 'for (unsigned i=0;i<sizeof(xs)/sizeof(xs[0]);i++) {' 'int got=edg_cfg_bad_condition_effect(xs[i],ys[i]);' 'if (got!=want[i]) { fprintf(stderr,"input x=%d y=%d got=%d expected=%d\\n",xs[i],ys[i],got,want[i]); return 1; }' '}' 'return 0;' '}' >edg_cfg_effect_driver.c
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_native_cfg_bad_condition_effect.c edg_cfg_effect_driver.c -o gcc_edg_cfg_effect
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_cfg_effect.o edg_cfg_effect_driver.c -o compiler_edg_cfg_effect
+            echo 'Run GCC source oracle for side-effectful condition'
+            ./gcc_edg_cfg_effect
+            echo 'Run native compiler for side-effectful condition'
+            ./compiler_edg_cfg_effect
+            # Source-owned, path-sensitive SSA definitions across &&, ||,
+            # nested conditions and mutable formals. Must execute identically
+            # to GCC, not merely compile successfully.
+            if ! "$binary" edg_sc_state.o --c11 edg_native_cfg_sc_state.c >edg_sc_state.log 2>&1; then
+              cat edg_sc_state.log
+              exit 1
+            fi
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_native_cfg_sc_state.c edg_native_cfg_sc_state_driver.c -o gcc_edg_sc_state
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_sc_state.o edg_native_cfg_sc_state_driver.c -o compiler_edg_sc_state
+            ./gcc_edg_sc_state
+            ./compiler_edg_sc_state
+            for source in edg_native_cfg_bad_uninit_if.c edg_native_cfg_bad_uninit_loop.c edg_native_cfg_bad_shadow_uninit.c edg_native_cfg_bad_do.c edg_native_cfg_bad_goto.c edg_native_cfg_bad_volatile.c; do
               rm -f bad_edg_cfg.o bad_edg_cfg.log
               if "$binary" bad_edg_cfg.o --c11 "$source" >bad_edg_cfg.log 2>&1; then
                 echo "Unsupported source unexpectedly compiled: $source"
@@ -272,7 +331,18 @@ jobs:
             gcc -std=c11 -O2 -Wall -Wextra -Werror edg_d3_native.o edg_native_d3_driver.c -o compiler_edg_d3
             ./gcc_edg_d3
             ./compiler_edg_d3
-            for source in edg_native_d3_bad_bool.c edg_native_d3_bad_short.c edg_native_d3_bad_float.c edg_native_d3_bad_pointer.c edg_native_d3_bad_effect.c; do
+            # This original "bad effect" fixture is now supported.
+            # Its output must agree with GCC, not be silently admitted.
+            if ! "$binary" edg_d3_effect.o --c11 edg_native_d3_bad_effect.c >edg_d3_effect.log 2>&1; then
+              cat edg_d3_effect.log
+              exit 1
+            fi
+            printf '%s\n' 'int edg_d3_bad_effect(int,int);' 'int main(void) {' 'const int a[]={0,1,-3,7};' 'const int b[]={8,0,2,-1};' 'for (unsigned i=0;i<4;i++) if (edg_d3_bad_effect(a[i],b[i])!=a[i]) return 1;' 'return 0;' '}' >edg_d3_effect_driver.c
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_native_d3_bad_effect.c edg_d3_effect_driver.c -o gcc_edg_d3_effect
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_d3_effect.o edg_d3_effect_driver.c -o compiler_edg_d3_effect
+            ./gcc_edg_d3_effect
+            ./compiler_edg_d3_effect
+            for source in edg_native_d3_bad_bool.c edg_native_d3_bad_short.c edg_native_d3_bad_float.c edg_native_d3_bad_pointer.c; do
               rm -f bad_edg_d3.o bad_edg_d3.log
               if "$binary" bad_edg_d3.o --c11 "$source" >bad_edg_d3.log 2>&1; then
                 echo "Unsupported EDG D3 C semantics unexpectedly compiled: $source"
@@ -341,7 +411,23 @@ jobs:
             gcc -std=c11 -O2 -Wall -Wextra -Werror edg_d3c_values.o edg_native_d3c_values_driver.c -o compiler_d3c
             ./gcc_d3c
             ./compiler_d3c
-            for source in edg_native_d3c_bad_ternary_assign.c edg_native_d3c_bad_effectful_logical.c edg_native_d3c_bad_pointer.c; do
+            # Conditional assignment arms and logical assignment operands
+            # now carry per-path source SSA versions. Check the original
+            # C11 sources against GCC-linked executable behavior.
+            if ! "$binary" edg_d3c_ternary.o --c11 edg_native_d3c_bad_ternary_assign.c >edg_d3c_ternary.log 2>&1; then
+              cat edg_d3c_ternary.log
+              exit 1
+            fi
+            if ! "$binary" edg_d3c_logical.o --c11 edg_native_d3c_bad_effectful_logical.c >edg_d3c_logical.log 2>&1; then
+              cat edg_d3c_logical.log
+              exit 1
+            fi
+            printf '%s\n' 'int edg_d3c_bad_ternary_assign(int,int);' 'int edg_d3c_bad_effectful_logical(int,int);' 'int main(void) {' 'const int c[]={0,1,-3,0,2};' 'const int x[]={7,0,-9,-11,42};' 'for (unsigned i=0;i<5;i++) {' 'int want=c[i]?x[i]:3;' 'if (edg_d3c_bad_ternary_assign(c[i],x[i])!=want) return 1;' 'if (edg_d3c_bad_effectful_logical(c[i],x[i])!=(c[i]!=0)) return 2;' '}' 'return 0;' '}' >edg_d3c_effect_driver.c
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_native_d3c_bad_ternary_assign.c edg_native_d3c_bad_effectful_logical.c edg_d3c_effect_driver.c -o gcc_edg_d3c_effect
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_d3c_ternary.o edg_d3c_logical.o edg_d3c_effect_driver.c -o compiler_edg_d3c_effect
+            ./gcc_edg_d3c_effect
+            ./compiler_edg_d3c_effect
+            for source in edg_native_d3c_bad_pointer.c; do
               rm -f bad_d3c.o bad_d3c.log
               if "$binary" bad_d3c.o --c11 "$source" >bad_d3c.log 2>&1; then
                 echo "Source with unmodeled C expression effects unexpectedly compiled: $source"
@@ -727,12 +813,16 @@ jobs:
             probe edg_native_struct_fields.c edg_native_struct_fields_driver.c records
             probe edg_stdio_hello_puts.c '' glibc-puts
             probe edg_stdio_printf_many.c '' glibc-printf-stack
-            # Temporary controlled rollback remains usable on the same
-            # original source, but the unflagged command above is TypeId.
-            "$binary" rollback_legacy.o --legacy-x86 --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu edg_stdio_hello_puts.c >rollback.log 2>&1
-            gcc -std=c11 -O2 rollback_legacy.o -o rollback_legacy
-            ./rollback_legacy >rollback.out
-            test "$(cat rollback.out)" = 'Hello, world!'
+            # The retired legacy-x86 rollback must not reappear as a
+            # second executable compiler backend. Reject the old flag
+            # with no partial ELF; the TypeId runs above are authoritative.
+            rm -f rollback_legacy.o
+            if "$binary" rollback_legacy.o --legacy-x86 --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu edg_stdio_hello_puts.c >rollback.log 2>&1; then
+              cat rollback.log
+              echo "Retired EDG legacy-x86 backend unexpectedly accepted" >&2
+              exit 1
+            fi
+            test ! -e rollback_legacy.o
             rm -f typeid_bad_fp.o
             if "$binary" typeid_bad_fp.o --typeid-native --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu edg_stdio_printf_bad_fp.c >typeid_bad_fp.log 2>&1; then
               echo "TypeId native illegally accepted unsupported floating point vararg"
