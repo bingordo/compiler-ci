@@ -79,7 +79,7 @@ ulimit -c 0
 # Baseline: these public C fixtures independently isolate GNU layout,
 # linkage, calling-convention, and naked attributes. GCC is the dialect
 # oracle; EDG acceptance is a different, parser-only result.
-for kind in alignment linkage abi naked; do
+for kind in alignment linkage abi naked control_globals weak_function section_function control_asm aligned_global; do
   fixture="/workspace/bootstrap/fixtures/edg-gnu-attributes/${kind}.c"
   test -s "$fixture"
   gcc -std=gnu11 -fsyntax-only "$fixture"
@@ -142,7 +142,7 @@ timeout --signal=TERM --kill-after=10s 20m cargo build --quiet \
   --manifest-path compiler/tools/edg-driver/Cargo.toml
 native=/workspace/compiler/tools/edg-driver/target/debug/compiler-edg-driver
 test -x "$native"
-for kind in alignment linkage abi naked; do
+for kind in alignment linkage abi naked control_globals weak_function section_function control_asm aligned_global; do
   fixture="/workspace/bootstrap/fixtures/edg-gnu-attributes/${kind}.c"
   output="/audit-tmp/edg-gnu-${kind}.o"
   rm -f "$output"
@@ -155,6 +155,21 @@ for kind in alignment linkage abi naked; do
   kind_rc=$?
   set -e
   echo "EDG_GNU_ATTR_NATIVE_${kind^^}_EXIT=$kind_rc"
+  if (( kind_rc != 0 )); then
+    # This is a public source fixture, so a short structured rejection
+    # message is safe. Do not apply this to the private real-C logs.
+    python3 - "/audit-tmp/edg-gnu-${kind}-native.log" "${kind^^}" <<'PY'
+from pathlib import Path
+import sys
+lines = Path(sys.argv[1]).read_text(errors="replace").splitlines()
+matches = [line.split("rejected source:", 1)[-1].strip()
+           for line in lines if "rejected source:" in line]
+if matches:
+    print("EDG_GNU_ATTR_NATIVE_" + sys.argv[2] + "_REJECTION=" + matches[0][:240])
+else:
+    print("EDG_GNU_ATTR_NATIVE_" + sys.argv[2] + "_REJECTION=no_native_adapter_diagnostic")
+PY
+  fi
   if (( kind_rc == 0 )); then
     # Check that success actually produced an ELF64 object without depending
     # on the absent 'file' utility in the pinned EDG container.
