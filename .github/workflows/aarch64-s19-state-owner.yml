@@ -76,3 +76,86 @@ jobs:
                   for tok in ('X','PSTATE','R','AddWithCarry'):
                       print('S19_INSTR_USE',op,tok,'count',len(re.findall(r'\b'+tok+r'\b',asl)))
           PY
+
+  source-owner-typecheck:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    container:
+      image: ocaml/opam:alpine-3.21-ocaml-5.2
+      options: --user root
+    env:
+      OPAMROOT: /home/opam/.opam
+      OPAMROOTISOK: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: herd/herdtools7
+          ref: cfc4f56c522ec0d701acaf5a23139b47e8711299
+          path: herd
+          persist-credentials: false
+      - name: Build exact upstream ASLRef
+        shell: sh
+        run: |
+          set -eu
+          apk add --no-cache bash python3 curl coreutils git openssh-client gmp-dev pkgconf
+          opam install -y dune menhir zarith
+          (cd herd && opam exec -- dune build -p aslref --profile release)
+          ./herd/_build/default/asllib/aslref.exe --version | grep -Fx 'aslref version 1.0-EAC2'
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 83f60a5eddc1745745af73b1fe1f7f7dc788d9
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Compare real source-owned X PSTATE vs original missing-state typing
+        shell: sh
+        run: |
+          set -eu
+          test "$(git -C compiler rev-parse HEAD)" = 83f60a5eddc1745745af73b1fe1f7f7dc788d9
+          curl -fLsS --retry 3 --connect-timeout 20 --max-time 240 --max-filesize 200000000 -o /tmp/arm2026.tar.gz https://developer.arm.com/-/cdn-downloads/permalink/Exploration-Tools-A64-ISA/ISA_A64/ISA_A64_xml_A_profile-2026-09.tar.gz
+          echo '44cfb89c763c7eea8e59de0ad2221e3c012e6aa77899bd7f1c3e1f24537191d7  /tmp/arm2026.tar.gz' | sha256sum -c -
+          python3 - <<'PY'
+          import sys, json, tarfile, tempfile, re, subprocess, hashlib
+          from pathlib import Path
+          sys.path.insert(0,'compiler/tools')
+          from aarch64_a32_addwithcarry_asl_runtime import published_addwithcarry
+          from aarch64_a32_source_state_owners import pinned_state_sources,state_candidate
+          from aarch64_a32_adc_full_instruction_frontier import INSTRUCTIONS,valid_entry,probe_program
+          from aarch64_a32_aslref_compat import load_bundler
+          from aarch64_a32_asl_source_links import ROOT
+          from aarch64_a32_full_source_catalog import validate_catalog
+          from aarch64_a32_asl_source_links import source_entries
+          archive=Path('/tmp/arm2026.tar.gz')
+          sources=pinned_state_sources(archive)
+          state=state_candidate(sources)
+          helper=published_addwithcarry(archive)
+          bundler=load_bundler(Path('herd/herd/libdir/asl-pseudocode/bundler.py'))
+          exe=str(Path('herd/_build/default/asllib/aslref.exe').resolve())
+          # Cross-check original pins and only compare the effect of real owner additions.
+          with tarfile.open(archive,'r:gz') as tar,tempfile.TemporaryDirectory() as td:
+              folder=Path(td)
+              for op,pin in INSTRUCTIONS.items():
+                  raw=tar.extractfile(ROOT+op.lower()+'.xml').read()
+                  path=folder/(op.lower()+'.xml')
+                  path.write_bytes(raw)
+                  instruction=bundler.one_instruction_to_string(path)
+                  assert hashlib.sha256(raw).hexdigest()==pin['xml_sha256']
+                  assert hashlib.sha256(instruction.encode()).hexdigest()==pin['bundled_sha256']
+                  outcomes=[]
+                  for has_state in (False,True):
+                      script=(state+'\n' if has_state else '') + probe_program(helper,instruction,pin['entry'])
+                      inp=folder/(op.lower()+('_with_state' if has_state else '_baseline')+'.asl')
+                      inp.write_text(script)
+                      r=subprocess.run([exe,'--version-eac1','--type-check-strict','--no-exec','-1',inp.name],cwd=folder,capture_output=True,timeout=70)
+                      diag=r.stderr.decode('utf8','replace')
+                      kinds={k:len(re.findall(v,diag,re.I)) for k,v in [
+                          ('undefined',r'\bundefined\b'),
+                          ('type_error',r'type error'),
+                          ('grammar_error',r'grammar error'),
+                          ('conflicting',r'conflict'),
+                          ('unbound',r'\bunbound\b')]}
+                      outcomes.append((has_state,r.returncode,kinds,len(r.stderr)))
+                  print('S19_ORIGINAL_TYPED_OWNER_DIFFERENTIAL',op,outcomes)
+                  assert len(outcomes)==2 and outcomes[0][1]!=0
+          PY
