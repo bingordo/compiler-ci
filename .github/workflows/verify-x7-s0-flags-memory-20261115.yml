@@ -1,0 +1,98 @@
+name: X7 S0 source CMP TEST and real memory physical encoder events
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-x7-s0-flags-memory-20261115.yml'
+permissions:
+  contents: read
+jobs:
+  physical-source-flags-memory-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: dd790aea461c6a3d77e83a00200a5a06949c946b
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin exact compiler source on compiler-ci only
+        run: test "$(git -C compiler rev-parse HEAD)" = "dd790aea461c6a3d77e83a00200a5a06949c946b"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-source-flags-memory-actual-encoder
+      - name: Isolate local TypeId backend (no pinned SSH frontend needed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Actual physical flags and memory source provenance and negative checks
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test x7_s0_other_form_encoder_events -- --nocapture
+          cargo test -p compiler-backend-x86 --test x7_s3l_l4c_typeid_flags_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test x7_s3l_l5d_gp_write_typeid_native -- --nocapture
+          cargo test -p compiler-backend-x86 --no-default-features --test x7_s0_other_form_encoder_events -- --nocapture
+          cargo test -p compiler-backend-x86 --no-default-features --test x7_s3l_l4c_typeid_flags_native -- --nocapture
+          cargo test -p compiler-backend-x86 --no-default-features --lib
+          cargo test -p compiler-backend-x86 --lib
+          echo X7_S0_SOURCE_FLAGS_MEMORY_PHYSICAL_ENCODER_PASS
+  unmodified-source-and-gas-elf:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust pinned frontend sources
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: dd790aea461c6a3d77e83a00200a5a06949c946b
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Exact compiler revision
+        run: test "$(git -C compiler rev-parse HEAD)" = "dd790aea461c6a3d77e83a00200a5a06949c946b"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-s0-source-flags-real-source
+      - name: Real optimized Mini-C driver v2 JSON and unchanged native object
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test x7_s0_source_encoder_report -- --nocapture
+          cargo test -p compiler --test x86_annotated_asm
+          cargo check -p compiler
+          cargo build -p compiler
+          python3 tools/x86_x7_s0_source_cohort.py \
+            --compiler target/debug/compiler \
+            --destination /tmp/x7-s0-flags-memory-sources \
+            --source-revision dd790aea461c6a3d77e83a00200a5a06949c946b \
+            --source tests/fixtures/inliner/rolling_checksum.c \
+            --source tests/fixtures/inliner/RollingChecksum.mod \
+            --source examples/Math.mod \
+            --source examples/lto-build/caller.c \
+            --source examples/lto-build/helper.c
+          echo X7_S0_REAL_SOURCE_FLAGS_MEMORY_V2_COHORT_PASS
+      - name: Preserve exact JSON + observed and plain ELF objects
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-s0-actual-source-flags-memory-encoder-cohort
+          path: /tmp/x7-s0-flags-memory-sources
+          if-no-files-found: ignore
