@@ -79,7 +79,7 @@ ulimit -c 0
 # Baseline: these public C fixtures independently isolate GNU layout,
 # linkage, calling-convention, and naked attributes. GCC is the dialect
 # oracle; EDG acceptance is a different, parser-only result.
-for kind in alignment linkage abi naked control_globals weak_function section_function control_asm aligned_global; do
+for kind in alignment linkage abi naked control_globals weak_function section_function control_asm aligned_global scalar_global weak_scalar_global; do
   fixture="/workspace/bootstrap/fixtures/edg-gnu-attributes/${kind}.c"
   test -s "$fixture"
   gcc -std=gnu11 -fsyntax-only "$fixture"
@@ -142,7 +142,7 @@ timeout --signal=TERM --kill-after=10s 20m cargo build --quiet \
   --manifest-path compiler/tools/edg-driver/Cargo.toml
 native=/workspace/compiler/tools/edg-driver/target/debug/compiler-edg-driver
 test -x "$native"
-for kind in alignment linkage abi naked control_globals weak_function section_function control_asm aligned_global; do
+for kind in alignment linkage abi naked control_globals weak_function section_function control_asm aligned_global scalar_global weak_scalar_global; do
   fixture="/workspace/bootstrap/fixtures/edg-gnu-attributes/${kind}.c"
   output="/audit-tmp/edg-gnu-${kind}.o"
   rm -f "$output"
