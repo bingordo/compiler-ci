@@ -1,0 +1,56 @@
+name: BT4 isolate legacy x86 inliner from debug builds
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/bt4-x86-inliner-unit-scope-20261115.yml'
+permissions:
+  contents: read
+jobs:
+  bt4-inliner:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9ccdcd8bed1bad9921fbecb9896c54c20b4707f7
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert source and historical regression preservation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 9ccdcd8bed1bad9921fbecb9896c54c20b4707f7
+          python3 compiler/tools/check_bt4_backend_boundary.py
+          python3 - <<'PY'
+          from pathlib import Path
+          root = Path("compiler/crates/backend-x86")
+          lib = (root/"src/lib.rs").read_text()
+          old = (root/"tests/inliner_target_cost.rs")
+          new = root/"tests/unit/inliner_target_cost.rs"
+          assert not old.exists()
+          assert new.is_file()
+          tests = new.read_text()
+          assert tests.count("#[test]") == 3
+          assert "use crate::inliner_cost;" in tests
+          assert 'mod inliner_target_cost_tests;' in lib
+          assert '#[cfg(any(test, feature = "historical-function-oracle"))]\npub mod inliner_cost;' in lib
+          print("BT4_INLINER_TEST_ONLY_SOURCE_PASS count=3")
+          PY
+      - name: Minimal full x86 core workspace (offline)
+        shell: bash
+        run: |
+          printf '[workspace]\nresolver="2"\nmembers=["crates/ir","crates/opt","crates/backend","crates/backend-x86"]\n' > compiler/Cargo.toml
+      - name: Test all original inliner cases in ordinary default library suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 --offline --lib inliner_target_cost_tests -- --nocapture
+          cargo test -p compiler-backend-x86 --offline --lib
+          cargo test -p compiler-backend-x86 --offline --lib --no-default-features
+          cargo check -p compiler-backend-x86 --offline
+          cargo check -p compiler-backend-x86 --offline --release
+          cargo check -p compiler-backend-x86 --offline --features historical-function-oracle
+          echo BT4_INLINER_DEBUG_NOT_LEGACY_GREEN
