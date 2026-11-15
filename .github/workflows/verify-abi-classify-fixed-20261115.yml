@@ -1,0 +1,63 @@
+name: ABI fixed FP/aggregate classifier, independent of FP TypeId IR (compiler #1830)
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-abi-classify-fixed-20261115.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  class-oracle:
+    name: fixed ABI classes / ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x86_64
+            os: ubuntu-24.04
+          - platform: aarch64
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 22959a6b6466f46fe34030dbd8db6515310e2db1
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require exact compiler source and isolated FP-IR paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "22959a6b6466f46fe34030dbd8db6515310e2db1"
+          test -f compiler/crates/backend/src/abi_classify.rs
+          test -f compiler/crates/backend/src/lib.rs
+          echo "Source pin 22959a6b6466f46fe34030dbd8db6515310e2db1 / host $(uname -m)" >> "$GITHUB_STEP_SUMMARY"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: abi-fixed-classify-only-20261115
+      - name: Isolate compiler IR and shared backend (no FP branch or source compiler)
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Rustfmt for new ABI classifier only
+        run: rustfmt --edition 2021 --check compiler/crates/backend/src/abi_classify.rs
+      - name: Run independent ABI classification and existing generic backend unit tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib abi_classify -- --nocapture
+          cargo test -p compiler-backend --lib
+      - name: Strict shared backend lib Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend --lib -- -D warnings
