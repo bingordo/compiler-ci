@@ -1,7 +1,7 @@
 name: EDG GNU attributes - isolated parser and TypeId diagnostic
 on:
   push:
-    branches: [ci/standalone-edg-gnu-attribute-probe, ci/edg-gnu-attribute-control-slices]
+    branches: [ci/standalone-edg-gnu-attribute-probe, ci/edg-gnu-attribute-control-slices, ci/edg-bootstrap-scalar-global-provenance]
     paths:
       - '.github/workflows/probe-edg-gnu-attributes.yml'
       - 'bootstrap/run-mrustc-edg-gap.sh'
@@ -76,7 +76,7 @@ jobs:
             tail -n 20 "$RUNNER_TEMP/edg-attributes-audit.log"
             exit "$rc"
           fi
-          for kind in ALIGNMENT LINKAGE ABI NAKED CONTROL_GLOBALS WEAK_FUNCTION SECTION_FUNCTION CONTROL_ASM ALIGNED_GLOBAL; do
+          for kind in ALIGNMENT LINKAGE ABI NAKED CONTROL_GLOBALS WEAK_FUNCTION SECTION_FUNCTION CONTROL_ASM ALIGNED_GLOBAL SCALAR_GLOBAL WEAK_SCALAR_GLOBAL; do
             grep -q "^EDG_GNU_ATTR_PARSE_${kind}_EXIT=" "$RUNNER_TEMP/edg-attributes-audit.log" || {
               echo "::error::Missing EDG GNU attribute result for $kind"
               exit 1
@@ -112,6 +112,86 @@ jobs:
             fi
           else
             echo "EDG_GNU_ATTR_SECTION_FUNCTION_ELF=object_not_emitted"
+          fi
+          # A successful native exit is not sufficient: this source requires
+          # an ELF WEAK definition, whereas the plain control requires a
+          # real, externally defined data symbol.
+          for kind in scalar_global weak_scalar_global; do
+            object="$RUNNER_TEMP/edg-gnu-$kind.o"
+            if [[ ! -s "$object" ]]; then
+              echo "EDG_GNU_ATTR_${kind^^}_ELF=object_not_emitted"
+              continue
+            fi
+            if [[ "$kind" == weak_scalar_global ]]; then
+              if readelf -W -s "$object" |
+                 grep -Eq 'WEAK.*probe_scalar_global'; then
+                echo "EDG_GNU_ATTR_WEAK_SCALAR_GLOBAL_ELF=weak"
+              else
+                echo "EDG_GNU_ATTR_WEAK_SCALAR_GLOBAL_ELF=not_weak"
+              fi
+            elif readelf -W -s "$object" |
+                 grep -Eq 'GLOBAL.*probe_scalar_global'; then
+              echo "EDG_GNU_ATTR_SCALAR_GLOBAL_ELF=defined_global_candidate"
+            else
+              echo "EDG_GNU_ATTR_SCALAR_GLOBAL_ELF=no_global_symbol"
+            fi
+          done
+          # Bootstrap safety gate: until EDG source attribute provenance
+          # reaches TypeId, an accepted weak definition must carry STB_WEAK.
+          # A clear rejection with no ELF is safe; success with a strong
+          # definition is a compiler correctness regression.
+          weak_exit=$(sed -n 's/^EDG_GNU_ATTR_NATIVE_WEAK_SCALAR_GLOBAL_EXIT=//p' "$RUNNER_TEMP/edg-attributes-audit.log" | tail -n 1)
+          if [[ -z "$weak_exit" ]]; then
+            echo "::error::Missing native weak C global result"
+            exit 1
+          fi
+          if [[ "$weak_exit" == "0" ]]; then
+            if [[ "$weak_exit" == "0" && ! -s "$RUNNER_TEMP/edg-gnu-weak_scalar_global.o" ]]; then
+              echo "::error::Native weak global claimed success without ELF"
+              exit 1
+            fi
+            if ! readelf -W -s "$RUNNER_TEMP/edg-gnu-weak_scalar_global.o" |
+                 grep -Eq 'WEAK.*probe_scalar_global'; then
+              echo "::error::Native C weak definition silently lost STB_WEAK"
+              exit 1
+            fi
+          elif [[ -e "$RUNNER_TEMP/edg-gnu-weak_scalar_global.o" ]]; then
+            echo "::error::Rejected weak C global left partial ELF"
+            exit 1
+          fi
+          # When the C source-defined scalar is implemented, require a real
+          # cross-TU load and writable ELF data, not initializer substitution.
+          plain_exit=$(sed -n 's/^EDG_GNU_ATTR_NATIVE_SCALAR_GLOBAL_EXIT=//p' "$RUNNER_TEMP/edg-attributes-audit.log" | tail -n 1)
+          if [[ -z "$plain_exit" ]]; then
+            echo "::error::Missing plain C global native result"
+            exit 1
+          fi
+          if [[ "$plain_exit" == "0" ]]; then
+            if [[ ! -s "$RUNNER_TEMP/edg-gnu-scalar_global.o" ]]; then
+              echo "::error::Native scalar claimed success without ELF"
+              exit 1
+            fi
+            cat > "$RUNNER_TEMP/scalar-global-harness.c" <<'C'
+          extern int probe_scalar_global;
+          extern int probe_scalar_read(void);
+          int main(void) {
+            if (probe_scalar_global != 7 || probe_scalar_read() != 7) return 1;
+            probe_scalar_global = 29;
+            return probe_scalar_read() == 29 ? 0 : 2;
+          }
+          C
+            if gcc -no-pie "$RUNNER_TEMP/scalar-global-harness.c" \
+                   "$RUNNER_TEMP/edg-gnu-scalar_global.o" \
+                   -o "$RUNNER_TEMP/scalar-global-runtime" &&
+               timeout 10s "$RUNNER_TEMP/scalar-global-runtime"; then
+              echo "EDG_GNU_ATTR_NATIVE_RUNTIME_SCALAR_GLOBAL=pass"
+            else
+              echo "::error::Native C scalar global failed cross-TU read/write"
+              exit 1
+            fi
+          elif [[ -e "$RUNNER_TEMP/edg-gnu-scalar_global.o" ]]; then
+            echo "::error::Rejected plain C global left partial ELF"
+            exit 1
           fi
           cat > "$RUNNER_TEMP/attribute-harness.c" <<'C'
           extern int attribute_layout(void);
