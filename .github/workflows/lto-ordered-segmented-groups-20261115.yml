@@ -1,0 +1,58 @@
+name: LTO ordered segmented archive semantics
+on:
+  push:
+    branches: [verify/lto-ordered-segmented-groups-20261115]
+    paths: ['.github/workflows/lto-ordered-segmented-groups-20261115.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  segmented:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7b959a65734b075608f4aa294139e3bcff21f379
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm compiler source SHA and redirect public Git dependencies
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "7b959a65734b075608f4aa294139e3bcff21f379"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - name: Isolate the driver workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/driver"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: lto-ordered-segments
+      - name: Segmented object and static archive one-pass extraction regressions
+        working-directory: compiler
+        run: |
+          cargo test -p compiler --test lto_ordered_build -- --nocapture
+          cargo test -p compiler --test lto_link_wrapper
+          cargo test -p compiler --test lto_mixed_link
+          cargo test -p compiler --test lto_elf_admission
+          cargo test -p compiler --test lto_elf_visibility
+          cargo test -p compiler --test lto_generated_multitu
+      - name: Strict LTO segmented linker lint
+        working-directory: compiler
+        run: cargo clippy -p compiler --test lto_ordered_build -- -D warnings
+      - name: Existing Make and CMake executable workflows
+        working-directory: compiler
+        run: |
+          make -C examples/lto-build COMPILER="$(pwd)/target/debug/compiler"
+          examples/lto-build/program
+          cmake -S examples/lto-build -B /tmp/lto-segments-cmake-${{ github.run_id }} -DCOMPILER_LTO_DRIVER="$(pwd)/target/debug/compiler"
+          cmake --build /tmp/lto-segments-cmake-${{ github.run_id }}
+          /tmp/lto-segments-cmake-${{ github.run_id }}/program
