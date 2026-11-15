@@ -1,0 +1,143 @@
+name: X7 S3.F exact Intel/XED flag/effect policy
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/x86-s3f-pinned-xed-effect-policy.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  x7-s3f-effect-policy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      SOURCE_SHA: 'c34da4bdb3973eff5c8bfda9441aded1b73980b0'
+      INTEL_REV: '35eface1b7ee003a1cda95005ec5fd83de658a64'
+      PYTHONPATH: compiler/tools
+    steps:
+      - name: Checkout exact compiler candidate, never run compiler Actions
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c34da4bdb3973eff5c8bfda9441aded1b73980b0
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+
+      - name: Retrieve immutable full Intel/XED S2 joined source inventory
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s2-pinned-intel-xed-variant-join
+          run-id: 43635408689
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3f-s2
+
+      - name: Retrieve immutable SHA-linked conditional S3.D source/XED models
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3d-logic-xed-candidate-evidence
+          run-id: 43662715536
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3f-s3d
+
+      - name: Retrieve independently verified S3.E actual XED/native ELF witnesses
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3e-pinned-xed-native-encoding-evidence
+          run-id: 43666444512
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-s3f-s3e
+
+      - name: Verify source revision, original Intel XML and solver preparation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          test -s /tmp/x7-s3f-s2/join-1.json
+          test -s /tmp/x7-s3f-s3d/logic-source-smt.json
+          test -s /tmp/x7-s3f-s3d/logic-xed-width-join.json
+          test -s /tmp/x7-s3f-s3e/exact-xed-native-encoding.json
+          mkdir -p /tmp/x7-s3f-intel /tmp/x7-s3f-proof
+          for op in AND OR XOR; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 45 \
+              "https://raw.githubusercontent.com/intel/SDM/${INTEL_REV}/data/instruction/${op}.xml" \
+              -o "/tmp/x7-s3f-intel/${op}.xml"
+          done
+          python3 -m venv /tmp/x7-s3f-venv
+          /tmp/x7-s3f-venv/bin/python -m pip install 'z3-solver==4.13.4.0'
+
+      - name: Rerun 36 source-conditional SMT checks and exact upstream SHA verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          /tmp/x7-s3f-venv/bin/python -m compileall -q \
+            compiler/tools/x86_s3f_source_xed_effect_policy.py \
+            compiler/tools/test_x86_s3f_source_xed_effect_policy.py
+          /tmp/x7-s3f-venv/bin/python compiler/tools/x86_s3_logic_source_proof.py \
+            --xml-dir /tmp/x7-s3f-intel \
+            --out /tmp/x7-s3f-proof/logic-source-smt.json
+          /tmp/x7-s3f-venv/bin/python - <<'PY'
+          import json, hashlib
+          def sh(p):
+              v=json.load(open(p))
+              return hashlib.sha256(json.dumps(
+                  v, sort_keys=True, separators=(',', ':'), allow_nan=False
+              ).encode()).hexdigest()
+          model = '/tmp/x7-s3f-proof/logic-source-smt.json'
+          earlier = '/tmp/x7-s3f-s3d/logic-source-smt.json'
+          stage = json.load(open('/tmp/x7-s3f-s3d/logic-xed-width-join.json'))
+          assert sh(model) == sh(earlier) == stage['logic_proof_report_sha256']
+          assert json.load(open(model))['smt_unsat_total'] == 36
+          print('X7_S3F_SOURCE_SMT_SHA_MATCH 36 unsat, no ISA admission')
+          PY
+
+      - name: Run real pinned Intel/XED metadata, flag-definedness and negative tests
+        shell: bash
+        env:
+          X7_S3F_REAL_S2_JOIN: /tmp/x7-s3f-s2/join-1.json
+          X7_S3F_REAL_S3D: /tmp/x7-s3f-s3d/logic-xed-width-join.json
+          X7_S3F_REAL_S3E: /tmp/x7-s3f-s3e/exact-xed-native-encoding.json
+          X7_S3F_REAL_INTEL_DIR: /tmp/x7-s3f-intel
+          X7_S3C_PINNED_LOGIC_XML_DIR: /tmp/x7-s3f-intel
+        run: |
+          set -euo pipefail
+          /tmp/x7-s3f-venv/bin/python -m unittest -v \
+            test_x86_s3_logic_source_proof \
+            test_x86_s3_logic_xed_width_join \
+            test_x86_s3f_source_xed_effect_policy
+          /tmp/x7-s3f-venv/bin/python compiler/tools/x86_s3f_source_xed_effect_policy.py \
+            --s2 "$X7_S3F_REAL_S2_JOIN" \
+            --s3d "$X7_S3F_REAL_S3D" \
+            --s3e "$X7_S3F_REAL_S3E" \
+            --intel-dir "$X7_S3F_REAL_INTEL_DIR" \
+            --out /tmp/x7-s3f-proof/source-xed-effects.json
+          /tmp/x7-s3f-venv/bin/python compiler/tools/x86_s3f_source_xed_effect_policy.py \
+            --s2 "$X7_S3F_REAL_S2_JOIN" \
+            --s3d "$X7_S3F_REAL_S3D" \
+            --s3e "$X7_S3F_REAL_S3E" \
+            --intel-dir "$X7_S3F_REAL_INTEL_DIR" \
+            --out /tmp/x7-s3f-proof/source-xed-effects.json --check
+          /tmp/x7-s3f-venv/bin/python - <<'PY'
+          import json
+          r=json.load(open('/tmp/x7-s3f-proof/source-xed-effects.json'))
+          assert r['covered_intel_iforms']==3
+          assert r['conditional_operand_widths']==6
+          assert r['native_decoded_paths_bound_to_effect_metadata']==18
+          assert r['source_xed_undefined_af_action_matches']==3
+          assert r['fault_signal_and_os_state_proven'] is False
+          assert r['production_selection_eligible'] is False
+          assert r['newly_bulk_source_admitted_forms']==0
+          print('X7_S3F_SOURCE_XED_EFFECT_POLICY_PASS iforms=3 bytes=18 eligible=0')
+          PY
+
+      - name: Archive exact effect evidence, not production ISA admission
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-s3f-source-xed-flag-effect-no-admission
+          path: /tmp/x7-s3f-proof/source-xed-effects.json
+          if-no-files-found: error
