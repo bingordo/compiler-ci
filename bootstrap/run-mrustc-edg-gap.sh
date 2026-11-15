@@ -44,6 +44,17 @@ version="$(gcc -dumpfullversion -dumpversion)"
 IFS=. read -r major minor patch <<< "$version"
 gnu_number=$((10#${major}*10000+10#${minor:-0}*100+10#${patch:-0}))
 echo "EDG_C_AUDIT source=$AUDIT_SOURCE gnu_version=$gnu_number"
+# The bridge's native driver discovers GCC include paths; explicitly supply
+# the same host built-in/system directories to the parse-only EDG example.
+mapfile -t gcc_includes < <(
+  gcc -E -x c /dev/null -v 2>&1 |
+    awk '/#include <...> search starts here:/{active=1;next} /^End of search list/{active=0} active && /^ /{sub(/^[[:space:]]+/, "");print}'
+)
+include_args=()
+for dir in "${gcc_includes[@]}"; do
+  if [[ -d "$dir" ]]; then include_args+=("-I$dir"); fi
+done
+echo "EDG_C_AUDIT builtin_include_dirs=${#include_args[@]}"
 timeout --signal=TERM --kill-after=10s 20m cargo build --quiet \
   --manifest-path edgcpp-rust/Cargo.toml --example parse
 parser=/workspace/edgcpp-rust/target/debug/examples/parse
@@ -52,7 +63,7 @@ set +e
 (
   cd /workspace/edgcpp/build/gcc-release
   timeout --signal=TERM --kill-after=10s 90s \
-    "$parser" --gcc --c11 --no_strict_gnu --gnu_version "$gnu_number" "$AUDIT_SOURCE"
+    "$parser" --gcc --c11 --no_strict_gnu --gnu_version "$gnu_number" "${include_args[@]}" "$AUDIT_SOURCE"
 ) > /audit-tmp/edg-generated-c-parse.log 2>&1
 parse_rc=$?
 set -e
