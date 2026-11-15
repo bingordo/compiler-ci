@@ -140,3 +140,37 @@ jobs:
                   print('S18_ORIGINAL_ASL_TYPE_FRONTIER',op,'rc',r.returncode,'categories',categories,'bytes',len(r.stderr),'source_modified',False)
                   assert r.returncode!=0, 'unexpectedly complete architecture state without register inputs'
           PY
+
+      - name: Install private source checkout dependency
+        shell: sh
+        run: apk add --no-cache openssh-client
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: df9f2c68c79fdd73c666fd640b1792cc367ddeb9
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Validate exact compiler S18 full original-body frontiers
+        shell: sh
+        run: |
+          set -eu
+          test "$(git -C compiler rev-parse HEAD)" = df9f2c68c79fdd73c666fd640b1792cc367ddeb9
+          python3 -m unittest discover -s compiler/tools -p 'test_aarch64_a32_adc_full_instruction_frontier.py' -v
+          python3 compiler/tools/aarch64_a32_full_source_catalog.py --isa-xml-archive /tmp/arm2026.tar.gz --out /tmp/s18-source-catalog.json
+          python3 compiler/tools/aarch64_a32_adc_full_instruction_frontier.py \
+            --catalog /tmp/s18-source-catalog.json --archive /tmp/arm2026.tar.gz \
+            --bundler herd/herd/libdir/asl-pseudocode/bundler.py \
+            --aslref "$(pwd)/herd/_build/default/asllib/aslref.exe" \
+            --out /tmp/s18-original-instruction-frontier.json
+          python3 - <<'PY'
+          import json
+          x=json.load(open('/tmp/s18-original-instruction-frontier.json'))
+          assert x['operation_count']==2
+          assert [r['operation'] for r in x['operations']]==['ADC','ADCS']
+          assert all(r['parser_or_arch_state_blocked'] and not r['strict_typechecked'] for r in x['operations'])
+          assert all(r['diagnostic_categories']['undefined'] > 0 for r in x['operations'])
+          assert x['original_helper_unmodified'] and x['original_instructions_unmodified']
+          assert not x['instruction_execution_verified'] and not x['architectural_state_equivalence_proven'] and not x['selection_eligible']
+          print('S18_EXACT_ORIGINAL_ASL_ARCHITECTURAL_STATE_GATE',x['operation_count'])
+          PY
