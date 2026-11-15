@@ -1,0 +1,101 @@
+name: X7 S3.L L5 register-only source batch candidate census
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/x86-s3l-l5-reg-batch-20261115.yml'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  source-candidate-census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      SOURCE_SHA: 'db75b46dd2229ff5ba115a5001a4ab9a542a66de'
+      PYTHONPATH: compiler/tools
+      X7_S3L_L4A_S2: /tmp/x7-l5-batch/s2/join-1.json
+      X7_S3L_L4A_SMT: /tmp/x7-l5-batch/smt/semantics-z3.json
+      X7_S3L_L4A_OP_AST: /tmp/x7-l5-batch/smt/operations.json
+      X7_S3L_L4A_INTEL_DIR: /tmp/x7-l5-batch/intel
+    steps:
+      - name: Checkout exact compiler source without compiler Actions
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: db75b46dd2229ff5ba115a5001a4ab9a542a66de
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pinned independent original Intel/XED S2 report
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s2-pinned-intel-xed-variant-join
+          run-id: 43635408689
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-l5-batch/s2
+      - name: Original Intel semantics AST and UNSAT source SMT certificates
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3l-l2b-l3a-9-ops-generic-helper-smt-source-evidence
+          run-id: 43687620382
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-l5-batch/smt
+      - name: Download exact source files for every proven operation, not a per-iform list
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          mkdir -p "$X7_S3L_L4A_INTEL_DIR" /tmp/x7-l5-batch/out
+          python3 - <<'PY'
+          import json, os, pathlib, re, subprocess
+          ast=json.load(open(os.environ["X7_S3L_L4A_OP_AST"]))
+          directory=pathlib.Path(os.environ["X7_S3L_L4A_INTEL_DIR"])
+          names=sorted(r["name"] for r in ast["normalized"])
+          assert 1 <= len(names) <= 128 and len(names)==len(set(names))
+          for name in names:
+              assert re.fullmatch(r"[A-Z][A-Z0-9_]*",name), name
+              url=("https://raw.githubusercontent.com/intel/SDM/"
+                   "35eface1b7ee003a1cda95005ec5fd83de658a64/"
+                   "data/instruction/"+name+".xml")
+              subprocess.run(["curl","--fail","--silent","--show-error",
+                              "--location","--retry","2","--max-time","50",
+                              url,"-o",str(directory/(name+".xml"))],check=True)
+          print("X7_L5_SCANNED_SOURCE_OPERATIONS",len(names),names)
+          PY
+      - name: Run original Intel/XED/SMT batch generation and adversarial tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile compiler/tools/x86_s3l_l5_register_batch.py \
+            compiler/tools/test_x86_s3l_l5_register_batch.py
+          python3 -m unittest -v test_x86_s3l_l5_register_batch
+          python3 compiler/tools/x86_s3l_l5_register_batch.py \
+            --intel-dir "$X7_S3L_L4A_INTEL_DIR" \
+            --operation-ast "$X7_S3L_L4A_OP_AST" \
+            --generic-smt "$X7_S3L_L4A_SMT" \
+            --s2 "$X7_S3L_L4A_S2" \
+            --out /tmp/x7-l5-batch/out/real-register-flags-candidates.json
+          python3 - <<'PY'
+          import json
+          p='/tmp/x7-l5-batch/out/real-register-flags-candidates.json'
+          r=json.load(open(p))
+          assert r["new_production_admissions"] == 0
+          assert r["native_typeid_selections"] == 0
+          assert r["candidate_unique_iforms"] >= 1
+          print("X7_L5_GP_GP_CANDIDATES",r["candidate_unique_iforms"],
+                "width-variants",r["candidate_form_width_variants"],
+                "blocked",len(r["blocked"]))
+          for row in r["candidates"]:
+              print("X7_L5_GP_GP_ELIGIBLE_SOURCE",row["intel_iform"],
+                    row["widths"],row["intel_iform_sha256"],
+                    row["xed_variant_id"])
+          PY
+      - name: Preserve original source census and blockers, not production evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-s3l-l5-original-register-iform-candidates-not-admitted
+          path: /tmp/x7-l5-batch/out/real-register-flags-candidates.json
+          if-no-files-found: ignore
