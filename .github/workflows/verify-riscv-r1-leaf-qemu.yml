@@ -1,0 +1,87 @@
+name: RV64 R1 TypeId i64 leaf ELF and QEMU oracle
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-riscv-r1-leaf-qemu.yml']
+permissions:
+  contents: read
+jobs:
+  leaf:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 160dd5854353f95e0a1e011ce355e39db83d1929
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "160dd5854353f95e0a1e011ce355e39db83d1929"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install independent GNU RISC-V tools and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y binutils-riscv64-linux-gnu qemu-user python3-yaml
+      - name: Restrict workspace to frontend-independent crates
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-riscv64"]
+          EOF
+          rm -f Cargo.lock
+      - name: Run Rust tests and generated source contract checks
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-riscv64 --all-targets
+          cargo clippy -p compiler-backend-riscv64 --all-targets -- -D warnings
+          python3 tools/riscv_udb_rust_leaf_forms.py \
+            --catalog data/riscv_udb_r0_catalog.json \
+            --output crates/backend-riscv64/src/generated_encoding.rs --check
+      - name: Emit direct TypeId RV64 ELF and matching GAS assembly
+        working-directory: compiler
+        run: |
+          cargo run -p compiler-backend-riscv64 --example rv64_leaf -- \
+            /tmp/rv64_add_leaf.o /tmp/rv64_add_leaf.s
+          riscv64-linux-gnu-readelf -h /tmp/rv64_add_leaf.o
+          riscv64-linux-gnu-readelf -s /tmp/rv64_add_leaf.o
+          riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+            /tmp/rv64_add_leaf.s -o /tmp/rv64_leaf_from_gas.o
+          riscv64-linux-gnu-objcopy -O binary -j .text \
+            /tmp/rv64_add_leaf.o /tmp/rv64_leaf_direct.bin
+          riscv64-linux-gnu-objcopy -O binary -j .text \
+            /tmp/rv64_leaf_from_gas.o /tmp/rv64_leaf_gas.bin
+          cmp /tmp/rv64_leaf_direct.bin /tmp/rv64_leaf_gas.bin
+          riscv64-linux-gnu-objdump -dr /tmp/rv64_add_leaf.o
+      - name: Link a static RV64 LP64 Linux syscall harness and execute under QEMU
+        run: |
+          set -euo pipefail
+          cat > /tmp/rv64_start.s <<'EOF'
+          .option norvc
+          .text
+          .globl _start
+          _start:
+            addi a0, zero, 7
+            addi a1, zero, 18
+            call rv64_add_leaf
+            addi a7, zero, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+            /tmp/rv64_start.s -o /tmp/rv64_start.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax \
+            -e _start /tmp/rv64_start.o /tmp/rv64_add_leaf.o \
+            -o /tmp/rv64_leaf.elf
+          set +e
+          qemu-riscv64 /tmp/rv64_leaf.elf
+          status=$?
+          set -e
+          test "$status" -eq 25
+          echo "RV64 TypeId ELF/QEMU result: $status (expected 25)"
