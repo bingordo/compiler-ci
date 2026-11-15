@@ -1,0 +1,50 @@
+name: LTO GCC style linker wrapper integration
+on:
+  push:
+    branches: [verify/lto-gcc-link-wrapper-20261115]
+    paths: ['.github/workflows/lto-gcc-link-wrapper-20261115.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  gcc-adapter:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2ff6ce36448b29ef92c859037e184484070079ed
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned source and public Git frontend dependencies
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "2ff6ce36448b29ef92c859037e184484070079ed"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - name: Focus native compiler workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/driver"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: lto-gcc-link-wrapper
+      - name: Execute native build wrapper and LTO regression tests
+        working-directory: compiler
+        run: |
+          python3 -m py_compile tools/lto-link-wrapper.py
+          cargo test -p compiler --test lto_link_wrapper -- --nocapture
+          cargo test -p compiler --test lto_ordered_build
+          cargo test -p compiler --test lto_mixed_link
+          cargo test -p compiler --test lto_elf_admission
+          cargo test -p compiler --test lto_elf_visibility
+      - name: Strict targeted lint
+        working-directory: compiler
+        run: cargo clippy -p compiler --test lto_link_wrapper -- -D warnings
