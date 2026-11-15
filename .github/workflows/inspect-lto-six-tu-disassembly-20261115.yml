@@ -1,0 +1,87 @@
+name: Inspect six TU GCC vs compiler native and LTO assembly
+on:
+  push:
+    branches: [inspect/lto-six-tu-disassembly-20261115]
+    paths: ['.github/workflows/inspect-lto-six-tu-disassembly-20261115.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9d82575c17b1046d6a86be3a4a6ed1e9ef282f3a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and allow public deps
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "9d82575c17b1046d6a86be3a4a6ed1e9ef282f3a"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - name: Focus native driver workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/driver"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: six-tu-asm-inspection
+      - name: Generate identical TUs and compile three modes
+        working-directory: compiler
+        run: |
+          cargo build -p compiler --bin compiler
+          mkdir -p /tmp/lto-asm-inspect
+          python3 - <<'PY'
+          import runpy
+          from pathlib import Path
+          f=runpy.run_path("tools/lto-runtime-bench.py")
+          f["generate_sources"](Path("/tmp/lto-asm-inspect"),350000)
+          PY
+          cd /tmp/lto-asm-inspect
+          gcc -O2 -c main.c -o main.o
+          for i in 0 1 2 3 4 5; do
+            gcc -O2 -c unit_${i}.c -o gcc-unit_${i}.o
+            "$GITHUB_WORKSPACE/compiler/target/debug/compiler" unit_${i}.c --language mini-c --target x86_64 --emit obj -o unit_${i}.o --lto-sidecar unit_${i}.clto
+          done
+          gcc main.o gcc-unit_{0,1,2,3,4,5}.o -o gcc-native
+          gcc main.o unit_{0,1,2,3,4,5}.o -o compiler-native
+          python3 "$GITHUB_WORKSPACE/compiler/tools/lto-link-wrapper.py" --compiler "$GITHUB_WORKSPACE/compiler/target/debug/compiler" -- main.o unit_{0,1,2,3,4,5}.o -o compiler-lto
+          sha256sum gcc-native compiler-native compiler-lto
+          for mode in gcc-native compiler-native compiler-lto; do
+            printf "CHECKSUM %s: " "$mode"
+            ./"$mode"
+            size -A "$mode" | grep -E '^\\.text|^Total'
+            objdump -t "$mode" | grep -E ' unit_[0-5]$| local$| bias$' | head -35 || true
+            objdump -dr -Mintel --no-show-raw-insn "$mode" > "${mode}.asm"
+          done
+          cat > /tmp/lto-asm-inspect/selected-disassembly.txt <<'EOF'
+          Source-pinned six-TU disassembly, -O2 GCC vs compiler native vs compiler LTO.
+          Symbols: main, unit_0, unit_1, unit_2, unit_3, unit_4, unit_5.
+          EOF
+          for mode in gcc-native compiler-native compiler-lto; do
+            for sym in main unit_0 unit_1 unit_2 unit_3 unit_4 unit_5; do
+              printf '\\n==== %s %s ====\\n' "$mode" "$sym" | tee -a selected-disassembly.txt
+              objdump -d -Mintel --no-show-raw-insn --disassemble="$sym" "$mode" | tee -a selected-disassembly.txt
+            done
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: six-tu-asm-comparison
+          path: |
+            /tmp/lto-asm-inspect/selected-disassembly.txt
+            /tmp/lto-asm-inspect/gcc-native.asm
+            /tmp/lto-asm-inspect/compiler-native.asm
+            /tmp/lto-asm-inspect/compiler-lto.asm
+            /tmp/lto-asm-inspect/unit_0.c
+            /tmp/lto-asm-inspect/unit_1.c
+            /tmp/lto-asm-inspect/unit_5.c
