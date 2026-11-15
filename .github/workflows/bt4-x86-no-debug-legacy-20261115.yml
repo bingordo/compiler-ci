@@ -1,0 +1,86 @@
+name: BT4 x86 historical Function no-debug default-tests parity
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/bt4-x86-no-debug-legacy-20261115.yml'
+permissions:
+  contents: read
+jobs:
+  x86-history-isolated:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - name: Exact compiler SHA; never compiler Actions
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7e4dd96ff18564500010b0a4f76de48fd09b5595
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Source boundary and negative debug gate mutation tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 7e4dd96ff18564500010b0a4f76de48fd09b5595
+          cd compiler
+          python3 tools/check_bt4_backend_boundary.py
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          import sys
+          guard = [sys.executable, 'tools/check_bt4_backend_boundary.py']
+          def mutation(path, old, new, expected):
+              data = path.read_text()
+              assert old in data, (path, old)
+              path.write_text(data.replace(old, new, 1))
+              try:
+                  r = subprocess.run(guard, capture_output=True, text=True)
+                  assert r.returncode != 0, f'bad source guard accepted mutation {path}'
+                  assert expected in r.stderr, r.stderr
+              finally:
+                  path.write_text(data)
+          lib = Path('crates/backend-x86/src/lib.rs')
+          manifest = Path('crates/backend-x86/Cargo.toml')
+          mutation(
+              lib,
+              '#[cfg(any(test, feature = "historical-function-oracle"))]\npub mod historical_backend;',
+              '#[cfg(any(test, debug_assertions, feature = "historical-function-oracle"))]\npub mod historical_backend;',
+              'historical x86 Function emitter entered normal debug builds',
+          )
+          mutation(
+              manifest,
+              'compiler-backend-x86 = { path = ".", features = ["historical-function-oracle"] }',
+              'compiler-backend-x86 = { path = "." }',
+              'missing test-only historical self dev-dependency feature',
+          )
+          print('BT4_X86_DEBUG_SOURCE_AND_NEGATIVE_MUTANTS_PASS')
+          PY
+          python3 tools/check_bt4_backend_boundary.py
+      - name: Core backend workspace offline
+        run: |
+          printf '[workspace]\nresolver="2"\nmembers=["crates/ir","crates/opt","crates/backend","crates/backend-x86"]\n' > compiler/Cargo.toml
+      - name: Non-test debug/release build does not require historical Function
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo check --offline -p compiler-backend-x86
+          cargo check --offline -p compiler-backend-x86 --release
+          cargo rustc --offline -p compiler-backend-x86 --lib -- --print cfg > /tmp/normal-x86-cfg.txt
+          if grep -Fq 'feature="historical-function-oracle"' /tmp/normal-x86-cfg.txt; then
+            echo 'historical feature improperly auto-enabled for non-test debug build'
+            exit 1
+          fi
+          cargo check --offline -p compiler-backend-x86 --features historical-function-oracle
+          echo BT4_X86_OLD_FUNCTION_NOT_IN_DEBUG_PASS
+      - name: Exact original historical x86 library and integration suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test --offline -p compiler-backend-x86 --lib
+          cargo test --offline -p compiler-backend-x86 --lib --no-default-features
+          cargo test --offline -p compiler-backend-x86 --tests --no-run
+          cargo test --offline -p compiler-backend-x86 --tests
+          echo BT4_X86_ALL_ORIGINAL_TESTS_GREEN
