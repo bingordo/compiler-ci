@@ -1,0 +1,207 @@
+name: S23.50o default-on integer/XOR DAG cancellations
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-50o-integer-dag-admission.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  default-generated-mode:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler candidate (Actions only on compiler-ci)
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 68abae4f5f9e16314815373e7056544ef3a5bb16
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check source pin and configure public Cargo Git dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 68abae4f5f9e16314815373e7056544ef3a5bb16
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          mkdir -p results
+          rustc --version
+          python3 --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: s23-50o-default-on
+      - name: Test native default-on and explicit opt-out
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test native_s2350o_integer_dag_cancel -- --nocapture
+          cargo test -p compiler-opt --test native_s2350n_complement_partition -- --nocapture
+          cargo test -p compiler-opt --test native_s2350m_complement_xor_batch -- --nocapture
+          cargo test -p compiler-opt --test native_default_generated_flags -- --nocapture
+          cargo test -p compiler-opt --test native_s2350_two_op_factoring -- --nocapture
+          cargo clippy -p compiler-opt --test native_s2350o_integer_dag_cancel -- -D warnings
+          cargo clippy -p compiler-opt --test native_default_generated_flags -- -D warnings
+          cargo check -p compiler-opt --no-default-features
+      - name: Validate 55 rule families and generated SSA matcher code
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools/typeid-rule-gen -p 'test_*.py' -v
+          python3 tools/typeid-rule-gen/rules.py tools/typeid-rule-gen/examples.rules \
+            --emit-ssa-rust > "$RUNNER_TEMP/s2350o-ssa.rs"
+          rustc --edition=2021 --crate-type=lib "$RUNNER_TEMP/s2350o-ssa.rs" \
+            -o "$RUNNER_TEMP/libs2350o-ssa.rlib"
+      - name: Install signed Ubuntu Z3 solver package for QF_BV proofs
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends z3
+          command -v z3
+          z3 -version
+          dpkg-query -W z3
+
+      - name: Prove 1260 exact-width and orientation obligations with 5 SAT negative controls
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/typeid-rule-gen/prove.py tools/typeid-rule-gen/examples.rules \
+            --timeout-ms 2500 --process-timeout 5 \
+            --manifest "$RUNNER_TEMP/s2350o-proofs.json"
+          python3 - "$RUNNER_TEMP/s2350o-proofs.json" <<'PY'
+          import json,sys
+          x=json.load(open(sys.argv[1]))
+          assert x['schema']=='compiler.typeid-proofs.v1'
+          assert x['logic']=='QF_BV'
+          assert x['family_count']==55
+          assert x['proof_count']==1260
+          assert x['sat_negative_controls']==5
+          assert len({(p['id'],p['width'],p['orientation']) for p in x['proofs']})==1260
+          assert all(p['result']=='unsat' for p in x['proofs'])
+          print("S2350O_PROOFS families=55 unsat=1260 sat_controls=5",flush=True)
+          PY
+
+      - name: Build real production driver, check CLI help
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release -p compiler --bin compiler
+          target/release/compiler --help | tee "$GITHUB_WORKSPACE/results/help.txt"
+          grep -- '--no-generated-rewrites' "$GITHUB_WORKSPACE/results/help.txt"
+          grep -- '--generated-rewrites' "$GITHUB_WORKSPACE/results/help.txt"
+      - name: Compare real x86 objects and execute GCC oracle in three modes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > results/factor.c <<'EOF'
+          int factor(int x, int y, int z) {
+            return (x & y) | (x & z);
+          }
+          int maskfold(int x, int y) {
+            return (x ^ y) | (x & y);
+          }
+          int addnot(int x) {
+            return x + ~x;
+          }
+          int xorpair(int x, int y, int z) {
+            return (x ^ y) ^ (x ^ z);
+          }
+          int subaddpair(int x, int y, int z) {
+            return (x + y) - (x + z);
+          }
+          int addsubchain(int x, int y, int z) {
+            return (x - y) + (y - z);
+          }
+          int subsubpair(int x, int y, int z) {
+            return (x - y) - (x - z);
+          }
+          int subaddsub(int x, int y, int z) {
+            return (x + y) - (x - z);
+          }
+          EOF
+          cat > results/oracle.c <<'EOF'
+          extern int factor(int, int, int);
+          extern int maskfold(int, int);
+          extern int addnot(int);
+          extern int xorpair(int,int,int);
+          extern int subaddpair(int,int,int);
+          extern int addsubchain(int,int,int);
+          extern int subsubpair(int,int,int);
+          extern int subaddsub(int,int,int);
+          int main(void) {
+            for (int a = -11; a <= 11; a++)
+              for (int b = -13; b <= 13; b++)
+                for (int c = -9; c <= 9; c++)
+                  if (factor(a,b,c) != ((a & b) | (a & c)))
+                    return 1;
+            for (int a = -31; a <= 31; a++)
+              for (int b = -31; b <= 31; b++)
+                if (maskfold(a,b) != (a | b)) return 2;
+            for (int a = -123; a <= 123; a++)
+              if (addnot(a) != -1) return 3;
+            for (int a = -11; a <= 11; a++)
+              for (int b = -13; b <= 13; b++)
+                for (int c = -9; c <= 9; c++) {
+                  if (xorpair(a,b,c) != (b ^ c)) return 4;
+                  if (subaddpair(a,b,c) != (b-c)) return 5;
+                  if (addsubchain(a,b,c) != (a-c)) return 6;
+                  if (subsubpair(a,b,c) != (c-b)) return 7;
+                  if (subaddsub(a,b,c) != (b+c)) return 8;
+                }
+            return 0;
+          }
+          EOF
+          for mode in default enabled disabled; do
+            case "$mode" in
+              default) flag="" ;;
+              enabled) flag="--generated-rewrites" ;;
+              disabled) flag="--no-generated-rewrites" ;;
+            esac
+            compiler/target/release/compiler results/factor.c \
+              --language mini-c --target x86_64 --emit obj \
+              $flag -o "results/$mode.o"
+            gcc -O0 results/oracle.c "results/$mode.o" -o "results/$mode.exe"
+            "results/$mode.exe"
+          done
+          cmp results/default.o results/enabled.o
+          if compiler/target/release/compiler results/factor.c --language mini-c \
+             --generated-rewrites --no-generated-rewrites --emit obj \
+             -o results/conflict.o >results/conflict.stdout 2>results/conflict.stderr; then
+            echo "conflicting rewrite flags unexpectedly accepted"
+            exit 1
+          fi
+          grep 'choose at most one generated-rewrites flag' results/conflict.stderr
+          echo "S2350O_MODES default=passed on=passed off=passed conflict=rejected"
+      - name: Verify dump and AArch64 object paths honor both rewrite modes
+        shell: bash
+        run: |
+          set -euo pipefail
+          for mode in default disabled; do
+            flag=""
+            if test "$mode" = disabled; then flag="--no-generated-rewrites"; fi
+            compiler/target/release/compiler results/factor.c \
+              --language mini-c --target x86_64 --emit obj $flag \
+              --dump-ir "results/$mode-stages" -o "results/dump-$mode.o"
+            cmp "results/$mode.o" "results/dump-$mode.o"
+            compiler/target/release/compiler results/factor.c \
+              --language mini-c --target aarch64 --emit obj $flag \
+              -o "results/aarch-$mode.o"
+          done
+          file results/aarch-default.o results/aarch-disabled.o
+      - name: Preserve pinned smoke and CLI artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s23-50o-integer-dag-evidence
+          path: results/
+          if-no-files-found: warn
+          retention-days: 14
