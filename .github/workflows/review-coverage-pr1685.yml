@@ -1,0 +1,69 @@
+name: One-off compiler source review coverage PR1685
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/review-coverage-pr1685.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  review:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: bcc13a0eca8265fbfd91cd35def0f982db48ad8f
+          fetch-depth: 12
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin reviewed source
+        run: test "$(git -C compiler rev-parse HEAD)" = "bcc13a0eca8265fbfd91cd35def0f982db48ad8f"
+      - name: Review evidence and dynamic Git inventory
+        working-directory: compiler
+        run: |
+          python3 tools/review_coverage.py --check
+          python3 -m unittest discover -s tools -p 'test_review_coverage.py' -v
+          python3 tools/review_coverage.py --json > /tmp/compiler-review-coverage.json
+          python3 - <<'PY'
+          import json
+          report=json.load(open('/tmp/compiler-review-coverage.json'))
+          assert len(report['files']) == report['total']
+          assert 'crates/backend-riscv64' in report['subsystems']
+          assert 'crates/backend-wasm' in report['subsystems']
+          print('REVIEW_COVERAGE_FILE_COUNT',report['total'])
+          print('REVIEW_COVERAGE_STATUS',report['summary'])
+          PY
+      - name: Check documentation links
+        working-directory: compiler
+        run: python3 tools/check_doc_links.py
+      - name: Self-contained IR and optimizer workspace
+        shell: bash
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: review-coverage-pr1685
+      - name: Typed and legacy dominator oracle
+        working-directory: compiler
+        run: cargo test -p compiler-ir --lib dominance::tests -- --nocapture
+      - name: Full compiler IR unit tests
+        working-directory: compiler
+        run: cargo test -p compiler-ir --lib
+      - name: Verifier mutation regression
+        working-directory: compiler
+        run: cargo test -p compiler-ir --test verifier_mutations
+      - name: Dominator-consuming native CSE regression
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typed_cse
+      - name: Strict IR and optimizer library Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-opt --lib -- -D warnings
