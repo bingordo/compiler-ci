@@ -1,0 +1,62 @@
+name: Review source-pinned TypeId CFG trap PRE LICM
+on:
+  push:
+    branches: [review/typed-cfg-trap-pre-689]
+    paths: ['.github/workflows/review-typed-cfg-trap-pre-689.yml']
+  pull_request:
+    paths: ['.github/workflows/review-typed-cfg-trap-pre-689.yml']
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout compiler-ci
+        uses: actions/checkout@v4
+      - name: Checkout exact reviewed compiler SHA
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 6c30f3ef7f2f12a10006f1313230b5083b112f00
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact source SHA
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "6c30f3ef7f2f12a10006f1313230b5083b112f00"
+      - name: Restrict workspace to reviewed core crates
+        working-directory: compiler
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          """)
+          PY
+      - name: Cache target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: review-cfg-trap-pre-689
+      - name: Run exact-width path-sensitive TypeId PRE/LICM/ifconv reference oracle
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test review_typed_cfg_trap_pre -- --nocapture
+      - name: Existing TypeId PRE and LICM source tests
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typed_pre_native -- --nocapture
+          cargo test -p compiler-opt --test typed_licm_native -- --nocapture
+      - name: Existing branch and loop trap tests
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test loop_trap_semantics -- --nocapture
+          cargo test -p compiler-opt --test division_effects -- --nocapture
+      - name: Strict affected Clippy
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-ir -p compiler-opt --lib -- -D warnings
+          cargo clippy -p compiler-opt --test review_typed_cfg_trap_pre -- -D warnings
