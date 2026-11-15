@@ -18,7 +18,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/mini-c
-          ref: 0f9cd07200024946fce23d7a597184a32a1442e3
+          ref: 55d56d37b598d59a201a2da0db1239c28e5b6a12
           path: mini-c
           persist-credentials: false
       - name: Print source version
@@ -78,6 +78,49 @@ jobs:
           cargo run -q -p mini-c --features internal-cpp -- check \
             --cpp=internal-stream -D_GNU_SOURCE tests/fixtures/glibc-s12/hello_stdio.c
 
+      - name: Bootstrap-scale 68 MiB streaming CPP checker and peak RSS
+        working-directory: mini-c
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          cargo build -q -p mini-c --features internal-cpp
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          root = Path(os.environ["RUNNER_TEMP"]) / "generated-68mib.c"
+          target = 68 * 1024 * 1024
+          with root.open("wb") as out:
+              out.write(b"#define ADD1(x) ((x)+1)\n")
+              for i in range(12000):
+                  out.write(f"int generated_{i} = ADD1({i});\n".encode())
+              out.write(b"/*")
+              remaining = target - out.tell() - len(b"*/\nint final_value = ADD1(41);\n")
+              chunk = b"x" * (1024 * 1024)
+              while remaining > 0:
+                  n = min(remaining, len(chunk))
+                  out.write(chunk[:n])
+                  remaining -= n
+              out.write(b"*/\nint final_value = ADD1(41);\n")
+          assert root.stat().st_size == target, root.stat().st_size
+          print(f"Generated valid C input: {root.stat().st_size:,} bytes")
+          PY
+          # Legacy mode must retain its existing defensive 16 MiB failure.
+          if target/debug/mini-c check --cpp=internal -nostdinc "$RUNNER_TEMP/generated-68mib.c" \
+              >"$RUNNER_TEMP/legacy-output.txt" 2>&1; then
+            echo "ERROR: legacy 16 MiB cap unexpectedly disabled"
+            exit 1
+          fi
+          grep -q 'source byte limit exceeded' "$RUNNER_TEMP/legacy-output.txt"
+          # Streamed mode must parse the entire 68 MiB file, including the
+          # final declaration after the long source comment.
+          timeout --signal=TERM --kill-after=10s 360s \
+            /usr/bin/time -f 'Elapsed seconds: %e; Peak RSS KiB: %M' \
+            -o "$RUNNER_TEMP/stream-68mib-metrics.txt" \
+            target/debug/mini-c check --cpp=internal-stream -nostdinc \
+              "$RUNNER_TEMP/generated-68mib.c"
+          echo '### 68 MiB generated C streaming checker benchmark' >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/stream-68mib-metrics.txt" >> "$GITHUB_STEP_SUMMARY"
+          echo 'Generated workload: 12,000 macro-expanded global initializers plus a long source comment.' >> "$GITHUB_STEP_SUMMARY"
       - name: Mini-C parser and Cranelift internal CPP integration
         working-directory: mini-c
         run: |
