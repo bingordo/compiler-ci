@@ -10,6 +10,16 @@ export EDGCPP_COMPILE_COMMANDS=/workspace/edgcpp/build/gcc-release/compile_comma
 export EDGCPP_LIB_DIR=/workspace/edgcpp/build/gcc-release/lib
 export EDGCPP_EDG_REVISION=b195677be8b9b56c8337afad6be8064d21a54082
 
+# The GitHub runner owns these bind-mounted checkouts, whereas this pinned
+# EDG container may run as a different UID. Trust ONLY the three explicitly
+# mounted checkout directories needed by this probe, not every repository.
+# Git 2.35+ otherwise rejects rev-parse with "dubious ownership" before EDG
+# has a chance to parse any generated C.
+for checkout in /workspace/edgcpp /workspace/edgcpp-rust /workspace/compiler; do
+  test -d "$checkout/.git"
+  git config --global --add safe.directory "$checkout"
+done
+
 test "$(git -C edgcpp rev-parse HEAD)" = "$EDGCPP_EDG_REVISION"
 test "$(git -C edgcpp-rust rev-parse HEAD)" = 6bcf1508555fcc0c892c1e8e00929dda26154931
 test -f "$AUDIT_SOURCE"
