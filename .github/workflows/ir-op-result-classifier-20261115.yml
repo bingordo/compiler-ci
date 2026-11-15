@@ -1,0 +1,50 @@
+name: Exhaustive IR opcode result category
+on:
+  push:
+    branches: [ci/ir-op-result-classifier-20261115]
+    paths: [.github/workflows/ir-op-result-classifier-20261115.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  ir-result:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SOURCE_SHA: 029d4422f168e45e09739e778957cc3c3a29be97
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler SHA
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 029d4422f168e45e09739e778957cc3c3a29be97
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and isolate compilation
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-exhaustive-result-check-20261115
+      - name: IR full regression tests
+        working-directory: compiler
+        run: cargo test -p compiler-ir
+      - name: Cross-crate optimizer and target compatibility
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --lib
+          cargo check -p compiler-backend-x86 -p compiler-backend-aarch64 -p compiler-backend-riscv64 -p compiler-backend-wasm --all-targets
+      - name: Strict IR lint
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir --all-targets -- -D warnings
