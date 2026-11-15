@@ -1,0 +1,113 @@
+name: X7 source-proven DAG action and ordered rule group production parity
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-x7-generated-dag-action-groups-20261115.yml']
+permissions:
+  contents: read
+jobs:
+  generated-rule-semantic-action:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 03e1f028288ba5b3ffb363f1a0463fa65023c7a5
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check pinned compiler revision; run no compiler Actions
+        run: test "$(git -C compiler rev-parse HEAD)" = "03e1f028288ba5b3ffb363f1a0463fa65023c7a5"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-source-proven-dag-native-action
+      - name: Generated table source and action fail-closed tests
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools -p 'test_x86_dag_codegen.py' -v
+          python3 -m unittest discover -s tools -p 'test_x86_dag_rule_groups.py' -v
+          python3 tools/regen_x86_dag_rule_groups.py --check
+      - name: Core local workspace only for source-pinned x86 Rust validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Production native generated DAG matching and ABI/ELF oracles
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend-x86 --no-default-features --lib
+          cargo test -p compiler-backend-x86 --test dag_add_integration_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test x6_add64_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test x4_cfg_pressure_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test x4_effects_native -- --nocapture
+          echo X7_GENERATED_DAG_PRODUCTION_NATIVE_PARITY_PASS
+  normal-source-byte-parity-against-exact-parent:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust pinned Mini-C/Oberon GitHub SSH source
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 03e1f028288ba5b3ffb363f1a0463fa65023c7a5
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: cce91aa1369a1511a4588f0a0a13735d880c98ce
+          path: baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check exact new source and pre-change production baseline SHAs
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "03e1f028288ba5b3ffb363f1a0463fa65023c7a5"
+          test "$(git -C baseline rev-parse HEAD)" = "cce91aa1369a1511a4588f0a0a13735d880c98ce"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-source-proven-dag-source-diff
+      - name: Compile real native driver at both revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p compiler --manifest-path compiler/Cargo.toml
+          cargo build -p compiler --manifest-path baseline/Cargo.toml
+      - name: Unmodified C/Oberon normal TypeId object bytes equal baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/x7-dag-exact-parent-parity
+          for source in \
+            tests/fixtures/inliner/rolling_checksum.c \
+            tests/fixtures/inliner/RollingChecksum.mod \
+            examples/Math.mod \
+            examples/lto-build/caller.c \
+            examples/lto-build/helper.c; do
+            name=$(echo "$source" | tr '/.' '__')
+            cp "compiler/$source" "/tmp/x7-dag-exact-parent-parity/$name.${source##*.}"
+            input="/tmp/x7-dag-exact-parent-parity/$name.${source##*.}"
+            baseline/target/debug/compiler "$input" --target x86_64 --emit obj -o "/tmp/x7-dag-exact-parent-parity/$name.old.o"
+            compiler/target/debug/compiler "$input" --target x86_64 --emit obj -o "/tmp/x7-dag-exact-parent-parity/$name.new.o"
+            cmp "/tmp/x7-dag-exact-parent-parity/$name.old.o" "/tmp/x7-dag-exact-parent-parity/$name.new.o"
+            echo "X7_IDENTICAL_NATIVE_ELF $source"
+          done
+          echo X7_GENERATED_ACTION_5_SOURCE_COHORT_BIT_EXACT
