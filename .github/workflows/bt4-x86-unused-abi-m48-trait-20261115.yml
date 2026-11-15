@@ -1,0 +1,68 @@
+name: BT4 x86 remove unused old constructor and M48 trait methods
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/bt4-x86-unused-abi-m48-trait-20261115.yml'
+permissions:
+  contents: read
+jobs:
+  bt4-x86-legacy-trait:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - name: Exact compiler source; no compiler Actions
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1e5acd751484d8881017403b0be5e9d72e061c21
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Permanent BT4 guard and negative old-method mutant
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 1e5acd751484d8881017403b0be5e9d72e061c21
+          cd compiler
+          python3 tools/check_bt4_backend_boundary.py
+          python3 - <<'PY'
+          import subprocess,sys
+          from pathlib import Path
+          source=Path('crates/backend-x86/src/historical_backend.rs')
+          prior=source.read_text()
+          try:
+              source.write_text(prior+'\n    fn emit_object_linked_with_initializers(&self) {}\n')
+              got=subprocess.run([sys.executable,'tools/check_bt4_backend_boundary.py'],capture_output=True,text=True)
+              assert got.returncode!=0
+              assert 'obsolete historical Function trait forwarding method resurrected' in got.stderr,got.stderr
+          finally:
+              source.write_text(prior)
+          print('BT4_HISTORICAL_M48_SOURCE_NEGATIVE_MUTANT_REJECTED')
+          PY
+          python3 tools/check_bt4_backend_boundary.py
+      - name: Offline x86 core build
+        shell: bash
+        run: |
+          printf '[workspace]\nresolver = "2"\nmembers = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]\n' > compiler/Cargo.toml
+      - name: Build normal and historical explicit x86 library
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo check --offline -p compiler-backend-x86
+          cargo check --offline --release -p compiler-backend-x86
+          cargo check --offline -p compiler-backend-x86 --features historical-function-oracle
+          cargo test --offline -p compiler-backend-x86 --lib
+          cargo test --offline -p compiler-backend-x86 --lib --no-default-features
+      - name: Compile every original x86 integration target and exercise real native ABI
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test --offline -p compiler-backend-x86 --tests --no-run
+          cargo test --offline -p compiler-backend-x86 --test m4_8_checked_symbol_attributes_native
+          cargo test --offline -p compiler-backend-x86 --test m4_8_ssa_tls_native
+          cargo test --offline -p compiler-backend-x86 --test m4_7_gp_variadic_native
+          cargo test --offline -p compiler-backend-x86 --test m4_global_data_only_native
+          cargo test --offline -p compiler-backend-x86 --test bt4_x86_historical_scalar_native
+          echo BT4_UNUSED_HISTORICAL_ABI_M48_REMOVAL_GREEN
