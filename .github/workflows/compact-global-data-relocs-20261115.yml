@@ -1,0 +1,54 @@
+name: Native TypeId compact globals and relocation acceptance
+on:
+  push:
+    branches: [verify/compact-global-data-relocs-20261115]
+    paths: ['.github/workflows/compact-global-data-relocs-20261115.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ef54190c08e15705d417dbde67a4aac729751e82
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source commit
+        run: test "$(git -C compiler rev-parse HEAD)" = "ef54190c08e15705d417dbde67a4aac729751e82"
+      - name: Isolate native workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: native-typeid-compact-global-data-relocs
+      - name: Parser, malformed globals, typed ABI and canonical fixture roundtrips
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-ir --test native_fixture_text --test native_module_text_v3 -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test native_fixed_v3_canonical -- --nocapture
+      - name: Install real AArch64 GCC and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross binutils-aarch64-linux-gnu qemu-user
+      - name: Preserve original global ELF relocation init-array and C11 QEMU ABI oracles
+        working-directory: compiler
+        env:
+          COMPILER_REQUIRE_AARCH64_QEMU: "1"
+        run: |
+          cargo test -p compiler-backend-aarch64 --test module_globals --test typeid_globals_native --test typeid_abi_calls_native -- --nocapture
+      - name: Strict scoped Clippy
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-ir --no-deps --test native_fixture_text --test native_module_text_v3 -- -D warnings
+          cargo clippy -p compiler-backend-aarch64 --no-deps --test module_globals --test typeid_globals_native --test typeid_abi_calls_native --test native_fixed_v3_canonical -- -D warnings
