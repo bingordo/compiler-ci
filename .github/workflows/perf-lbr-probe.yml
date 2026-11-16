@@ -1,0 +1,47 @@
+name: Probe perf LBR
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Check perf and LBR access
+        shell: bash
+        run: |
+          set -uo pipefail
+          echo "CPU and kernel"
+          uname -a
+          lscpu | grep -E 'Model name|Hypervisor|Virtualization' || true
+          cat /proc/sys/kernel/perf_event_paranoid || true
+          sudo apt-get update
+          sudo apt-get install -y linux-tools-common linux-tools-generic
+          PERF="$(command -v perf)"
+          "$PERF" --version
+          echo "Basic PMU"
+          set +e
+          perf stat -e cycles,instructions -- bash -c 'for ((i=0;i<2000000;i++)); do :; done'
+          pmu_rc=$?
+          echo "Basic PMU exit code: $pmu_rc"
+          echo "LBR branch-stack sampling"
+          perf record -o /tmp/lbr.data -e cycles:u -j any,u -- bash -c 'for ((i=0;i<2000000;i++)); do :; done'
+          lbr_rc=$?
+          echo "LBR record exit code: $lbr_rc"
+          if [ "$lbr_rc" -eq 0 ]; then
+            perf script -i /tmp/lbr.data -F ip,brstack > /tmp/lbr.txt
+            script_rc=$?
+            head -n 15 /tmp/lbr.txt
+            if [ "$script_rc" -eq 0 ] && grep -Eq '0x[0-9a-fA-F]+/' /tmp/lbr.txt; then
+              echo "RESULT: LBR branch stacks recorded"
+            else
+              echo "RESULT: perf record succeeded but no branch stacks verified"
+            fi
+          else
+            echo "RESULT: LBR unavailable or restricted"
+          fi
+          echo "PMU_EXIT=$pmu_rc LBR_EXIT=$lbr_rc"
+          exit 0
