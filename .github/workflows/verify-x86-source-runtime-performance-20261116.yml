@@ -1,0 +1,49 @@
+name: x86 real-source generated runtime vs GCC
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/verify-x86-source-runtime-performance-20261116.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 87aaa851c1904340de3ac779e1dd45e8cbb5e1c2
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source and configure private frontends
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "87aaa851c1904340de3ac779e1dd45e8cbb5e1c2"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x86-generated-runtime-20261116
+      - name: Native runtime median and GCC independent correctness oracle
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release -p compiler --test x7_s4_rolling_checksum_source -- --nocapture
+          cargo test --release -p compiler --test x86_source_runtime_performance -- --ignored --nocapture 2>&1 | tee "$RUNNER_TEMP/x86-generated-runtime.log"
+          grep -q 'X86_SOURCE_RUNTIME mode=gcc_O2 ' "$RUNNER_TEMP/x86-generated-runtime.log"
+          grep -q 'X86_SOURCE_RUNTIME mode=mini_default ' "$RUNNER_TEMP/x86-generated-runtime.log"
+          grep -q 'X86_SOURCE_RUNTIME mode=mini_noinline ' "$RUNNER_TEMP/x86-generated-runtime.log"
+          grep -q 'X86_SOURCE_RUNTIME mode=gcc_Os ' "$RUNNER_TEMP/x86-generated-runtime.log"
+      - name: Preserve executable runtime and GCC checksums
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x86-generated-runtime
+          path: ${{ runner.temp }}/x86-generated-runtime.log
+          if-no-files-found: ignore
