@@ -1,0 +1,71 @@
+name: Source-pinned AArch64 nested same-successor mixed PHI callback review #689
+on:
+  push:
+    branches: [review/aarch64-nested-same-successor-689]
+    paths: ['.github/workflows/review-aarch64-nested-same-successor-689.yml']
+  pull_request:
+    paths: ['.github/workflows/review-aarch64-nested-same-successor-689.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 35
+    steps:
+      - name: Checkout temporary CI configuration
+        uses: actions/checkout@v4
+      - name: Checkout exact reviewed compiler PR
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: be5f58ef8a51d1666eef1566b615914e21e9f912
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source SHA on native AArch64
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "be5f58ef8a51d1666eef1566b615914e21e9f912"
+          test "$(uname -m)" = "aarch64"
+          command -v gcc
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Isolate core Rust workspace on ARM64 CI
+        working-directory: compiler
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          """)
+          PY
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: review-aarch64-nested-same-successor-689
+      - name: New nested same-target mixed pointer scalar PHI and returning callback C11 oracle
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test review_aarch64_nested_same_successor_phi -- --nocapture
+      - name: Prior AArch64 mixed critical-edge PHI with returned indirect call
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test review_aarch64_mixed_phi_critical_call -- --nocapture
+      - name: Prior ARM64 local/global and partial-width pointer alias callback controls
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test review_aarch64_mixed_global_escape_loop -- --nocapture
+          cargo test -p compiler-opt --test review_aarch64_loop_byte_phi_callback -- --nocapture
+          cargo test -p compiler-opt --test review_aarch64_byte_phi_indirect_memory -- --nocapture
+      - name: Existing AArch64 pointer PHI, ABI, memory and physical call pressure controls
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-aarch64 --test ptr64_calls -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test typeid_abi_calls_native -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test typeid_historical_pressure -- --nocapture
+      - name: Strict affected library and new TypeId ARM64 test Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-aarch64 --lib -- -D warnings
+          cargo clippy -p compiler-opt --test review_aarch64_nested_same_successor_phi -- -D warnings
