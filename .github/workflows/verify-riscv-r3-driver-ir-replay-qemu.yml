@@ -1,0 +1,131 @@
+name: RV64 R3 unified driver checked TypeId replay GAS QEMU
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-riscv-r3-driver-ir-replay-qemu.yml']
+permissions:
+  contents: read
+jobs:
+  replay:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Configure read-only SSH access to pinned source dependencies
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust pinned GitHub SSH endpoint
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 635c176d540bbefd5e2ce0e11650a2e7a3bf006a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require exact compiler source SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = 635c176d540bbefd5e2ce0e11650a2e7a3bf006a
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Build and validate the complete driver with actual frontend dependencies
+        working-directory: compiler
+        shell: bash
+        env:
+          RV64_DRIVER_IR_FIXTURE_DIR: /tmp/rv64-driver-fixtures
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test riscv64_load_ir -- --nocapture
+          cargo clippy -p compiler --bin compiler --test riscv64_load_ir -- -D warnings
+          cargo build -p compiler --bin compiler
+          python3 tools/regen_riscv_native_selector_rules.py --check
+          python3 tools/riscv_udb_rust_leaf_forms.py \
+            --catalog data/riscv_udb_r0_catalog.json \
+            --output crates/backend-riscv64/src/generated_encoding.rs --check
+          test -f /tmp/rv64-driver-fixtures/add.ir
+          test -f /tmp/rv64-driver-fixtures/add.irb
+          test -f /tmp/rv64-driver-fixtures/mul64.ir
+          test -f /tmp/rv64-driver-fixtures/divs64.ir
+      - name: Install independent RISC-V binutils and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y binutils-riscv64-linux-gnu qemu-user
+      - name: CLI replay metadata and GNU GAS byte parity for all three ISA modes
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="$PWD/target/debug/compiler"
+          for scenario in \
+              "add rv64i rv64i2p1" \
+              "mul64 rv64izmmul rv64i2p1_zmmul1p0" \
+              "divs64 rv64im rv64i2p1_m2p0_zmmul1p0"; do
+            read -r kind mode arch <<<"$scenario"
+            src="/tmp/rv64-driver-fixtures/${kind}.ir"
+            base="/tmp/driver_${kind}"
+            "$binary" --load-ir "$src" --target riscv64 --riscv-isa "$mode" \
+              --emit obj -o "${base}.o"
+            "$binary" --load-ir "$src" --target riscv64 --riscv-isa "$mode" \
+              --emit asm -o "${base}.s"
+            riscv64-linux-gnu-as -march="$mode" -mabi=lp64 "${base}.s" -o "${base}_gas.o"
+            riscv64-linux-gnu-objcopy -O binary -j .text "${base}.o" "${base}.bin"
+            riscv64-linux-gnu-objcopy -O binary -j .text "${base}_gas.o" "${base}_gas.bin"
+            cmp "${base}.bin" "${base}_gas.bin"
+            riscv64-linux-gnu-readelf -A "${base}.o" | grep -F "Tag_RISCV_arch: \"${arch}\""
+            riscv64-linux-gnu-readelf -SW "${base}.o" | \
+              grep -E '[[:space:]]+\.riscv\.attributes[[:space:]]+RISCV_ATTRIBUTES'
+          done
+          # The selected-mode feature gate must run before either file can be written.
+          if "$binary" --load-ir /tmp/rv64-driver-fixtures/divs64.ir \
+              --target riscv64 --riscv-isa rv64izmmul \
+              --emit obj -o /tmp/driver_should_not_exist.o >/tmp/reject-driver.log 2>&1; then
+            echo 'Zmmul-only driver accidentally emitted RV64IM DIV' >&2
+            exit 1
+          fi
+          grep -q 'unsupported scalar instruction' /tmp/reject-driver.log
+          test ! -e /tmp/driver_should_not_exist.o
+      - name: Execute compiler-driver-generated RV64IM ELF objects under QEMU
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/rv64_driver_start.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            mv s0, sp
+            li a0, 40
+            li a1, 2
+            call rv64_add_leaf
+            li t0, 42
+            bne a0, t0, failure
+            bne sp, s0, failure
+            li a0, 7
+            li a1, 6
+            call rv64_mul64_leaf
+            li t0, 42
+            bne a0, t0, failure
+            bne sp, s0, failure
+            li a0, 84
+            li a1, 2
+            call rv64_divs64_leaf
+            li t0, 42
+            bne a0, t0, failure
+            bne sp, s0, failure
+            li a0, 0
+            j exit
+          failure:
+            li a0, 1
+          exit:
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64im -mabi=lp64 \
+            /tmp/rv64_driver_start.s -o /tmp/rv64_driver_start.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax -e _start \
+            /tmp/rv64_driver_start.o /tmp/driver_add.o \
+            /tmp/driver_mul64.o /tmp/driver_divs64.o -o /tmp/rv64_driver_link.elf
+          timeout 15s qemu-riscv64 /tmp/rv64_driver_link.elf
+          echo 'Verified TypeId -> unified compiler CLI -> direct ELF -> static LP64 QEMU succeeded'
