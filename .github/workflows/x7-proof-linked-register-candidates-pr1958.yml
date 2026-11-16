@@ -1,0 +1,94 @@
+name: X7 proof-linked generic register candidates PR1958
+on:
+  pull_request:
+    paths: ['.github/workflows/x7-proof-linked-register-candidates-pr1958.yml']
+permissions:
+  contents: read
+  actions: read
+jobs:
+  original-intel-xed-smt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SOURCE_SHA: 81c3c5b8975743d7838a7f7dd7eb6b9cc6de028a
+      PYTHONPATH: compiler/tools
+      X7_S3L_L4A_INTEL_DIR: /tmp/x7-proof/intel
+      X7_S3L_L4A_OP_AST: /tmp/x7-proof/smt/operations.json
+      X7_S3L_L4A_SMT: /tmp/x7-proof/smt/semantics-z3.json
+      X7_S3L_L4A_S2: /tmp/x7-proof/s2/join-1.json
+    steps:
+      - name: Exact-source compiler checkout, without compiler Actions
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 81c3c5b8975743d7838a7f7dd7eb6b9cc6de028a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Frozen original Intel/XED candidate identity
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s2-pinned-intel-xed-variant-join
+          run-id: 43635408689
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-proof/s2
+      - name: Independent nine-operation source AST and Z3 proof certificates
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3l-l2b-l3a-9-ops-generic-helper-smt-source-evidence
+          run-id: 43687620382
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-proof/smt
+      - name: Fetch pinned original Intel operation XML
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          mkdir -p "$X7_S3L_L4A_INTEL_DIR" /tmp/x7-proof/out
+          for name in ADD SUB CMP AND OR XOR TEST ADC SBB; do
+            curl -fsSL --retry 2 --max-time 50 \
+              "https://raw.githubusercontent.com/intel/SDM/35eface1b7ee003a1cda95005ec5fd83de658a64/data/instruction/$name.xml" \
+              -o "$X7_S3L_L4A_INTEL_DIR/$name.xml"
+          done
+      - name: Source-proven complete real-form census and fail-closed mutations
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile compiler/tools/x86_s3l_l5_register_batch.py compiler/tools/test_x86_s3l_l5_register_batch.py
+          python3 -m unittest -v test_x86_s3l_l5_register_batch
+          python3 compiler/tools/x86_s3l_l5_register_batch.py \
+            --intel-dir "$X7_S3L_L4A_INTEL_DIR" \
+            --operation-ast "$X7_S3L_L4A_OP_AST" \
+            --generic-smt "$X7_S3L_L4A_SMT" --s2 "$X7_S3L_L4A_S2" \
+            --out /tmp/x7-proof/out/candidates.json
+          python3 compiler/tools/x86_s3l_l5_register_batch.py \
+            --intel-dir "$X7_S3L_L4A_INTEL_DIR" \
+            --operation-ast "$X7_S3L_L4A_OP_AST" \
+            --generic-smt "$X7_S3L_L4A_SMT" --s2 "$X7_S3L_L4A_S2" \
+            --out /tmp/x7-proof/out/candidates-replay.json
+          cmp /tmp/x7-proof/out/candidates.json /tmp/x7-proof/out/candidates-replay.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          x=json.loads(Path("/tmp/x7-proof/out/candidates.json").read_text())
+          assert x["new_production_admissions"] == x["native_typeid_selections"] == 0
+          assert x["candidates"], "no original source-proven forms discovered"
+          for c in x["candidates"]:
+              assert len(c["source_operation_sha256"]) == 64
+              assert len(c["source_syntax_ast_sha256"]) == 64
+              assert [p["bits"] for p in c["semantic_width_proofs"]] == [32,64]
+              assert all(len(p["certificate_sha256"]) == 64
+                         and p["proof_status"] == "unsat"
+                         for p in c["semantic_width_proofs"])
+              assert c["production_admitted"] is False
+          print("X7_PROOF_LINKED_REAL_SOURCE_CANDIDATES_PASS", len(x["candidates"]))
+          PY
+      - name: Preserve candidate source/XED/Z3 receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-proof-linked-register-candidates-pr1958
+          path: /tmp/x7-proof/out/*.json
+          if-no-files-found: ignore
