@@ -1,0 +1,2297 @@
+name: RV64 R2 exact LP64 ELF ISA arch attributes GAS QEMU
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-riscv-r2-elf-isa-attributes-qemu.yml']
+permissions:
+  contents: read
+jobs:
+  logic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a4595afcac7f6aad43fbfeae3ef18e9906798bb2
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require exact compiler source revision
+        run: test "$(git -C compiler rev-parse HEAD)" = "a4595afcac7f6aad43fbfeae3ef18e9906798bb2"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Restrict workspace to the native TypeId backend
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-riscv64"]
+          EOF
+          rm -f Cargo.lock
+      - name: Rust, Clippy, exact UDB and source-admission gates
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib
+          cargo test -p compiler-backend-riscv64 --all-targets
+          cargo clippy -p compiler-backend-riscv64 --all-targets -- -D warnings
+          python3 tools/regen_riscv_native_selector_rules.py --check
+          python3 -m unittest discover -s tools -p test_riscv_native_selector_rules.py -v
+          python3 tools/riscv_udb_rust_leaf_forms.py \
+            --catalog data/riscv_udb_r0_catalog.json \
+            --output crates/backend-riscv64/src/generated_encoding.rs --check
+      - name: Install independent RISC-V GAS, objdump, linker and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu qemu-user
+      - name: Independently verify versioned RISC-V ELF ISA attributes and exact GAS parity
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for triple in \
+              "rv64i add rv64i2p1" \
+              "rv64izmmul mul64 rv64i2p1_zmmul1p0" \
+              "rv64im divs64 rv64i2p1_m2p0_zmmul1p0" \
+              "rv64im add rv64i2p1_m2p0_zmmul1p0"; do
+            read -r mode kind arch <<< "$triple"
+            name="/tmp/arch_${mode}_${kind}"
+            cargo run -p compiler-backend-riscv64 --example rv64_leaf -- \
+              "${name}.o" "${name}.s" "$kind" "--isa=${mode}"
+            grep -Fx ".attribute arch, \"${arch}\"" "${name}.s"
+            riscv64-linux-gnu-as -march="${mode}" -mabi=lp64 \
+              "${name}.s" -o "${name}_gas.o"
+            for object in "${name}.o" "${name}_gas.o"; do
+              riscv64-linux-gnu-readelf -A "$object" > "${object}.attributes"
+              grep -F "Tag_RISCV_arch: \"${arch}\"" "${object}.attributes"
+              grep -F "Tag_RISCV_stack_align: 16-bytes" "${object}.attributes"
+              riscv64-linux-gnu-readelf -SW "$object" | \
+                grep -E '[[:space:]]+\.riscv\.attributes[[:space:]]+RISCV_ATTRIBUTES'
+              riscv64-linux-gnu-readelf -h "$object" | \
+                grep -E 'Flags:[[:space:]]+0x0'
+            done
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "${name}.o" "${name}_direct.bin"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "${name}_gas.o" "${name}_gas.bin"
+            cmp "${name}_direct.bin" "${name}_gas.bin"
+          done
+          echo "4 RV64 target/machine pairs have readable exact ISA attributes and GNU GAS parity"
+      - name: Direct ELF vs independent GNU GAS bytes and opcode disassembly
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for kind in mul64 mul32; do
+            case "$kind" in mul64) op=mul ;; mul32) op=mulw ;; esac
+            cargo run -p compiler-backend-riscv64 --example rv64_leaf -- \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}.s" "${kind}"
+            grep -qE "^[[:space:]]+${op} x[0-9]+, x[0-9]+, x[0-9]+$" "/tmp/rv64_${kind}.s"
+            riscv64-linux-gnu-as -march=rv64im -mabi=lp64 \
+              "/tmp/rv64_${kind}.s" -o "/tmp/rv64_${kind}_gas.o"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}_direct.bin"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}_gas.o" "/tmp/rv64_${kind}_gas.bin"
+            cmp "/tmp/rv64_${kind}_direct.bin" "/tmp/rv64_${kind}_gas.bin"
+            riscv64-linux-gnu-objdump -dr "/tmp/rv64_${kind}.o" | grep -w "${op}"
+          done
+      - name: Execute 40 RV64IM multiplication boundary cases under QEMU
+        run: |
+          set -euo pipefail
+          cat > /tmp/rv64_zmmul_start.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            mv s0, sp
+            li a0, 0
+            li a1, 0
+            call rv64_mul64_leaf
+            li t0, 0
+            bne a0, t0, fail1
+            bne sp, s0, fail_sp
+            li a0, 1
+            li a1, 1
+            call rv64_mul64_leaf
+            li t0, 1
+            bne a0, t0, fail2
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, -1
+            call rv64_mul64_leaf
+            li t0, 1
+            bne a0, t0, fail3
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 2
+            call rv64_mul64_leaf
+            li t0, -2
+            bne a0, t0, fail4
+            bne sp, s0, fail_sp
+            li a0, 0
+            li a1, 9223372036854775807
+            call rv64_mul64_leaf
+            li t0, 0
+            bne a0, t0, fail5
+            bne sp, s0, fail_sp
+            li a0, -9223372036854775808
+            li a1, -1
+            call rv64_mul64_leaf
+            li t0, -9223372036854775808
+            bne a0, t0, fail6
+            bne sp, s0, fail_sp
+            li a0, -9223372036854775808
+            li a1, 2
+            call rv64_mul64_leaf
+            li t0, 0
+            bne a0, t0, fail7
+            bne sp, s0, fail_sp
+            li a0, 9223372036854775807
+            li a1, 2
+            call rv64_mul64_leaf
+            li t0, -2
+            bne a0, t0, fail8
+            bne sp, s0, fail_sp
+            li a0, 4294967296
+            li a1, 4294967296
+            call rv64_mul64_leaf
+            li t0, 0
+            bne a0, t0, fail9
+            bne sp, s0, fail_sp
+            li a0, -4294967296
+            li a1, -4294967296
+            call rv64_mul64_leaf
+            li t0, 0
+            bne a0, t0, fail10
+            bne sp, s0, fail_sp
+            li a0, 2147483647
+            li a1, 2147483647
+            call rv64_mul64_leaf
+            li t0, 4611686014132420609
+            bne a0, t0, fail11
+            bne sp, s0, fail_sp
+            li a0, 0x123456789abcdef0
+            li a1, 0x0f0f0f0f0f0f0f0f
+            call rv64_mul64_leaf
+            li t0, -8757983591596482544
+            bne a0, t0, fail12
+            bne sp, s0, fail_sp
+            li a0, -1234567890123456
+            li a1, 987654321
+            call rv64_mul64_leaf
+            li t0, 3472023916819964224
+            bne a0, t0, fail13
+            bne sp, s0, fail_sp
+            li a0, 0x8000000000000000
+            li a1, 3
+            call rv64_mul64_leaf
+            li t0, -9223372036854775808
+            bne a0, t0, fail14
+            bne sp, s0, fail_sp
+            li a0, 0x7fffffffffffffff
+            li a1, 0x7fffffffffffffff
+            call rv64_mul64_leaf
+            li t0, 1
+            bne a0, t0, fail15
+            bne sp, s0, fail_sp
+            li a0, 0x5555555555555555
+            li a1, 0xaaaaaaaaaaaaaaaa
+            call rv64_mul64_leaf
+            li t0, 2049638230412172402
+            bne a0, t0, fail16
+            bne sp, s0, fail_sp
+            li a0, 65536
+            li a1, 65536
+            call rv64_mul64_leaf
+            li t0, 4294967296
+            bne a0, t0, fail17
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 9223372036854775807
+            call rv64_mul64_leaf
+            li t0, -9223372036854775807
+            bne a0, t0, fail18
+            bne sp, s0, fail_sp
+            li a0, 0x0000000100000001
+            li a1, 0x0000000100000001
+            call rv64_mul64_leaf
+            li t0, 8589934593
+            bne a0, t0, fail19
+            bne sp, s0, fail_sp
+            li a0, -987654321
+            li a1, -123456789
+            call rv64_mul64_leaf
+            li t0, 121932631112635269
+            bne a0, t0, fail20
+            bne sp, s0, fail_sp
+            li a0, 0
+            li a1, 0
+            call rv64_mul32_leaf
+            li t0, 0
+            bne a0, t0, fail21
+            bne sp, s0, fail_sp
+            li a0, 1
+            li a1, 1
+            call rv64_mul32_leaf
+            li t0, 1
+            bne a0, t0, fail22
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, -1
+            call rv64_mul32_leaf
+            li t0, 1
+            bne a0, t0, fail23
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 2
+            call rv64_mul32_leaf
+            li t0, -2
+            bne a0, t0, fail24
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, -1
+            call rv64_mul32_leaf
+            li t0, -2147483648
+            bne a0, t0, fail25
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, 2
+            call rv64_mul32_leaf
+            li t0, 0
+            bne a0, t0, fail26
+            bne sp, s0, fail_sp
+            li a0, 2147483647
+            li a1, 2
+            call rv64_mul32_leaf
+            li t0, -2
+            bne a0, t0, fail27
+            bne sp, s0, fail_sp
+            li a0, 65536
+            li a1, 65536
+            call rv64_mul32_leaf
+            li t0, 0
+            bne a0, t0, fail28
+            bne sp, s0, fail_sp
+            li a0, 32768
+            li a1, 32768
+            call rv64_mul32_leaf
+            li t0, 1073741824
+            bne a0, t0, fail29
+            bne sp, s0, fail_sp
+            li a0, -32768
+            li a1, -32768
+            call rv64_mul32_leaf
+            li t0, 1073741824
+            bne a0, t0, fail30
+            bne sp, s0, fail_sp
+            li a0, 46341
+            li a1, 46341
+            call rv64_mul32_leaf
+            li t0, -2147479015
+            bne a0, t0, fail31
+            bne sp, s0, fail_sp
+            li a0, -46341
+            li a1, 46341
+            call rv64_mul32_leaf
+            li t0, 2147479015
+            bne a0, t0, fail32
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, -2147483648
+            call rv64_mul32_leaf
+            li t0, 0
+            bne a0, t0, fail33
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, 2147483647
+            call rv64_mul32_leaf
+            li t0, -2147483648
+            bne a0, t0, fail34
+            bne sp, s0, fail_sp
+            li a0, 0x7fffffff
+            li a1, 0x7fffffff
+            call rv64_mul32_leaf
+            li t0, 1
+            bne a0, t0, fail35
+            bne sp, s0, fail_sp
+            li a0, -123456789
+            li a1, 987654321
+            call rv64_mul32_leaf
+            li t0, 67153019
+            bne a0, t0, fail36
+            bne sp, s0, fail_sp
+            li a0, 1431655765
+            li a1, -1431655766
+            call rv64_mul32_leaf
+            li t0, 1908874354
+            bne a0, t0, fail37
+            bne sp, s0, fail_sp
+            li a0, -987654321
+            li a1, -123456789
+            call rv64_mul32_leaf
+            li t0, -67153019
+            bne a0, t0, fail38
+            bne sp, s0, fail_sp
+            li a0, 0x80000001
+            li a1, 0x80000001
+            call rv64_mul32_leaf
+            li t0, 1
+            bne a0, t0, fail39
+            bne sp, s0, fail_sp
+            li a0, 0xffffffff
+            li a1, 0xffffffff
+            call rv64_mul32_leaf
+            li t0, 1
+            bne a0, t0, fail40
+            bne sp, s0, fail_sp
+            li a0, 0
+            j exit
+          fail1: li a0, 1
+            j exit
+          fail2: li a0, 2
+            j exit
+          fail3: li a0, 3
+            j exit
+          fail4: li a0, 4
+            j exit
+          fail5: li a0, 5
+            j exit
+          fail6: li a0, 6
+            j exit
+          fail7: li a0, 7
+            j exit
+          fail8: li a0, 8
+            j exit
+          fail9: li a0, 9
+            j exit
+          fail10: li a0, 10
+            j exit
+          fail11: li a0, 11
+            j exit
+          fail12: li a0, 12
+            j exit
+          fail13: li a0, 13
+            j exit
+          fail14: li a0, 14
+            j exit
+          fail15: li a0, 15
+            j exit
+          fail16: li a0, 16
+            j exit
+          fail17: li a0, 17
+            j exit
+          fail18: li a0, 18
+            j exit
+          fail19: li a0, 19
+            j exit
+          fail20: li a0, 20
+            j exit
+          fail21: li a0, 21
+            j exit
+          fail22: li a0, 22
+            j exit
+          fail23: li a0, 23
+            j exit
+          fail24: li a0, 24
+            j exit
+          fail25: li a0, 25
+            j exit
+          fail26: li a0, 26
+            j exit
+          fail27: li a0, 27
+            j exit
+          fail28: li a0, 28
+            j exit
+          fail29: li a0, 29
+            j exit
+          fail30: li a0, 30
+            j exit
+          fail31: li a0, 31
+            j exit
+          fail32: li a0, 32
+            j exit
+          fail33: li a0, 33
+            j exit
+          fail34: li a0, 34
+            j exit
+          fail35: li a0, 35
+            j exit
+          fail36: li a0, 36
+            j exit
+          fail37: li a0, 37
+            j exit
+          fail38: li a0, 38
+            j exit
+          fail39: li a0, 39
+            j exit
+          fail40: li a0, 40
+            j exit
+          fail_sp: li a0, 41
+          exit:
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64im -mabi=lp64 \
+            /tmp/rv64_zmmul_start.s -o /tmp/rv64_zmmul_start.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax \
+            -e _start /tmp/rv64_zmmul_start.o \
+            /tmp/rv64_mul64.o /tmp/rv64_mul32.o -o /tmp/rv64_zmmul.elf
+          timeout 15s qemu-riscv64 /tmp/rv64_zmmul.elf
+          echo "40 RV64 Zmmul TypeId multiplication wraparound and sign-extension QEMU cases passed"
+      - name: Validate eight full-M checked division operations against GAS
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for kind in divs32 divs64 divu32 divu64 rems32 rems64 remu32 remu64; do
+            case "$kind" in
+              divs32) op=divw ;;
+              divs64) op=div ;;
+              divu32) op=divuw ;;
+              divu64) op=divu ;;
+              rems32) op=remw ;;
+              rems64) op=rem ;;
+              remu32) op=remuw ;;
+              remu64) op=remu ;;
+            esac
+            cargo run -p compiler-backend-riscv64 --example rv64_leaf -- \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}.s" "$kind" --isa=rv64im
+            grep -Eq "^[[:space:]]+${op} x[0-9]+, x[0-9]+, x[0-9]+$" "/tmp/rv64_${kind}.s"
+            grep -q "    ebreak" "/tmp/rv64_${kind}.s"
+            grep -q "    bne x" "/tmp/rv64_${kind}.s"
+            riscv64-linux-gnu-as -march=rv64im -mabi=lp64 \
+              "/tmp/rv64_${kind}.s" -o "/tmp/rv64_${kind}_gas.o"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}_direct.bin"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}_gas.o" "/tmp/rv64_${kind}_gas.bin"
+            cmp "/tmp/rv64_${kind}_direct.bin" "/tmp/rv64_${kind}_gas.bin"
+            riscv64-linux-gnu-objdump -dr "/tmp/rv64_${kind}.o" | grep -w "$op"
+            rm -f "/tmp/forbidden_${kind}.o" "/tmp/forbidden_${kind}.s"
+            if cargo run -p compiler-backend-riscv64 --example rv64_leaf -- \
+              "/tmp/forbidden_${kind}.o" "/tmp/forbidden_${kind}.s" "$kind" --isa=rv64izmmul \
+              > "/tmp/reject_${kind}.log" 2>&1; then
+              echo "ERROR: Zmmul-only mode accepted full M $kind" >&2
+              exit 1
+            fi
+            grep -q "unsupported scalar instruction" "/tmp/reject_${kind}.log"
+            test ! -e "/tmp/forbidden_${kind}.o"
+            test ! -e "/tmp/forbidden_${kind}.s"
+          done
+      - name: Execute valid RV64IM quotient/remainder LP64 QEMU oracle
+        run: |
+          set -euo pipefail
+          cat > /tmp/rv64_divrem_valid.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            mv s0, sp
+            li a0, 0
+            li a1, 1
+            call rv64_divs32_leaf
+            li t0, 0
+            bne a0, t0, fail1
+            bne sp, s0, fail_sp
+            li a0, 1
+            li a1, 1
+            call rv64_divs32_leaf
+            li t0, 1
+            bne a0, t0, fail2
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 1
+            call rv64_divs32_leaf
+            li t0, -1
+            bne a0, t0, fail3
+            bne sp, s0, fail_sp
+            li a0, 1
+            li a1, -1
+            call rv64_divs32_leaf
+            li t0, -1
+            bne a0, t0, fail4
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 2
+            call rv64_divs32_leaf
+            li t0, 0
+            bne a0, t0, fail5
+            bne sp, s0, fail_sp
+            li a0, 2
+            li a1, -1
+            call rv64_divs32_leaf
+            li t0, -2
+            bne a0, t0, fail6
+            bne sp, s0, fail_sp
+            li a0, 7
+            li a1, 3
+            call rv64_divs32_leaf
+            li t0, 2
+            bne a0, t0, fail7
+            bne sp, s0, fail_sp
+            li a0, -7
+            li a1, 3
+            call rv64_divs32_leaf
+            li t0, -2
+            bne a0, t0, fail8
+            bne sp, s0, fail_sp
+            li a0, 7
+            li a1, -3
+            call rv64_divs32_leaf
+            li t0, -2
+            bne a0, t0, fail9
+            bne sp, s0, fail_sp
+            li a0, -7
+            li a1, -3
+            call rv64_divs32_leaf
+            li t0, 2
+            bne a0, t0, fail10
+            bne sp, s0, fail_sp
+            li a0, 2147483647
+            li a1, 2
+            call rv64_divs32_leaf
+            li t0, 1073741823
+            bne a0, t0, fail11
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, 2
+            call rv64_divs32_leaf
+            li t0, -1073741824
+            bne a0, t0, fail12
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 2
+            call rv64_divs32_leaf
+            li t0, 0
+            bne a0, t0, fail13
+            bne sp, s0, fail_sp
+            li a0, 0
+            li a1, 2
+            call rv64_divs32_leaf
+            li t0, 0
+            bne a0, t0, fail14
+            bne sp, s0, fail_sp
+            li a0, 0
+            li a1, -1
+            call rv64_divs32_leaf
+            li t0, 0
+            bne a0, t0, fail15
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, 2147483647
+            call rv64_divs32_leaf
+            li t0, -1
+            bne a0, t0, fail16
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 3
+            call rv64_divs32_leaf
+            li t0, 0
+            bne a0, t0, fail17
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, -2
+            call rv64_divs32_leaf
+            li t0, 0
+            bne a0, t0, fail18
+            bne sp, s0, fail_sp
+            li a0, 0
+            li a1, -1
+            call rv64_divs32_leaf
+            li t0, 0
+            bne a0, t0, fail19
+            bne sp, s0, fail_sp
+            li a0, -1698898192
+            li a1, 74565
+            call rv64_divs32_leaf
+            li t0, -22784
+            bne a0, t0, fail20
+            bne sp, s0, fail_sp
+            li a0, -2
+            li a1, -2
+            call rv64_divs32_leaf
+            li t0, 1
+            bne a0, t0, fail21
+            bne sp, s0, fail_sp
+            li a0, -3
+            li a1, 7
+            call rv64_divs32_leaf
+            li t0, 0
+            bne a0, t0, fail22
+            bne sp, s0, fail_sp
+            li a0, 0
+            li a1, 1
+            call rv64_divs64_leaf
+            li t0, 0
+            bne a0, t0, fail23
+            bne sp, s0, fail_sp
+            li a0, 1
+            li a1, 1
+            call rv64_divs64_leaf
+            li t0, 1
+            bne a0, t0, fail24
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 1
+            call rv64_divs64_leaf
+            li t0, -1
+            bne a0, t0, fail25
+            bne sp, s0, fail_sp
+            li a0, 1
+            li a1, -1
+            call rv64_divs64_leaf
+            li t0, -1
+            bne a0, t0, fail26
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 2
+            call rv64_divs64_leaf
+            li t0, 0
+            bne a0, t0, fail27
+            bne sp, s0, fail_sp
+            li a0, 2
+            li a1, -1
+            call rv64_divs64_leaf
+            li t0, -2
+            bne a0, t0, fail28
+            bne sp, s0, fail_sp
+            li a0, 7
+            li a1, 3
+            call rv64_divs64_leaf
+            li t0, 2
+            bne a0, t0, fail29
+            bne sp, s0, fail_sp
+            li a0, -7
+            li a1, 3
+            call rv64_divs64_leaf
+            li t0, -2
+            bne a0, t0, fail30
+            bne sp, s0, fail_sp
+            li a0, 7
+            li a1, -3
+            call rv64_divs64_leaf
+            li t0, -2
+            bne a0, t0, fail31
+            bne sp, s0, fail_sp
+            li a0, -7
+            li a1, -3
+            call rv64_divs64_leaf
+            li t0, 2
+            bne a0, t0, fail32
+            bne sp, s0, fail_sp
+            li a0, 2147483647
+            li a1, 2
+            call rv64_divs64_leaf
+            li t0, 1073741823
+            bne a0, t0, fail33
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, 2
+            call rv64_divs64_leaf
+            li t0, -1073741824
+            bne a0, t0, fail34
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, -1
+            call rv64_divs64_leaf
+            li t0, 2147483648
+            bne a0, t0, fail35
+            bne sp, s0, fail_sp
+            li a0, 9223372036854775807
+            li a1, 2
+            call rv64_divs64_leaf
+            li t0, 4611686018427387903
+            bne a0, t0, fail36
+            bne sp, s0, fail_sp
+            li a0, -9223372036854775808
+            li a1, 2
+            call rv64_divs64_leaf
+            li t0, -4611686018427387904
+            bne a0, t0, fail37
+            bne sp, s0, fail_sp
+            li a0, 2147483648
+            li a1, 2147483647
+            call rv64_divs64_leaf
+            li t0, 1
+            bne a0, t0, fail38
+            bne sp, s0, fail_sp
+            li a0, 4294967295
+            li a1, 3
+            call rv64_divs64_leaf
+            li t0, 1431655765
+            bne a0, t0, fail39
+            bne sp, s0, fail_sp
+            li a0, 9223372036854775807
+            li a1, -2
+            call rv64_divs64_leaf
+            li t0, -4611686018427387903
+            bne a0, t0, fail40
+            bne sp, s0, fail_sp
+            li a0, -9223372036854775808
+            li a1, 9223372036854775807
+            call rv64_divs64_leaf
+            li t0, -1
+            bne a0, t0, fail41
+            bne sp, s0, fail_sp
+            li a0, 1311768467463790320
+            li a1, 74565
+            call rv64_divs64_leaf
+            li t0, 17592281465349
+            bne a0, t0, fail42
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, -9223372036854775808
+            call rv64_divs64_leaf
+            li t0, 0
+            bne a0, t0, fail43
+            bne sp, s0, fail_sp
+            li a0, -2
+            li a1, -2
+            call rv64_divs64_leaf
+            li t0, 1
+            bne a0, t0, fail44
+            bne sp, s0, fail_sp
+            li a0, -3
+            li a1, 7
+            call rv64_divs64_leaf
+            li t0, 0
+            bne a0, t0, fail45
+            bne sp, s0, fail_sp
+            li a0, 0
+            li a1, 1
+            call rv64_divu32_leaf
+            li t0, 0
+            bne a0, t0, fail46
+            bne sp, s0, fail_sp
+            li a0, 1
+            li a1, 1
+            call rv64_divu32_leaf
+            li t0, 1
+            bne a0, t0, fail47
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 1
+            call rv64_divu32_leaf
+            li t0, -1
+            bne a0, t0, fail48
+            bne sp, s0, fail_sp
+            li a0, 1
+            li a1, -1
+            call rv64_divu32_leaf
+            li t0, 0
+            bne a0, t0, fail49
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 2
+            call rv64_divu32_leaf
+            li t0, 2147483647
+            bne a0, t0, fail50
+            bne sp, s0, fail_sp
+            li a0, 2
+            li a1, -1
+            call rv64_divu32_leaf
+            li t0, 0
+            bne a0, t0, fail51
+            bne sp, s0, fail_sp
+            li a0, 7
+            li a1, 3
+            call rv64_divu32_leaf
+            li t0, 2
+            bne a0, t0, fail52
+            bne sp, s0, fail_sp
+            li a0, -7
+            li a1, 3
+            call rv64_divu32_leaf
+            li t0, 1431655763
+            bne a0, t0, fail53
+            bne sp, s0, fail_sp
+            li a0, 7
+            li a1, -3
+            call rv64_divu32_leaf
+            li t0, 0
+            bne a0, t0, fail54
+            bne sp, s0, fail_sp
+            li a0, -7
+            li a1, -3
+            call rv64_divu32_leaf
+            li t0, 0
+            bne a0, t0, fail55
+            bne sp, s0, fail_sp
+            li a0, 2147483647
+            li a1, 2
+            call rv64_divu32_leaf
+            li t0, 1073741823
+            bne a0, t0, fail56
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, 2
+            call rv64_divu32_leaf
+            li t0, 1073741824
+            bne a0, t0, fail57
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, -1
+            call rv64_divu32_leaf
+            li t0, 0
+            bne a0, t0, fail58
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 2
+            call rv64_divu32_leaf
+            li t0, 2147483647
+            bne a0, t0, fail59
+            bne sp, s0, fail_sp
+            li a0, 0
+            li a1, 2
+            call rv64_divu32_leaf
+            li t0, 0
+            bne a0, t0, fail60
+            bne sp, s0, fail_sp
+            li a0, 0
+            li a1, -1
+            call rv64_divu32_leaf
+            li t0, 0
+            bne a0, t0, fail61
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, 2147483647
+            call rv64_divu32_leaf
+            li t0, 1
+            bne a0, t0, fail62
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 3
+            call rv64_divu32_leaf
+            li t0, 1431655765
+            bne a0, t0, fail63
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, -2
+            call rv64_divu32_leaf
+            li t0, 1
+            bne a0, t0, fail64
+            bne sp, s0, fail_sp
+            li a0, 0
+            li a1, -1
+            call rv64_divu32_leaf
+            li t0, 0
+            bne a0, t0, fail65
+            bne sp, s0, fail_sp
+            li a0, -1698898192
+            li a1, 74565
+            call rv64_divu32_leaf
+            li t0, 34816
+            bne a0, t0, fail66
+            bne sp, s0, fail_sp
+            li a0, -2
+            li a1, -2
+            call rv64_divu32_leaf
+            li t0, 1
+            bne a0, t0, fail67
+            bne sp, s0, fail_sp
+            li a0, -3
+            li a1, 7
+            call rv64_divu32_leaf
+            li t0, 613566756
+            bne a0, t0, fail68
+            bne sp, s0, fail_sp
+            li a0, 0
+            li a1, 1
+            call rv64_divu64_leaf
+            li t0, 0
+            bne a0, t0, fail69
+            bne sp, s0, fail_sp
+            li a0, 1
+            li a1, 1
+            call rv64_divu64_leaf
+            li t0, 1
+            bne a0, t0, fail70
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 1
+            call rv64_divu64_leaf
+            li t0, -1
+            bne a0, t0, fail71
+            bne sp, s0, fail_sp
+            li a0, 1
+            li a1, -1
+            call rv64_divu64_leaf
+            li t0, 0
+            bne a0, t0, fail72
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 2
+            call rv64_divu64_leaf
+            li t0, 9223372036854775807
+            bne a0, t0, fail73
+            bne sp, s0, fail_sp
+            li a0, 2
+            li a1, -1
+            call rv64_divu64_leaf
+            li t0, 0
+            bne a0, t0, fail74
+            bne sp, s0, fail_sp
+            li a0, 7
+            li a1, 3
+            call rv64_divu64_leaf
+            li t0, 2
+            bne a0, t0, fail75
+            bne sp, s0, fail_sp
+            li a0, -7
+            li a1, 3
+            call rv64_divu64_leaf
+            li t0, 6148914691236517203
+            bne a0, t0, fail76
+            bne sp, s0, fail_sp
+            li a0, 7
+            li a1, -3
+            call rv64_divu64_leaf
+            li t0, 0
+            bne a0, t0, fail77
+            bne sp, s0, fail_sp
+            li a0, -7
+            li a1, -3
+            call rv64_divu64_leaf
+            li t0, 0
+            bne a0, t0, fail78
+            bne sp, s0, fail_sp
+            li a0, 2147483647
+            li a1, 2
+            call rv64_divu64_leaf
+            li t0, 1073741823
+            bne a0, t0, fail79
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, 2
+            call rv64_divu64_leaf
+            li t0, 9223372035781033984
+            bne a0, t0, fail80
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, -1
+            call rv64_divu64_leaf
+            li t0, 0
+            bne a0, t0, fail81
+            bne sp, s0, fail_sp
+            li a0, 9223372036854775807
+            li a1, 2
+            call rv64_divu64_leaf
+            li t0, 4611686018427387903
+            bne a0, t0, fail82
+            bne sp, s0, fail_sp
+            li a0, -9223372036854775808
+            li a1, 2
+            call rv64_divu64_leaf
+            li t0, 4611686018427387904
+            bne a0, t0, fail83
+            bne sp, s0, fail_sp
+            li a0, -9223372036854775808
+            li a1, -1
+            call rv64_divu64_leaf
+            li t0, 0
+            bne a0, t0, fail84
+            bne sp, s0, fail_sp
+            li a0, 2147483648
+            li a1, 2147483647
+            call rv64_divu64_leaf
+            li t0, 1
+            bne a0, t0, fail85
+            bne sp, s0, fail_sp
+            li a0, 4294967295
+            li a1, 3
+            call rv64_divu64_leaf
+            li t0, 1431655765
+            bne a0, t0, fail86
+            bne sp, s0, fail_sp
+            li a0, 9223372036854775807
+            li a1, -2
+            call rv64_divu64_leaf
+            li t0, 0
+            bne a0, t0, fail87
+            bne sp, s0, fail_sp
+            li a0, -9223372036854775808
+            li a1, 9223372036854775807
+            call rv64_divu64_leaf
+            li t0, 1
+            bne a0, t0, fail88
+            bne sp, s0, fail_sp
+            li a0, 1311768467463790320
+            li a1, 74565
+            call rv64_divu64_leaf
+            li t0, 17592281465349
+            bne a0, t0, fail89
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, -9223372036854775808
+            call rv64_divu64_leaf
+            li t0, 1
+            bne a0, t0, fail90
+            bne sp, s0, fail_sp
+            li a0, -2
+            li a1, -2
+            call rv64_divu64_leaf
+            li t0, 1
+            bne a0, t0, fail91
+            bne sp, s0, fail_sp
+            li a0, -3
+            li a1, 7
+            call rv64_divu64_leaf
+            li t0, 2635249153387078801
+            bne a0, t0, fail92
+            bne sp, s0, fail_sp
+            li a0, 0
+            li a1, 1
+            call rv64_rems32_leaf
+            li t0, 0
+            bne a0, t0, fail93
+            bne sp, s0, fail_sp
+            li a0, 1
+            li a1, 1
+            call rv64_rems32_leaf
+            li t0, 0
+            bne a0, t0, fail94
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 1
+            call rv64_rems32_leaf
+            li t0, 0
+            bne a0, t0, fail95
+            bne sp, s0, fail_sp
+            li a0, 1
+            li a1, -1
+            call rv64_rems32_leaf
+            li t0, 0
+            bne a0, t0, fail96
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 2
+            call rv64_rems32_leaf
+            li t0, -1
+            bne a0, t0, fail97
+            bne sp, s0, fail_sp
+            li a0, 2
+            li a1, -1
+            call rv64_rems32_leaf
+            li t0, 0
+            bne a0, t0, fail98
+            bne sp, s0, fail_sp
+            li a0, 7
+            li a1, 3
+            call rv64_rems32_leaf
+            li t0, 1
+            bne a0, t0, fail99
+            bne sp, s0, fail_sp
+            li a0, -7
+            li a1, 3
+            call rv64_rems32_leaf
+            li t0, -1
+            bne a0, t0, fail100
+            bne sp, s0, fail_sp
+            li a0, 7
+            li a1, -3
+            call rv64_rems32_leaf
+            li t0, 1
+            bne a0, t0, fail101
+            bne sp, s0, fail_sp
+            li a0, -7
+            li a1, -3
+            call rv64_rems32_leaf
+            li t0, -1
+            bne a0, t0, fail102
+            bne sp, s0, fail_sp
+            li a0, 2147483647
+            li a1, 2
+            call rv64_rems32_leaf
+            li t0, 1
+            bne a0, t0, fail103
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, 2
+            call rv64_rems32_leaf
+            li t0, 0
+            bne a0, t0, fail104
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 2
+            call rv64_rems32_leaf
+            li t0, -1
+            bne a0, t0, fail105
+            bne sp, s0, fail_sp
+            li a0, 0
+            li a1, 2
+            call rv64_rems32_leaf
+            li t0, 0
+            bne a0, t0, fail106
+            bne sp, s0, fail_sp
+            li a0, 0
+            li a1, -1
+            call rv64_rems32_leaf
+            li t0, 0
+            bne a0, t0, fail107
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, 2147483647
+            call rv64_rems32_leaf
+            li t0, -1
+            bne a0, t0, fail108
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 3
+            call rv64_rems32_leaf
+            li t0, -1
+            bne a0, t0, fail109
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, -2
+            call rv64_rems32_leaf
+            li t0, -1
+            bne a0, t0, fail110
+            bne sp, s0, fail_sp
+            li a0, 0
+            li a1, -1
+            call rv64_rems32_leaf
+            li t0, 0
+            bne a0, t0, fail111
+            bne sp, s0, fail_sp
+            li a0, -1698898192
+            li a1, 74565
+            call rv64_rems32_leaf
+            li t0, -9232
+            bne a0, t0, fail112
+            bne sp, s0, fail_sp
+            li a0, -2
+            li a1, -2
+            call rv64_rems32_leaf
+            li t0, 0
+            bne a0, t0, fail113
+            bne sp, s0, fail_sp
+            li a0, -3
+            li a1, 7
+            call rv64_rems32_leaf
+            li t0, -3
+            bne a0, t0, fail114
+            bne sp, s0, fail_sp
+            li a0, 0
+            li a1, 1
+            call rv64_rems64_leaf
+            li t0, 0
+            bne a0, t0, fail115
+            bne sp, s0, fail_sp
+            li a0, 1
+            li a1, 1
+            call rv64_rems64_leaf
+            li t0, 0
+            bne a0, t0, fail116
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 1
+            call rv64_rems64_leaf
+            li t0, 0
+            bne a0, t0, fail117
+            bne sp, s0, fail_sp
+            li a0, 1
+            li a1, -1
+            call rv64_rems64_leaf
+            li t0, 0
+            bne a0, t0, fail118
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 2
+            call rv64_rems64_leaf
+            li t0, -1
+            bne a0, t0, fail119
+            bne sp, s0, fail_sp
+            li a0, 2
+            li a1, -1
+            call rv64_rems64_leaf
+            li t0, 0
+            bne a0, t0, fail120
+            bne sp, s0, fail_sp
+            li a0, 7
+            li a1, 3
+            call rv64_rems64_leaf
+            li t0, 1
+            bne a0, t0, fail121
+            bne sp, s0, fail_sp
+            li a0, -7
+            li a1, 3
+            call rv64_rems64_leaf
+            li t0, -1
+            bne a0, t0, fail122
+            bne sp, s0, fail_sp
+            li a0, 7
+            li a1, -3
+            call rv64_rems64_leaf
+            li t0, 1
+            bne a0, t0, fail123
+            bne sp, s0, fail_sp
+            li a0, -7
+            li a1, -3
+            call rv64_rems64_leaf
+            li t0, -1
+            bne a0, t0, fail124
+            bne sp, s0, fail_sp
+            li a0, 2147483647
+            li a1, 2
+            call rv64_rems64_leaf
+            li t0, 1
+            bne a0, t0, fail125
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, 2
+            call rv64_rems64_leaf
+            li t0, 0
+            bne a0, t0, fail126
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, -1
+            call rv64_rems64_leaf
+            li t0, 0
+            bne a0, t0, fail127
+            bne sp, s0, fail_sp
+            li a0, 9223372036854775807
+            li a1, 2
+            call rv64_rems64_leaf
+            li t0, 1
+            bne a0, t0, fail128
+            bne sp, s0, fail_sp
+            li a0, -9223372036854775808
+            li a1, 2
+            call rv64_rems64_leaf
+            li t0, 0
+            bne a0, t0, fail129
+            bne sp, s0, fail_sp
+            li a0, 2147483648
+            li a1, 2147483647
+            call rv64_rems64_leaf
+            li t0, 1
+            bne a0, t0, fail130
+            bne sp, s0, fail_sp
+            li a0, 4294967295
+            li a1, 3
+            call rv64_rems64_leaf
+            li t0, 0
+            bne a0, t0, fail131
+            bne sp, s0, fail_sp
+            li a0, 9223372036854775807
+            li a1, -2
+            call rv64_rems64_leaf
+            li t0, 1
+            bne a0, t0, fail132
+            bne sp, s0, fail_sp
+            li a0, -9223372036854775808
+            li a1, 9223372036854775807
+            call rv64_rems64_leaf
+            li t0, -1
+            bne a0, t0, fail133
+            bne sp, s0, fail_sp
+            li a0, 1311768467463790320
+            li a1, 74565
+            call rv64_rems64_leaf
+            li t0, 42135
+            bne a0, t0, fail134
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, -9223372036854775808
+            call rv64_rems64_leaf
+            li t0, -1
+            bne a0, t0, fail135
+            bne sp, s0, fail_sp
+            li a0, -2
+            li a1, -2
+            call rv64_rems64_leaf
+            li t0, 0
+            bne a0, t0, fail136
+            bne sp, s0, fail_sp
+            li a0, -3
+            li a1, 7
+            call rv64_rems64_leaf
+            li t0, -3
+            bne a0, t0, fail137
+            bne sp, s0, fail_sp
+            li a0, 0
+            li a1, 1
+            call rv64_remu32_leaf
+            li t0, 0
+            bne a0, t0, fail138
+            bne sp, s0, fail_sp
+            li a0, 1
+            li a1, 1
+            call rv64_remu32_leaf
+            li t0, 0
+            bne a0, t0, fail139
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 1
+            call rv64_remu32_leaf
+            li t0, 0
+            bne a0, t0, fail140
+            bne sp, s0, fail_sp
+            li a0, 1
+            li a1, -1
+            call rv64_remu32_leaf
+            li t0, 1
+            bne a0, t0, fail141
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 2
+            call rv64_remu32_leaf
+            li t0, 1
+            bne a0, t0, fail142
+            bne sp, s0, fail_sp
+            li a0, 2
+            li a1, -1
+            call rv64_remu32_leaf
+            li t0, 2
+            bne a0, t0, fail143
+            bne sp, s0, fail_sp
+            li a0, 7
+            li a1, 3
+            call rv64_remu32_leaf
+            li t0, 1
+            bne a0, t0, fail144
+            bne sp, s0, fail_sp
+            li a0, -7
+            li a1, 3
+            call rv64_remu32_leaf
+            li t0, 0
+            bne a0, t0, fail145
+            bne sp, s0, fail_sp
+            li a0, 7
+            li a1, -3
+            call rv64_remu32_leaf
+            li t0, 7
+            bne a0, t0, fail146
+            bne sp, s0, fail_sp
+            li a0, -7
+            li a1, -3
+            call rv64_remu32_leaf
+            li t0, -7
+            bne a0, t0, fail147
+            bne sp, s0, fail_sp
+            li a0, 2147483647
+            li a1, 2
+            call rv64_remu32_leaf
+            li t0, 1
+            bne a0, t0, fail148
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, 2
+            call rv64_remu32_leaf
+            li t0, 0
+            bne a0, t0, fail149
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, -1
+            call rv64_remu32_leaf
+            li t0, -2147483648
+            bne a0, t0, fail150
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 2
+            call rv64_remu32_leaf
+            li t0, 1
+            bne a0, t0, fail151
+            bne sp, s0, fail_sp
+            li a0, 0
+            li a1, 2
+            call rv64_remu32_leaf
+            li t0, 0
+            bne a0, t0, fail152
+            bne sp, s0, fail_sp
+            li a0, 0
+            li a1, -1
+            call rv64_remu32_leaf
+            li t0, 0
+            bne a0, t0, fail153
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, 2147483647
+            call rv64_remu32_leaf
+            li t0, 1
+            bne a0, t0, fail154
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 3
+            call rv64_remu32_leaf
+            li t0, 0
+            bne a0, t0, fail155
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, -2
+            call rv64_remu32_leaf
+            li t0, 1
+            bne a0, t0, fail156
+            bne sp, s0, fail_sp
+            li a0, 0
+            li a1, -1
+            call rv64_remu32_leaf
+            li t0, 0
+            bne a0, t0, fail157
+            bne sp, s0, fail_sp
+            li a0, -1698898192
+            li a1, 74565
+            call rv64_remu32_leaf
+            li t0, 14064
+            bne a0, t0, fail158
+            bne sp, s0, fail_sp
+            li a0, -2
+            li a1, -2
+            call rv64_remu32_leaf
+            li t0, 0
+            bne a0, t0, fail159
+            bne sp, s0, fail_sp
+            li a0, -3
+            li a1, 7
+            call rv64_remu32_leaf
+            li t0, 1
+            bne a0, t0, fail160
+            bne sp, s0, fail_sp
+            li a0, 0
+            li a1, 1
+            call rv64_remu64_leaf
+            li t0, 0
+            bne a0, t0, fail161
+            bne sp, s0, fail_sp
+            li a0, 1
+            li a1, 1
+            call rv64_remu64_leaf
+            li t0, 0
+            bne a0, t0, fail162
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 1
+            call rv64_remu64_leaf
+            li t0, 0
+            bne a0, t0, fail163
+            bne sp, s0, fail_sp
+            li a0, 1
+            li a1, -1
+            call rv64_remu64_leaf
+            li t0, 1
+            bne a0, t0, fail164
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, 2
+            call rv64_remu64_leaf
+            li t0, 1
+            bne a0, t0, fail165
+            bne sp, s0, fail_sp
+            li a0, 2
+            li a1, -1
+            call rv64_remu64_leaf
+            li t0, 2
+            bne a0, t0, fail166
+            bne sp, s0, fail_sp
+            li a0, 7
+            li a1, 3
+            call rv64_remu64_leaf
+            li t0, 1
+            bne a0, t0, fail167
+            bne sp, s0, fail_sp
+            li a0, -7
+            li a1, 3
+            call rv64_remu64_leaf
+            li t0, 0
+            bne a0, t0, fail168
+            bne sp, s0, fail_sp
+            li a0, 7
+            li a1, -3
+            call rv64_remu64_leaf
+            li t0, 7
+            bne a0, t0, fail169
+            bne sp, s0, fail_sp
+            li a0, -7
+            li a1, -3
+            call rv64_remu64_leaf
+            li t0, -7
+            bne a0, t0, fail170
+            bne sp, s0, fail_sp
+            li a0, 2147483647
+            li a1, 2
+            call rv64_remu64_leaf
+            li t0, 1
+            bne a0, t0, fail171
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, 2
+            call rv64_remu64_leaf
+            li t0, 0
+            bne a0, t0, fail172
+            bne sp, s0, fail_sp
+            li a0, -2147483648
+            li a1, -1
+            call rv64_remu64_leaf
+            li t0, -2147483648
+            bne a0, t0, fail173
+            bne sp, s0, fail_sp
+            li a0, 9223372036854775807
+            li a1, 2
+            call rv64_remu64_leaf
+            li t0, 1
+            bne a0, t0, fail174
+            bne sp, s0, fail_sp
+            li a0, -9223372036854775808
+            li a1, 2
+            call rv64_remu64_leaf
+            li t0, 0
+            bne a0, t0, fail175
+            bne sp, s0, fail_sp
+            li a0, -9223372036854775808
+            li a1, -1
+            call rv64_remu64_leaf
+            li t0, -9223372036854775808
+            bne a0, t0, fail176
+            bne sp, s0, fail_sp
+            li a0, 2147483648
+            li a1, 2147483647
+            call rv64_remu64_leaf
+            li t0, 1
+            bne a0, t0, fail177
+            bne sp, s0, fail_sp
+            li a0, 4294967295
+            li a1, 3
+            call rv64_remu64_leaf
+            li t0, 0
+            bne a0, t0, fail178
+            bne sp, s0, fail_sp
+            li a0, 9223372036854775807
+            li a1, -2
+            call rv64_remu64_leaf
+            li t0, 9223372036854775807
+            bne a0, t0, fail179
+            bne sp, s0, fail_sp
+            li a0, -9223372036854775808
+            li a1, 9223372036854775807
+            call rv64_remu64_leaf
+            li t0, 1
+            bne a0, t0, fail180
+            bne sp, s0, fail_sp
+            li a0, 1311768467463790320
+            li a1, 74565
+            call rv64_remu64_leaf
+            li t0, 42135
+            bne a0, t0, fail181
+            bne sp, s0, fail_sp
+            li a0, -1
+            li a1, -9223372036854775808
+            call rv64_remu64_leaf
+            li t0, 9223372036854775807
+            bne a0, t0, fail182
+            bne sp, s0, fail_sp
+            li a0, -2
+            li a1, -2
+            call rv64_remu64_leaf
+            li t0, 0
+            bne a0, t0, fail183
+            bne sp, s0, fail_sp
+            li a0, -3
+            li a1, 7
+            call rv64_remu64_leaf
+            li t0, 6
+            bne a0, t0, fail184
+            bne sp, s0, fail_sp
+            li a0, 0
+            j exit
+          fail1: li a0, 1
+            j exit
+          fail2: li a0, 2
+            j exit
+          fail3: li a0, 3
+            j exit
+          fail4: li a0, 4
+            j exit
+          fail5: li a0, 5
+            j exit
+          fail6: li a0, 6
+            j exit
+          fail7: li a0, 7
+            j exit
+          fail8: li a0, 8
+            j exit
+          fail9: li a0, 9
+            j exit
+          fail10: li a0, 10
+            j exit
+          fail11: li a0, 11
+            j exit
+          fail12: li a0, 12
+            j exit
+          fail13: li a0, 13
+            j exit
+          fail14: li a0, 14
+            j exit
+          fail15: li a0, 15
+            j exit
+          fail16: li a0, 16
+            j exit
+          fail17: li a0, 17
+            j exit
+          fail18: li a0, 18
+            j exit
+          fail19: li a0, 19
+            j exit
+          fail20: li a0, 20
+            j exit
+          fail21: li a0, 21
+            j exit
+          fail22: li a0, 22
+            j exit
+          fail23: li a0, 23
+            j exit
+          fail24: li a0, 24
+            j exit
+          fail25: li a0, 25
+            j exit
+          fail26: li a0, 26
+            j exit
+          fail27: li a0, 27
+            j exit
+          fail28: li a0, 28
+            j exit
+          fail29: li a0, 29
+            j exit
+          fail30: li a0, 30
+            j exit
+          fail31: li a0, 31
+            j exit
+          fail32: li a0, 32
+            j exit
+          fail33: li a0, 33
+            j exit
+          fail34: li a0, 34
+            j exit
+          fail35: li a0, 35
+            j exit
+          fail36: li a0, 36
+            j exit
+          fail37: li a0, 37
+            j exit
+          fail38: li a0, 38
+            j exit
+          fail39: li a0, 39
+            j exit
+          fail40: li a0, 40
+            j exit
+          fail41: li a0, 41
+            j exit
+          fail42: li a0, 42
+            j exit
+          fail43: li a0, 43
+            j exit
+          fail44: li a0, 44
+            j exit
+          fail45: li a0, 45
+            j exit
+          fail46: li a0, 46
+            j exit
+          fail47: li a0, 47
+            j exit
+          fail48: li a0, 48
+            j exit
+          fail49: li a0, 49
+            j exit
+          fail50: li a0, 50
+            j exit
+          fail51: li a0, 51
+            j exit
+          fail52: li a0, 52
+            j exit
+          fail53: li a0, 53
+            j exit
+          fail54: li a0, 54
+            j exit
+          fail55: li a0, 55
+            j exit
+          fail56: li a0, 56
+            j exit
+          fail57: li a0, 57
+            j exit
+          fail58: li a0, 58
+            j exit
+          fail59: li a0, 59
+            j exit
+          fail60: li a0, 60
+            j exit
+          fail61: li a0, 61
+            j exit
+          fail62: li a0, 62
+            j exit
+          fail63: li a0, 63
+            j exit
+          fail64: li a0, 64
+            j exit
+          fail65: li a0, 65
+            j exit
+          fail66: li a0, 66
+            j exit
+          fail67: li a0, 67
+            j exit
+          fail68: li a0, 68
+            j exit
+          fail69: li a0, 69
+            j exit
+          fail70: li a0, 70
+            j exit
+          fail71: li a0, 71
+            j exit
+          fail72: li a0, 72
+            j exit
+          fail73: li a0, 73
+            j exit
+          fail74: li a0, 74
+            j exit
+          fail75: li a0, 75
+            j exit
+          fail76: li a0, 76
+            j exit
+          fail77: li a0, 77
+            j exit
+          fail78: li a0, 78
+            j exit
+          fail79: li a0, 79
+            j exit
+          fail80: li a0, 80
+            j exit
+          fail81: li a0, 81
+            j exit
+          fail82: li a0, 82
+            j exit
+          fail83: li a0, 83
+            j exit
+          fail84: li a0, 84
+            j exit
+          fail85: li a0, 85
+            j exit
+          fail86: li a0, 86
+            j exit
+          fail87: li a0, 87
+            j exit
+          fail88: li a0, 88
+            j exit
+          fail89: li a0, 89
+            j exit
+          fail90: li a0, 90
+            j exit
+          fail91: li a0, 91
+            j exit
+          fail92: li a0, 92
+            j exit
+          fail93: li a0, 93
+            j exit
+          fail94: li a0, 94
+            j exit
+          fail95: li a0, 95
+            j exit
+          fail96: li a0, 96
+            j exit
+          fail97: li a0, 97
+            j exit
+          fail98: li a0, 98
+            j exit
+          fail99: li a0, 99
+            j exit
+          fail100: li a0, 100
+            j exit
+          fail101: li a0, 101
+            j exit
+          fail102: li a0, 102
+            j exit
+          fail103: li a0, 103
+            j exit
+          fail104: li a0, 104
+            j exit
+          fail105: li a0, 105
+            j exit
+          fail106: li a0, 106
+            j exit
+          fail107: li a0, 107
+            j exit
+          fail108: li a0, 108
+            j exit
+          fail109: li a0, 109
+            j exit
+          fail110: li a0, 110
+            j exit
+          fail111: li a0, 111
+            j exit
+          fail112: li a0, 112
+            j exit
+          fail113: li a0, 113
+            j exit
+          fail114: li a0, 114
+            j exit
+          fail115: li a0, 115
+            j exit
+          fail116: li a0, 116
+            j exit
+          fail117: li a0, 117
+            j exit
+          fail118: li a0, 118
+            j exit
+          fail119: li a0, 119
+            j exit
+          fail120: li a0, 120
+            j exit
+          fail121: li a0, 121
+            j exit
+          fail122: li a0, 122
+            j exit
+          fail123: li a0, 123
+            j exit
+          fail124: li a0, 124
+            j exit
+          fail125: li a0, 125
+            j exit
+          fail126: li a0, 126
+            j exit
+          fail127: li a0, 127
+            j exit
+          fail128: li a0, 128
+            j exit
+          fail129: li a0, 129
+            j exit
+          fail130: li a0, 130
+            j exit
+          fail131: li a0, 131
+            j exit
+          fail132: li a0, 132
+            j exit
+          fail133: li a0, 133
+            j exit
+          fail134: li a0, 134
+            j exit
+          fail135: li a0, 135
+            j exit
+          fail136: li a0, 136
+            j exit
+          fail137: li a0, 137
+            j exit
+          fail138: li a0, 138
+            j exit
+          fail139: li a0, 139
+            j exit
+          fail140: li a0, 140
+            j exit
+          fail141: li a0, 141
+            j exit
+          fail142: li a0, 142
+            j exit
+          fail143: li a0, 143
+            j exit
+          fail144: li a0, 144
+            j exit
+          fail145: li a0, 145
+            j exit
+          fail146: li a0, 146
+            j exit
+          fail147: li a0, 147
+            j exit
+          fail148: li a0, 148
+            j exit
+          fail149: li a0, 149
+            j exit
+          fail150: li a0, 150
+            j exit
+          fail151: li a0, 151
+            j exit
+          fail152: li a0, 152
+            j exit
+          fail153: li a0, 153
+            j exit
+          fail154: li a0, 154
+            j exit
+          fail155: li a0, 155
+            j exit
+          fail156: li a0, 156
+            j exit
+          fail157: li a0, 157
+            j exit
+          fail158: li a0, 158
+            j exit
+          fail159: li a0, 159
+            j exit
+          fail160: li a0, 160
+            j exit
+          fail161: li a0, 161
+            j exit
+          fail162: li a0, 162
+            j exit
+          fail163: li a0, 163
+            j exit
+          fail164: li a0, 164
+            j exit
+          fail165: li a0, 165
+            j exit
+          fail166: li a0, 166
+            j exit
+          fail167: li a0, 167
+            j exit
+          fail168: li a0, 168
+            j exit
+          fail169: li a0, 169
+            j exit
+          fail170: li a0, 170
+            j exit
+          fail171: li a0, 171
+            j exit
+          fail172: li a0, 172
+            j exit
+          fail173: li a0, 173
+            j exit
+          fail174: li a0, 174
+            j exit
+          fail175: li a0, 175
+            j exit
+          fail176: li a0, 176
+            j exit
+          fail177: li a0, 177
+            j exit
+          fail178: li a0, 178
+            j exit
+          fail179: li a0, 179
+            j exit
+          fail180: li a0, 180
+            j exit
+          fail181: li a0, 181
+            j exit
+          fail182: li a0, 182
+            j exit
+          fail183: li a0, 183
+            j exit
+          fail184: li a0, 184
+            j exit
+          fail_sp: li a0, 185
+          exit:
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64im -mabi=lp64 \
+            /tmp/rv64_divrem_valid.s -o /tmp/rv64_divrem_valid.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax \
+            -e _start /tmp/rv64_divrem_valid.o \
+            /tmp/rv64_divs32.o /tmp/rv64_divs64.o /tmp/rv64_divu32.o /tmp/rv64_divu64.o /tmp/rv64_rems32.o /tmp/rv64_rems64.o /tmp/rv64_remu32.o /tmp/rv64_remu64.o \
+            -o /tmp/rv64_divrem_valid.elf
+          timeout 15s qemu-riscv64 /tmp/rv64_divrem_valid.elf
+          echo "184 RV64IM division/remainder normal-value oracle cases passed"
+      - name: Execute divisor-zero and signed-overflow EBREAK trap QEMU oracles
+        run: |
+          set -euo pipefail
+          ulimit -c 0
+          cat > /tmp/trap_divs32_zero.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            li a0, 7
+            li a1, 0
+            call rv64_divs32_leaf
+            li a0, 0
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64im -mabi=lp64 \
+            /tmp/trap_divs32_zero.s -o /tmp/trap_divs32_zero.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax -e _start \
+            /tmp/trap_divs32_zero.o /tmp/rv64_divs32.o -o /tmp/trap_divs32_zero.elf
+          set +e
+          timeout 5s qemu-riscv64 /tmp/trap_divs32_zero.elf >/tmp/trap_divs32_zero.log 2>&1
+          status=$?
+          set -e
+          if test "$status" -ne 133; then
+            echo "ERROR: divs32_zero expected SIGTRAP (133), got $status" >&2
+            cat /tmp/trap_divs32_zero.log
+            exit 1
+          fi
+          cat > /tmp/trap_divs64_zero.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            li a0, 7
+            li a1, 0
+            call rv64_divs64_leaf
+            li a0, 0
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64im -mabi=lp64 \
+            /tmp/trap_divs64_zero.s -o /tmp/trap_divs64_zero.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax -e _start \
+            /tmp/trap_divs64_zero.o /tmp/rv64_divs64.o -o /tmp/trap_divs64_zero.elf
+          set +e
+          timeout 5s qemu-riscv64 /tmp/trap_divs64_zero.elf >/tmp/trap_divs64_zero.log 2>&1
+          status=$?
+          set -e
+          if test "$status" -ne 133; then
+            echo "ERROR: divs64_zero expected SIGTRAP (133), got $status" >&2
+            cat /tmp/trap_divs64_zero.log
+            exit 1
+          fi
+          cat > /tmp/trap_divu32_zero.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            li a0, 7
+            li a1, 0
+            call rv64_divu32_leaf
+            li a0, 0
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64im -mabi=lp64 \
+            /tmp/trap_divu32_zero.s -o /tmp/trap_divu32_zero.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax -e _start \
+            /tmp/trap_divu32_zero.o /tmp/rv64_divu32.o -o /tmp/trap_divu32_zero.elf
+          set +e
+          timeout 5s qemu-riscv64 /tmp/trap_divu32_zero.elf >/tmp/trap_divu32_zero.log 2>&1
+          status=$?
+          set -e
+          if test "$status" -ne 133; then
+            echo "ERROR: divu32_zero expected SIGTRAP (133), got $status" >&2
+            cat /tmp/trap_divu32_zero.log
+            exit 1
+          fi
+          cat > /tmp/trap_divu64_zero.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            li a0, 7
+            li a1, 0
+            call rv64_divu64_leaf
+            li a0, 0
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64im -mabi=lp64 \
+            /tmp/trap_divu64_zero.s -o /tmp/trap_divu64_zero.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax -e _start \
+            /tmp/trap_divu64_zero.o /tmp/rv64_divu64.o -o /tmp/trap_divu64_zero.elf
+          set +e
+          timeout 5s qemu-riscv64 /tmp/trap_divu64_zero.elf >/tmp/trap_divu64_zero.log 2>&1
+          status=$?
+          set -e
+          if test "$status" -ne 133; then
+            echo "ERROR: divu64_zero expected SIGTRAP (133), got $status" >&2
+            cat /tmp/trap_divu64_zero.log
+            exit 1
+          fi
+          cat > /tmp/trap_rems32_zero.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            li a0, 7
+            li a1, 0
+            call rv64_rems32_leaf
+            li a0, 0
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64im -mabi=lp64 \
+            /tmp/trap_rems32_zero.s -o /tmp/trap_rems32_zero.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax -e _start \
+            /tmp/trap_rems32_zero.o /tmp/rv64_rems32.o -o /tmp/trap_rems32_zero.elf
+          set +e
+          timeout 5s qemu-riscv64 /tmp/trap_rems32_zero.elf >/tmp/trap_rems32_zero.log 2>&1
+          status=$?
+          set -e
+          if test "$status" -ne 133; then
+            echo "ERROR: rems32_zero expected SIGTRAP (133), got $status" >&2
+            cat /tmp/trap_rems32_zero.log
+            exit 1
+          fi
+          cat > /tmp/trap_rems64_zero.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            li a0, 7
+            li a1, 0
+            call rv64_rems64_leaf
+            li a0, 0
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64im -mabi=lp64 \
+            /tmp/trap_rems64_zero.s -o /tmp/trap_rems64_zero.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax -e _start \
+            /tmp/trap_rems64_zero.o /tmp/rv64_rems64.o -o /tmp/trap_rems64_zero.elf
+          set +e
+          timeout 5s qemu-riscv64 /tmp/trap_rems64_zero.elf >/tmp/trap_rems64_zero.log 2>&1
+          status=$?
+          set -e
+          if test "$status" -ne 133; then
+            echo "ERROR: rems64_zero expected SIGTRAP (133), got $status" >&2
+            cat /tmp/trap_rems64_zero.log
+            exit 1
+          fi
+          cat > /tmp/trap_remu32_zero.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            li a0, 7
+            li a1, 0
+            call rv64_remu32_leaf
+            li a0, 0
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64im -mabi=lp64 \
+            /tmp/trap_remu32_zero.s -o /tmp/trap_remu32_zero.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax -e _start \
+            /tmp/trap_remu32_zero.o /tmp/rv64_remu32.o -o /tmp/trap_remu32_zero.elf
+          set +e
+          timeout 5s qemu-riscv64 /tmp/trap_remu32_zero.elf >/tmp/trap_remu32_zero.log 2>&1
+          status=$?
+          set -e
+          if test "$status" -ne 133; then
+            echo "ERROR: remu32_zero expected SIGTRAP (133), got $status" >&2
+            cat /tmp/trap_remu32_zero.log
+            exit 1
+          fi
+          cat > /tmp/trap_remu64_zero.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            li a0, 7
+            li a1, 0
+            call rv64_remu64_leaf
+            li a0, 0
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64im -mabi=lp64 \
+            /tmp/trap_remu64_zero.s -o /tmp/trap_remu64_zero.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax -e _start \
+            /tmp/trap_remu64_zero.o /tmp/rv64_remu64.o -o /tmp/trap_remu64_zero.elf
+          set +e
+          timeout 5s qemu-riscv64 /tmp/trap_remu64_zero.elf >/tmp/trap_remu64_zero.log 2>&1
+          status=$?
+          set -e
+          if test "$status" -ne 133; then
+            echo "ERROR: remu64_zero expected SIGTRAP (133), got $status" >&2
+            cat /tmp/trap_remu64_zero.log
+            exit 1
+          fi
+          cat > /tmp/trap_divs32_overflow.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            li a0, -2147483648
+            li a1, -1
+            call rv64_divs32_leaf
+            li a0, 0
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64im -mabi=lp64 \
+            /tmp/trap_divs32_overflow.s -o /tmp/trap_divs32_overflow.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax -e _start \
+            /tmp/trap_divs32_overflow.o /tmp/rv64_divs32.o -o /tmp/trap_divs32_overflow.elf
+          set +e
+          timeout 5s qemu-riscv64 /tmp/trap_divs32_overflow.elf >/tmp/trap_divs32_overflow.log 2>&1
+          status=$?
+          set -e
+          if test "$status" -ne 133; then
+            echo "ERROR: divs32_overflow expected SIGTRAP (133), got $status" >&2
+            cat /tmp/trap_divs32_overflow.log
+            exit 1
+          fi
+          cat > /tmp/trap_divs64_overflow.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            li a0, -9223372036854775808
+            li a1, -1
+            call rv64_divs64_leaf
+            li a0, 0
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64im -mabi=lp64 \
+            /tmp/trap_divs64_overflow.s -o /tmp/trap_divs64_overflow.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax -e _start \
+            /tmp/trap_divs64_overflow.o /tmp/rv64_divs64.o -o /tmp/trap_divs64_overflow.elf
+          set +e
+          timeout 5s qemu-riscv64 /tmp/trap_divs64_overflow.elf >/tmp/trap_divs64_overflow.log 2>&1
+          status=$?
+          set -e
+          if test "$status" -ne 133; then
+            echo "ERROR: divs64_overflow expected SIGTRAP (133), got $status" >&2
+            cat /tmp/trap_divs64_overflow.log
+            exit 1
+          fi
+          cat > /tmp/trap_rems32_overflow.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            li a0, -2147483648
+            li a1, -1
+            call rv64_rems32_leaf
+            li a0, 0
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64im -mabi=lp64 \
+            /tmp/trap_rems32_overflow.s -o /tmp/trap_rems32_overflow.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax -e _start \
+            /tmp/trap_rems32_overflow.o /tmp/rv64_rems32.o -o /tmp/trap_rems32_overflow.elf
+          set +e
+          timeout 5s qemu-riscv64 /tmp/trap_rems32_overflow.elf >/tmp/trap_rems32_overflow.log 2>&1
+          status=$?
+          set -e
+          if test "$status" -ne 133; then
+            echo "ERROR: rems32_overflow expected SIGTRAP (133), got $status" >&2
+            cat /tmp/trap_rems32_overflow.log
+            exit 1
+          fi
+          cat > /tmp/trap_rems64_overflow.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            li a0, -9223372036854775808
+            li a1, -1
+            call rv64_rems64_leaf
+            li a0, 0
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64im -mabi=lp64 \
+            /tmp/trap_rems64_overflow.s -o /tmp/trap_rems64_overflow.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax -e _start \
+            /tmp/trap_rems64_overflow.o /tmp/rv64_rems64.o -o /tmp/trap_rems64_overflow.elf
+          set +e
+          timeout 5s qemu-riscv64 /tmp/trap_rems64_overflow.elf >/tmp/trap_rems64_overflow.log 2>&1
+          status=$?
+          set -e
+          if test "$status" -ne 133; then
+            echo "ERROR: rems64_overflow expected SIGTRAP (133), got $status" >&2
+            cat /tmp/trap_rems64_overflow.log
+            exit 1
+          fi
+          echo "12 required TypeId division traps verified by QEMU SIGTRAP"
