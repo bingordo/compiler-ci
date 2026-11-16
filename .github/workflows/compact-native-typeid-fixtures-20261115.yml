@@ -1,0 +1,54 @@
+name: Native TypeId compact fixture acceptance
+on:
+  push:
+    branches: [verify/compact-native-typeid-fixtures-20261115]
+    paths: ['.github/workflows/compact-native-typeid-fixtures-20261115.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b4c679ff094b5192f13cd335502f5b75f60c0735
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin exact source
+        run: test "$(git -C compiler rev-parse HEAD)" = "b4c679ff094b5192f13cd335502f5b75f60c0735"
+      - name: Restrict workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: native-typeid-compact-source
+      - name: Parser, canonical writer and fixture negative cases
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-ir --test native_fixture_text --test native_module_text_v3 -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test native_fixed_v3_canonical -- --nocapture
+      - name: Install AArch64 C11 QEMU toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross binutils-aarch64-linux-gnu qemu-user
+      - name: Machine selection and original real C11 QEMU oracles
+        working-directory: compiler
+        env:
+          COMPILER_REQUIRE_AARCH64_QEMU: "1"
+        run: |
+          cargo test -p compiler-backend-aarch64 --test double_index_native --test indexed_scales --test double_index_store_native -- --nocapture
+      - name: Strict scoped Clippy
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-ir --no-deps --test native_fixture_text --test native_module_text_v3 -- -D warnings
+          cargo clippy -p compiler-backend-aarch64 --no-deps --test double_index_native --test indexed_scales --test native_fixed_v3_canonical -- -D warnings
