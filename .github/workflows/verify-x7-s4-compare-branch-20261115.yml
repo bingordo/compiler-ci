@@ -1,0 +1,95 @@
+name: X7 S4 one-use TypeId compare branch physical and source
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-x7-s4-compare-branch-20261115.yml'
+permissions:
+  contents: read
+jobs:
+  typed-machine-compare-branch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1841b755269d7b950f2dfe938d05ab1cecb028e3
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned compiler commit
+        run: test "$(git -C compiler rev-parse HEAD)" = "1841b755269d7b950f2dfe938d05ab1cecb028e3"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-s4-compare-branch-backend
+      - name: Isolate native TypeId backend workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Run flag-safe selected machine tests and all backend library tests
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib x7_s4 -- --nocapture
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend-x86 --no-default-features --lib
+          echo X7_S4_TYPED_CMP_BRANCH_BACKEND_GREEN
+  production-source-executables:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub SSH for real Mini-C/Oberon sources
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1841b755269d7b950f2dfe938d05ab1cecb028e3
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned compiler commit
+        run: test "$(git -C compiler rev-parse HEAD)" = "1841b755269d7b950f2dfe938d05ab1cecb028e3"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-s4-compare-branch-source
+      - name: Build real production compiler
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo build -p compiler
+          python3 tools/test_x7_s4_executable_source_gate.py -v
+      - name: Real optimized Mini-C/Oberon default/shared ELF/GAS C11 oracles
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/x7_s4_executable_source_gate.py \
+            --compiler target/debug/compiler \
+            --source-sha 1841b755269d7b950f2dfe938d05ab1cecb028e3 \
+            --out ../x7-s4-compare-branch \
+            --scales 8 24 48 \
+            --languages mini_c oberon \
+            --modes plain framed pic pic_framed \
+            --groups 3
+          echo X7_S4_COMPARE_BRANCH_SOURCE_PARITY_GREEN
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-s4-compare-branch-executable-baseline
+          path: x7-s4-compare-branch
+          if-no-files-found: ignore
