@@ -1,0 +1,123 @@
+name: X7 M3 retire duplicate GP generated Rust lookup outputs
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-x7-retire-duplicate-gp-outputs-20261113.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: x7-gp-output-cleanup-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  generated:
+    name: 55 GP recipes, sole Rust output, strict source validators, C11/Clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 70dec32299dc6bb72b2244f3721ecb6bcc7b5590
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require pinned compiler SHA
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "70dec32299dc6bb72b2244f3721ecb6bcc7b5590"
+      - name: Generator consistency and negative manifest cases
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/regen_x86_forms.py --check
+          python3 tools/regen_x86_scalar_bin_forms.py --check
+          python3 tools/regen_x86_scalar_misc_forms.py --check
+          python3 tools/regen_x86_gp_recipes.py --check
+          python3 -m unittest discover -s tools -p test_x86_gp_recipes.py -v
+          python3 -m unittest discover -s tools -p test_x86_scalar_bin_forms.py -v
+          python3 -m unittest discover -s tools -p test_x86_scalar_misc_forms.py -v
+      - name: Ensure no superseded GP Rust lookup outputs remain
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test ! -e crates/backend-x86/src/generated_scalar_bin_forms.rs
+          test ! -e crates/backend-x86/src/generated_scalar_misc_forms.rs
+          grep -F 'include!("generated_gp_recipes.rs");' crates/backend-x86/src/binary.rs
+          python3 -m unittest discover -s tools -p test_x86_gp_recipes.py -v
+      - name: Isolate compiler core Rust workspace from private source frontends
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: x7-gp-output-cleanup-focused
+      - name: All 55 GP recipes including opt-in XOR RMW exact byte oracles
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib generated_gp_recipe_tests -- --nocapture
+          cargo test -p compiler-backend-x86 --lib generated_scalar_bin_tests -- --nocapture
+          cargo test -p compiler-backend-x86 --lib generated_scalar_misc_tests -- --nocapture
+      - name: Verify generated semantic admission is independent of physical encoding
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --features x7-native-form-validation --lib generated_gp_recipe_tests::native_rmw_semantic_admission_is_source_generated_and_independent -- --nocapture
+      - name: Opt-in ADD/XOR-only memory RMW independent C11 ELF and GAS
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation --lib generated_gp_recipe_tests::reviewed_rmw_memory_add_xor_match_c11_gas_and_elf -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation --lib generated_gp_recipe_tests::physical_recipes_preserve_exact_rex_sib_bytes_and_signed_index_width -- --nocapture
+      - name: Independent negative-index TypeId GCC C11 native and shared ELF/GAS
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --features x7-shared-machine-cutover --test x7_shared_signed_index_native -- --test-threads=1
+      - name: All targets all features strict Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-x86 --all-targets --all-features -- -D warnings
+  regressions:
+    name: Full default all-features x86 and core TypeId regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 70dec32299dc6bb72b2244f3721ecb6bcc7b5590
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require pinned compiler SHA
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "70dec32299dc6bb72b2244f3721ecb6bcc7b5590"
+      - name: Isolate compiler core Rust workspace from private source frontends
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: x7-gp-output-cleanup-regressions
+      - name: Full default x86 backend regression
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 -- --test-threads=2
+      - name: Full all-features x86 backend regression
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --all-features -- --test-threads=2
+      - name: Install GDB for existing DWARF oracle
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gdb
+      - name: Full core TypeId IR and optimization regressions
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -- --test-threads=2
