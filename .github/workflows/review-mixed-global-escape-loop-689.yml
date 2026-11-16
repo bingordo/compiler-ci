@@ -1,0 +1,69 @@
+name: Review #689 mixed local/global loop pointer-escape native oracle
+on:
+  push:
+    branches: [review/mixed-global-escape-loop-689]
+    paths: ['.github/workflows/review-mixed-global-escape-loop-689.yml']
+  pull_request:
+    paths: ['.github/workflows/review-mixed-global-escape-loop-689.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout compiler-ci
+        uses: actions/checkout@v4
+      - name: Checkout exact reviewed compiler SHA
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 8df0a0b51f22866da3dcf9367ada5b7385457b9f
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert pinned source commit
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "8df0a0b51f22866da3dcf9367ada5b7385457b9f"
+      - name: Isolate core Rust crates on CI runner only
+        working-directory: compiler
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          """)
+          PY
+      - name: Cache core Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: review-mixed-global-escape-loop-689
+      - name: New native mixed global/local cyclic PHI indirect callback C11 oracle
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test review_mixed_global_escape_loop -- --nocapture
+      - name: Existing native cyclic byte PHI and callbacks
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test review_loop_byte_phi_callback -- --nocapture
+          cargo test -p compiler-opt --test review_memory_callback_order -- --nocapture
+      - name: Existing global/alias/memory loop interpreter
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test memory_execution_oracle -- --nocapture
+          cargo test -p compiler-opt --test typed_global_memory -- --nocapture
+          cargo test -p compiler-opt --test alias_phi_exhaustive -- --nocapture
+      - name: Existing TypeId module global native x86
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --test native_typeid_memory_calls -- --nocapture
+      - name: Strict affected Clippy on library and new test
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --lib -- -D warnings
+          cargo clippy -p compiler-opt --test review_mixed_global_escape_loop -- -D warnings
