@@ -1,0 +1,56 @@
+name: BT4 GT1 generated native TypeId differential pilot
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-bt4-gt1-native-20261115.yml'
+permissions:
+  contents: read
+jobs:
+  generated-typeid-gas-elf-c:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a7202bbd190e4a0e8e5816d8770abacf83047327
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: bt4-gt1-native-generated-v3
+      - name: Source pin, test-only boundary and BT4 retirement guard
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "a7202bbd190e4a0e8e5816d8770abacf83047327"
+          python3 tools/check_bt4_backend_boundary.py
+          if grep -Eq 'to_legacy|from_legacy|LegacyFunctionBackend|machine::select' crates/backend-x86/tests/bt4_gt1_generated_native_differential.rs; then
+            echo "GT1 must not use historical Function codegen"
+            exit 1
+          fi
+      - name: Restrict workspace to dependency-clean compiler core
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Compile all x86 targets and new GT1 native differential matrix
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-backend-x86 --all-targets
+          cargo test -p compiler-backend-x86 --test bt4_gt1_generated_native_differential -- --nocapture
+          cargo test -p compiler-backend-x86 --test typed_generated_cfg_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test bt4_x86_historical_signed_cmp_branches_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test bt4_x86_physical_budget_native -- --nocapture
+          echo BT4_GT1_NATIVE_GENERATED_GAS_ELF_C_AND_LEGACY_ORACLES_PASS
