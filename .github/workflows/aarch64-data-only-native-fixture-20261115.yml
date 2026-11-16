@@ -1,0 +1,57 @@
+name: AArch64 data-only compact TypeId native module acceptance
+on:
+  push:
+    branches: [verify/aarch64-data-only-native-fixture-20261115]
+    paths: ['.github/workflows/aarch64-data-only-native-fixture-20261115.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2914b3e958eef7429d5f1b44b30b5bd66ea3295e
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact source SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "2914b3e958eef7429d5f1b44b30b5bd66ea3295e"
+      - name: Isolate native TypeId crates
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: aarch64-data-only-compact-module-20261115
+      - name: Parser data-only positive and empty-unit negative cases
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-ir --test native_fixture_text --test native_module_text_v3 -- --nocapture
+      - name: Complete 54 TypeId fixtures canonical roundtrip and inventory
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend-aarch64 --test native_fixed_v3_canonical -- --nocapture
+      - name: Install real AArch64 GCC binutils QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross binutils-aarch64-linux-gnu qemu-user
+      - name: Original data-only ELF GAS PIC bindings relocations and real C11 QEMU
+        working-directory: compiler
+        env:
+          COMPILER_REQUIRE_AARCH64_QEMU: "1"
+        run: |
+          cargo test -p compiler-backend-aarch64 --test module_gas -- --nocapture
+      - name: Strict Clippy
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-ir --no-deps --test native_fixture_text -- -D warnings
+          cargo clippy -p compiler-backend-aarch64 --no-deps --test module_gas --test native_fixed_v3_canonical -- -D warnings
