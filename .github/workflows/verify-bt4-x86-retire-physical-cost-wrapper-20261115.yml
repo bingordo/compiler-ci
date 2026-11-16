@@ -1,0 +1,63 @@
+name: BT4 retire legacy physical cost emission wrappers
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-bt4-x86-retire-physical-cost-wrapper-20261115.yml'
+permissions:
+  contents: read
+jobs:
+  native-typeid-cost-and-historical-x7-oracles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 0bc44389739132f24c8d7292b4564ea77f46cbfa
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: bt4-native-physical-cost-source-only
+      - name: Verify exact commit, BT4 guard, and no legacy method callers
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "0bc44389739132f24c8d7292b4564ea77f46cbfa"
+          python3 tools/check_bt4_backend_boundary.py
+          if git grep -nE '(profile_physical_costs|emit_selected|emit_object_with_mode)[[:space:]]*\(' -- '*.rs' | grep -E 'profile_physical_costs[[:space:]]*\(|(^|[^[:alnum:]_])emit_selected[[:space:]]*\(|(^|[^[:alnum:]_])emit_object_with_mode[[:space:]]*\('; then
+            echo 'BT4_FAIL: legacy Function-only x86 profiling/emitter wrapper still referenced'
+            exit 1
+          fi
+          echo BT4_NO_HISTORICAL_WRAPPER_RUST_CALLERS
+      - name: Scope native TypeId x86 compilation to dependency-clean core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Build and test native-cost exact source and historical independent GAS ELF X7 gates
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-backend-x86 --all-targets
+          cargo check -p compiler-backend-x86 --lib --no-default-features
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend-x86 --no-default-features --lib
+          cargo test -p compiler-backend-x86 --test typeid_real_physical_observer -- --nocapture
+          cargo test -p compiler-backend-x86 --test m4_global_definitions_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test m4_relro_linkage_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test m4_7_gp_variadic_native -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation --test x7_g10_n11_cfg_spill_probe -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation --test x7_g10_n16_bitwise_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test bt4_x86_physical_budget_native -- --nocapture
+          echo BT4_NATIVE_PHYSICAL_COST_X7_ELF_GAS_ACCEPTANCE_PASS
