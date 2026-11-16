@@ -49,7 +49,8 @@ jobs:
           # PR #1823 merged; validate the production compiler main branch.
           # Compiler PR #1841 is merged; keep the normal production checkout.
           # Compiler #1853 merged; production main owns native C++ startup.
-          ref: 355ea7385949dee1d5025a8fbc3bca0f7a618bd6
+          # Final source after removing temporary class AST diagnostics.
+          ref: 77972eab65718bcb686d0f502462ef89fc45d6dc
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -878,6 +879,18 @@ jobs:
             g++ -std=c++17 -fno-exceptions -O2 -Wall -Wextra -Werror native_class_order.o edg_native_cxx5_class_order_driver.cpp -o native_class_order
             test "$(./gxx_class_order)" = '12345'
             test "$(./native_class_order)" = '12345'
+            # Both explicit TypeId optimizer modes must preserve all source
+            # ctor calls and every atexit(D1, object, __dso_handle) effect.
+            for mode in leaves cfg; do
+              if ! "$binary" "native_class_order_$mode.o" --c++17 --no_exceptions "--typeid-inline=$mode" edg_native_cxx5_class_order.cpp >"native_class_order_$mode.log" 2>&1; then
+                cat "native_class_order_$mode.log"
+                exit 1
+              fi
+              readelf -SW "native_class_order_$mode.o" | grep -F .init_array
+              readelf -rW "native_class_order_$mode.o" | grep -F .rela.init_array
+              g++ -std=c++17 -fno-exceptions -O2 -Wall -Wextra -Werror "native_class_order_$mode.o" edg_native_cxx5_class_order_driver.cpp -o "native_class_order_$mode"
+              test "$("./native_class_order_$mode")" = '12345'
+            done
             for source in edg_native_cxx5_header_effectful.cpp edg_native_cxx5_global_trace.cpp; do
               rm -f edg_dynamic_probe.o
               if "$binary" edg_dynamic_probe.o --c++17 --dump-edg-global-provenance "$source" >edg_dynamic_probe.log 2>&1; then
