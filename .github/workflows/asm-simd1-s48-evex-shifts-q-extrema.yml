@@ -1,0 +1,209 @@
+# Source-pinned EVEX S4.8 feature and current-main acceptance; no compiler Actions.
+name: ASM SIMD1 S4.8 EVEX per-lane shifts and qword extrema acceptance
+on:
+  push:
+    branches: [ci/asm-simd1-s48-evex-shifts-q-extrema-20261116]
+    paths: ['.github/workflows/asm-simd1-s48-evex-shifts-q-extrema.yml']
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/asm-simd1-s48-evex-shifts-q-extrema.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  feature:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 307dd60d39f3ff58292fe99862f97cdb2ef05f0b
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify feature pin
+        run: test "$(git rev-parse HEAD)" = "307dd60d39f3ff58292fe99862f97cdb2ef05f0b"
+      - name: Restrict workspace
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: asm-simd1-s48-evex-shifts-q-extrema-feature
+      - name: Validate generated VEX, GNU as and objdump
+        run: |
+          set -euo pipefail
+          as --version | head -n1
+          objdump --version | head -n1
+          python3 tools/regen_x86_sse_packed_forms.py --check
+          python3 tools/regen_x86_sse_vex_forms.py --check
+          python3 tools/regen_x86_sse_evex_forms.py --check
+          python3 tools/regen_x86_sse_shift_imm_forms.py --check
+          python3 tools/regen_x86_sse_move_forms.py --check
+          python3 -m unittest discover -s tools -p test_regen_x86_sse_move_forms.py -v
+          python3 -m unittest discover -s tools -p test_regen_x86_sse_shift_imm_forms.py -v
+          python3 -m unittest discover -s tools -p test_regen_x86_sse_evex_forms.py -v
+          python3 -m unittest discover -s tools -p test_regen_x86_sse_vex_forms.py -v
+          cargo check -p compiler-backend-x86 --all-targets
+          cargo test -p compiler-backend-x86 --test att_sse_evex -- --list | tee /tmp/evex-listed-tests
+          grep -qF 'evex_per_lane_shift_and_qword_extrema_match_independent_gnu_bytes: test' /tmp/evex-listed-tests
+          grep -qF 'generated_evex_forms_use_shared_physical_stream_and_elf_encoder: test' /tmp/evex-listed-tests
+          grep -qF 'generated_evex_target_feature_and_mask_constraints: test' /tmp/evex-listed-tests
+          grep -qF 'generated_evex_invalid_modifiers_banks_and_memory_fail_closed: test' /tmp/evex-listed-tests
+          grep -qF 'generated_evex_bytes_and_decoded_operands_match_gnu_as_objdump: test' /tmp/evex-listed-tests
+          grep -qF 'generated_evex_0f38_tuple_and_bw_feature_split: test' /tmp/evex-listed-tests
+          grep -qF 'basic_packed_integer_evex_opcode_and_target_requirements: test' /tmp/evex-listed-tests
+          grep -qF 'shared_mnemonics_select_evex_only_when_operands_require_it: test' /tmp/evex-listed-tests
+          cargo test -p compiler-backend-x86 --test att_sse_evex -- --nocapture
+          cargo test -p compiler-backend-x86 --lib sse_evex -- --nocapture
+          cargo test -p compiler-backend-x86 --lib sse_packed -- --nocapture
+          cargo test -p compiler-backend-x86 --lib sse_vex -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_sse_packed -- --list | tee /tmp/packed-listed-tests
+          grep -qF 'generated_packed_sse_bytes_and_objdump_agree_with_gnu_as: test' /tmp/packed-listed-tests
+          grep -qF 'every_generated_packed_sse_form_enters_shared_physical_encoder: test' /tmp/packed-listed-tests
+          cargo test -p compiler-backend-x86 --test att_sse_packed -- --nocapture
+          cargo test -p compiler-backend-x86 --lib sse_shift_imm -- --nocapture
+          cargo test -p compiler-backend-x86 --lib sse_moves -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_sse_moves -- --list | tee /tmp/move-listed-tests
+          grep -qF 'generated_packed_moves_share_physical_elf_instruction_stream: test' /tmp/move-listed-tests
+          grep -qF 'packed_move_invalid_bank_direction_memory_and_width_fail_closed: test' /tmp/move-listed-tests
+          grep -qF 'source_generated_packed_move_load_store_bytes_match_gnu_as_objdump: test' /tmp/move-listed-tests
+          cargo test -p compiler-backend-x86 --test att_sse_moves -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_sse_shift_imm -- --list | tee /tmp/shift-listed-tests
+          grep -qF 'generated_imm_shifts_enter_one_physical_stream: test' /tmp/shift-listed-tests
+          grep -qF 'generated_shift_negative_immediates_width_arity_and_register_banks: test' /tmp/shift-listed-tests
+          grep -qF 'source_generated_shift_immediates_match_gnu_as_objdump_bytes: test' /tmp/shift-listed-tests
+          cargo test -p compiler-backend-x86 --test att_sse_shift_imm -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_sse_vex -- --list | tee /tmp/vex-listed-tests
+          grep -qF 'all_generated_vex_forms_enter_production_physical_encoder: test' /tmp/vex-listed-tests
+          grep -qF 'all_generated_vex_forms_reject_invalid_vector_and_memory_operands: test' /tmp/vex-listed-tests
+          grep -qF 'generated_vex_encoding_and_objdump_match_gnu_as: test' /tmp/vex-listed-tests
+          grep -qF 'variable_count_shift_requires_xmm_count_with_ymm_destination: test' /tmp/vex-listed-tests
+          grep -qF 'all_generated_vex_forms_enter_production_physical_encoder: test' /tmp/vex-listed-tests
+          grep -qF 'generated_0f38_forms_have_width_specific_avx2_target_constraints: test' /tmp/vex-listed-tests
+          cargo test -p compiler-backend-x86 --test att_sse_vex -- --nocapture
+          cargo test -p compiler-backend-x86 --lib sse_vex -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_sse_packed -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_sse_scalar -- --nocapture
+          cargo test -p compiler-backend-x86 --lib generated_form_tests -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_asm
+          cargo test -p compiler-backend-x86 --test att_module
+          cargo clippy -p compiler-backend-x86 --lib --test att_sse_evex --test att_sse_moves --test att_sse_shift_imm --test att_sse_vex -- -D warnings -A private_interfaces -A unused_variables -A clippy::suspicious_assignment_formatting
+          echo 'ASM_SIMD1_S42_EVEX_FEATURE source=307dd60d39f3ff58292fe99862f97cdb2ef05f0b status=PASS' >> "$GITHUB_STEP_SUMMARY"
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e5c50a622062cc8c56ce923dacb26ae265744566
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          fetch-depth: 128
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 307dd60d39f3ff58292fe99862f97cdb2ef05f0b
+          path: feature
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          fetch-depth: 128
+      - name: Simulate and assert exact main merge
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "e5c50a622062cc8c56ce923dacb26ae265744566"
+          test "$(git -C feature rev-parse HEAD)" = "307dd60d39f3ff58292fe99862f97cdb2ef05f0b"
+          cd compiler
+          git config user.name compiler-ci
+          git config user.email compiler-ci@example.invalid
+          git fetch ../feature HEAD
+          test "$(git rev-parse FETCH_HEAD)" = "307dd60d39f3ff58292fe99862f97cdb2ef05f0b"
+          git merge --no-commit --no-ff FETCH_HEAD
+          test "$(git rev-parse MERGE_HEAD)" = "307dd60d39f3ff58292fe99862f97cdb2ef05f0b"
+          grep -q 'pub mod sse_vex' crates/backend-x86/src/lib.rs
+          grep -q 'pub mod sse_evex' crates/backend-x86/src/lib.rs
+          grep -q 'pub(crate) fn encode_evex' crates/backend-x86/src/binary.rs
+          grep -q 'pub(crate) fn encode_vex' crates/backend-x86/src/binary.rs
+          git diff --check
+          git diff --cached --check
+          echo 'ASM_SIMD1_S42_EVEX_MERGE main=e5c50a622062cc8c56ce923dacb26ae265744566 feature=307dd60d39f3ff58292fe99862f97cdb2ef05f0b' >> "$GITHUB_STEP_SUMMARY"
+      - name: Restrict workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: asm-simd1-s48-evex-shifts-q-extrema-integration
+      - name: Validate merged VEX with GNU as and objdump
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          as --version | head -n1
+          objdump --version | head -n1
+          python3 tools/regen_x86_sse_packed_forms.py --check
+          python3 tools/regen_x86_sse_vex_forms.py --check
+          python3 tools/regen_x86_sse_evex_forms.py --check
+          python3 tools/regen_x86_sse_shift_imm_forms.py --check
+          python3 tools/regen_x86_sse_move_forms.py --check
+          python3 -m unittest discover -s tools -p test_regen_x86_sse_move_forms.py -v
+          python3 -m unittest discover -s tools -p test_regen_x86_sse_shift_imm_forms.py -v
+          python3 -m unittest discover -s tools -p test_regen_x86_sse_evex_forms.py -v
+          python3 -m unittest discover -s tools -p test_regen_x86_sse_vex_forms.py -v
+          cargo check -p compiler-backend-x86 --all-targets
+          cargo test -p compiler-backend-x86 --test att_sse_evex -- --list | tee /tmp/evex-listed-tests
+          grep -qF 'evex_per_lane_shift_and_qword_extrema_match_independent_gnu_bytes: test' /tmp/evex-listed-tests
+          grep -qF 'generated_evex_forms_use_shared_physical_stream_and_elf_encoder: test' /tmp/evex-listed-tests
+          grep -qF 'generated_evex_target_feature_and_mask_constraints: test' /tmp/evex-listed-tests
+          grep -qF 'generated_evex_invalid_modifiers_banks_and_memory_fail_closed: test' /tmp/evex-listed-tests
+          grep -qF 'generated_evex_bytes_and_decoded_operands_match_gnu_as_objdump: test' /tmp/evex-listed-tests
+          grep -qF 'generated_evex_0f38_tuple_and_bw_feature_split: test' /tmp/evex-listed-tests
+          grep -qF 'basic_packed_integer_evex_opcode_and_target_requirements: test' /tmp/evex-listed-tests
+          grep -qF 'shared_mnemonics_select_evex_only_when_operands_require_it: test' /tmp/evex-listed-tests
+          cargo test -p compiler-backend-x86 --test att_sse_evex -- --nocapture
+          cargo test -p compiler-backend-x86 --lib sse_evex -- --nocapture
+          cargo test -p compiler-backend-x86 --lib sse_packed -- --nocapture
+          cargo test -p compiler-backend-x86 --lib sse_vex -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_sse_packed -- --list | tee /tmp/packed-listed-tests
+          grep -qF 'generated_packed_sse_bytes_and_objdump_agree_with_gnu_as: test' /tmp/packed-listed-tests
+          grep -qF 'every_generated_packed_sse_form_enters_shared_physical_encoder: test' /tmp/packed-listed-tests
+          cargo test -p compiler-backend-x86 --test att_sse_packed -- --nocapture
+          cargo test -p compiler-backend-x86 --lib sse_shift_imm -- --nocapture
+          cargo test -p compiler-backend-x86 --lib sse_moves -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_sse_moves -- --list | tee /tmp/move-listed-tests
+          grep -qF 'generated_packed_moves_share_physical_elf_instruction_stream: test' /tmp/move-listed-tests
+          grep -qF 'packed_move_invalid_bank_direction_memory_and_width_fail_closed: test' /tmp/move-listed-tests
+          grep -qF 'source_generated_packed_move_load_store_bytes_match_gnu_as_objdump: test' /tmp/move-listed-tests
+          cargo test -p compiler-backend-x86 --test att_sse_moves -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_sse_shift_imm -- --list | tee /tmp/shift-listed-tests
+          grep -qF 'generated_imm_shifts_enter_one_physical_stream: test' /tmp/shift-listed-tests
+          grep -qF 'generated_shift_negative_immediates_width_arity_and_register_banks: test' /tmp/shift-listed-tests
+          grep -qF 'source_generated_shift_immediates_match_gnu_as_objdump_bytes: test' /tmp/shift-listed-tests
+          cargo test -p compiler-backend-x86 --test att_sse_shift_imm -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_sse_vex -- --list | tee /tmp/vex-listed-tests
+          grep -qF 'all_generated_vex_forms_enter_production_physical_encoder: test' /tmp/vex-listed-tests
+          grep -qF 'all_generated_vex_forms_reject_invalid_vector_and_memory_operands: test' /tmp/vex-listed-tests
+          grep -qF 'generated_vex_encoding_and_objdump_match_gnu_as: test' /tmp/vex-listed-tests
+          grep -qF 'variable_count_shift_requires_xmm_count_with_ymm_destination: test' /tmp/vex-listed-tests
+          grep -qF 'all_generated_vex_forms_enter_production_physical_encoder: test' /tmp/vex-listed-tests
+          grep -qF 'generated_0f38_forms_have_width_specific_avx2_target_constraints: test' /tmp/vex-listed-tests
+          cargo test -p compiler-backend-x86 --test att_sse_vex -- --nocapture
+          cargo test -p compiler-backend-x86 --lib sse_vex -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_sse_packed -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_sse_scalar -- --nocapture
+          cargo test -p compiler-backend-x86 --lib generated_form_tests -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_asm
+          cargo test -p compiler-backend-x86 --test att_module
+          cargo clippy -p compiler-backend-x86 --lib --test att_sse_evex --test att_sse_moves --test att_sse_shift_imm --test att_sse_vex -- -D warnings -A private_interfaces -A unused_variables -A clippy::suspicious_assignment_formatting
+          echo 'ASM_SIMD1_S42_EVEX_INTEGRATION status=PASS' >> "$GITHUB_STEP_SUMMARY"
