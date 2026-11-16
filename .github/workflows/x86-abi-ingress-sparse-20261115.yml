@@ -1,0 +1,60 @@
+name: x86 TypeId sparse SysV argument ingress
+on:
+  push:
+    branches: [verify/x86-abi-ingress-sparse-20261115]
+    paths: ['.github/workflows/x86-abi-ingress-sparse-20261115.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  ingress:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: dbbe088af204891d97026af0a4b2be6a7070360b
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check pinned compiler source and public deps
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "dbbe088af204891d97026af0a4b2be6a7070360b"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - name: Isolate compiler and x86 backend workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/driver"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x86-sparse-ingress
+      - name: x86 allocator/emitter unit tests
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend-x86 --lib -- --nocapture
+          cargo clippy -p compiler-backend-x86 --lib -- -D warnings
+      - name: Native and LTO executable ABI regressions
+        working-directory: compiler
+        run: |
+          cargo test -p compiler --test lto_fnptr_stack_abi
+          cargo test -p compiler --test lto_generated_abi_memory
+          cargo test -p compiler --test lto_ordered_build
+      - name: Source-pinned six-unit output/performance comparison
+        working-directory: compiler
+        run: |
+          cargo build -p compiler --bin compiler
+          python3 tools/lto-runtime-bench.py --compiler ./target/debug/compiler --rounds 3 --iterations 350000 --json ingress-runtime-results.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sparse-abi-ingress-benchmark
+          path: compiler/ingress-runtime-results.json
+          if-no-files-found: ignore
