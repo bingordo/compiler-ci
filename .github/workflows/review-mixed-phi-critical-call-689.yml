@@ -1,0 +1,62 @@
+name: Source-pinned mixed-width critical-edge PHI and indirect call review 689
+on:
+  push:
+    branches: [review/mixed-phi-critical-call-689]
+    paths: ['.github/workflows/review-mixed-phi-critical-call-689.yml']
+  pull_request:
+    paths: ['.github/workflows/review-mixed-phi-critical-call-689.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 36
+    steps:
+      - name: Checkout compiler-ci
+        uses: actions/checkout@v4
+      - name: Checkout exact reviewed compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 370f7c75f4724ff888d67c86c7dbe4ea6a2cf5b7
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert source SHA
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "370f7c75f4724ff888d67c86c7dbe4ea6a2cf5b7"
+      - name: CI-only core workspace
+        working-directory: compiler
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          """)
+          PY
+      - name: Cache core Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: review-mixed-phi-critical-call-689
+      - name: Physical mixed-width critical-edge phi and call-return oracle
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test review_mixed_phi_critical_call -- --nocapture
+      - name: Preserve previous pointer cycle and call-pressure acceptance
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test review_phi_call_pressure -- --nocapture
+          cargo test -p compiler-backend-x86 --test bt4_x86_historical_pointer_phi_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test bt4_x86_historical_wide_copy_cycle_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test bt4_x86_historical_arity_phi_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test bt4_x86_historical_dead_phi_native -- --nocapture
+      - name: Strict affected code and new test Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --lib -- -D warnings
+          cargo clippy -p compiler-opt --test review_mixed_phi_critical_call -- -D warnings
