@@ -50,6 +50,7 @@ jobs:
           # Compiler PR #1841 is merged; keep the normal production checkout.
           # Compiler #1853 merged; production main owns native C++ startup.
           # Compiler PR #1877 is merged; use production main for regression.
+          # Compiler EH-0 PR #1893 is merged; production main has the D1 guard.
           ref: ${{ inputs.source_ref || 'main' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
@@ -891,13 +892,20 @@ jobs:
               g++ -std=c++17 -fno-exceptions -O2 -Wall -Wextra -Werror "native_class_order_$mode.o" edg_native_cxx5_class_order_driver.cpp -o "native_class_order_$mode"
               test "$("./native_class_order_$mode")" = '12345'
             done
-            for source in edg_native_cxx5_header_effectful.cpp edg_native_cxx5_global_trace.cpp; do
+            # Even a C++17 explicitly noexcept destructor creates EDG's
+            # portable EH stack when C++ exceptions remain enabled. Do not
+            # silently elide that protocol or emit a partially linked ELF.
+            for source in edg_native_cxx5_header_effectful.cpp edg_native_cxx5_global_trace.cpp edg_native_cxx5_global_noexcept.cpp; do
               rm -f edg_dynamic_probe.o
               if "$binary" edg_dynamic_probe.o --c++17 --dump-edg-global-provenance "$source" >edg_dynamic_probe.log 2>&1; then
                 echo "Unsupported class-global initialization unexpectedly compiled: $source"
                 exit 1
               fi
               test ! -e edg_dynamic_probe.o
+              if test "$source" = edg_native_cxx5_global_noexcept.cpp; then
+                grep -F 'EDG portable EH stack protocol' edg_dynamic_probe.log
+                grep -F 'native Itanium invoke/unwind, cleanup and LSDA are not implemented' edg_dynamic_probe.log
+              fi
               grep -E 'EDG_GLOBAL_PROVENANCE|EDG_CXX5_INIT_CENSUS|EDG_CXX5_REAL_GLOBAL|EDG_CXX5_INIT_LOWERED|EDG_STARTUP_BODY|STARTUP_REF|EDG_CXX5_SOURCE_CLOSURE|EDG -> compiler-ir rejected' edg_dynamic_probe.log | tail -n 100
             done
             g++ -std=c++17 -O2 -Wall -Wextra -Werror edg_native_cxx5_global_trace.cpp edg_native_cxx5_global_trace_driver.cpp -o gxx_global_trace
