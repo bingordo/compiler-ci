@@ -49,6 +49,7 @@ jobs:
           # PR #1823 merged; validate the production compiler main branch.
           # Compiler PR #1841 is merged; keep the normal production checkout.
           # Compiler #1853 merged; production main owns native C++ startup.
+          # Compiler PR #1877 is merged; use production main for regression.
           ref: ${{ inputs.source_ref || 'main' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
@@ -789,6 +790,8 @@ jobs:
           cp tools/edg-driver/tests/fixtures/edg_native_cxx5_dynamic_order*.cpp ../edgcpp/build/gcc-release/
           cp tools/edg-driver/tests/fixtures/edg_native_cxx5_header_effectful.cpp ../edgcpp/build/gcc-release/
           cp tools/edg-driver/tests/fixtures/edg_native_cxx5_global_trace*.cpp ../edgcpp/build/gcc-release/
+          cp tools/edg-driver/tests/fixtures/edg_native_cxx5_global_noexcept*.cpp ../edgcpp/build/gcc-release/
+          cp tools/edg-driver/tests/fixtures/edg_native_cxx5_class_order*.cpp ../edgcpp/build/gcc-release/
           (
             cd ../edgcpp/build/gcc-release
             source environment.sh
@@ -848,6 +851,46 @@ jobs:
               test "$(cat "native_dynamic_order_$mode.out")" = '123'
             done
             grep -E 'EDG_GLOBAL_PROVENANCE|EDG_CXX5_INIT_CENSUS|EDG_CXX5_REAL_GLOBAL|EDG_CXX5_INIT_LOWERED|EDG_STARTUP_BODY|EDG_CXX5_SOURCE_CLOSURE' edg_dynamic_positive.log
+            # Exact C++ class global: native-generated startup runs the
+            # original inlined field write/call, then registers a source
+            # D1 destructor through __cxa_atexit. Never accept no-ELF.
+            if ! "$binary" native_class_trace.o --c++17 --no_exceptions --dump-edg-global-provenance edg_native_cxx5_global_noexcept.cpp >native_class_trace.log 2>&1; then
+              cat native_class_trace.log
+              exit 1
+            fi
+            readelf -SW native_class_trace.o | grep -F .init_array
+            readelf -rW native_class_trace.o | grep -F .rela.init_array
+            nm -g --defined-only native_class_trace.o | grep -Eq '[[:space:]]edg_noexcept_global$'
+            nm -g --defined-only native_class_trace.o | grep -Eq 'D1Ev$'
+            g++ -std=c++17 -fno-exceptions -O2 -Wall -Wextra -Werror native_class_trace.o edg_native_cxx5_global_noexcept_driver.cpp -o native_class_trace
+            g++ -std=c++17 -fno-exceptions -O2 -Wall -Wextra -Werror edg_native_cxx5_global_noexcept.cpp edg_native_cxx5_global_noexcept_driver.cpp -o gxx_class_trace
+            test "$(./native_class_trace)" = '123'
+            test "$(./gxx_class_trace)" = '123'
+            # Two *real* class objects: ctor order 1,2, main 3,
+            # __cxa_atexit destructor registration must reverse to 4,5.
+            if ! "$binary" native_class_order.o --c++17 --no_exceptions edg_native_cxx5_class_order.cpp >native_class_order.log 2>&1; then
+              cat native_class_order.log
+              exit 1
+            fi
+            readelf -SW native_class_order.o | grep -F .init_array
+            readelf -rW native_class_order.o | grep -F .rela.init_array
+            test "$(nm -g --defined-only native_class_order.o | grep -Ec '[[:space:]]edg_order_(first|second)$')" = 2
+            g++ -std=c++17 -fno-exceptions -O2 -Wall -Wextra -Werror edg_native_cxx5_class_order.cpp edg_native_cxx5_class_order_driver.cpp -o gxx_class_order
+            g++ -std=c++17 -fno-exceptions -O2 -Wall -Wextra -Werror native_class_order.o edg_native_cxx5_class_order_driver.cpp -o native_class_order
+            test "$(./gxx_class_order)" = '12345'
+            test "$(./native_class_order)" = '12345'
+            # Both explicit TypeId optimizer modes must preserve all source
+            # ctor calls and every atexit(D1, object, __dso_handle) effect.
+            for mode in leaves cfg; do
+              if ! "$binary" "native_class_order_$mode.o" --c++17 --no_exceptions "--typeid-inline=$mode" edg_native_cxx5_class_order.cpp >"native_class_order_$mode.log" 2>&1; then
+                cat "native_class_order_$mode.log"
+                exit 1
+              fi
+              readelf -SW "native_class_order_$mode.o" | grep -F .init_array
+              readelf -rW "native_class_order_$mode.o" | grep -F .rela.init_array
+              g++ -std=c++17 -fno-exceptions -O2 -Wall -Wextra -Werror "native_class_order_$mode.o" edg_native_cxx5_class_order_driver.cpp -o "native_class_order_$mode"
+              test "$("./native_class_order_$mode")" = '12345'
+            done
             for source in edg_native_cxx5_header_effectful.cpp edg_native_cxx5_global_trace.cpp; do
               rm -f edg_dynamic_probe.o
               if "$binary" edg_dynamic_probe.o --c++17 --dump-edg-global-provenance "$source" >edg_dynamic_probe.log 2>&1; then
