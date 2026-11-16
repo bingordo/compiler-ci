@@ -1,0 +1,67 @@
+name: LTO link benchmark and incremental artifact acceptance
+on:
+  push:
+    branches: [verify/lto-incremental-bench-20261115]
+    paths: ['.github/workflows/lto-incremental-bench-20261115.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5dabe53c50e664d105bf61e139a52a5ee84ef5aa
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm pinned source and public frontend dependencies
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "5dabe53c50e664d105bf61e139a52a5ee84ef5aa"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - name: Isolate native driver workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/driver"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: lto-incremental-bench
+      - name: Build target and execute LTO/native timing and incremental acceptance
+        working-directory: compiler
+        run: |
+          python3 -m py_compile tools/lto-build-bench.py
+          cargo build -p compiler --bin compiler
+          python3 tools/lto-build-bench.py --compiler ./target/debug/compiler --rounds 3 --json lto-bench-results.json
+          python3 - <<'PY'
+          import json
+          data=json.load(open("lto-bench-results.json"))
+          assert data["schema_version"]==1
+          assert data["make_incremental"]["noop_unchanged"]
+          assert data["make_incremental"]["rebuilt_after_helper_edit"]==["helper.clto","helper.o","program"]
+          for key in ("gcc_native","compiler_native","compiler_lto"):
+              assert len(data["link"][key]["link_ms"])==3
+              assert data["link"][key]["median_ms"]>=0
+          PY
+      - name: LTO regressions and strict lint
+        working-directory: compiler
+        run: |
+          cargo test -p compiler --test lto_coemit
+          cargo test -p compiler --test lto_ordered_build
+          cargo test -p compiler --test lto_link_wrapper
+          cargo clippy -p compiler --test lto_link_wrapper -- -D warnings
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lto-build-benchmark-json
+          path: compiler/lto-bench-results.json
+          if-no-files-found: ignore
