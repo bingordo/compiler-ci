@@ -1,0 +1,100 @@
+name: X7 source-linked GP-write proof receipts PR1979
+on:
+  pull_request:
+    paths: ['.github/workflows/x7-gp-write-proof-receipts-pr1979.yml']
+permissions:
+  contents: read
+  actions: read
+jobs:
+  frozen-source-gp-write:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: cbba26a1162324c19be35e2cb0e21781263678a1
+      PYTHONPATH: compiler/tools
+      X7_S3L_L5D_INTEL_DIR: /tmp/l5d/intel
+      X7_S3L_L5D_OP_AST: /tmp/l5d/smt/operations.json
+      X7_S3L_L5D_SMT: /tmp/l5d/smt/semantics-z3.json
+      X7_S3L_L5D_S2: /tmp/l5d/s2/join-1.json
+    steps:
+      - name: Checkout pinned compiler source only on compiler-ci
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: cbba26a1162324c19be35e2cb0e21781263678a1
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Original exact Intel/XED S2 identity and source-linked GP receipts
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s2-pinned-intel-xed-variant-join
+          run-id: 43635408689
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/l5d/s2
+      - name: Original nine-operation AST plus independent Z3
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3l-l2b-l3a-9-ops-generic-helper-smt-source-evidence
+          run-id: 43687620382
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/l5d/smt
+      - name: Exact pinned Intel source forms
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          mkdir -p "$X7_S3L_L5D_INTEL_DIR" /tmp/l5d/out
+          for name in ADD SUB AND OR XOR; do
+            curl -fsSL --retry 2 --max-time 50 \
+              "https://raw.githubusercontent.com/intel/SDM/35eface1b7ee003a1cda95005ec5fd83de658a64/data/instruction/$name.xml" \
+              -o "$X7_S3L_L5D_INTEL_DIR/$name.xml"
+          done
+      - name: Generic source/XED/Z3 generator, linked receipts and negative mutations
+        shell: bash
+        run: |
+          set -euo pipefail
+          CMD="python3 compiler/tools/x86_s3l_l5_gp_write.py"
+          $CMD --intel-dir "$X7_S3L_L5D_INTEL_DIR" \
+            --operation-ast "$X7_S3L_L5D_OP_AST" \
+            --generic-smt "$X7_S3L_L5D_SMT" --s2 "$X7_S3L_L5D_S2" \
+            --report /tmp/l5d/out/gp-write.json
+          git -C compiler diff --exit-code -- \
+            crates/backend-x86/src/generated_x7_s3l_l5_gp_write_recipes.rs
+          $CMD --intel-dir "$X7_S3L_L5D_INTEL_DIR" \
+            --operation-ast "$X7_S3L_L5D_OP_AST" \
+            --generic-smt "$X7_S3L_L5D_SMT" --s2 "$X7_S3L_L5D_S2" \
+            --report /tmp/l5d/out/gp-write.json --check
+          python3 -m unittest -v test_x86_s3l_l5_gp_write
+      - name: Offline TypeId native workspace
+        run: |
+          cd compiler
+          printf '[workspace]\nresolver = "2"\nmembers = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]\n' > Cargo.toml
+      - name: Native source selected and fallback C11 GAS/ELF oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          for feature in default no-default validation source-only; do
+            case "$feature" in
+              default) cargo test -p compiler-backend-x86 --test x7_s3l_l5d_gp_write_typeid_native --offline -- --nocapture ;;
+              no-default) cargo test -p compiler-backend-x86 --no-default-features --test x7_s3l_l5d_gp_write_typeid_native --offline ;;
+              validation) cargo test -p compiler-backend-x86 --no-default-features --features 'x7-native-form-validation x7-c-defined-64' --test x7_s3l_l5d_gp_write_typeid_native --offline ;;
+              source-only) cargo test -p compiler-backend-x86 --no-default-features --features x7-c-defined-source-gp-write --test x7_s3l_l5d_gp_write_typeid_native --offline ;;
+            esac
+          done
+          cargo test -p compiler-backend-x86 --lib --offline
+          cargo test -p compiler-backend-x86 --no-default-features --lib --offline
+          cargo test -p compiler-backend-x86 --test x7_s3l_l5b_regreg_typeid_native --offline
+          cargo test -p compiler-backend-x86 --test x7_s3l_l5c_regcmp_typeid_native --offline
+          cargo test -p compiler-backend-x86 --test x7_s3l_l4c_typeid_flags_native --offline
+          echo X7_L5D_GP_WRITE_SOURCE_NATIVE_MATRIX_PASS
+      - name: Save source-verified form receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-gp-write-proof-receipts-pr1979
+          path: /tmp/l5d/out/gp-write.json
+          if-no-files-found: ignore
