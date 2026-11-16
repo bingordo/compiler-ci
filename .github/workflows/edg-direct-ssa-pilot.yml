@@ -51,6 +51,7 @@ jobs:
           # Compiler #1853 merged; production main owns native C++ startup.
           # Compiler PR #1877 is merged; use production main for regression.
           # Compiler EH-0 PR #1893 is merged; production main has the D1 guard.
+          # Original C++17 iostream probes merged in compiler #1899.
           ref: ${{ inputs.source_ref || 'main' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
@@ -780,6 +781,69 @@ jobs:
             fi
             cat bad_printf.log
             test ! -e bad_printf.o
+          )
+
+      - name: EDG original system iostream C++17 no-exceptions acceptance probe
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          fixtures=tools/edg-driver/tests/fixtures
+          cp "$fixtures/edg_native_cxx5_iostream.cpp" ../edgcpp/build/gcc-release/
+          cp "$fixtures/edg_native_cxx5_iostream_no_endl.cpp" ../edgcpp/build/gcc-release/
+          cp "$fixtures/edg_native_cxx5_iostream_unused.cpp" ../edgcpp/build/gcc-release/
+          (
+            cd ../edgcpp/build/gcc-release
+            source environment.sh
+            binary="../../../compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+            g++ -std=c++17 -v -E -x c++ /dev/null >gxx_include_search.log 2>&1
+            mapfile -t include_dirs < <(awk '
+              /#include <\.\.\.> search starts here:/{active=1;next}
+              /^End of search list/{active=0}
+              active && /^ /{sub(/^[[:space:]]+/,"");print}
+            ' gxx_include_search.log)
+            test "${#include_dirs[@]}" -ge 3
+            include_flags=()
+            for directory in "${include_dirs[@]}"; do
+              test -d "$directory"
+              include_flags+=("-I$directory")
+            done
+            gnu_version="$(g++ -dumpfullversion -dumpversion)"
+            IFS=. read -r gnu_major gnu_minor gnu_patch <<<"$gnu_version"
+            gnu_number=$((10#${gnu_major}*10000 + 10#${gnu_minor:-0}*100 + 10#${gnu_patch:-0}))
+            echo "EDG_IOSTREAM_GNU_VERSION=$gnu_version ($gnu_number)"
+            for case in unused no_endl endl; do
+              case "$case" in
+                unused) source_file=edg_native_cxx5_iostream_unused.cpp ;;
+                no_endl) source_file=edg_native_cxx5_iostream_no_endl.cpp ;;
+                endl) source_file=edg_native_cxx5_iostream.cpp ;;
+              esac
+              g++ -std=c++17 -fno-exceptions -O0 -Wall -Wextra -Werror "$source_file" -o "gxx_$case"
+              timeout 15s "./gxx_$case" >"gxx_$case.out" 2>"gxx_$case.err"
+              rm -f "native_$case.o"
+              set +e
+              timeout 180s "$binary" "native_$case.o" --g++ --c++17 --no_strict_gnu --no_exceptions --gnu_version "$gnu_number" "${include_flags[@]}" "$source_file" >"edg_$case.log" 2>&1
+              status=$?
+              set -e
+              if test "$status" -eq 0; then
+                test "$(od -An -tx1 -N4 "native_$case.o" | tr -d '[:space:]')" = 7f454c46
+                if g++ -std=c++17 -fno-exceptions "native_$case.o" -o "native_$case" >"link_$case.log" 2>&1; then
+                  timeout 15s "./native_$case" >"native_$case.out" 2>"native_$case.err"
+                  test "$(sha256sum "gxx_$case.out" | cut -d' ' -f1)" = "$(sha256sum "native_$case.out" | cut -d' ' -f1)"
+                  test "$(sha256sum "gxx_$case.err" | cut -d' ' -f1)" = "$(sha256sum "native_$case.err" | cut -d' ' -f1)"
+                  echo "EDG_IOSTREAM case=$case result=full_runtime_parity"
+                else
+                  echo "EDG_IOSTREAM case=$case result=native_elf_link_blocked"
+                  tail -n 15 "link_$case.log"
+                fi
+              elif test "$status" -eq 124 || test "$status" -eq 137; then
+                echo "EDG_IOSTREAM case=$case result=compiler_timeout_or_killed exit=$status"
+                exit 1
+              else
+                test ! -e "native_$case.o"
+                echo "EDG_IOSTREAM case=$case result=clean_native_rejection exit=$status"
+                grep -E 'EDG -> compiler-ir rejected|native TypeId x86 backend|Error:|error:' "edg_$case.log" | tail -n 6 || tail -n 12 "edg_$case.log"
+              fi
+            done
           )
 
       - name: EDG C++5 native scalar dynamic init-array vs G++, class negative
