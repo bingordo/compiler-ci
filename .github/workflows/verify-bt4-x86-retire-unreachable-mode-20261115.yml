@@ -1,0 +1,65 @@
+name: BT4 retire unreachable historical PIC ctor mode plumbing
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-bt4-x86-retire-unreachable-mode-20261115.yml'
+permissions:
+  contents: read
+jobs:
+  x86-source-pinned-retired-modes-and-native-physical-oracles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 55785cc69b922eaf1a743503a5afdb57548f3691
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: bt4-retire-unreachable-legacy-mode-knobs
+      - name: Verify source pin, BT4 source guard, and whole-repo dead constructor reference absence
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "55785cc69b922eaf1a743503a5afdb57548f3691"
+          python3 tools/check_bt4_backend_boundary.py
+          if git grep -nE 'validate_module_initializers[[:space:]]*\(' -- '*.rs'; then
+            echo 'BT4_FAIL: retired legacy Function-only constructor validator still called'
+            exit 1
+          fi
+          echo BT4_NO_DEAD_OLD_FUNCTION_CONSTRUCTOR_VALIDATOR
+      - name: Isolate native TypeId core backend workspace; avoid optional frontend git dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: x86 all-target build, native and old ISA/ABI/TLS/ELF/GAS/C/X7 oracles
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-backend-x86 --all-targets
+          cargo check -p compiler-backend-x86 --lib --no-default-features
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend-x86 --no-default-features --lib
+          cargo test -p compiler-backend-x86 --test m4_7_gp_variadic_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test m4_8_ssa_tls_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test m4_8_checked_symbol_attributes_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test m4_global_definitions_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test m4_relro_linkage_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test typeid_real_physical_observer -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation --test x7_g10_n11_cfg_spill_probe -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation --test x7_g10_n16_bitwise_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test bt4_x86_physical_budget_native -- --nocapture
+          echo BT4_DEAD_FUNCTION_MODE_RETIREMENT_ALL_ORACLES_PASS
