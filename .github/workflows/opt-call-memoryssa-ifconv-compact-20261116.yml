@@ -1,0 +1,63 @@
+name: Optimizer call if-conversion and MemorySSA compact TypeId fixture acceptance
+on:
+  push:
+    branches: [verify/opt-call-memoryssa-ifconv-compact-20261116]
+    paths: ['.github/workflows/opt-call-memoryssa-ifconv-compact-20261116.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d3a8bd6e2010bb68ea48cf41b4ee3966461b7cb7
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler source
+        run: test "$(git -C compiler rev-parse HEAD)" = "d3a8bd6e2010bb68ea48cf41b4ee3966461b7cb7"
+      - name: Isolate native optimizer workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64", "crates/backend-x86", "crates/opt"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: opt-ifconv-memoryssa-26-compact-20261116
+      - name: All 64 optimizer IR inputs canonical fixture and binary roundtrips
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test native_v3_fixture_inventory -- --nocapture
+          cargo test -p compiler-ir --test native_fixture_text --test native_module_text_v3
+      - name: Install AArch64 cross toolchain and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross binutils-aarch64-linux-gnu qemu-user
+      - name: Original CT, inliner, if-conversion, core and C11 QEMU regression suites
+        working-directory: compiler
+        env:
+          COMPILER_REQUIRE_AARCH64_QEMU: "1"
+        run: |
+          cargo test -p compiler-opt --test al05_native_bridge --test array_fold_native --test ct03_typed_alias_epoch_native --test ct05_identical_native --test ctfe --test typed_identical_merges --test if_conversion_typeid_multimerge --test if_conversion_typeid_remaining --test if_conversion_typeid_x86 --test typed_inline_cfg_native --test inline_modern_scalar_native --test inline_practical_native --test typed_inline_wide_void_native --test typed_core_inline_integration --test typed_core_native_verifier --test typed_core_pipeline --test typed_if_conversion_native -- --nocapture
+      - name: Real feature-gated M6 egraph and MemorySSA oracles
+        working-directory: compiler
+        env:
+          COMPILER_REQUIRE_AARCH64_QEMU: "1"
+        run: |
+          cargo test -p compiler-opt --features typeid-egraph --test m6_typeid_egraph --test m6_typeid_memoryssa --test m6_typeid_memoryssa_cfg --test m6_typeid_memoryssa_stress -- --nocapture
+      - name: Retain independent native IR CLI directive test corpus
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test ir_fixture_directives -- --nocapture
+      - name: Strict Clippy for all affected optimizer tests
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-opt --no-deps --test al05_native_bridge --test array_fold_native --test ct03_typed_alias_epoch_native --test ct05_identical_native --test ctfe --test typed_identical_merges --test if_conversion_typeid_multimerge --test if_conversion_typeid_remaining --test if_conversion_typeid_x86 --test typed_inline_cfg_native --test inline_modern_scalar_native --test inline_practical_native --test typed_inline_wide_void_native --test typed_core_inline_integration --test typed_core_native_verifier --test typed_core_pipeline --test typed_if_conversion_native --test native_v3_fixture_inventory -- -D warnings
+          cargo clippy -p compiler-opt --features typeid-egraph --no-deps --test m6_typeid_egraph --test m6_typeid_memoryssa --test m6_typeid_memoryssa_cfg --test m6_typeid_memoryssa_stress -- -D warnings
