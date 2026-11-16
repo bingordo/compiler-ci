@@ -1,0 +1,47 @@
+name: LTO mixed native linker integration
+on:
+  push:
+    branches: [verify/lto-mixed-link-coordinator-20261114]
+    paths: ['.github/workflows/lto-mixed-link-coordinator-20261114.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  mixed-link:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ff605df4b6ea6b28377fa9f04346724a12b11f27
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source SHA and route public frontend Git deps
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "ff605df4b6ea6b28377fa9f04346724a12b11f27"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - name: Restrict build workspace to driver
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/driver"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: lto-mixed-native-link
+      - name: Mixed LTO/native executable and fallback regression
+        working-directory: compiler
+        run: |
+          cargo test -p compiler --test lto_mixed_link -- --nocapture
+          cargo test -p compiler --test lto_coemit
+          cargo test -p compiler --test lto_source_sidecar
+      - name: Strict targeted mixed-link lint
+        working-directory: compiler
+        run: cargo clippy -p compiler --test lto_mixed_link -- -D warnings
