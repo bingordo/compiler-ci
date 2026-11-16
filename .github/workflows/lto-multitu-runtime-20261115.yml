@@ -1,0 +1,68 @@
+name: LTO six-TU execution and code size benchmark
+on:
+  push:
+    branches: [verify/lto-multitu-runtime-20261115]
+    paths: ['.github/workflows/lto-multitu-runtime-20261115.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 142a26ca33f29af5a1517003b93484cfd23b8f84
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned source and public Git dependencies
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "142a26ca33f29af5a1517003b93484cfd23b8f84"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - name: Focus driver workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/driver"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: lto-multitu-runtime
+      - name: Six-unit GCC/native/LTO runtime and code-size comparison
+        working-directory: compiler
+        run: |
+          python3 -m py_compile tools/lto-runtime-bench.py
+          cargo build -p compiler --bin compiler
+          python3 tools/lto-runtime-bench.py --compiler ./target/debug/compiler --rounds 5 --iterations 350000 --json lto-runtime-results.json
+          python3 - <<'PY'
+          import json
+          x=json.load(open("lto-runtime-results.json"))
+          assert x["schema_version"]==1 and x["units"]==6 and x["rounds"]==5
+          assert x["checksum"].lstrip("-").isdigit()
+          for key in ["gcc_native","compiler_native","compiler_lto"]:
+              mode=x["modes"][key]
+              assert len(mode["runtime_ms"])==5
+              assert mode["runtime_median_ms"]>=0
+              assert mode["text_bytes"]>0 and mode["executable_bytes"]>0
+          PY
+      - name: Previously merged LTO link regressions and strict lint
+        working-directory: compiler
+        run: |
+          cargo test -p compiler --test lto_generated_abi_memory
+          cargo test -p compiler --test lto_fnptr_stack_abi
+          cargo test -p compiler --test lto_ordered_build
+          cargo clippy -p compiler --test lto_generated_abi_memory -- -D warnings
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lto-multitu-runtime-results
+          path: compiler/lto-runtime-results.json
+          if-no-files-found: ignore
