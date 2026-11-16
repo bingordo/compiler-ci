@@ -1,0 +1,62 @@
+name: BT4 retire obsolete Function GP varargs forwarding
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-bt4-x86-retire-function-gp-varargs-20261115.yml'
+permissions:
+  contents: read
+jobs:
+  x86-exact-source-no-old-trait-and-oracles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 88d792b118f412229ab5075dbc17c2459cf9a1fc
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: bt4-x86-no-dead-gp-varargs-trait
+      - name: Exact commit and full repo Rust references plus BT4 source boundary
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "88d792b118f412229ab5075dbc17c2459cf9a1fc"
+          python3 tools/check_bt4_backend_boundary.py
+          if git grep -nE '(emit_object_linked_with_gp_varargs|emit_assembly_linked_with_gp_varargs)' -- '*.rs'; then
+            echo 'BT4_FAIL: obsolete Function-only GP variadic forwarding still has Rust references'
+            exit 1
+          fi
+          test -f crates/backend-x86/tests/m4_7_gp_variadic_native.rs
+          test -f crates/backend-x86/tests/native_typeid_indirect_gp_varargs.rs
+          echo BT4_NO_OLD_TRAIT_METHOD_REFERENCES
+      - name: Use core TypeId and x86 backend workspace; no frontend network dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Native x86 all-targets and original source/ABI/ELF/GAS references
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-backend-x86 --all-targets
+          cargo check -p compiler-backend-x86 --all-targets --no-default-features
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend-x86 --no-default-features --lib
+          cargo test -p compiler-backend-x86 --test m4_7_gp_variadic_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test native_typeid_indirect_gp_varargs -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation --test x7_g10_n11_cfg_spill_probe -- --nocapture
+          cargo test -p compiler-backend-x86 --test bt4_x86_physical_budget_native -- --nocapture
+          echo BT4_HISTORICAL_TRAIT_RETIREMENT_NATIVE_ORACLES_PASS
