@@ -121,3 +121,35 @@ jobs:
           grep -F 'EDG_CXX5_STARTUP_CALL' "$RUNNER_TEMP/edg-cxx5-startup-owner.log" | head -n 24 || true
           ! grep -Fq 'executable_schedule_proven=true' "$RUNNER_TEMP/edg-cxx5-startup-owner.log"
           echo "EDG_CXX5_STARTUP native_effectful_owner=result_provenance_pass no_elf_admission=true" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Original GCC C++17 iostream source startup provenance (no ELF admission)
+        working-directory: edgcpp/build/gcc-release
+        run: |
+          set -euo pipefail
+          source environment.sh
+          cat >original-iostream.cpp <<'CPP'
+          #include <iostream>
+          int main() { std::cout << "Hello, world!" << std::endl; }
+          CPP
+          g++ -std=c++17 -v -E -x c++ /dev/null >"$RUNNER_TEMP/edg-cxx5-include-search.log" 2>&1
+          mapfile -t include_dirs < <(awk '
+            /#include <\.\.\.> search starts here:/{active=1;next}
+            /^End of search list/{active=0}
+            active && /^ /{sub(/^[[:space:]]+/,"");print}
+          ' "$RUNNER_TEMP/edg-cxx5-include-search.log")
+          test "${#include_dirs[@]}" -ge 3
+          include_flags=()
+          for dir in "${include_dirs[@]}"; do
+            if test -d "$dir"; then include_flags+=("-I$dir"); fi
+          done
+          version="$(g++ -dumpfullversion -dumpversion)"
+          IFS=. read -r major minor patch <<<"$version"
+          gnu_number=$((10#$major*10000+10#${minor:-0}*100+10#${patch:-0}))
+          "$GITHUB_WORKSPACE/edgcpp-rust/target/debug/examples/parse" \
+            --g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number" \
+            "${include_flags[@]}" original-iostream.cpp >"$RUNNER_TEMP/edg-cxx5-original-iostream.log" 2>&1
+          grep -Fq 'EDG status: 0' "$RUNNER_TEMP/edg-cxx5-original-iostream.log"
+          grep -F 'EDG_CXX5_STARTUP_EVIDENCE ' "$RUNNER_TEMP/edg-cxx5-original-iostream.log" | head -n 1
+          grep -E '^EDG_CXX5_STARTUP_(ROOT_SOURCE|CALL) ' "$RUNNER_TEMP/edg-cxx5-original-iostream.log" | head -n 32 || true
+          ! grep -Fq 'executable_schedule_proven=true' "$RUNNER_TEMP/edg-cxx5-original-iostream.log"
+          echo 'EDG_CXX5_STARTUP original_iostream=source_diagnostic_pass no_elf_admission=true' >>"$GITHUB_STEP_SUMMARY"
