@@ -29,7 +29,7 @@ jobs:
       run:
         shell: edg-container-exec "bash -eo pipefail {0}"
     env:
-      EDG_SOURCE_SHA: 4fa9e45eb8b986b910304204caf231ea2dc5b968
+      EDG_SOURCE_SHA: d56dd85608c9dfe7c0f162d35bd76fbad6bca1b8
       EDG_RELEASE_TAG: edgcpfe-ci-799603e0b5ab
       EDG_RELEASE_SHA256: fa769825e70766fbefe017806816b2338acd03daa93bb5562369c293972ce64c
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -40,7 +40,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 2c593cdf4882ec23a847349ab1355f17139b45ab
+          ref: 5f1aa5b434a731ecd473ccedea8ce8f1db7c4c79
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -49,7 +49,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: bingundu/edgcpp
-          ref: 4fa9e45eb8b986b910304204caf231ea2dc5b968
+          ref: d56dd85608c9dfe7c0f162d35bd76fbad6bca1b8
           path: edgcpp
           persist-credentials: false
 
@@ -93,7 +93,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/edgcpp-rust
-          ref: 00f9e62feffb0760b014269980427f26c0744057
+          ref: 7e9bb56be6d7882235bfd7089ebace0e55946275
           path: edg-rust-call-target
           persist-credentials: false
 
@@ -388,6 +388,9 @@ jobs:
           cargo test --manifest-path tools/edg-driver/Cargo.toml const_class_alias_rejection_reports_bounded_source_chain -- --nocapture
           cargo test --manifest-path tools/edg-driver/Cargo.toml direct_u16_field_layout_does_not_admit_scalar_execution -- --nocapture
           cargo test --manifest-path tools/edg-driver/Cargo.toml cxx_const_pointer_automatic_is_storage_only_not_class_admission -- --nocapture
+          cargo test --manifest-path tools/edg-driver/Cargo.toml global_memory_census_preserves_external_and_effectful_distinction -- --nocapture
+          cargo test --manifest-path tools/edg-driver/Cargo.toml source_file_init -- --nocapture
+          cargo test --manifest-path tools/edg-driver/Cargo.toml scalar_globals -- --nocapture
           cargo test --manifest-path tools/edg-driver/Cargo.toml tagless_storage_never_admits_unknown_class_effects_or_value_use -- --nocapture
           cargo test --manifest-path tools/edg-driver/Cargo.toml nontrivial_record_rejection_has_exact_source_root_evidence -- --nocapture
           cargo test --manifest-path tools/edg-driver/Cargo.toml rejected_class_native_field_and_local_source_provenance_is_reported -- --nocapture
@@ -548,6 +551,35 @@ jobs:
             test "$(sha256sum "$unit-reference.err" | cut -d' ' -f1)" = "$(sha256sum "$unit-native.err" | cut -d' ' -f1)"
             echo "EDG_CXX5_NATIVE gate=gxx_executable_parity fixture=$unit result=pass"
           done
+          # C++ P3b next narrow slice: a genuinely statically initialized
+          # scalar global, with no constructor, cleanup or startup root.
+          # Diagnostic only until the TypeId global-memory admission is proven.
+          cat >global-scalar.cpp <<'CPP'
+          int edg_scalar_global = 7;
+          int main() { return edg_scalar_global == 7 ? 0 : 19; }
+          CPP
+          g++ -std=c++17 -Wall -Wextra -Werror global-scalar.cpp -o global-scalar-reference
+          timeout 15s ./global-scalar-reference >global-scalar-reference.out 2>global-scalar-reference.err
+          rm -f global-scalar.o
+          "$compiler" global-scalar.o --typeid-native --dump-edg-global-provenance "${edg_flags[@]}" "${include_flags[@]}" global-scalar.cpp >global-scalar.log 2>&1 || {
+            tail -n 70 global-scalar.log >&2
+            test ! -e global-scalar.o
+            exit 1
+          }
+          test "$(od -An -tx1 -N4 global-scalar.o | tr -d '[:space:]')" = 7f454c46
+          grep -Fq 'EDG_GLOBAL_PROVENANCE globals=1 dynamic=0 init_exprs=0' global-scalar.log
+          grep -Fq 'EDG_SOURCE_FILE_INIT_SLICES observed=0 tu_complete=false' global-scalar.log
+          grep -Fq 'name=Some("edg_scalar_global")' global-scalar.log
+          grep -Fq 'INTEGER_INIT InitializerInteger' global-scalar.log
+          nm -C global-scalar.o | grep -Eq ' [DB] edg_scalar_global$'
+          readelf -r global-scalar.o | grep -Fq 'edg_scalar_global'
+          objdump -s -j .data global-scalar.o | grep -Fq '07000000'
+          g++ global-scalar.o -o global-scalar-native
+          timeout 15s ./global-scalar-native >global-scalar-native.out 2>global-scalar-native.err
+          test "$(sha256sum global-scalar-reference.out | cut -d ' ' -f1)" = "$(sha256sum global-scalar-native.out | cut -d ' ' -f1)"
+          test "$(sha256sum global-scalar-reference.err | cut -d ' ' -f1)" = "$(sha256sum global-scalar-native.err | cut -d ' ' -f1)"
+          grep -E 'EDG_GLOBAL_PROVENANCE|EDG_FILE_SCOPE_SCHEDULER|EDG_SOURCE_FILE_INIT_SLICES|EDG_SCOPE_DYNAMIC_INITS|GLOBAL id=|VARIABLE_INIT|INTEGER_INIT' global-scalar.log | head -n 80 | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "EDG_CXX5_NATIVE gate=static_scalar_global_native_gxx_parity result=pass"
           cp "$fixtures/edg_native_cxx5_header_effectful.cpp" global-effect.cpp
           g++ -std=c++17 -Wall -Wextra -Werror -fsyntax-only global-effect.cpp
           rm -f global-effect.o
@@ -563,6 +595,16 @@ jobs:
           fi
           grep -Fq 'EDG_FILE_SCOPE_SCHEDULER available=false' global-effect.log
           grep -Fq 'EDG_SCOPE_DYNAMIC_INITS entries=1' global-effect.log
+          # Exact native b_lower_file_scope_dynamic_inits producer hook:
+          # a generated startup slice and one processed global_effect init.
+          # This is member-local completeness, never all-TU init coverage.
+          grep -Fq 'EDG_SOURCE_FILE_INIT_SLICES observed=1 tu_complete=false' global-effect.log
+          grep -Eq 'SOURCE_INIT_SLICE routine=[0-9]+ name=Some\("__sti__[^"]+"\) priority=[0-9]+ tls=false processed=1' global-effect.log
+          # Source lowering owns this *processed* native init, distinct
+          # from the post-lowering scope-list dik_none=0 dtor-only entry.
+          grep -Eq 'SOURCE_INIT_MEMBER position=0 variable_id=[0-9]+ variable=Some\("global_effect"\) destructor=Some\("Effectful::~Effectful\(\)"\) kind=5' global-effect.log
+          grep -F 'EDG_SOURCE_FILE_INIT_SLICES' global-effect.log | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -E 'SOURCE_INIT_SLICE|SOURCE_INIT_MEMBER' global-effect.log | head -n 12 | tee -a "$GITHUB_STEP_SUMMARY"
           grep -Fq 'variable=Some("global_effect") destructor=Some("Effectful::~Effectful()") kind=0' global-effect.log
           # Flag is owned by EDG; generated __sti__ spelling is diagnostic only.
           grep -F 'EDG_GENERATED_ROUTINE' global-effect.log | head -n 25
@@ -643,24 +685,29 @@ jobs:
                 grep -F "ROUTINE_ID RoutineIdentity { routine: SymbolId($rejected_member)," "$variant-native-compile.log" | head -n 1 | tee -a "$GITHUB_STEP_SUMMARY" || true
               fi
               grep -E "^Error:|EDG -> compiler-ir rejected" "$variant-native-compile.log" | tail -n 1 | tee -a "$GITHUB_STEP_SUMMARY" || true
-              # This candidate correctly advances past the previous
-              # inherited-class witness and now reaches a genuinely
-              # materialized nontrivial record. Require this exact next
-              # fail-closed boundary, not an arbitrary compiler error.
-              grep -Fq 'EDG -> compiler-ir rejected source: C++ local record has user/nontrivial member or lifetime semantics' "$variant-native-compile.log"
-              # A source-specific conservative class-storage witness is
-              # mandatory, not merely an anonymous nontrivial record error.
-              grep -F 'C++ local record has user/nontrivial member or lifetime semantics' "$variant-native-compile.log" |
-                grep -Eq 'record=TypeId\([0-9]+\) conservative_roots=[1-9][0-9]* origins=\['
-              # The 240-byte three-field class is *still* unadmitted,
-              # but every source-owned field and scope/local origin must
-              # be present for the next bounded implementation step.
-              grep -F 'C++ local record has user/nontrivial member or lifetime semantics' "$variant-native-compile.log" |
-                grep -Fq 'native_layout=Some((240, 8)) record_shape=Some((3, 0))'
-              grep -F 'C++ local record has user/nontrivial member or lifetime semantics' "$variant-native-compile.log" |
-                grep -Fq 'native_field_evidence=[position=0'
-              grep -F 'C++ local record has user/nontrivial member or lifetime semantics' "$variant-native-compile.log" |
-                grep -Fq 'statement_decls='
+              # PROBE ONLY. Reject the original unchanged iostream sources
+              # before ELF output and capture native source global evidence.
+              # An imported name alone never licenses static construction.
+              grep -Fq 'EDG -> compiler-ir rejected source: native adapter has no checked global memory semantics yet:' "$variant-native-compile.log"
+              grep -Eq 'globals=[1-9][0-9]*' "$variant-native-compile.log"
+              grep -Fq 'extern_candidates=' "$variant-native-compile.log"
+              grep -Fq 'proven_extern_addresses=' "$variant-native-compile.log"
+              grep -Fq 'referenced_by_emitted_bodies=' "$variant-native-compile.log"
+              grep -Fq 'live_sample=[' "$variant-native-compile.log"
+              grep -Fq 'native_dynamic_owners=' "$variant-native-compile.log"
+              grep -Fq 'file_scope_schedule=' "$variant-native-compile.log"
+              grep -Fq 'runtime_links=' "$variant-native-compile.log"
+              # Include producer-based start-up evidence in the diagnostic
+              # artifact even when only the global-effect TU has an actual
+              # generated startup slice. Absence is UNKNOWN, not no effects.
+              grep -F 'EDG_SOURCE_FILE_INIT_SLICES observed=' "$variant-native-compile.log" |
+                head -n 1 | tee -a "$GITHUB_STEP_SUMMARY"
+              grep -F 'SOURCE_INIT_SLICE routine=' "$variant-native-compile.log" |
+                head -n 12 | tee -a "$GITHUB_STEP_SUMMARY" || true
+              grep -F 'SOURCE_INIT_MEMBER position=' "$variant-native-compile.log" |
+                head -n 24 | tee -a "$GITHUB_STEP_SUMMARY" || true
+              grep -F 'EDG -> compiler-ir rejected source:' "$variant-native-compile.log" |
+                tail -n 1 | tee -a "$GITHUB_STEP_SUMMARY"
               if test "$variant" = hello-no-endl; then
                 grep -F 'EDG_CXX5_CALL_GLOBAL path=' "$variant-native-compile.log" | grep -Fq 'name=Some("std::cout") source_link_proof=Ok("_ZSt4cout")'
               fi
@@ -683,7 +730,7 @@ jobs:
               grep -F 'EDG_NATIVE_SCOPE_OWNER ' "$variant-native-compile.log" |
                 grep -F 'class_bytes=240' | head -n 4 | tee -a "$GITHUB_STEP_SUMMARY"
               grep -F 'EDG_NATIVE_SCOPE_OWNER ' "$variant-native-compile.log" | head -n 20 | tee -a "$GITHUB_STEP_SUMMARY"
-              grep -F 'C++ local record has user/nontrivial member or lifetime semantics' "$variant-native-compile.log" | tail -n 1 | tee -a "$GITHUB_STEP_SUMMARY"
+              grep -F 'EDG -> compiler-ir rejected source:' "$variant-native-compile.log" | tail -n 1 | tee -a "$GITHUB_STEP_SUMMARY"
               echo "EDG_CXX5_NATIVE gate=iostream_fail_closed fixture=$variant result=pass"
             fi
           done
