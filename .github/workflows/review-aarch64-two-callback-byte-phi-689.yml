@@ -1,0 +1,67 @@
+name: Source-pinned ARM64 two-callback same-target byte-PHI review 689
+on:
+  push:
+    branches: [review/aarch64-two-callback-byte-phi-689]
+    paths: ['.github/workflows/review-aarch64-two-callback-byte-phi-689.yml']
+  pull_request:
+    paths: ['.github/workflows/review-aarch64-two-callback-byte-phi-689.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 35
+    steps:
+      - name: Checkout temporary CI configuration
+        uses: actions/checkout@v4
+      - name: Checkout exact reviewed compiler PR source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 0a3f5ba538b645b39f07fedd75428b8279f14841
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Guard exact pin and native ARM64 host
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "0a3f5ba538b645b39f07fedd75428b8279f14841"
+          test "$(uname -m)" = "aarch64"
+          command -v gcc
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Isolate core Rust workspace on ARM64 CI runner
+        working-directory: compiler
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          """)
+          PY
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: review-aarch64-two-callback-byte-phi-689
+      - name: New two-callback path-sensitive AArch64 byte-PHI C11 regression
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test review_aarch64_byte_phi_indirect_memory -- --nocapture
+      - name: Previously merged ARM64 loop-carried byte-PHI parity
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test review_aarch64_loop_byte_phi_callback -- --nocapture
+      - name: Previously merged ARM64 local/global escaped pointer-PHI parity
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test review_aarch64_mixed_global_escape_loop -- --nocapture
+      - name: Existing AArch64 narrow memory, pointer and callback ABI controls
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-aarch64 --test local_memory -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test ptr64_calls -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test typeid_abi_calls_native -- --nocapture
+      - name: Strict reviewed core and new test Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-aarch64 --lib -- -D warnings
+          cargo clippy -p compiler-opt --test review_aarch64_byte_phi_indirect_memory -- -D warnings
