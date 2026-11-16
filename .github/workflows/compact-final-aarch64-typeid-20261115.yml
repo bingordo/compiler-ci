@@ -1,0 +1,53 @@
+name: Complete AArch64 TypeId compact fixture acceptance
+on:
+  push:
+    branches: [verify/compact-final-aarch64-typeid-20261115]
+    paths: ['.github/workflows/compact-final-aarch64-typeid-20261115.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c106daf9ee5da3abc00f3ae66c3afce6cae7e487
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned source tree
+        run: test "$(git -C compiler rev-parse HEAD)" = "c106daf9ee5da3abc00f3ae66c3afce6cae7e487"
+      - name: Isolate native workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: aarch64-typeid-final-compact-fixture-inventory
+      - name: Verify all 53 compact TypeId fixture sources and canonical v3 roundtrips
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend-aarch64 --test native_fixed_v3_canonical -- --nocapture
+          cargo test -p compiler-ir --test native_fixture_text --test native_module_text_v3
+      - name: Install AArch64 GCC binutils and real QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross binutils-aarch64-linux-gnu qemu-user
+      - name: Run original I64 and LP64 pointer machine/ABI/C11 QEMU oracles
+        working-directory: compiler
+        env:
+          COMPILER_REQUIRE_AARCH64_QEMU: "1"
+        run: |
+          cargo test -p compiler-backend-aarch64 --test i64_scalar_complete --test ptr64_calls -- --nocapture
+      - name: Strict Clippy for all changed test code
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-backend-aarch64 --no-deps --test native_fixed_v3_canonical --test i64_scalar_complete --test ptr64_calls -- -D warnings
