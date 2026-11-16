@@ -1,0 +1,115 @@
+name: S4 real-source TypeId shared selected-machine x86 cutover
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-x7-s4-real-source-20261115.yml']
+permissions:
+  contents: read
+jobs:
+  real-optimized-compiler-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust pinned frontend GitHub SSH
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: fc5f35f5e1898e580d47da484833fbaffe0c1664
+          ssh-key: ${{ secrets.CI_KEY }}
+          path: compiler
+          persist-credentials: false
+      - name: Pin source SHA and toolchain
+        run: test "$(git -C compiler rev-parse HEAD)" = "fc5f35f5e1898e580d47da484833fbaffe0c1664"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: s4-selected-machine-source-native
+      - name: End-to-end real Mini-C executable native and selected machine ELF/GAS
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test x7_selected_machine_source -- --nocapture
+          cargo test -p compiler --test x86_annotated_asm -- --nocapture
+          cargo check -p compiler
+          cargo build -p compiler
+      - name: Real unmodified C and Oberon source candidate acceptance (no fallback)
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/x7-s4-unmodified-real-source
+          ok=0; bad=0
+          for source in \
+            tests/fixtures/inliner/rolling_checksum.c \
+            tests/fixtures/inliner/RollingChecksum.mod \
+            examples/Math.mod \
+            examples/lto-build/caller.c \
+            examples/lto-build/helper.c; do
+            artifact=$(echo "$source" | tr '/.' '__')
+            cp "$source" "/tmp/x7-s4-unmodified-real-source/$artifact.${source##*.}"
+            input="/tmp/x7-s4-unmodified-real-source/$artifact.${source##*.}"
+            target="/tmp/x7-s4-unmodified-real-source/$artifact.selected.o"
+            if target/debug/compiler "$input" --target x86_64 --emit obj --x7-selected-machine -o "$target" >"/tmp/x7-s4-unmodified-real-source/$artifact.stdout" 2>"/tmp/x7-s4-unmodified-real-source/$artifact.stderr"; then
+              test -s "$target"
+              readelf -h "$target" >/dev/null
+              echo "X7_S4_REAL_SOURCE_ADMITTED $source"
+              ok=$((ok+1))
+            else
+              test ! -e "$target"
+              echo "X7_S4_REAL_SOURCE_REJECTED $source"
+              cat "/tmp/x7-s4-unmodified-real-source/$artifact.stderr"
+              bad=$((bad+1))
+            fi
+          done
+          echo "X7_S4_COHORT attempted=5 admitted=$ok rejected=$bad"
+          test "$ok" -gt 0
+          echo X7_S4_NORMAL_SOURCE_REAL_SELECTED_MACHINE_PASS
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-s4-selected-machine-unmodified-source-cohort
+          path: /tmp/x7-s4-unmodified-real-source
+          if-no-files-found: ignore
+  selected-machine-backend-executable:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: fc5f35f5e1898e580d47da484833fbaffe0c1664
+          ssh-key: ${{ secrets.CI_KEY }}
+          path: compiler
+          persist-credentials: false
+      - name: Pin compiler source
+        run: test "$(git -C compiler rev-parse HEAD)" = "fc5f35f5e1898e580d47da484833fbaffe0c1664"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-s4-shared-machine-backend
+      - name: Use TypeId/backend crates only
+        shell: bash
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Shared selected machine native executable ABI and ELF/GAS validation
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test x7_shared_machine_native_parity -- --nocapture
+          cargo test -p compiler-backend-x86 --test x7_shared_pic_global_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test x7_shared_narrow_alu_casts -- --nocapture
+          cargo test -p compiler-backend-x86 --test x7_shared_signed_index_native -- --nocapture
+          cargo test -p compiler-backend-x86 --lib
+          echo X7_S4_SHARED_MACHINE_NATIVE_ABI_GAS_ELF_PARITY_PASS
