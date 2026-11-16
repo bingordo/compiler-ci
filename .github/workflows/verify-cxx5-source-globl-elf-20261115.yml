@@ -1,0 +1,228 @@
+name: C++5 source-owned .globl undefined ELF symbol contract
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/verify-cxx5-source-globl-elf-20261115.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cxx5-source-globl-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cxx5-source-globl:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    container:
+      image: ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8
+    defaults:
+      run:
+        shell: edg-container-exec "bash -eo pipefail {0}"
+    env:
+      COMPILER_SHA: f41bfcd333e7ac4920e23f42dd304e682c658ef7
+      EDG_SOURCE_SHA: b195677be8b9b56c8337afad6be8064d21a54082
+      EDG_BRIDGE_SHA: 7f67a31a9ad5db038c8b1544e49117f23b462e45
+      EDG_RELEASE_TAG: edgcpfe-v2026.11.14-upstream-177765bb7731
+      EDG_RELEASE_SHA256: 1ce495b629924f31382ecccc891a7a72caae1014ddfa2ba7dd39b44d8b0a9526
+      RUST_TOOLCHAIN_VERSION: 1.99.1
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+      EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+      EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+      EDGCPP_EDG_REVISION: b195677be8b9b56c8337afad6be8064d21a54082
+    steps:
+      - name: Check out exactly pinned compiler integration candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f41bfcd333e7ac4920e23f42dd304e682c658ef7
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+
+      - name: Check out source headers matching upstream EDG release
+        uses: actions/checkout@v4
+        with:
+          repository: bingundu/edgcpp
+          ref: b195677be8b9b56c8337afad6be8064d21a54082
+          path: edgcpp
+          persist-credentials: false
+
+      - name: Assert source revisions and unmodified Hello World
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          test "$(git -C edgcpp rev-parse HEAD)" = "$EDG_SOURCE_SHA"
+          grep -Fq 'rev = "7f67a31a9ad5db038c8b1544e49117f23b462e45"' compiler/tools/edg-driver/Cargo.toml
+          ! grep -q 'edgcpp_capture_' edgcpp/src/lower_il.c
+          fixture=compiler/tools/edg-driver/tests/fixtures/edg_native_cxx5_iostream.cpp
+          test -f "$fixture"
+          grep -Fq '#include <iostream>' "$fixture"
+          grep -Fq 'std::cout << "Hello, world!" << std::endl;' "$fixture"
+          printf 'Compiler SHA: %s\nEDG package SHA: %s\nBridge SHA: %s\n' "$COMPILER_SHA" "$EDG_SOURCE_SHA" "$EDG_BRIDGE_SHA" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Configure EDG header tooling without rebuilding full frontend
+        working-directory: edgcpp
+        env:
+          EDG_BASE: ${{ github.workspace }}/edgcpp/bases/docker/dev-env/gcc
+        run: |
+          set -euo pipefail
+          cmake --preset linux-gcc-release -DEDG_BUILD_LIB=OFF -DEDG_BUILD_CALLABLE_LIBRARY=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          cmake --build build/gcc-release --target error-info --parallel 2
+          test -s build/gcc-release/src/includes/err_codes.h
+          test -s build/gcc-release/src/includes/err_data.h
+
+      - name: Restore checksummed upstream EDG callable release
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          mkdir -p build/gcc-release/lib build/prebuilt-edg
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error --retry 4 --retry-delay 2 \
+            "https://github.com/bingundu/edgcpp/releases/download/$EDG_RELEASE_TAG/edgcpfe-ci-upstream-callable-edg-release-20261114-linux-x86_64.tar.gz" \
+            -o build/prebuilt-edg/archive.tar.gz
+          printf '%s  %s\n' "$EDG_RELEASE_SHA256" build/prebuilt-edg/archive.tar.gz | sha256sum -c -
+          tar -xzf build/prebuilt-edg/archive.tar.gz -C build/prebuilt-edg
+          grep -Fx "commit=$EDG_SOURCE_SHA" build/prebuilt-edg/BUILD-INFO.txt
+          grep -Fx 'platform=linux-x86_64' build/prebuilt-edg/BUILD-INFO.txt
+          test -s build/prebuilt-edg/lib/libedgcpfe.a
+          cp build/prebuilt-edg/lib/libedgcpfe.a build/gcc-release/lib/libedgcpfe.a
+
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          if ! command -v cargo >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN_VERSION"
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install "$RUST_TOOLCHAIN_VERSION" --profile minimal
+          rustup default "$RUST_TOOLCHAIN_VERSION"
+
+
+      - name: Validate shared ELF writer and EDG strict source directive tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test -p compiler-backend --test cxx5_scope_globl_elf -- --nocapture
+          cargo test --manifest-path tools/edg-driver/Cargo.toml source_scope_asm -- --nocapture
+          cargo build --manifest-path tools/edg-driver/Cargo.toml
+          test -x tools/edg-driver/target/debug/compiler-edg-driver
+          echo 'CXX5 source_globl=rust_negative_positive_tests_pass' >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Native source .globl differential against independent GCC and readelf
+        working-directory: edgcpp/build/gcc-release
+        run: |
+          set -euo pipefail
+          source ./environment.sh
+          driver="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          work="$RUNNER_TEMP/cxx5-globl-direct-elf"
+          mkdir -p "$work"
+          cd "$work"
+          cat >source.cpp <<'CPP'
+          asm(".globl edg_cxx5_asm_control_symbol");
+          int main() { return 0; }
+          CPP
+          version="$(g++ -dumpfullversion -dumpversion)"
+          IFS=. read -r major minor patch <<<"$version"
+          gnu_number=$((10#$major*10000+10#${minor:-0}*100+10#${patch:-0}))
+          g++ -std=c++17 -c source.cpp -o gcc.o
+          "$driver" native.o --typeid-native --g++ --c++17 --no_strict_gnu \
+            --gnu_version "$gnu_number" source.cpp >native.log 2>&1 || {
+              tail -n 100 native.log >&2
+              test ! -e native.o
+              exit 1
+            }
+          test "$(od -An -tx1 -N4 native.o | tr -d '[:space:]')" = 7f454c46
+          nm -u gcc.o | grep -Eq ' U edg_cxx5_asm_control_symbol$'
+          nm -u native.o | grep -Eq ' U edg_cxx5_asm_control_symbol$'
+          readelf -Ws native.o | grep -E 'GLOBAL +DEFAULT +UND +edg_cxx5_asm_control_symbol$'
+          ! readelf -rW native.o | grep -Fq edg_cxx5_asm_control_symbol
+          objdump -dr native.o >native.disasm
+          objdump -dr gcc.o >gcc.disasm
+          g++ native.o -o native
+          timeout 15s ./native
+          "$driver" optimized.o --typeid-native --typeid-inline=cfg --g++ --c++17 --no_strict_gnu \
+            --gnu_version "$gnu_number" source.cpp >optimized.log 2>&1 || {
+              tail -n 100 optimized.log >&2
+              test ! -e optimized.o
+              exit 1
+            }
+          nm -u optimized.o | grep -Eq ' U edg_cxx5_asm_control_symbol$'
+          g++ optimized.o -o optimized
+          timeout 15s ./optimized
+          echo 'CXX5 source_globl=one_undefined_no_relocation both_modes=pass native_executable=pass' >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Reject unsupported source asm before creating any ELF
+        working-directory: edgcpp/build/gcc-release
+        run: |
+          set -euo pipefail
+          source ./environment.sh
+          driver="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          work="$RUNNER_TEMP/cxx5-globl-negative"
+          mkdir -p "$work"
+          cd "$work"
+          version="$(g++ -dumpfullversion -dumpversion)"
+          IFS=. read -r major minor patch <<<"$version"
+          gnu_number=$((10#$major*10000+10#${minor:-0}*100+10#${patch:-0}))
+          cat >bad-directive.cpp <<'CPP'
+          asm(".weak unsupported_native_symbol");
+          int main() { return 0; }
+          CPP
+          cat >bad-compound.cpp <<'CPP'
+          asm(".globl first\n.globl second");
+          int main() { return 0; }
+          CPP
+          for kind in directive compound; do
+            rm -f "$kind.o"
+            if "$driver" "$kind.o" --typeid-native --g++ --c++17 --no_strict_gnu \
+              --gnu_version "$gnu_number" "bad-$kind.cpp" >"$kind.log" 2>&1; then
+              echo "::error::Unsupported source asm admitted: $kind"
+              exit 1
+            fi
+            test ! -e "$kind.o"
+            grep -E '(unsupported file-scope asm|invalid or compound .globl)' "$kind.log"
+          done
+          echo 'CXX5 unsupported_source_asm=no_partial_elf pass' >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Original GCC15 iostream remains a separately checked executable gate
+        working-directory: edgcpp/build/gcc-release
+        run: |
+          set -euo pipefail
+          source ./environment.sh
+          driver="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          fixture="$GITHUB_WORKSPACE/compiler/tools/edg-driver/tests/fixtures/edg_native_cxx5_iostream.cpp"
+          work="$RUNNER_TEMP/cxx5-original-iostream-globl"
+          mkdir -p "$work"
+          cd "$work"
+          cp "$fixture" original.cpp
+          g++ -std=c++17 -v -E -x c++ /dev/null >include-search.log 2>&1
+          mapfile -t dirs < <(awk '
+            /#include <\.\.\.> search starts here:/{active=1;next}
+            /^End of search list/{active=0}
+            active && /^ /{sub(/^[[:space:]]+/,"");print}
+          ' include-search.log)
+          includes=()
+          for dir in "${dirs[@]}"; do
+            if test -d "$dir"; then includes+=("-I$dir"); fi
+          done
+          version="$(g++ -dumpfullversion -dumpversion)"
+          IFS=. read -r major minor patch <<<"$version"
+          gnu_number=$((10#$major*10000+10#${minor:-0}*100+10#${patch:-0}))
+          rm -f original.o
+          if "$driver" original.o --typeid-native --g++ --c++17 --no_strict_gnu \
+            --gnu_version "$gnu_number" "${includes[@]}" original.cpp >original.log 2>&1; then
+            nm -u original.o | tee original.undefined
+            nm -u original.o | grep -F '_ZSt21ios_base_library_initv'
+            echo 'CXX5 original_iostream=native_object_present further_elf_parity_needed' >>"$GITHUB_STEP_SUMMARY"
+          else
+            test ! -e original.o
+            tail -n 50 original.log
+            echo 'CXX5 original_iostream=still_fail_closed other_source_blockers' >>"$GITHUB_STEP_SUMMARY"
+          fi
