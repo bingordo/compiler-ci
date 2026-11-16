@@ -1,0 +1,62 @@
+name: BT4 retire unused historical weak hidden symbol wrappers
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-bt4-x86-retire-checked-symbol-wrapper-20261115.yml'
+permissions:
+  contents: read
+jobs:
+  source-pinned-x86-symbol-visibility-oracles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 3fa356a26b9ba1c2e51ff1179695253d19f37113
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: bt4-x86-no-unused-checked-symbol-wrappers
+      - name: Exact source pin, BT4 boundary, and full repo unused API absence
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "3fa356a26b9ba1c2e51ff1179695253d19f37113"
+          python3 tools/check_bt4_backend_boundary.py
+          if git grep -nE '(emit_object_with_checked_symbol_attributes|emit_assembly_with_checked_symbol_attributes)' -- '*.rs'; then
+            echo 'BT4_FAIL: historical weak/hidden-only wrapper still referenced'
+            exit 1
+          fi
+          echo BT4_UNUSED_CHECKED_SYMBOL_WRAPPERS_ABSENT
+      - name: Narrow to native TypeId core backend workspace, avoiding optional frontend git deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Source-owned x86 ELF GAS TLS visibility ABI C and generated-form oracles
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-backend-x86 --all-targets
+          cargo check -p compiler-backend-x86 --lib --no-default-features
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend-x86 --no-default-features --lib
+          cargo test -p compiler-backend-x86 --test m4_8_checked_symbol_attributes_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test m4_8_ssa_tls_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test m4_global_definitions_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test m4_relro_linkage_native -- --nocapture
+          cargo test -p compiler-backend-x86 --features x7-native-form-validation --test x7_g10_n11_cfg_spill_probe -- --nocapture
+          cargo test -p compiler-backend-x86 --test bt4_x86_physical_budget_native -- --nocapture
+          echo BT4_WEAK_HIDDEN_SYMBOL_WRAPPER_RETIREMENT_ALL_ORACLES_PASS
