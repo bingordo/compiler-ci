@@ -1,0 +1,52 @@
+name: AArch64 I64 and address chains native TypeId compact migration
+on:
+  push:
+    branches: [verify/aarch64-i64-address-chains-compact-20261115]
+    paths: ['.github/workflows/aarch64-i64-address-chains-compact-20261115.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 83a5cc1a132f1d6c9b02d6b5b00ed9bff640a7c4
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "83a5cc1a132f1d6c9b02d6b5b00ed9bff640a7c4"
+      - name: Isolate native workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: aarch64-i64-chains-compact-20261115
+      - name: Export original graph modules through production v3 writer
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend-aarch64 --test i64_transport export_original_native_v3_for_migration -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test address_chains export_original_native_v3_for_migration -- --nocapture
+      - name: Install real AArch64 GCC and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross binutils-aarch64-linux-gnu qemu-user
+      - name: Original AArch64 machine/ABI and C11 QEMU oracles
+        working-directory: compiler
+        env:
+          COMPILER_REQUIRE_AARCH64_QEMU: "1"
+        run: |
+          cargo test -p compiler-backend-aarch64 --test i64_transport --test address_chains -- --nocapture
+      - name: Strict scoped Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-aarch64 --no-deps --test i64_transport --test address_chains -- -D warnings
