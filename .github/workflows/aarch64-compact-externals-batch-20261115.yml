@@ -1,0 +1,61 @@
+name: AArch64 external call compact TypeId fixture batch
+on:
+  push:
+    branches: [verify/aarch64-compact-externals-batch-20261115]
+    paths: ['.github/workflows/aarch64-compact-externals-batch-20261115.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 868ff55d2e8ef9208c765132aa841fb8f215c530
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify compiler source SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "868ff55d2e8ef9208c765132aa841fb8f215c530"
+      - name: Restrict native workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: aarch64-external-call-compact-fixture
+      - name: Check compact external declaration and variadic parser regressions
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-ir --test native_fixture_text -- --nocapture
+          cargo test -p compiler-ir --test native_module_text_v3
+      - name: Export original Rust-built ABI/call TypeId modules
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend-aarch64 --test abi_aliases export_original_native_v3_for_migration -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test direct_calls export_original_native_v3_for_migration -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test unwind_cfi export_original_native_v3_for_migration -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test gp_varargs export_original_native_v3_for_migration -- --nocapture
+      - name: Install real AArch64 cross compiler and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross binutils-aarch64-linux-gnu qemu-user
+      - name: Preserve original machine, external ABI, C11 and real QEMU oracles
+        working-directory: compiler
+        env:
+          COMPILER_REQUIRE_AARCH64_QEMU: "1"
+        run: |
+          cargo test -p compiler-backend-aarch64 --test abi_aliases --test direct_calls --test unwind_cfi --test gp_varargs -- --nocapture
+      - name: Strict scoped Clippy
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-ir --no-deps --test native_fixture_text -- -D warnings
+          cargo clippy -p compiler-backend-aarch64 --no-deps --test abi_aliases --test direct_calls --test unwind_cfi --test gp_varargs -- -D warnings
