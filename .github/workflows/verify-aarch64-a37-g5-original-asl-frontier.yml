@@ -1,0 +1,214 @@
+name: AArch64 A3.7 G5 original ASL provenance crosswalk
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-aarch64-a37-g5-original-asl-frontier.yml'
+permissions:
+  contents: read
+jobs:
+  source-guard-join:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: cda1a69dd40cd8ef6703041979fe0285070e63e8
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check A3.7 guard and generic matcher negative tests
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = cda1a69dd40cd8ef6703041979fe0285070e63e8
+          python3 -m unittest discover -s compiler/tools -p 'test_aarch64_a36_source_guards.py' -v
+          python3 -m unittest discover -s compiler/tools -p 'test_aarch64_a35_candidate_bridge.py' -v
+          python3 -m unittest discover -s compiler/tools -p 'test_aarch64_mrs_catalog.py' -v
+          python3 -m unittest discover -s compiler/tools -p 'test_x86_generic_form_matcher.py' -v
+          python3 compiler/tools/regen_aarch64_scalar_gp_forms.py --check
+          python3 compiler/tools/regen_aarch64_native_selector_rules.py --check
+          python3 -m unittest discover -s compiler/tools -p 'test_aarch64_a37_guard_census.py' -v
+          python3 -m unittest discover -s compiler/tools -p 'test_aarch64_a37_boolean_guards.py' -v
+          python3 -m unittest discover -s compiler/tools -p 'test_aarch64_a37_source_bitfields.py' -v
+          python3 -m unittest discover -s compiler/tools -p 'test_aarch64_a37_universal_masks.py' -v
+          python3 -m unittest discover -s compiler/tools -p 'test_aarch64_a32_asl_source_links.py' -v
+          python3 -m unittest discover -s compiler/tools -p 'test_aarch64_a32_full_source_catalog.py' -v
+          python3 -m unittest discover -s compiler/tools -p 'test_aarch64_a37_asl_source_frontier.py' -v
+      - name: Evaluate 2026-09 pinned AARCHMRS conditions and source joins
+        run: |
+          set -euo pipefail
+          curl -fLsS --retry 3 --connect-timeout 20 --max-time 240 \
+            'https://kernel.googlesource.com/pub/scm/linux/kernel/git/maz/AARCHMRS/+/1346b16d47619400448f3cb6d4f22d62d3b76848/Instructions.json?format=TEXT' \
+            -o /tmp/aarchmrs-instructions.b64
+          base64 -d /tmp/aarchmrs-instructions.b64 > /tmp/aarchmrs-instructions.json
+          echo 'ef75f3ec02df1b9b9c0612f4ea259d6710ac3de686b097d8f9c83d1d97aa800a  /tmp/aarchmrs-instructions.json' | sha256sum -c -
+          wc -c /tmp/aarchmrs-instructions.json
+          python3 compiler/tools/aarch64_mrs_catalog.py \
+            --instructions /tmp/aarchmrs-instructions.json \
+            --expect-sha256 ef75f3ec02df1b9b9c0612f4ea259d6710ac3de686b097d8f9c83d1d97aa800a \
+            --out /tmp/aarchmrs-a64.json
+          python3 compiler/tools/aarch64_a35_candidate_bridge.py \
+            --aarchmrs-catalog /tmp/aarchmrs-a64.json \
+            --original-aarchmrs /tmp/aarchmrs-instructions.json \
+            --reviewed-forms compiler/data/aarch64_scalar_gp_forms.json \
+            --out /tmp/aarch64-a36-report.json
+          python3 - <<'PY'
+          import json
+          j=json.load(open('/tmp/aarch64-a36-report.json'))
+          assert j['reviewed_form_count']==12
+          assert j['source_guard_source_authenticated']
+          assert j['source_guard_literal_true_form_count']==12
+          assert j['source_mask_matched_form_count']==12
+          assert j['source_joined_form_count']==12, [
+              (x['reviewed_operation'], x['width_bits'],x['blocker_counts']) for x in j['forms']]
+          counts=j['source_guard_full_catalog_statuses']
+          assert sum(counts.values())==4429
+          assert all(x['candidate_count']>=1 for x in j['forms'])
+          assert all(not x['selection_eligible'] and not x['machine_effect_equivalence_proven'] and not x['asl_semantic_equivalence_proven'] for x in j['forms'])
+          assert not j['selection_eligible'] and not j['source_join_is_proof']
+          print('A36_REAL_SOURCE_GUARDS',counts,
+                'source-compatible',j['source_joined_form_count'],
+                'semantic_proofs',0,'new_rules',0)
+          PY
+
+          python3 compiler/tools/aarch64_a37_guard_census.py \
+            --original-aarchmrs /tmp/aarchmrs-instructions.json \
+            --aarchmrs-catalog /tmp/aarchmrs-a64.json \
+            --out /tmp/aarch64-a37-guard-census.json
+          python3 compiler/tools/aarch64_a37_guard_census.py \
+            --original-aarchmrs /tmp/aarchmrs-instructions.json \
+            --aarchmrs-catalog /tmp/aarchmrs-a64.json \
+            --out /tmp/aarch64-a37-guard-census.json --check
+          python3 - <<'PY'
+          import json
+          p=json.load(open('/tmp/aarch64-a37-guard-census.json'))
+          assert p['format']=='aarch64-a37-original-condition-census-v1'
+          assert p['instruction_path_count']==4429
+          assert sum(p['path_guard_statuses'].values())==4429
+          assert p['path_guard_statuses']['true']>=293
+          assert p['path_guard_statuses']['unknown']<=4136
+          assert p['operators_per_inherited_path'].get('||',0)>0
+          assert p['operators_per_inherited_path'].get('&&',0)>0
+          assert p['distinct_condition_ast_hashes']>0
+          assert p['inherited_condition_edges']>=4429
+          assert not any(p[k] for k in [
+              'selection_eligible','unknown_conditions_evaluated',
+              'asl_semantic_equivalence_proven','source_operand_legality_proven'])
+          print('A37_REAL_SOURCE_CONDITION_CENSUS',
+                'roots',p['root_kinds_per_inherited_path'],
+                'unresolved',p['unresolved_root_kinds_per_inherited_path'],
+                'operators',p['operators_per_inherited_path'])
+          PY
+
+          python3 compiler/tools/aarch64_a37_source_bitfields.py \
+            --original-aarchmrs /tmp/aarchmrs-instructions.json \
+            --aarchmrs-catalog /tmp/aarchmrs-a64.json \
+            --out /tmp/aarch64-a37-g3-witnesses.json
+          python3 compiler/tools/aarch64_a37_source_bitfields.py \
+            --original-aarchmrs /tmp/aarchmrs-instructions.json \
+            --aarchmrs-catalog /tmp/aarchmrs-a64.json \
+            --out /tmp/aarch64-a37-g3-witnesses.json --check
+          python3 - <<'PY'
+          import json
+          p=json.load(open('/tmp/aarch64-a37-g3-witnesses.json'))
+          assert p['format']=='aarch64-a37-g3-bitfield-word-witness-v1'
+          assert p['source_paths']==4429 and len(p['rows'])==4429
+          assert p['source_recomputed_exactly'] and p['word_specific_only']
+          assert p['original_path_statuses']=={'true':293, 'unknown':4136, 'false':0}
+          assert sum(p['sampled_word_guard_statuses'].values())==4429
+          assert not p['selection_eligible'] and not p['asl_semantic_equivalence_proven']
+          assert not p['source_operand_legality_proven']
+          assert all(not x['selection_eligible'] and x['word_specific_only'] and
+                     not x['semantic_equivalence_proven'] for x in p['rows'])
+          assert all('_original_condition_asts' not in x for x in p['rows'])
+          print('A37_G3_FULL_SOURCE_WORD_DIAGNOSTIC',
+                p['sampled_word_guard_statuses'],
+                p['blocked_counts'], 'selector_admitted=0')
+          PY
+
+          python3 compiler/tools/aarch64_a37_universal_masks.py \
+            --original-aarchmrs /tmp/aarchmrs-instructions.json \
+            --aarchmrs-catalog /tmp/aarchmrs-a64.json \
+            --out /tmp/aarch64-a37-g4-universal-mask.json
+          python3 compiler/tools/aarch64_a37_universal_masks.py \
+            --original-aarchmrs /tmp/aarchmrs-instructions.json \
+            --aarchmrs-catalog /tmp/aarchmrs-a64.json \
+            --out /tmp/aarch64-a37-g4-universal-mask.json --check
+          python3 - <<'PY'
+          import json
+          a=json.load(open('/tmp/aarch64-a37-g4-universal-mask.json'))
+          assert a['format']=='aarch64-a37-g4-universal-mask-predicates-v1'
+          assert a['source_path_count']==4429 and len(a['rows'])==4429
+          assert a['original_catalog_recomputed_exactly']
+          assert a['original_unbound_path_statuses']=={
+              'true':293, 'false':0, 'unknown':4136}
+          assert sum(a['universal_mask_predicate_statuses'].values())==4429
+          assert not a['selection_eligible']
+          assert not a['source_legality_proven']
+          assert not a['asl_semantic_equivalence_proven']
+          assert not a['machine_effect_equivalence_proven']
+          assert all(not row['selection_eligible'] and
+                     not row['source_legality_proven'] and
+                     not row['asl_semantic_equivalence_proven'] and
+                     not row['machine_effect_equivalence_proven'] and
+                     row['source_mask_only_quantifier']
+                     for row in a['rows'])
+          samples=json.load(open('/tmp/aarch64-a37-g3-witnesses.json'))
+          prior={(x['path'],x['operation_id']):x['word_condition_status']
+                 for x in samples['rows']}
+          for row in a['rows']:
+              candidate=prior[(row['path'],row['operation_id'])]
+              universal=row['universal_mask_predicate_status']
+              assert not (universal=='true' and candidate=='false'), row
+              assert not (universal=='false' and candidate=='true'), row
+          print('A37_G4_UNIVERSAL_GUARD_RESULTS',
+                a['universal_mask_predicate_statuses'],
+                'blocked',a['blocked_counts'],'selector_admitted=0')
+          PY
+
+      - name: Verify original official Arm 2026-09 XML ASL sources and crosswalk
+        run: |
+          set -euo pipefail
+          curl -fLsS --retry 3 --connect-timeout 25 --max-time 300 \
+            'https://developer.arm.com/-/cdn-downloads/permalink/Exploration-Tools-A64-ISA/ISA_A64/ISA_A64_xml_A_profile-2026-09.tar.gz' \
+            -o /tmp/ISA_A64_xml_A_profile-2026-09.tar.gz
+          echo '44cfb89c763c7eea8e59de0ad2221e3c012e6aa77899bd7f1c3e1f24537191d7  /tmp/ISA_A64_xml_A_profile-2026-09.tar.gz' | sha256sum -c -
+          python3 compiler/tools/aarch64_a32_full_source_catalog.py \
+            --isa-xml-archive /tmp/ISA_A64_xml_A_profile-2026-09.tar.gz \
+            --out /tmp/aarch64-g5-xml-only-catalog.json
+          python3 compiler/tools/aarch64_a32_full_source_catalog.py \
+            --isa-xml-archive /tmp/ISA_A64_xml_A_profile-2026-09.tar.gz \
+            --out /tmp/aarch64-g5-xml-only-catalog.json --check
+          python3 compiler/tools/aarch64_a37_asl_source_frontier.py \
+            --original-aarchmrs /tmp/aarchmrs-instructions.json \
+            --aarchmrs-catalog /tmp/aarchmrs-a64.json \
+            --isa-xml-archive /tmp/ISA_A64_xml_A_profile-2026-09.tar.gz \
+            --out /tmp/aarch64-g5-source-frontier.json
+          python3 compiler/tools/aarch64_a37_asl_source_frontier.py \
+            --original-aarchmrs /tmp/aarchmrs-instructions.json \
+            --aarchmrs-catalog /tmp/aarchmrs-a64.json \
+            --isa-xml-archive /tmp/ISA_A64_xml_A_profile-2026-09.tar.gz \
+            --out /tmp/aarch64-g5-source-frontier.json --check
+          python3 - <<'PY'
+          import json
+          j=json.load(open('/tmp/aarch64-g5-source-frontier.json'))
+          assert j['format']=='aarch64-a37-g5-cross-source-semantic-frontier-v1'
+          assert j['encoding_paths']==4429 and len(j['rows'])==4429
+          assert j['source_catalogs_independently_rebuilt']
+          assert j['isa_xml_release']=='2026-09'
+          assert j['isa_xml_archive_sha256']=='44cfb89c763c7eea8e59de0ad2221e3c012e6aa77899bd7f1c3e1f24537191d7'
+          assert j['aarchmrs_instructions_sha256']=='ef75f3ec02df1b9b9c0612f4ea259d6710ac3de686b097d8f9c83d1d97aa800a'
+          by_source=j['cross_source_path_statuses']
+          assert sum(sum(x.values()) for x in by_source.values())==4429
+          assert not j['selection_eligible'] and not j['asl_semantic_equivalence_proven']
+          assert not j['source_legality_proven'] and not j['machine_effect_equivalence_proven']
+          assert all(not r['selection_eligible'] and
+                     not r['source_legality_proven'] and
+                     not r['asl_semantic_equivalence_proven'] and
+                     not r['machine_effect_equivalence_proven'] and
+                     len(r['blockers'])>=4 for r in j['rows'])
+          assert 'X[d]' not in str(j)
+          print('A37_G5_REAL_CROSS_SOURCE',by_source,
+                'unique_xml',j['linked_distinct_xml_operations'],
+                'total_xml',j['official_xml_operations'],'admitted=0')
+          PY
