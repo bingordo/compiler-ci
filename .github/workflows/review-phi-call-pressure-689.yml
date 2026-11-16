@@ -1,0 +1,65 @@
+name: Source-pinned x86 pointer-PHI call pressure review 689
+on:
+  push:
+    branches: [review/phi-call-pressure-689]
+    paths: ['.github/workflows/review-phi-call-pressure-689.yml']
+  pull_request:
+    paths: ['.github/workflows/review-phi-call-pressure-689.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout temporary compiler-ci configuration
+        uses: actions/checkout@v4
+      - name: Checkout exact reviewed compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 76d6291f6fb42870918b907a7b7e523d4134ce59
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert compiler source pin
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "76d6291f6fb42870918b907a7b7e523d4134ce59"
+      - name: Limit external CI to core Rust workspace
+        working-directory: compiler
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          """)
+          PY
+      - name: Cache core Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: review-phi-call-pressure-689
+      - name: New 64 x86 executable pointer-PHI and 11-arg indirect-call modes
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test review_phi_call_pressure -- --nocapture
+      - name: Prior physical pointer-PHI and spill/copy cycle checks
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test bt4_x86_historical_pointer_phi_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test bt4_x86_historical_wide_copy_cycle_native -- --nocapture
+      - name: Prior physical many-argument call pressure and callback
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test call_clobber_pressure_native -- --nocapture
+          cargo test -p compiler-opt --test review_mixed_global_escape_loop -- --nocapture
+      - name: Strict affected core and new test Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --lib -- -D warnings
+          cargo clippy -p compiler-opt --test review_phi_call_pressure -- -D warnings
