@@ -1,0 +1,68 @@
+name: Source-pinned ARM64 native mixed-local/global escaped pointer review 689
+on:
+  push:
+    branches: [review/aarch64-mixed-global-escape-689]
+    paths: ['.github/workflows/review-aarch64-mixed-global-escape-689.yml']
+  pull_request:
+    paths: ['.github/workflows/review-aarch64-mixed-global-escape-689.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 35
+    steps:
+      - name: Checkout temporary CI configuration
+        uses: actions/checkout@v4
+      - name: Checkout exact compiler PR source commit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 515dfcb286a669af37ae6c30c178e31e5822bee4
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Guard exact source and native AArch64 environment
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "515dfcb286a669af37ae6c30c178e31e5822bee4"
+          test "$(uname -m)" = "aarch64"
+          command -v cc
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Isolate core Rust workspace on ARM64 CI runner
+        working-directory: compiler
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          """)
+          PY
+      - name: Cache reviewed Rust crates
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: review-aarch64-mixed-global-escape-689
+      - name: New native ARM64 cyclic local/global TypeId pointer-PHI call C11 oracle
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test review_aarch64_mixed_global_escape_loop -- --nocapture
+      - name: Existing native ARM64 pointer PHI and multi-argument indirect call
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-aarch64 --test ptr64_calls -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test typeid_abi_calls_native -- --nocapture
+      - name: Existing ARM64 memory and conditional PHI controls
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-aarch64 --test memory -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test typeid_historical_control_flow -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test typeid_historical_pressure -- --nocapture
+      - name: Strict affected library and ARM64 review test Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-aarch64 --lib -- -D warnings
+          cargo clippy -p compiler-opt --test review_aarch64_mixed_global_escape_loop -- -D warnings
