@@ -1,10 +1,14 @@
 name: Mini-C source-build GCC differential tests
+# Pin check: compiler branch 613d0c3685c59a507eb3af07fa7a0c8f1d2e016c
 
 on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-mini-c-differential.yml'
   workflow_dispatch:
     inputs:
       source_ref:
-        description: 'Compiler branch, tag or commit'
+        description: 'Temporary validation branch target is hardwired by this CI-only PR'
         required: false
         default: main
         type: string
@@ -29,7 +33,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: mini-c-differential-${{ inputs.source_ref || 'main' }}
+  group: mini-c-differential-current-frontend-pr
   cancel-in-progress: true
 
 jobs:
@@ -41,7 +45,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ inputs.source_ref || 'main' }}
+          ref: mini-c-current-frontend-typeid-integration
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -97,6 +101,63 @@ jobs:
             -p compiler-mini-c --bin compiler-mini-c \
             2>&1 | tee "$RUNNER_TEMP/mini-c-build.log"
           test -x compiler/tools/mini-c-driver/target/debug/compiler-mini-c
+      - name: Validate exact shared SysV ABI planner source with standalone Rust tests
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          # scalar_abi.rs is a standalone std-only Rust module. Test its
+          # exact source without resolving the unrelated private Oberon
+          # dependency of compiler's main Cargo workspace.
+          rustc --edition=2021 --test \
+            compiler/crates/backend-x86/src/scalar_abi.rs \
+            -o "$RUNNER_TEMP/sysv-planner-tests"
+          "$RUNNER_TEMP/sysv-planner-tests" --test-threads=2
+      - name: Test current checked frontend TypeId compatibility and unsupported-C99 gates
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 8m cargo test \
+            --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            --test modern_frontend_compat -- --test-threads=2
+      - name: Test stored logical TypeId SSA call contracts
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --edition=2021 --test compiler/crates/ir/src/lib.rs \
+            -o "$RUNNER_TEMP/compiler-ir-logical-tests"
+          timeout --signal=TERM --kill-after=10s 8m \
+            "$RUNNER_TEMP/compiler-ir-logical-tests" --test-threads=2
+      - name: Test backend logical TypeId ABI operand lowering
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 8m cargo test \
+            --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            --test abi_transport -- --test-threads=2
+      - name: Test native v4 target ABI legalization into verified TypeId SSA
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 8m cargo test \
+            --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            --test native_logical_legalize -- --test-threads=2
+      - name: Test pinned Mini-C semantic checker tag completion
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --quiet --depth 1 --branch fix/complete-tagref-aggregate-rvalues \
+            https://github.com/bingordo/mini-c.git "$RUNNER_TEMP/mini-c-sema"
+          test "$(git -C "$RUNNER_TEMP/mini-c-sema" rev-parse HEAD)" = \
+            "0c4ef5e200d5e121cd7c70203183866d17e00fa8"
+          timeout --signal=TERM --kill-after=10s 8m cargo test \
+            --manifest-path "$RUNNER_TEMP/mini-c-sema/Cargo.toml" \
+            -p mini-c-sema -- --test-threads=2
       - name: Compare compiled Mini-C against GCC
         if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
         shell: bash
