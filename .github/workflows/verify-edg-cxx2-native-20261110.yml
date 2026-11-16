@@ -58,10 +58,10 @@ jobs:
           test "$(git -C edgcpp rev-parse HEAD)" = "$EDG_SOURCE_SHA"
           git -C compiler rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
 
-      # A prebuilt archive predating the source hook cannot validate its
-      # semantics. Compile a genuinely matched native EDG callable library.
-      # Keep Actions in compiler-ci; no compiler-repo CI is initiated.
-      - name: Build exact source-owned EDG callable native library
+      # Compile commands must come from *this* checkout. EDG's upstream
+      # October release does not contain our source hooks, so neither the
+      # release tag nor a floating artifact can substitute for this SHA.
+      - name: Configure pinned native EDG callable source tree
         env:
           EDG_BASE: ${{ github.workspace }}/edgcpp/bases/docker/dev-env/gcc
         working-directory: edgcpp
@@ -71,12 +71,51 @@ jobs:
             -DEDG_BUILD_LIB=OFF \
             -DEDG_BUILD_CALLABLE_LIBRARY=ON \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+      # Immutable GitHub cache entries are keyed by the full source SHA,
+      # native compiler container digest, and CMake profile. Cache only the
+      # actual archive plus our checked manifest; regenerating CMake files
+      # above avoids accidentally loading a different source configuration.
+      - name: Restore native EDG archive by exact source revision
+        id: native-edg-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            edgcpp/build/gcc-release/lib/libedgcpfe.a
+            edgcpp/build/gcc-release/src/includes/
+            edgcpp/build/gcc-release/libedgcpfe.a.sha256
+            edgcpp/build/gcc-release/libedgcpfe.source
+          key: edg-callable-v2-${{ env.EDG_SOURCE_SHA }}-gcc-release-ci-container-14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8
+
+      - name: Build missing exact source-owned EDG callable archive
+        if: steps.native-edg-cache.outputs.cache-hit != 'true'
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
           cmake --build build/gcc-release --target edgcpfe --parallel 2
           test -s build/gcc-release/lib/libedgcpfe.a
-          # Distinguish the source-hook archive from the previously restored
-          # release archive. No mixed-source native objects are permitted.
+          echo "$EDG_SOURCE_SHA" >build/gcc-release/libedgcpfe.source
+          (cd build/gcc-release &&
+            sha256sum lib/libedgcpfe.a >libedgcpfe.a.sha256)
+
+      - name: Verify cached or newly built EDG source and library integrity
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EDG_SOURCE_SHA"
+          # CMake metadata is regenerated from the current, pinned checkout
+          # even when we reuse a cached native archive.
+          test -s build/gcc-release/compile_commands.json
+          test "$(cat build/gcc-release/libedgcpfe.source)" = "$EDG_SOURCE_SHA"
+          test -s build/gcc-release/lib/libedgcpfe.a
+          # The Rust/C++ bridge compiles against generated EDG headers;
+          # retaining the archive alone is not a usable prebuilt SDK.
+          test -s build/gcc-release/src/includes/err_codes.h
+          (cd build/gcc-release && sha256sum -c libedgcpfe.a.sha256)
+          # Reject a generic or legacy archive without the actual lowerers.
           ar t build/gcc-release/lib/libedgcpfe.a | grep -Fxq 'lower_il.c.o'
-          echo "EDG callable archive built wholly from source revision $EDG_SOURCE_SHA" >>"$GITHUB_STEP_SUMMARY"
+          ar t build/gcc-release/lib/libedgcpfe.a | grep -Fxq 'lower_init.c.o'
+          echo "EDG callable archive source=$EDG_SOURCE_SHA cache_hit=${{ steps.native-edg-cache.outputs.cache-hit }}" >>"$GITHUB_STEP_SUMMARY"
 
       - name: Check out C++0 EDG linker-symbol export candidate
         uses: actions/checkout@v4
@@ -112,6 +151,26 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           rustup toolchain install "$RUST_TOOLCHAIN_VERSION" --profile minimal
           rustup default "$RUST_TOOLCHAIN_VERSION"
+
+      # Our edgcpp-rust repository already caches Cargo builds in its own CI.
+      # The compiler-ci EDG job also checks out TWO bridge revisions; neither
+      # had any Rust target/registry cache. Keep their target dirs isolated,
+      # and key native compilation to the pinned EDG library/toolchain image.
+      - name: Restore bridge and compiler Cargo incremental caches
+        id: cargo-bridge-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            edg-rust/target
+            edg-rust-call-target/target
+            compiler/target
+            compiler/tools/edg-driver/target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: edg-bridge-rust-v1-${{ env.EDG_SOURCE_SHA }}-rust${{ env.RUST_TOOLCHAIN_VERSION }}-linux-x86_64-container14b3948c2c-devtest0-${{ hashFiles('edg-rust/Cargo.toml', 'edg-rust/Cargo.lock', 'edg-rust-call-target/Cargo.toml', 'edg-rust-call-target/Cargo.lock', 'compiler/Cargo.lock', 'compiler/tools/edg-driver/Cargo.toml', 'compiler/tools/edg-driver/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            edg-bridge-rust-v1-${{ env.EDG_SOURCE_SHA }}-rust${{ env.RUST_TOOLCHAIN_VERSION }}-linux-x86_64-container14b3948c2c-devtest0-${{ hashFiles('edg-rust/Cargo.toml', 'edg-rust/Cargo.lock', 'edg-rust-call-target/Cargo.toml', 'edg-rust-call-target/Cargo.lock', 'compiler/Cargo.lock', 'compiler/tools/edg-driver/Cargo.toml', 'compiler/tools/edg-driver/Cargo.lock') }}-
+            edg-bridge-rust-v1-${{ env.EDG_SOURCE_SHA }}-rust${{ env.RUST_TOOLCHAIN_VERSION }}-linux-x86_64-container14b3948c2c-devtest0-
 
       - name: Test source-authoritative EDG C++ dialect and class admission wire events
         env:
@@ -687,6 +746,22 @@ jobs:
               echo "EDG_CXX5_NATIVE gate=iostream_fail_closed fixture=$variant result=pass"
             fi
           done
+
+      # Save only successful, fully checked source builds. New commits
+      # restore via the revision/toolchain-compatible prefix; Cargo itself
+      # fingerprints all crate inputs before reusing compiled artifacts.
+      - name: Save bridge and compiler Cargo incremental caches
+        if: ${{ success() && steps.cargo-bridge-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            edg-rust/target
+            edg-rust-call-target/target
+            compiler/target
+            compiler/tools/edg-driver/target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ steps.cargo-bridge-cache.outputs.cache-primary-key }}
 
       - name: Preserve native C++17 minimal-header reference/ELF evidence
         if: always()
