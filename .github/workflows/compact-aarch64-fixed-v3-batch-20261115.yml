@@ -1,0 +1,54 @@
+name: Compact AArch64 fixed TypeId fixtures acceptance
+on:
+  push:
+    branches: [verify/compact-aarch64-fixed-v3-batch-20261115]
+    paths: ['.github/workflows/compact-aarch64-fixed-v3-batch-20261115.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 0419012a47e50e6aadfa3ef3fc4ce3930cd5ade8
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin exact compiler source
+        run: test "$(git -C compiler rev-parse HEAD)" = "0419012a47e50e6aadfa3ef3fc4ce3930cd5ade8"
+      - name: Restrict workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: compact-aarch64-fixed-v3-full-batch
+      - name: Verify all 10 compact source fixtures, parser and canonical writer
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend-aarch64 --test native_fixed_v3_canonical
+          cargo test -p compiler-ir --test native_fixture_text --test native_module_text_v3
+      - name: Install real AArch64 GCC and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross binutils-aarch64-linux-gnu qemu-user
+      - name: Original machine and C11/QEMU oracle suites for all 10 migrated fixtures
+        working-directory: compiler
+        env:
+          COMPILER_REQUIRE_AARCH64_QEMU: "1"
+        run: |
+          cargo test -p compiler-backend-aarch64 --test bit_branch_native --test madd_msub_native --test extended_addsub_native --test shifted_bit_branch_native --test lsl_asr_bit_branch_native --test subs_immediate_native -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test local_address_folding --test mixed_address_modes --test double_index_native --test indexed_scales -- --nocapture
+      - name: Strict Clippy for source fixture consumers
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-backend-aarch64 --no-deps --test bit_branch_native --test madd_msub_native --test extended_addsub_native --test shifted_bit_branch_native --test lsl_asr_bit_branch_native --test subs_immediate_native --test local_address_folding --test mixed_address_modes --test native_fixed_v3_canonical -- -D warnings
