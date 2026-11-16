@@ -1,0 +1,53 @@
+name: AArch64 indexed displaced and I64 div/rem native TypeId migration
+on:
+  push:
+    branches: [verify/aarch64-index-displace-divrem-compact-20261115]
+    paths: ['.github/workflows/aarch64-index-displace-divrem-compact-20261115.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 0588f3c7291f3a7cabd2367e2e036641d29b4a53
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler source
+        run: test "$(git -C compiler rev-parse HEAD)" = "0588f3c7291f3a7cabd2367e2e036641d29b4a53"
+      - name: Isolate native workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: aarch64-index-displace-divrem-compact
+      - name: Export original Rust graph modules with production native v3 writer
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend-aarch64 --test indexed_memory export_original_native_v3_for_migration -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test displaced_memory export_original_native_v3_for_migration -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test i64_div_rem export_original_native_v3_for_migration -- --nocapture
+      - name: Install AArch64 cross compiler and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross binutils-aarch64-linux-gnu qemu-user
+      - name: Original machine quality ABI signed traps and C11 QEMU
+        working-directory: compiler
+        env:
+          COMPILER_REQUIRE_AARCH64_QEMU: "1"
+        run: |
+          cargo test -p compiler-backend-aarch64 --test indexed_memory --test displaced_memory --test i64_div_rem -- --nocapture
+      - name: Strict scoped Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-aarch64 --no-deps --test indexed_memory --test displaced_memory --test i64_div_rem -- -D warnings
