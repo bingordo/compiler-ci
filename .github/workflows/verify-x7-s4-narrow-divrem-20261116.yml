@@ -1,0 +1,111 @@
+# Explicitly pinned external compiler SHA; no GitHub Actions in compiler.
+name: X7 S4 narrow i8/i16 DIV REM numeric SIGFPE parity
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-x7-s4-narrow-divrem-20261116.yml'
+permissions:
+  contents: read
+jobs:
+  x7-s4-abi-regressions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 61dd9b96f00b2af562b9df775b4cadf2df8a48ca
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "61dd9b96f00b2af562b9df775b4cadf2df8a48ca"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-s4-divrem-abi
+      - name: Isolate x86 backend workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Full x86 default and no-default backend libraries and real ABI parity
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend-x86 --no-default-features --lib
+          cargo test -p compiler-backend-x86 --test x7_s4_selected_unwind_native_parity -- --nocapture
+          cargo test -p compiler-backend-x86 --no-default-features --test x7_s4_selected_unwind_native_parity -- --nocapture
+          python3 tools/regen_x86_selector_rules.py --check
+          cargo test -p compiler-backend-x86 --test x7_s4_narrow_divrem_fault_parity -- --nocapture
+          cargo test -p compiler-backend-x86 --no-default-features --test x7_s4_narrow_divrem_fault_parity -- --nocapture
+          cargo test -p compiler-backend-x86 --test x7_s4_narrow_shift_cmp_parity -- --nocapture
+          cargo test -p compiler-backend-x86 --no-default-features --test x7_s4_narrow_shift_cmp_parity -- --nocapture
+          cargo test -p compiler-backend-x86 --test x7_shared_machine_native_parity
+          cargo test -p compiler-backend-x86 --test m4_8_ssa_tls_native -- --nocapture
+          cargo test -p compiler-backend-x86 --no-default-features --test m4_8_ssa_tls_native -- --nocapture
+          cargo test -p compiler-backend-x86 --test m4_8_checked_symbol_attributes_native
+          cargo test -p compiler-backend-x86 --test x7_shared_pic_global_native
+          echo X7_S4_NARROW_DIVREM_BACKEND_GREEN
+  x7-s4-source-oracles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub SSH for external compiler frontend
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 61dd9b96f00b2af562b9df775b4cadf2df8a48ca
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "61dd9b96f00b2af562b9df775b4cadf2df8a48ca"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-s4-divrem-source
+      - name: Build production source compiler and check ABI/metadata integration
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo build -p compiler
+          python3 tools/test_x7_s4_executable_source_gate.py -v
+          cargo test -p compiler --test x7_selected_machine_source -- --nocapture
+          cargo test -p compiler --test x7_s4_rolling_checksum_source -- --nocapture
+          cargo test -p compiler --test x7_s4_source_elf_metadata -- --nocapture
+          cargo test -p compiler --test typeid_tls_linker_matrix -- --nocapture
+      - name: Full 48 real C Oberon source native-selected ELF/GAS parity and cost
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/x7_s4_executable_source_gate.py \
+            --compiler target/debug/compiler \
+            --source-sha 61dd9b96f00b2af562b9df775b4cadf2df8a48ca \
+            --out ../x7-s4-narrow-divrem \
+            --scales 8 24 48 \
+            --languages mini_c oberon \
+            --modes plain framed pic pic_framed \
+            --groups 3
+          echo X7_S4_NARROW_DIVREM_SOURCE_GREEN
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-s4-narrow-divrem-source
+          path: x7-s4-narrow-divrem
+          if-no-files-found: ignore
