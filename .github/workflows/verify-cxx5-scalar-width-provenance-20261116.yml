@@ -247,3 +247,32 @@ jobs:
             grep -F 'C scalar memory type has no exact native width:' original.log >>"$GITHUB_STEP_SUMMARY"
             echo 'EDG_FN_PTR_ORIGINAL original_iostream=advanced_fail_closed' >>"$GITHUB_STEP_SUMMARY"
           fi
+
+          # Independent producer-mode comparison: the baseline above does
+          # not explicitly disable EDG EH, even though the target is
+          # also tested by the established -fno-exceptions G++ oracle.
+          # Never suppress or rewrite source effects in the adapter.
+          g++ -std=c++17 -fno-exceptions original.cpp -o gxx-no-exceptions
+          timeout 15s ./gxx-no-exceptions >gxx-noeh.out 2>gxx-noeh.err
+          rm -f noeh.o
+          set +e
+          "$driver" noeh.o --dump-edg-global-provenance --typeid-native \
+            --g++ --c++17 --no_exceptions --no_strict_gnu \
+            --gnu_version "$gnu_number" "${includes[@]}" original.cpp >noeh.log 2>&1
+          noeh_status=$?
+          set -e
+          echo "EDG_CXX5_NO_EXCEPTIONS status=$noeh_status"
+          tail -n 8 noeh.log || true
+          if test "$noeh_status" -eq 0; then
+            test -s noeh.o
+            g++ -fno-exceptions noeh.o -o native-noeh
+            timeout 15s ./native-noeh >native-noeh.out 2>native-noeh.err
+            cmp gxx-noeh.out native-noeh.out
+            cmp gxx-noeh.err native-noeh.err
+            echo 'EDG_CXX5_NO_EXCEPTIONS original_iostream=executable_parity' >>"$GITHUB_STEP_SUMMARY"
+          else
+            test ! -e noeh.o
+            grep -F 'EDG -> compiler-ir rejected source:' noeh.log
+            echo 'EDG_CXX5_NO_EXCEPTIONS original_iostream=fail_closed' >>"$GITHUB_STEP_SUMMARY"
+            grep -E 'C scalar memory type has no exact native width|C\+\+ automatic|portable EH|unsupported' noeh.log | tail -n 4 >>"$GITHUB_STEP_SUMMARY" || true
+          fi
