@@ -1,0 +1,57 @@
+name: LTO wrapper response files and Make CMake integration
+on:
+  push:
+    branches: [verify/lto-wrapper-response-build-examples-20261115]
+    paths: ['.github/workflows/lto-wrapper-response-build-examples-20261115.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  response-and-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: cdba9befc46134e2d29f4c8451646f6362bc0dcf
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check pinned compiler source and public frontend dependencies
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "cdba9befc46134e2d29f4c8451646f6362bc0dcf"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - name: Isolate driver workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/driver"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: lto-wrapper-response-build
+      - name: Test response files and existing link regressions
+        working-directory: compiler
+        run: |
+          python3 -m py_compile tools/lto-link-wrapper.py
+          cargo test -p compiler --test lto_link_wrapper -- --nocapture
+          cargo test -p compiler --test lto_ordered_build
+          cargo test -p compiler --test lto_mixed_link
+          cargo clippy -p compiler --test lto_link_wrapper -- -D warnings
+      - name: Build and execute Make integration example
+        working-directory: compiler
+        run: |
+          make -C examples/lto-build COMPILER="$(pwd)/target/debug/compiler"
+          examples/lto-build/program
+      - name: Build and execute CMake integration example
+        working-directory: compiler
+        run: |
+          cmake -S examples/lto-build -B /tmp/lto-cmake-example-${{ github.run_id }} -DCOMPILER_LTO_DRIVER="$(pwd)/target/debug/compiler"
+          cmake --build /tmp/lto-cmake-example-${{ github.run_id }}
+          /tmp/lto-cmake-example-${{ github.run_id }}/program
