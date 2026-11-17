@@ -1,0 +1,96 @@
+# Temporary exact-source X7 S4 shared x86 physical cutover acceptance.
+name: X7 S4 guarded shared x86 default switch
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-x7-s4-shared-default-20261117.yml'
+permissions:
+  contents: read
+jobs:
+  default-rollback-and-original-gcc-oracle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub SSH
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 465ac92a4b66cab0ebb39c709b26241c4079a783
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact source
+        run: test "$(git -C compiler rev-parse HEAD)" = "465ac92a4b66cab0ebb39c709b26241c4079a783"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-s4-shared-default
+      - name: Compiler default switch and legacy rollback executable correctness
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test x7_s4_shared_default -- --nocapture
+          for suite in x7_s4_pragmatic_driver_cutover x7_s4_selected_lto x7_s4_selected_ir_replay x7_selected_machine_source lto_cli lto_coemit lto_mixed_link lto_elf_visibility lto_generated_multitu; do
+            cargo test -p compiler --test "$suite"
+          done
+          cargo test -p compiler --bin compiler module_build::tests
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend-x86 --no-default-features --lib
+          echo X7_S4_SHARED_DEFAULT_FOCUSED_GREEN
+      - name: Real original 48-source/mode 17424 GCC ABBA rollback differential
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo build -p compiler
+          python3 tools/x7_s4_executable_source_gate.py \
+            --compiler target/debug/compiler \
+            --source-sha 465ac92a4b66cab0ebb39c709b26241c4079a783 \
+            --out ../x7-s4-shared-default-artifacts \
+            --scales 8 24 48 \
+            --languages mini_c oberon \
+            --modes plain framed pic pic_framed \
+            --groups 3
+          echo X7_S4_SHARED_DEFAULT_GCC_GATE_GREEN
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-s4-shared-default-gcc-paired
+          path: x7-s4-shared-default-artifacts
+          if-no-files-found: warn
+  broad-compiler-integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub SSH
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 465ac92a4b66cab0ebb39c709b26241c4079a783
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert source pin
+        run: test "$(git -C compiler rev-parse HEAD)" = "465ac92a4b66cab0ebb39c709b26241c4079a783"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-s4-shared-default-full
+      - name: Entire driver integration and unit acceptance under new default
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --tests -- --test-threads=4
+          echo X7_S4_SHARED_DEFAULT_DRIVER_ALL_TESTS_GREEN
