@@ -1,0 +1,109 @@
+# W9i: exact indexed local pointer-array elements with independent slot provenance and escape-denial tests.
+name: Wasm W9i pointer-array elements
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/wasm-w9i-exact-pointer-array-elements.yml'
+  workflow_dispatch:
+    inputs:
+      compiler_sha:
+        description: 'Exact compiler commit'
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  frontend-wasm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler and pinned Mini-C checker
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.compiler_sha || '04e3516a787e8ff1dd8b12a0e9619403a7a47fb5' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source pin and isolate checker, Wasm and native backends
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "${{ inputs.compiler_sha || '04e3516a787e8ff1dd8b12a0e9619403a7a47fb5' }}"
+          grep -F '11bc3d2a15c823946fcd669cf043f9b709447439' compiler/crates/driver/Cargo.toml
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86","crates/backend-aarch64","crates/backend-riscv64","crates/backend-wasm","crates/driver"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - name: Checkout exact Mini-C internal CPP engine source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: 11bc3d2a15c823946fcd669cf043f9b709447439
+          path: mini-c
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Test Mini-C internal CPP target layout and freestanding builtins
+        working-directory: mini-c
+        run: |
+          test "$(git rev-parse HEAD)" = "11bc3d2a15c823946fcd669cf043f9b709447439"
+          cargo test -p mini-c-preprocess --features internal-rcc --lib
+      - name: Independent Node WebAssembly execution engine
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Cache checked Mini-C and backend builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: wasm-w9g-immutable-alias-20261116
+      - name: Verify W9i exact pointer arrays W9h W9g W9e W9d W11 vs native/GCC
+        working-directory: compiler
+        run: cargo test -p compiler --test wasm32_minic_source -- --nocapture
+      - name: Verify TypeId IR text/binary pointer opcode roundtrips and optimizer
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-ir --lib
+          cargo test -p compiler-opt --lib
+      - name: Check W5 pointer32 import-export boundary and private call returns
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend-wasm --test pointer32 -- --nocapture
+      - name: Regress full W0-W6d Wasm backend
+        working-directory: compiler
+        run: cargo test -p compiler-backend-wasm --tests -- --nocapture
+      - name: Regress driver unit tests and shared native backend
+        working-directory: compiler
+        run: |
+          cargo test -p compiler --bin compiler -- --nocapture
+          cargo test -p compiler-backend --lib
+      - name: Regress current-main LTO sidecar, mixed-link and native C CLI
+        working-directory: compiler
+        run: |
+          cargo test -p compiler --test lto_cli -- --nocapture
+          cargo test -p compiler --test lto_source_sidecar -- --nocapture
+          cargo test -p compiler --test lto_mixed_link -- --nocapture
+          cargo test -p compiler --test mini_c_cli -- --nocapture
+      - name: Regress native x86 AArch64 and RISC-V backend libraries
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend-aarch64 --lib
+          cargo test -p compiler-backend-riscv64 --lib
+      - name: Check standalone native Mini-C TypeId adapter against updated checker API
+        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib
+      - name: Strict standalone Wasm backend Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-wasm --all-targets -- -D warnings
+      - name: Strict driver Clippy except existing unrelated native wrapper categories
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler --bin compiler --test wasm32_minic_source -- \
+            -D warnings -A dead_code -A clippy::too_many_arguments
