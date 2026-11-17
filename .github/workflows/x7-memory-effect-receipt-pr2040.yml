@@ -1,0 +1,193 @@
+name: X7 unified source proof required machine admission PR2040
+on:
+  pull_request:
+    paths: ['.github/workflows/x7-memory-effect-receipt-pr2040.yml']
+permissions:
+  contents: read
+  actions: read
+jobs:
+  frozen-source-gp-write:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: 6cecde76b135775bbb1281a548e4733da320104b
+      PYTHONPATH: compiler/tools
+      X7_S3L_L5D_INTEL_DIR: /tmp/l5d/intel
+      X7_S3L_L5D_OP_AST: /tmp/l5d/smt/operations.json
+      X7_S3L_L5D_SMT: /tmp/l5d/smt/semantics-z3.json
+      X7_S3L_L5D_S2: /tmp/l5d/s2/join-1.json
+    steps:
+      - name: Checkout pinned compiler source only on compiler-ci
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 6cecde76b135775bbb1281a548e4733da320104b
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Original exact Intel/XED S2 identity and source-linked GP receipts
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s2-pinned-intel-xed-variant-join
+          run-id: 43635408689
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/l5d/s2
+      - name: Original nine-operation AST plus independent Z3
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3l-l2b-l3a-9-ops-generic-helper-smt-source-evidence
+          run-id: 43687620382
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/l5d/smt
+      - name: Exact pinned Intel source forms
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          mkdir -p "$X7_S3L_L5D_INTEL_DIR" /tmp/l5d/out
+          for name in ADD SUB AND OR XOR; do
+            curl -fsSL --retry 2 --max-time 50 \
+              "https://raw.githubusercontent.com/intel/SDM/35eface1b7ee003a1cda95005ec5fd83de658a64/data/instruction/$name.xml" \
+              -o "$X7_S3L_L5D_INTEL_DIR/$name.xml"
+          done
+      - name: Generic source/XED/Z3 generator, linked receipts and negative mutations
+        shell: bash
+        run: |
+          set -euo pipefail
+          CMD="python3 compiler/tools/x86_s3l_l5_gp_write.py"
+          $CMD --intel-dir "$X7_S3L_L5D_INTEL_DIR" \
+            --operation-ast "$X7_S3L_L5D_OP_AST" \
+            --generic-smt "$X7_S3L_L5D_SMT" --s2 "$X7_S3L_L5D_S2" \
+            --report /tmp/l5d/out/gp-write.json
+          git -C compiler diff --exit-code -- \
+            crates/backend-x86/src/generated_x7_s3l_l5_gp_write_recipes.rs
+          $CMD --intel-dir "$X7_S3L_L5D_INTEL_DIR" \
+            --operation-ast "$X7_S3L_L5D_OP_AST" \
+            --generic-smt "$X7_S3L_L5D_SMT" --s2 "$X7_S3L_L5D_S2" \
+            --report /tmp/l5d/out/gp-write.json --check
+          python3 -m unittest -v test_x86_s3l_proof_receipt test_x86_s3l_l5_gp_write
+      - name: Offline TypeId native workspace
+        run: |
+          cd compiler
+          printf '[workspace]\nresolver = "2"\nmembers = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]\n' > Cargo.toml
+      - name: Native source selected and fallback C11 GAS/ELF oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          for feature in default no-default validation source-only; do
+            case "$feature" in
+              default) cargo test -p compiler-backend-x86 --test x7_s3l_l5d_gp_write_typeid_native --offline -- --nocapture ;;
+              no-default) cargo test -p compiler-backend-x86 --no-default-features --test x7_s3l_l5d_gp_write_typeid_native --offline ;;
+              validation) cargo test -p compiler-backend-x86 --no-default-features --features 'x7-native-form-validation x7-c-defined-64' --test x7_s3l_l5d_gp_write_typeid_native --offline ;;
+              source-only) cargo test -p compiler-backend-x86 --no-default-features --features x7-c-defined-source-gp-write --test x7_s3l_l5d_gp_write_typeid_native --offline ;;
+            esac
+          done
+          cargo test -p compiler-backend-x86 --lib --offline
+          cargo test -p compiler-backend-x86 --no-default-features --lib --offline
+          cargo test -p compiler-backend-x86 --test x7_s3l_l5b_regreg_typeid_native --offline
+          cargo test -p compiler-backend-x86 --test x7_s3l_l5c_regcmp_typeid_native --offline
+          cargo test -p compiler-backend-x86 --test x7_s3l_l4c_typeid_flags_native --offline
+          echo X7_L5D_GP_WRITE_SOURCE_NATIVE_MATRIX_PASS
+      - name: Save source-verified form receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-unified-gp-write-receipts-pr2040
+          path: /tmp/l5d/out/gp-write.json
+          if-no-files-found: ignore
+  pinned-source-flags-recipes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: 6cecde76b135775bbb1281a548e4733da320104b
+      PYTHONPATH: compiler/tools
+      X7_S3L_L4A_INTEL_DIR: /tmp/x7-linked/intel
+      X7_S3L_L4A_WORKLIST: /tmp/x7-linked/source/original-source-xed-iforms.json
+      X7_S3L_L4A_OP_AST: /tmp/x7-linked/smt/operations.json
+      X7_S3L_L4A_SMT: /tmp/x7-linked/smt/semantics-z3.json
+      X7_S3L_L4A_S2: /tmp/x7-linked/s2/join-1.json
+    steps:
+      - name: Exact compiler SHA on compiler-ci only
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 6cecde76b135775bbb1281a548e4733da320104b
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Original source-XED operation/iform worklist
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3l-l3c-source-XED-gated-production-admission
+          run-id: 43728544711
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-linked/source
+      - name: Original independently proven Intel semantic certificates
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3l-l2b-l3a-9-ops-generic-helper-smt-source-evidence
+          run-id: 43687620382
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-linked/smt
+      - name: Original exact Intel/XED S2 form identities
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s2-pinned-intel-xed-variant-join
+          run-id: 43635408689
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-linked/s2
+      - name: Fetch source-frozen nine Intel XML operations
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          mkdir -p "$X7_S3L_L4A_INTEL_DIR" /tmp/x7-linked/out
+          for name in ADD SUB CMP AND OR XOR TEST ADC SBB; do
+            curl -fsSL --retry 2 --max-time 50 \
+              "https://raw.githubusercontent.com/intel/SDM/35eface1b7ee003a1cda95005ec5fd83de658a64/data/instruction/$name.xml" \
+              -o "$X7_S3L_L4A_INTEL_DIR/$name.xml"
+          done
+      - name: Generated source candidates and proof-linked flags recipe parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest -v test_x86_s3l_proof_receipt test_x86_s3l_l5_register_batch test_x86_s3l_l4a_flags_recipe
+          python3 compiler/tools/x86_s3l_l5_register_batch.py \
+            --intel-dir "$X7_S3L_L4A_INTEL_DIR" \
+            --operation-ast "$X7_S3L_L4A_OP_AST" \
+            --generic-smt "$X7_S3L_L4A_SMT" --s2 "$X7_S3L_L4A_S2" \
+            --out /tmp/x7-linked/out/proof-linked-candidates.json
+          python3 compiler/tools/x86_s3l_l4a_flags_recipe.py \
+            --worklist "$X7_S3L_L4A_WORKLIST" \
+            --generic-smt "$X7_S3L_L4A_SMT" --s2 "$X7_S3L_L4A_S2" \
+            --operation-ast "$X7_S3L_L4A_OP_AST" \
+            --intel-dir "$X7_S3L_L4A_INTEL_DIR" \
+            --proof-linked-register-candidates /tmp/x7-linked/out/proof-linked-candidates.json \
+            --report /tmp/x7-linked/out/flags-receipt.json
+          git -C compiler diff --exit-code -- crates/backend-x86/src/generated_x7_s3l_l4a_flags_only_recipes.rs
+          python3 compiler/tools/x86_s3l_l4a_flags_recipe.py \
+            --worklist "$X7_S3L_L4A_WORKLIST" \
+            --generic-smt "$X7_S3L_L4A_SMT" --s2 "$X7_S3L_L4A_S2" \
+            --operation-ast "$X7_S3L_L4A_OP_AST" \
+            --intel-dir "$X7_S3L_L4A_INTEL_DIR" \
+            --proof-linked-register-candidates /tmp/x7-linked/out/proof-linked-candidates.json \
+            --report /tmp/x7-linked/out/flags-receipt.json --check
+          echo X7_PROOF_LINKED_FLAGS_RECIPES_UNCHANGED_PASS
+      - name: Compiler native TypeId production code unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git -C compiler diff --name-only -- crates/backend-x86/src)"
+      - name: Preserve original-form and linked-proof candidate receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-unified-flags-only-receipts-pr2040
+          path: /tmp/x7-linked/out/*.json
+          if-no-files-found: ignore
