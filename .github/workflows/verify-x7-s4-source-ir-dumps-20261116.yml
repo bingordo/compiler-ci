@@ -1,0 +1,99 @@
+name: X7 S4 selected-machine source TypeId optimizer dump acceptance
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-x7-s4-source-ir-dumps-20261116.yml'
+permissions:
+  contents: read
+jobs:
+  source-diagnostics-and-executable-parity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub SSH for private checked frontends
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 27f2a13908beeb7ffb6736afd2f3c0568ca1115f
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact source candidate
+        run: test "$(git -C compiler rev-parse HEAD)" = "27f2a13908beeb7ffb6736afd2f3c0568ca1115f"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-s4-selected-ir-dumps
+      - name: Real two-frontend TypeId pass-dump parity, metadata rejection and driver build
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --bin compiler x7_s4_source_ir_dump -- --nocapture
+          cargo test -p compiler --test x7_selected_machine_source -- --nocapture
+          cargo build -p compiler
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend-x86 --no-default-features --lib
+          python3 tools/test_x7_s4_executable_source_gate.py -v
+      - name: Actual production CLI proves selected obj identical with/without TypeId dumps
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          mkdir -p ../x7-s4-cli-dump-evidence
+          cat > ../x7-s4-cli-dump-evidence/answer.c <<'EOF'
+          int answer(int a, int b) { return a+b; }
+          EOF
+          cat > ../x7-s4-cli-dump-evidence/oracle.c <<'EOF'
+          extern int answer(int,int);
+          int main(void) { return answer(17,25)==42 ? 0 : 1; }
+          EOF
+          for mode in plain framed pic pic_framed; do
+            flags=()
+            case "$mode" in
+              framed) flags+=(--frame-pointer) ;;
+              pic) flags+=(--pic) ;;
+              pic_framed) flags+=(--pic --frame-pointer) ;;
+            esac
+            root="../x7-s4-cli-dump-evidence/$mode"
+            mkdir -p "$root"
+            target/debug/compiler ../x7-s4-cli-dump-evidence/answer.c --target x86_64 --language mini-c --emit obj --x7-selected-machine "${flags[@]}" -o "$root/plain.o"
+            target/debug/compiler ../x7-s4-cli-dump-evidence/answer.c --target x86_64 --language mini-c --emit obj --x7-selected-machine "${flags[@]}" --dump-ir "$root/snapshots" --dump-ir-format both -o "$root/dumped.o"
+            cmp "$root/plain.o" "$root/dumped.o"
+            test "$(find "$root/snapshots" -type f -name '*.ir' | wc -l)" -gt 0
+            test "$(find "$root/snapshots" -type f -name '*.irb' | wc -l)" -gt 0
+            cc -std=c11 -O2 ../x7-s4-cli-dump-evidence/oracle.c "$root/dumped.o" -o "$root/oracle"
+            "$root/oracle"
+          done
+          echo X7_S4_SOURCE_DUMP_CLI_GREEN
+      - name: Preserve full 48-source GCC executable parity and ABBA cost baseline
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/x7_s4_executable_source_gate.py \
+            --compiler target/debug/compiler \
+            --source-sha 27f2a13908beeb7ffb6736afd2f3c0568ca1115f \
+            --out ../x7-s4-source-regression \
+            --scales 8 24 48 \
+            --languages mini_c oberon \
+            --modes plain framed pic pic_framed \
+            --groups 3
+          echo X7_S4_SOURCE_DUMP_ORACLE_GREEN
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-s4-cli-dump-evidence
+          path: x7-s4-cli-dump-evidence
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-s4-real-source-parity
+          path: x7-s4-source-regression
+          if-no-files-found: warn
