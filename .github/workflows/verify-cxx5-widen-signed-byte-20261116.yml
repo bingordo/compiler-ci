@@ -2,7 +2,7 @@ name: C++5 source-verified signed-byte AL return and original GCC15 iostream
 
 on:
   push:
-    branches: ['ci/cxx5-postlower-vptr-graph-20261117']
+    branches: ['ci/cxx5-vptr-memory-20261117']
     paths:
       - '.github/workflows/verify-cxx5-widen-signed-byte-20261116.yml'
   pull_request:
@@ -28,7 +28,7 @@ jobs:
       run:
         shell: edg-container-exec "bash -eo pipefail {0}"
     env:
-      COMPILER_SHA: 8860cb6944475fd5c7d35a0c6e4525a48ef7a5d4
+      COMPILER_SHA: 7e576bff13a315435f28df7d59d35678d5c72113
       EDG_SOURCE_SHA: b195677be8b9b56c8337afad6be8064d21a54082
       EDG_BRIDGE_SHA: 7f67a31a9ad5db038c8b1544e49117f23b462e45
       EDG_RELEASE_TAG: edgcpfe-v2026.11.14-upstream-177765bb7731
@@ -45,7 +45,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 8860cb6944475fd5c7d35a0c6e4525a48ef7a5d4
+          ref: 7e576bff13a315435f28df7d59d35678d5c72113
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -342,24 +342,84 @@ jobs:
             ! grep -Fq 'source definition std::ctype<char>::widen: routine result type TypeId(550):' original_noexcept.log
             ! grep -Fq 'C array address needs native local source identity: path=0.0.0 ' original_noexcept.log
             ! grep -Fq 'C++ direct member call requires exact EDG &object: owner=TypeId(144)' original_noexcept.log
-            grep -F 'EDG call callee is not a direct C routine designator: function=' original_noexcept.log | head -n 2
-            grep -F 'postlower_target=' original_noexcept.log | head -n 2
-            grep -F 'postlower_dispatch=' original_noexcept.log | head -n 2
-            grep -F 'source_gp_signature=' original_noexcept.log | head -n 2
-            grep -F 'machine_virtual_abi=unproven_from_postlower' original_noexcept.log | head -n 2
-            # Source-only graph evidence, not permission to generate a vtable
-            # load, invent a slot or bypass live-object/lifetime admission.
-            grep -F 'EDG_POSTLOWER_TREE nodes=' original_noexcept.log | head -n 1 | cut -c1-18000
-            grep -Fq 'vptr_field_observation=Some(CalleeVptrFieldReference' original_noexcept.log
-            grep -Fq 'vtable_slot_proven=false' original_noexcept.log
-            grep -Fq 'virtual_origin_proven=false' original_noexcept.log
-            grep -Fq 'object_lifetime_proven=false' original_noexcept.log
-            grep -Fq 'bounded_limit=64' original_noexcept.log && {
-              echo '::error::C++5 native vptr expression unexpectedly exceeds diagnostic bound'
-              exit 1
-            } || true
+            # The verified vptr expression may now lower successfully.
+            # Preserve the no-partial-object guarantee and report the
+            # next actual blocker instead of assuming the old error text.
+            if grep -Fq 'EDG_POSTLOWER_TREE nodes=' original_noexcept.log; then
+              grep -m 1 'EDG_POSTLOWER_TREE nodes=' original_noexcept.log | cut -c1-8000
+              grep -Fq 'vtable_slot_proven=false' original_noexcept.log
+              echo 'EDG_CXX5_NOEXCEPT original_iostream=source_vptr_still_rejected' >>"$GITHUB_STEP_SUMMARY"
+            else
+              echo 'EDG_CXX5_NOEXCEPT original_iostream=advanced_past_vptr_source_tree' >>"$GITHUB_STEP_SUMMARY"
+            fi
+            ! grep -Fq 'source definition std::ctype<char>::widen: routine result type TypeId(550):' original_noexcept.log
+            ! grep -Fq 'C array address needs native local source identity: path=0.0.0 ' original_noexcept.log
+            ! grep -Fq 'C++ direct member call requires exact EDG &object: owner=TypeId(144)' original_noexcept.log
             echo 'EDG_CXX5_NOEXCEPT original_iostream=fail_closed' >>"$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Differential-check source vptr load on base and overridden methods
+        working-directory: edgcpp/build/gcc-release
+        run: |
+          set -euo pipefail
+          source ./environment.sh
+          driver="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          work="$RUNNER_TEMP/cxx5-vptr-override"
+          mkdir -p "$work"
+          cd "$work"
+          cat >invoke.cpp <<'CPP'
+          struct Root { virtual ~Root(); };
+          struct Facet : Root {
+            virtual int transform(int) const;
+            int via(int) const;
+          };
+          int Facet::via(int x) const { return transform(x); }
+          CPP
+          cat >owner.cpp <<'CPP'
+          #include <cstdio>
+          struct Root { virtual ~Root(); };
+          struct Facet : Root {
+            virtual int transform(int) const;
+            int via(int) const;
+          };
+          struct Override : Facet {
+            int transform(int) const override;
+          };
+          static int observed;
+          Root::~Root() {}
+          int Facet::transform(int x) const { ++observed; return x + 11; }
+          int Override::transform(int x) const { observed += 7; return x * 3; }
+          int main() {
+            Facet base;
+            Override derived;
+            int a=base.via(5), b=derived.via(3);
+            std::printf("%d %d %d\n",a,b,observed);
+            return a==16 && b==9 && observed==8 ? 0 : 1;
+          }
+          CPP
+          g++ -std=c++17 -fno-exceptions -Wall -Wextra -Werror \
+            invoke.cpp owner.cpp -o reference
+          timeout 15s ./reference >reference.stdout 2>reference.stderr
+          test ! -s reference.stderr
+          gnu_number="$(g++ -dumpfullversion -dumpversion | awk -F. '{print $1*10000+$2*100+$3}')"
+          if ! "$driver" native.o --typeid-native --g++ --c++17 --no_strict_gnu \
+            --no_exceptions --gnu_version "$gnu_number" invoke.cpp >native.log 2>&1; then
+            echo "::error::Source-verified virtual pointer expression not admitted"
+            grep -E 'postlower vptr|EDG call callee|EDG -> compiler-ir' native.log | head -n 15 >&2 || true
+            tail -n 15 native.log >&2
+            test ! -e native.o
+            exit 1
+          fi
+          test "$(od -An -tx1 -N4 native.o | tr -d '[:space:]')" = 7f454c46
+          objdump -dr native.o >native.disasm
+          grep -E 'call(q)?[[:space:]]+\*' native.disasm
+          g++ -std=c++17 -fno-exceptions native.o owner.cpp -o native
+          timeout 15s ./native >native.stdout 2>native.stderr
+          test "$(sha256sum reference.stdout | awk '{print $1}')" = \
+               "$(sha256sum native.stdout | awk '{print $1}')"
+          test "$(sha256sum reference.stderr | awk '{print $1}')" = \
+               "$(sha256sum native.stderr | awk '{print $1}')"
+          echo 'EDG_CXX5_VPTR real_source_indirect_override=pass' >>"$GITHUB_STEP_SUMMARY"
 
       - name: Verify exact AL bool-return ABI against independent G++ definition
         working-directory: edgcpp/build/gcc-release
