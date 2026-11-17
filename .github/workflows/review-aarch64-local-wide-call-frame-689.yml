@@ -1,0 +1,66 @@
+name: Review 689 native AArch64 frame-local and wide indirect call alias
+on:
+  push:
+    branches: [review/aarch64-local-wide-call-frame-689]
+    paths: ['.github/workflows/review-aarch64-local-wide-call-frame-689.yml']
+  pull_request:
+    paths: ['.github/workflows/review-aarch64-local-wide-call-frame-689.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout exact compiler PR source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 822c98aa46b7001fea70d73c9fb1f43d401b7f32
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Guard source pin and native ARM64
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "822c98aa46b7001fea70d73c9fb1f43d401b7f32"
+          test "$(uname -m)" = "aarch64"
+          command -v gcc
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Isolate core workspace
+        working-directory: compiler
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          """)
+          PY
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: review-689-aarch64-local-wide-call
+      - name: New native ARM64 local plus 12-arg indirect callback C11 oracle
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test review_aarch64_local_wide_call_frame -- --nocapture
+      - name: Existing nested same successor PHI and physical frame audit
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test review_aarch64_nested_same_successor_phi -- --nocapture
+      - name: Existing local/global alias and mixed critical edge controls
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test review_aarch64_mixed_global_escape_loop -- --nocapture
+          cargo test -p compiler-opt --test review_aarch64_mixed_phi_critical_call -- --nocapture
+      - name: Existing local memory, wide ABI and pressure controls
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend-aarch64 --test local_memory -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test typeid_abi_calls_native -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test typeid_historical_pressure -- --nocapture
+      - name: Strict scoped Clippy
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-aarch64 --lib -- -D warnings
+          cargo clippy -p compiler-opt --test review_aarch64_local_wide_call_frame -- -D warnings
