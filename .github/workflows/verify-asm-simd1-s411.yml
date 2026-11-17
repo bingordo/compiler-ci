@@ -1,0 +1,83 @@
+name: ASM SIMD1 S4.11 pinned VPTERNLOGD/Q feature and merge
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-asm-simd1-s411.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: asm-simd1-s411-pinned
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [feature, simulated-main]
+    steps:
+      - name: Checkout pinned S4.11 compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 795044e8f00735d08036bcaac70d2447e1df6506
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - name: Checkout pinned main snapshot for simulated integration
+        if: matrix.mode == 'simulated-main'
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 313cf552d16fb5368c006dda3d49b0b92d779862
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler-main
+      - name: Pin and verify actual merge parents
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = '795044e8f00735d08036bcaac70d2447e1df6506'
+          if [ "${{ matrix.mode }}" = simulated-main ]; then
+            git -C compiler config user.name compiler-ci
+            git -C compiler config user.email compiler-ci@users.noreply.github.com
+            git -C compiler fetch ../compiler-main HEAD
+            test "$(git -C compiler rev-parse FETCH_HEAD)" = '313cf552d16fb5368c006dda3d49b0b92d779862'
+            git -C compiler merge --no-commit --no-ff FETCH_HEAD
+            test "$(git -C compiler rev-parse MERGE_HEAD)" = '313cf552d16fb5368c006dda3d49b0b92d779862'
+          fi
+          echo "S4.11 mode=${{ matrix.mode }} tested feature=795044e8f00735d08036bcaac70d2447e1df6506 main=313cf552d16fb5368c006dda3d49b0b92d779862" >> "$GITHUB_STEP_SUMMARY"
+      - name: Check generated source and mutation suite
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/regen_x86_sse_evex_ternlog_forms.py --check
+          python3 tools/test_regen_x86_sse_evex_ternlog_forms.py
+          python3 tools/test_x86_evex_ternlog_gas_reference.py
+      - name: Restrict workspace to shared compiler core
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: asm-simd1-s411-${{ matrix.mode }}
+      - name: Compile and run independent physical GAS/ELF oracles
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib sse_evex_ternlog -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_sse_evex_ternlog -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_sse_evex_mask_compare -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_sse_evex_shift_imm -- --nocapture
+      - name: Strict lib Clippy admission
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-x86 --lib -- -D warnings
