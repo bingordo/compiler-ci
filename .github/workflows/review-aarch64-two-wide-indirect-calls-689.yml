@@ -1,0 +1,64 @@
+name: Source-pinned AArch64 heterogeneous indirect call frame review #689
+on:
+  push:
+    branches: [review/aarch64-two-wide-indirect-calls-689]
+    paths: ['.github/workflows/review-aarch64-two-wide-indirect-calls-689.yml']
+  pull_request:
+    paths: ['.github/workflows/review-aarch64-two-wide-indirect-calls-689.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 36
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout exact compiler PR source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 38aad43dc389ef28091c670c6f484c7208156162
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source SHA and native AArch64 host
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "38aad43dc389ef28091c670c6f484c7208156162"
+          test "$(uname -m)" = "aarch64"
+          command -v gcc
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Isolate core Rust workspace
+        working-directory: compiler
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          """)
+          PY
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: review-aarch64-two-wide-indirect-calls-689
+      - name: New 12 plus 9 argument indirect callbacks and physical frame oracle
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test review_aarch64_two_wide_call_frame -- --nocapture
+      - name: Existing wide-call local/spill/outgoing physical auditing
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test review_aarch64_local_wide_call_frame -- --nocapture
+      - name: Existing nested mixed pointer-scalar PHI physical and C11 oracle
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test review_aarch64_nested_same_successor_phi -- --nocapture
+      - name: Existing native AArch64 mixed-width critical edge and ABI
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test review_aarch64_mixed_phi_critical_call -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test typeid_abi_calls_native -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test typeid_historical_pressure -- --nocapture
+      - name: Strict IR/opt/backend/ARM64 libraries and new test Clippy
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-aarch64 --lib -- -D warnings
+          cargo clippy -p compiler-opt --test review_aarch64_two_wide_call_frame -- -D warnings
