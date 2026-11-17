@@ -1,0 +1,67 @@
+# External exact-source acceptance for pragmatic shared x86 driver migration.
+name: X7 S4 pragmatic shared x86 source driver cutover
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-x7-s4-pragmatic-driver-20261117.yml'
+permissions:
+  contents: read
+jobs:
+  source-coemit-and-oberon-module-cutover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub SSH
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: dbaad26d42bf7e56184efa606395f8eadc61568d
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact candidate source
+        run: test "$(git -C compiler rev-parse HEAD)" = "dbaad26d42bf7e56184efa606395f8eadc61568d"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-s4-pragmatic-driver
+      - name: CLI selected co-emission and Oberon build with independent GCC oracle
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test x7_s4_pragmatic_driver_cutover -- --nocapture
+          for suite in lto_coemit lto_cli lto_mixed_link lto_elf_visibility lto_generated_multitu x7_s4_selected_lto x7_s4_selected_ir_replay x7_selected_machine_source; do
+            cargo test -p compiler --test "$suite"
+          done
+          cargo test -p compiler --bin compiler module_build::tests -- --nocapture
+          cargo test -p compiler --bin compiler x7_s4_source_ir_dump
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend-x86 --no-default-features --lib
+          echo X7_S4_PRAGMATIC_DRIVER_INTEGRATION_GREEN
+      - name: Existing 48-case 17424 GCC independent source oracle
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo build -p compiler
+          python3 tools/x7_s4_executable_source_gate.py \
+            --compiler target/debug/compiler \
+            --source-sha dbaad26d42bf7e56184efa606395f8eadc61568d \
+            --out ../x7-s4-pragmatic-source-regression \
+            --scales 8 24 48 \
+            --languages mini_c oberon \
+            --modes plain framed pic pic_framed \
+            --groups 3
+          echo X7_S4_PRAGMATIC_DRIVER_SOURCE_GATE_GREEN
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-s4-pragmatic-driver-source-regression
+          path: x7-s4-pragmatic-source-regression
+          if-no-files-found: warn
