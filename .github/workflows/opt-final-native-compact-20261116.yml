@@ -1,0 +1,56 @@
+name: Final optimizer compact TypeId fixture corpus
+on:
+  push:
+    branches: [verify/opt-final-native-compact-20261116]
+    paths: ['.github/workflows/opt-final-native-compact-20261116.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b51121ffab69842b7a1721aa28dcc3e3528e31b7
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned source SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "b51121ffab69842b7a1721aa28dcc3e3528e31b7"
+      - name: Isolate optimizer and backend workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64", "crates/backend-x86", "crates/opt"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: optimizer-63-compact-1-canonical-20261116
+      - name: Verify 63 compact, strict replay golden and all native binary roundtrips
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test native_v3_fixture_inventory -- --nocapture
+          cargo test -p compiler-ir --test native_fixture_text --test native_module_text_v3 -- --nocapture
+      - name: Install AArch64 cross GCC and QEMU for real C11 oracles
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross binutils-aarch64-linux-gnu qemu-user
+      - name: Execute original DSE inline LICM mem2reg SCCP no-inline and strict replay tests
+        working-directory: compiler
+        env:
+          COMPILER_REQUIRE_AARCH64_QEMU: "1"
+        run: |
+          cargo test -p compiler-opt --test typed_dse --test typed_inline_leaf_native --test typed_inline_memory_native --test typed_inline_postopt_native_trial --test typed_inline_wide_void_native --test typed_licm_native --test typed_mem2reg --test typed_sccp --test sccp_sparse_native --test typeid_source_no_inline --test ir_replay_cli -- --nocapture
+      - name: Verify existing independent directive CLI corpus
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test ir_fixture_directives -- --nocapture
+      - name: Strict scoped Clippy across changed tests and unchanged oracles
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-opt --no-deps --test native_v3_fixture_inventory --test typed_dse --test typed_inline_leaf_native --test typed_inline_memory_native --test typed_inline_postopt_native_trial --test typed_inline_wide_void_native --test typed_licm_native --test typed_mem2reg --test typed_sccp --test sccp_sparse_native --test typeid_source_no_inline --test ir_replay_cli --test ir_fixture_directives -- -D warnings
