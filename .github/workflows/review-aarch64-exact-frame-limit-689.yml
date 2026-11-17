@@ -1,0 +1,62 @@
+name: Source-pinned ARM64 exact 16368-byte frame limit review 689
+on:
+  push:
+    branches: [review/aarch64-exact-frame-limit-689]
+    paths: ['.github/workflows/review-aarch64-exact-frame-limit-689.yml']
+  pull_request:
+    paths: ['.github/workflows/review-aarch64-exact-frame-limit-689.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout exact compiler PR source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: edad3c34132f129d0da4797e6af29474f3496e7c
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source SHA and native AArch64
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "edad3c34132f129d0da4797e6af29474f3496e7c"
+          test "$(uname -m)" = "aarch64"
+          command -v gcc
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Isolate core workspace
+        working-directory: compiler
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          """)
+          PY
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: review-689-aarch64-exact-frame-limit
+      - name: New exact-frame acceptance 16 GP incoming and overflow rejection
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test review_aarch64_16incoming_two_calls -- --nocapture
+      - name: Existing two-call local frame physical and C11 controls
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test review_aarch64_two_wide_call_frame -- --nocapture
+      - name: Existing mixed-width AArch64 ABI/pressure controls
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-aarch64 --test typeid_abi_calls_native -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test typeid_historical_pressure -- --nocapture
+      - name: Strict affected libraries and test Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-aarch64 --lib -- -D warnings
+          cargo clippy -p compiler-opt --test review_aarch64_16incoming_two_calls -- -D warnings
