@@ -1,0 +1,100 @@
+name: ABI x86 fixed scalar shared call planner bridge (#2044)
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-abi-x86-fixed-scalar-shared-20261116.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-x86:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 07bf2470566d723246266a0eab4d93667eefc3e7
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact compiler source and x86 native runner
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "07bf2470566d723246266a0eab4d93667eefc3e7"
+          test "$(uname -m)" = x86_64
+      - name: Isolate shared ABI and existing x86 machine backend
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: abi-x86-fixed-scalar-bridge-20261116
+      - name: Fixed-call differential oracle and current x86 scalar ABI unit tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib abi_plan
+          cargo test -p compiler-backend-x86 --lib scalar_abi
+          cargo test -p compiler-backend-x86 --lib shared_fixed_scalar_parity
+      - name: Execute existing real C oracles through x86 ELF/GAS scalar stream
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test m4_7_scalar_sse_stream_native
+          cargo test -p compiler-backend-x86 --test native_typeid_function_signatures -- \
+            --skip typed_indirect_callee_provenance_rejects_mismatch_and_forgery
+      - name: Compile x86 library and enforce strict production Clippy
+        working-directory: compiler
+        run: |
+          cargo check -p compiler-backend-x86 --lib
+          # Existing generated X7 recipe table exposes a pub(crate) item
+          # whose recipe type is private. Existing old selector lints also
+          # predate this source-pinned ABI-only PR; no new source is excepted.
+          cargo clippy -p compiler-backend-x86 --lib -- \
+            -D warnings -A private_interfaces \
+            -A clippy::suspicious_assignment_formatting \
+            -A unused_variables -A clippy::too_many_arguments
+  shared-aarch64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 07bf2470566d723246266a0eab4d93667eefc3e7
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require exact merge candidate and native ARM64 host
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "07bf2470566d723246266a0eab4d93667eefc3e7"
+          test "$(uname -m)" = aarch64
+      - name: Isolate shared IR/backend without touching FP workstream
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: abi-x86-fixed-scalar-bridge-aarch64-20261116
+      - name: Preserve generic ABI planner behavior on AArch64
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend --lib abi_plan
+          cargo test -p compiler-backend --lib
+          cargo clippy -p compiler-backend --lib -- -D warnings
