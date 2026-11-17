@@ -425,6 +425,66 @@ jobs:
                "$(sha256sum native.stderr | awk '{print $1}')"
           echo 'EDG_CXX5_VPTR real_source_indirect_override=pass' >>"$GITHUB_STEP_SUMMARY"
 
+      - name: Execute source-borrowed stream manipulator return and preserve alternate object identity
+        working-directory: edgcpp/build/gcc-release
+        run: |
+          set -euo pipefail
+          source ./environment.sh
+          driver="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          work="$RUNNER_TEMP/cxx5-borrowed-manipulator-definition"
+          mkdir -p "$work"
+          cd "$work"
+          cat >invoke.cpp <<'CPP'
+          struct Stream {
+            int payload;
+            Stream& apply(Stream& (*callback)(Stream&));
+          };
+          Stream& Stream::apply(Stream& (*callback)(Stream&)) {
+            return callback(*this);
+          }
+          CPP
+          cat >caller.cpp <<'CPP'
+          #include <cstdio>
+          struct Stream {
+            int payload;
+            Stream& apply(Stream& (*callback)(Stream&));
+          };
+          static Stream alternate{13};
+          Stream& same(Stream& s) { s.payload += 2; return s; }
+          Stream& other(Stream& s) { alternate.payload += s.payload; return alternate; }
+          int main() {
+            Stream s{4};
+            Stream& a=s.apply(same);
+            Stream& b=s.apply(other);
+            bool addresses=(&a==&s && &b==&alternate && &b!=&s);
+            std::printf("%d %d %d\n",s.payload,alternate.payload,addresses);
+            return s.payload==6 && alternate.payload==19 && addresses ? 0 : 1;
+          }
+          CPP
+          g++ -std=c++17 -fno-exceptions -Wall -Wextra -Werror \
+            invoke.cpp caller.cpp -o reference
+          timeout 15s ./reference >reference.stdout 2>reference.stderr
+          test ! -s reference.stderr
+          gnu_number="$(g++ -dumpfullversion -dumpversion | awk -F. '{print $1*10000+$2*100+$3}')"
+          if ! "$driver" native.o --typeid-native --g++ --c++17 --no_strict_gnu \
+            --no_exceptions --gnu_version "$gnu_number" invoke.cpp >native.log 2>&1; then
+            echo '::error::Source-classified borrowed manipulator definition rejected'
+            grep -E 'source definition|C++ manipulator|borrowed|EDG -> compiler-ir' native.log | head -n 25 >&2 || true
+            tail -n 25 native.log >&2
+            test ! -e native.o
+            exit 1
+          fi
+          test "$(od -An -tx1 -N4 native.o | tr -d '[:space:]')" = 7f454c46
+          objdump -dr native.o >native.disasm
+          grep -E 'call(q)?[[:space:]]+\*' native.disasm
+          g++ -std=c++17 -fno-exceptions native.o caller.cpp -o native
+          timeout 15s ./native >native.stdout 2>native.stderr
+          test "$(sha256sum reference.stdout | awk '{print $1}')" = \
+               "$(sha256sum native.stdout | awk '{print $1}')"
+          test "$(sha256sum reference.stderr | awk '{print $1}')" = \
+               "$(sha256sum native.stderr | awk '{print $1}')"
+          echo 'EDG_CXX5_BORROWED_MANIPULATOR redirect_object_identity=pass' >>"$GITHUB_STEP_SUMMARY"
+
       - name: Verify exact AL bool-return ABI against independent G++ definition
         working-directory: edgcpp/build/gcc-release
         run: |
