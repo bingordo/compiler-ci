@@ -24,22 +24,24 @@ jobs:
       run:
         shell: edg-container-exec "bash -eo pipefail {0}"
     env:
-      COMPILER_SHA: 73494eafa2836dbfb440ddcdaf794a1d83c2961a
-      EDG_SOURCE_SHA: 4fa9e45eb8b986b910304204caf231ea2dc5b968
-      EDG_BRIDGE_SHA: ed1851f40f1d02ac3e2e8c40e8a7c89e5991398c
+      COMPILER_SHA: b8806aace8bb9cbf2dfd6295233ac77cb78c4efc
+      EDG_SOURCE_SHA: b195677be8b9b56c8337afad6be8064d21a54082
+      EDG_BRIDGE_SHA: 7f67a31a9ad5db038c8b1544e49117f23b462e45
+      EDG_RELEASE_TAG: edgcpfe-v2026.11.14-upstream-177765bb7731
+      EDG_RELEASE_SHA256: 1ce495b629924f31382ecccc891a7a72caae1014ddfa2ba7dd39b44d8b0a9526
       RUST_TOOLCHAIN_VERSION: 1.99.1
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
       EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
       EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
       EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
-      EDGCPP_EDG_REVISION: 4fa9e45eb8b986b910304204caf231ea2dc5b968
+      EDGCPP_EDG_REVISION: b195677be8b9b56c8337afad6be8064d21a54082
     steps:
       - name: Check out exactly pinned compiler integration candidate
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 73494eafa2836dbfb440ddcdaf794a1d83c2961a
+          ref: b8806aace8bb9cbf2dfd6295233ac77cb78c4efc
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -48,7 +50,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingundu/edgcpp
-          ref: 4fa9e45eb8b986b910304204caf231ea2dc5b968
+          ref: b195677be8b9b56c8337afad6be8064d21a54082
           path: edgcpp
           persist-credentials: false
 
@@ -57,32 +59,39 @@ jobs:
           set -euo pipefail
           test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
           test "$(git -C edgcpp rev-parse HEAD)" = "$EDG_SOURCE_SHA"
-          grep -Fq 'rev = "ed1851f40f1d02ac3e2e8c40e8a7c89e5991398c"' compiler/tools/edg-driver/Cargo.toml
-          grep -Fq 'edgcpp_capture_pre_lower_virtual_call' edgcpp/src/lower_il.c
-          grep -Fq 'edgcpp_capture_post_lower_virtual_call' edgcpp/src/lower_il.c
-          grep -Fq 'edgcpp_capture_virtual_receiver_pair' edgcpp/src/lower_il.c
+          grep -Fq 'rev = "7f67a31a9ad5db038c8b1544e49117f23b462e45"' compiler/tools/edg-driver/Cargo.toml
+          ! grep -q 'edgcpp_capture_' edgcpp/src/lower_il.c
           fixture=compiler/tools/edg-driver/tests/fixtures/edg_native_cxx5_iostream.cpp
           test -f "$fixture"
           grep -Fq '#include <iostream>' "$fixture"
           grep -Fq 'std::cout << "Hello, world!" << std::endl;' "$fixture"
           printf 'Compiler SHA: %s\nEDG package SHA: %s\nBridge SHA: %s\n' "$COMPILER_SHA" "$EDG_SOURCE_SHA" "$EDG_BRIDGE_SHA" >>"$GITHUB_STEP_SUMMARY"
 
-      - name: Build exact source-owned EDG callable with virtual observers
+      - name: Configure EDG header tooling without rebuilding full frontend
         working-directory: edgcpp
         env:
           EDG_BASE: ${{ github.workspace }}/edgcpp/bases/docker/dev-env/gcc
         run: |
           set -euo pipefail
-          cmake --preset linux-gcc-release \
-            -DEDG_BUILD_LIB=OFF \
-            -DEDG_BUILD_CALLABLE_LIBRARY=ON \
-            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-          cmake --build build/gcc-release --target edgcpfe --parallel 2
+          cmake --preset linux-gcc-release -DEDG_BUILD_LIB=OFF -DEDG_BUILD_CALLABLE_LIBRARY=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          cmake --build build/gcc-release --target error-info --parallel 2
           test -s build/gcc-release/src/includes/err_codes.h
           test -s build/gcc-release/src/includes/err_data.h
-          test -s build/gcc-release/lib/libedgcpfe.a
-          ar t build/gcc-release/lib/libedgcpfe.a | grep -Fxq 'lower_il.c.o'
-          echo "CXX5_EDG_SOURCE matched_virtual_observers=$EDG_SOURCE_SHA built_from_source=yes" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Restore checksummed upstream EDG callable release
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          mkdir -p build/gcc-release/lib build/prebuilt-edg
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error --retry 4 --retry-delay 2 \
+            "https://github.com/bingundu/edgcpp/releases/download/$EDG_RELEASE_TAG/edgcpfe-ci-upstream-callable-edg-release-20261114-linux-x86_64.tar.gz" \
+            -o build/prebuilt-edg/archive.tar.gz
+          printf '%s  %s\n' "$EDG_RELEASE_SHA256" build/prebuilt-edg/archive.tar.gz | sha256sum -c -
+          tar -xzf build/prebuilt-edg/archive.tar.gz -C build/prebuilt-edg
+          grep -Fx "commit=$EDG_SOURCE_SHA" build/prebuilt-edg/BUILD-INFO.txt
+          grep -Fx 'platform=linux-x86_64' build/prebuilt-edg/BUILD-INFO.txt
+          test -s build/prebuilt-edg/lib/libedgcpfe.a
+          cp build/prebuilt-edg/lib/libedgcpfe.a build/gcc-release/lib/libedgcpfe.a
 
       - name: Install pinned Rust toolchain
         run: |
@@ -115,7 +124,6 @@ jobs:
           cargo test --manifest-path tools/edg-driver/Cargo.toml cxx5_exact_pointer_call_identity_tests -- --nocapture
           cargo test --manifest-path tools/edg-driver/Cargo.toml cxx5_signed_byte_result_abi_tests -- --nocapture
           cargo test --manifest-path tools/edg-driver/Cargo.toml cxx5_borrowed_this_array_tests -- --nocapture
-          cargo test --manifest-path tools/edg-driver/Cargo.toml virtual_dispatch::tests -- --nocapture
           cargo test --manifest-path tools/edg-driver/Cargo.toml -- --nocapture
           cargo build --manifest-path tools/edg-driver/Cargo.toml
           test -x tools/edg-driver/target/debug/compiler-edg-driver
@@ -273,9 +281,9 @@ jobs:
             ! grep -Fq 'C array address needs native local source identity: path=0.0.0 ' original_noexcept.log
             ! grep -Fq 'C++ direct member call requires exact EDG &object: owner=TypeId(144)' original_noexcept.log
             grep -F 'EDG call callee is not a direct C routine designator: function=' original_noexcept.log | head -n 2
-            grep -F 'source_chain=' original_noexcept.log | head -n 2
-            grep -F 'source_chain=Ok(VirtualSourceChain' original_noexcept.log | head -n 2
-            grep -F 'machine_virtual_abi=unproven' original_noexcept.log | head -n 2
+            grep -F 'postlower_target=' original_noexcept.log | head -n 2
+            grep -F 'postlower_dispatch=' original_noexcept.log | head -n 2
+            grep -F 'machine_virtual_abi=unproven_from_postlower' original_noexcept.log | head -n 2
             echo 'EDG_CXX5_NOEXCEPT original_iostream=fail_closed' >>"$GITHUB_STEP_SUMMARY"
           fi
 
@@ -632,5 +640,5 @@ jobs:
           test "$rc" -ne 0
           test ! -e bad.o
           grep -E '(virtual|unsupported|member|callee|Error:)' bad.log
-          grep -F 'machine_virtual_abi=unproven' bad.log
+          grep -F 'machine_virtual_abi=unproven_from_postlower' bad.log
           echo 'CXX5_BORROWED_THIS virtual_dispatch=fail_closed_no_partial_elf' >>"$GITHUB_STEP_SUMMARY"
