@@ -1,0 +1,164 @@
+name: RV64 R3 Mini-C scalar source preview GAS QEMU
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-riscv-r3-minic-source-preview-qemu.yml']
+permissions:
+  contents: read
+jobs:
+  preview:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 27
+    steps:
+      - name: Enable read-only SSH access to pinned frontend dependencies
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Record trusted GitHub SSH host
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 4c017430f6c5b7f1e90751d302214eb4dff34295
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler source commit
+        run: test "$(git -C compiler rev-parse HEAD)" = 4c017430f6c5b7f1e90751d302214eb4dff34295
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Build full production driver and test source/ABI admission
+        shell: bash
+        working-directory: compiler
+        env:
+          RV64_SOURCE_FIXTURE_DIR: /tmp/rv64-source-preview-fixtures
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --lib typed_module_abi
+          cargo test -p compiler --test riscv64_source_preview -- --nocapture
+          cargo test -p compiler --test riscv64_load_ir -- --nocapture
+          cargo clippy -p compiler --bin compiler --test riscv64_source_preview \
+            -- -D warnings -A clippy::too_many_arguments
+          cargo build -p compiler --bin compiler
+          python3 tools/regen_riscv_native_selector_rules.py --check
+          python3 tools/riscv_udb_rust_leaf_forms.py \
+            --catalog data/riscv_udb_r0_catalog.json \
+            --output crates/backend-riscv64/src/generated_encoding.rs --check
+          for fn in rv64_add_source rv64_mul_source rv64_div_source; do
+            test -f "/tmp/rv64-source-preview-fixtures/${fn}.c"
+          done
+      - name: Install independent RISC-V GNU binutils and QEMU user mode
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y binutils-riscv64-linux-gnu qemu-user
+      - name: End-to-end source Mini-C against GNU GAS and readelf
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          driver="$PWD/target/debug/compiler"
+          for case in \
+              'rv64_add_source rv64i rv64i2p1' \
+              'rv64_mul_source rv64izmmul rv64i2p1_zmmul1p0' \
+              'rv64_div_source rv64im rv64i2p1_m2p0_zmmul1p0'; do
+            read -r name mode arch <<<"$case"
+            source="/tmp/rv64-source-preview-fixtures/${name}.c"
+            "$driver" "$source" --target riscv64 --riscv-source \
+              --riscv-isa "$mode" --emit obj -o "/tmp/src_${name}.o"
+            "$driver" "$source" --target riscv64 --riscv-source \
+              --riscv-isa "$mode" --emit asm -o "/tmp/src_${name}.s"
+            riscv64-linux-gnu-as -march="$mode" -mabi=lp64 \
+              "/tmp/src_${name}.s" -o "/tmp/src_${name}_gas.o"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/src_${name}.o" "/tmp/src_${name}.bin"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/src_${name}_gas.o" "/tmp/src_${name}_gas.bin"
+            cmp "/tmp/src_${name}.bin" "/tmp/src_${name}_gas.bin"
+            riscv64-linux-gnu-readelf -A "/tmp/src_${name}.o" | \
+              grep -F "Tag_RISCV_arch: \"${arch}\""
+            riscv64-linux-gnu-readelf -SW "/tmp/src_${name}.o" | \
+              grep -E '[[:space:]]+\.riscv\.attributes[[:space:]]+RISCV_ATTRIBUTES'
+          done
+      - name: Run C source-generated RV64I Zmmul and RV64IM under QEMU
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/rv64_minic_harness.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            mv s0, sp
+            li a0, 40
+            li a1, 2
+            call rv64_add_source
+            li t0, 42
+            bne a0, t0, fail
+            bne sp, s0, fail
+            li a0, 7
+            li a1, 6
+            call rv64_mul_source
+            li t0, 42
+            bne a0, t0, fail
+            bne sp, s0, fail
+            li a0, -84
+            li a1, 2
+            call rv64_div_source
+            li t0, -42
+            bne a0, t0, fail
+            bne sp, s0, fail
+            li a0, 0
+            j exit
+          fail:
+            li a0, 1
+          exit:
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64im -mabi=lp64 \
+            /tmp/rv64_minic_harness.s -o /tmp/rv64_minic_harness.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax -e _start \
+            /tmp/rv64_minic_harness.o /tmp/src_rv64_add_source.o \
+            /tmp/src_rv64_mul_source.o /tmp/src_rv64_div_source.o \
+            -o /tmp/rv64_minic_harness.elf
+          timeout 15s qemu-riscv64 /tmp/rv64_minic_harness.elf
+          echo 'Mini-C source -> TypeId native optimizer -> selected RV64 ELF -> QEMU PASSED'
+      - name: Prove source-level division exceptional cases trap under QEMU
+        shell: bash
+        run: |
+          set -euo pipefail
+          ulimit -c 0
+          for scenario in '0 13 0' 'overflow -9223372036854775808 -1'; do
+            read -r kind a b <<<"$scenario"
+            cat > "/tmp/rv64_src_trap_${kind}.s" <<EOF
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            li a0, $a
+            li a1, $b
+            call rv64_div_source
+            li a0, 0
+            li a7, 93
+            ecall
+          EOF
+            riscv64-linux-gnu-as -march=rv64im -mabi=lp64 \
+              "/tmp/rv64_src_trap_${kind}.s" -o "/tmp/rv64_src_trap_${kind}.o"
+            riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax -e _start \
+              "/tmp/rv64_src_trap_${kind}.o" /tmp/src_rv64_div_source.o \
+              -o "/tmp/rv64_src_trap_${kind}.elf"
+            set +e
+            timeout 5s qemu-riscv64 "/tmp/rv64_src_trap_${kind}.elf" \
+              >"/tmp/rv64_src_trap_${kind}.log" 2>&1
+            status=$?
+            set -e
+            if test "$status" -ne 133; then
+              echo "RISC-V Mini-C ${kind} expected SIGTRAP=133, got $status" >&2
+              exit 1
+            fi
+          done
+          echo 'Both source-level zero and signed MIN/-1 traps passed'
