@@ -1,6 +1,10 @@
 name: C++5 source-verified signed-byte AL return and original GCC15 iostream
 
 on:
+  push:
+    branches: ['ci/cxx5-formal-indirect-20261116']
+    paths:
+      - '.github/workflows/verify-cxx5-widen-signed-byte-20261116.yml'
   pull_request:
     branches: [main]
     paths:
@@ -24,7 +28,7 @@ jobs:
       run:
         shell: edg-container-exec "bash -eo pipefail {0}"
     env:
-      COMPILER_SHA: 4bf626a44d465ea07ad0d4accc1b60b454f13aa7
+      COMPILER_SHA: 1d617e6d9f2273a97882a686ba96fafcb5502f68
       EDG_SOURCE_SHA: b195677be8b9b56c8337afad6be8064d21a54082
       EDG_BRIDGE_SHA: 7f67a31a9ad5db038c8b1544e49117f23b462e45
       EDG_RELEASE_TAG: edgcpfe-v2026.11.14-upstream-177765bb7731
@@ -41,7 +45,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 4bf626a44d465ea07ad0d4accc1b60b454f13aa7
+          ref: 1d617e6d9f2273a97882a686ba96fafcb5502f68
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -200,8 +204,60 @@ jobs:
             exit 1
           fi
           test ! -e invalid.o
-          grep -E '(manipulator|scalar memory)' invalid.log
+          grep -E '(manipulator|scalar memory|function-pointer argument)' invalid.log
           echo 'EDG_FN_PTR_ABI unsupported_function_pointer=no_partial_elf' >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Execute EDG-native function pointer formal via real SysV indirect call
+        working-directory: edgcpp/build/gcc-release
+        run: |
+          set -euo pipefail
+          source ./environment.sh
+          driver="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          work="$RUNNER_TEMP/cxx5-checked-formal-indirect"
+          mkdir -p "$work"
+          cd "$work"
+          cat >invoke.cpp <<'CPP'
+          int invoke(int (*callback)(int), int value) {
+            return callback(value);
+          }
+          CPP
+          cat >caller.cpp <<'CPP'
+          #include <cstdio>
+          extern int invoke(int (*callback)(int), int);
+          static int observed;
+          static int add(int x) { ++observed; return x + 11; }
+          static int multiply(int x) { observed += 2; return x * 3; }
+          int main() {
+            const int first = invoke(add, 5);
+            const int second = invoke(multiply, 3);
+            std::printf("%d %d %d\n", first, second, observed);
+            return first == 16 && second == 9 && observed == 3 ? 0 : 1;
+          }
+          CPP
+          g++ -std=c++17 -fno-exceptions -Wall -Wextra -Werror             invoke.cpp caller.cpp -o reference
+          timeout 15s ./reference >reference.stdout 2>reference.stderr
+          test ! -s reference.stderr
+          version="$(g++ -dumpfullversion -dumpversion)"
+          IFS=. read -r major minor patch <<<"$version"
+          gnu_number=$((10#$major*10000+10#${minor:-0}*100+10#${patch:-0}))
+          if ! "$driver" native.o --typeid-native --g++ --c++17 --no_strict_gnu             --no_exceptions --gnu_version "$gnu_number" invoke.cpp             >native.log 2>&1; then
+            echo '::error::EDG native formal indirect call did not pass exact source checks'
+            grep -E 'EDG call callee|indirect|function-pointer|EDG -> compiler-ir' native.log | head -n 60 >&2 || true
+            tail -n 80 native.log >&2
+            test ! -e native.o
+            exit 1
+          fi
+          test "$(od -An -tx1 -N4 native.o | tr -d '[:space:]')" = 7f454c46
+          objdump -dr native.o >native.disassembly
+          grep -E 'call(q)?[[:space:]]+\*' native.disassembly || {
+            echo '::error::Native ELF contains no indirect machine call'
+            exit 1
+          }
+          g++ -std=c++17 -fno-exceptions native.o caller.cpp -o native
+          timeout 15s ./native >native.stdout 2>native.stderr
+          cmp reference.stdout native.stdout
+          cmp reference.stderr native.stderr
+          printf 'EDG_CXX5_CALL_INDIRECT formal_source=checked runtime_oracle=pass\n' >>"$GITHUB_STEP_SUMMARY"
 
       - name: Verify original GCC15 iostream exact scalar type rejection and no partial ELF
         working-directory: edgcpp/build/gcc-release
