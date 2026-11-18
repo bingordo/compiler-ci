@@ -1,0 +1,130 @@
+# Temporary source-pinned shared typed SSA joins acceptance; never merge into CI main.
+name: TEMP shared typed SSA joins Mini-C and EDG
+on:
+  pull_request:
+    paths: [.github/workflows/fp-shared-typed-joins-20261117.yml]
+permissions:
+  contents: read
+jobs:
+  mini-c:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Authenticate pinned private frontend dependencies
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust git host
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 966a3805298cc7e5bb6d977d236e0a13f91aa047
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "966a3805298cc7e5bb6d977d236e0a13f91aa047"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Generic IR and typed CFG unit suites
+        working-directory: compiler
+        run: cargo test -p compiler-ir --lib
+      - name: Mini-C scalar FP shared joins native GCC ELF/GAS and negatives
+        working-directory: compiler
+        run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml --test fp_scalar -- --nocapture
+      - name: Mini-C TypeId native smoke
+        working-directory: compiler
+        run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml --test typeid_cli
+      - name: Warnings denied generic IR and Mini-C
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-ir --lib -- -D warnings
+          cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml --lib -- -D warnings -A clippy::too_many_arguments
+  fp-edg:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    container:
+      image: ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8
+    defaults:
+      run:
+        shell: edg-container-exec "bash -eo pipefail {0}"
+    env:
+      EDG_SOURCE_SHA: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+      EDG_RELEASE_TAG: edgcpfe-ci-799603e0b5ab
+      EDG_RELEASE_SHA256: fa769825e70766fbefe017806816b2338acd03daa93bb5562369c293972ce64c
+      RUST_TOOLCHAIN_VERSION: 1.99.1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 966a3805298cc7e5bb6d977d236e0a13f91aa047
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: bingundu/edgcpp
+          ref: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+          path: edgcpp
+          persist-credentials: false
+      - name: Assert exact source commit
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "966a3805298cc7e5bb6d977d236e0a13f91aa047"
+      - name: Prepare native EDG headers/config
+        working-directory: edgcpp
+        run: |
+          export EDG_BASE="$PWD/bases/docker/dev-env/gcc"
+          cmake --preset linux-gcc-release -DEDG_BUILD_LIB=OFF -DEDG_BUILD_CALLABLE_LIBRARY=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          cmake --build build/gcc-release --target error-info --parallel 2
+      - name: Restore checksum-pinned callable EDG archive
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          url="https://github.com/bingundu/edgcpp/releases/download/$EDG_RELEASE_TAG/edgcpfe-ci-x86_64-callable-release-linux-x86_64.tar.gz"
+          mkdir -p build/gcc-release/lib build/prebuilt-edg
+          curl --fail --location --silent --show-error --retry 4 --retry-delay 2 "$url" --output build/prebuilt-edg/archive.tar.gz
+          printf '%s  %s\n' "$EDG_RELEASE_SHA256" build/prebuilt-edg/archive.tar.gz | sha256sum --check --status
+          tar -xzf build/prebuilt-edg/archive.tar.gz -C build/prebuilt-edg
+          grep -Fx "commit=$EDG_SOURCE_SHA" build/prebuilt-edg/BUILD-INFO.txt
+          cp build/prebuilt-edg/lib/libedgcpfe.a build/gcc-release/lib/libedgcpfe.a
+      - name: Install pinned Rust toolchain
+        run: |
+          if ! command -v cargo >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN_VERSION"
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install "$RUST_TOOLCHAIN_VERSION" --profile minimal
+          rustup default "$RUST_TOOLCHAIN_VERSION"
+      - name: Build EDG native TypeId bridge
+        working-directory: compiler
+        env:
+          EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+          EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+          EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+          EDGCPP_EDG_REVISION: ${{ env.EDG_SOURCE_SHA }}
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test --manifest-path tools/edg-driver/Cargo.toml --no-run
+          cargo build --manifest-path tools/edg-driver/Cargo.toml
+      - name: Native F32 F64 source GCC executable and fail-closed local
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cp tools/edg-driver/tests/fixtures/edg_native_fp_leaf*.c ../edgcpp/build/gcc-release/
+          cd ../edgcpp/build/gcc-release
+          source environment.sh
+          tool="../../../compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          "$tool" native_fp.o --c11 edg_native_fp_leaf.c
+          gcc -std=c11 -O2 -Wall -Wextra -Werror edg_native_fp_leaf.c edg_native_fp_leaf_driver.c -o gcc_fp
+          gcc -std=c11 -O2 -Wall -Wextra -Werror native_fp.o edg_native_fp_leaf_driver.c -o compiler_fp
+          ./gcc_fp
+          ./compiler_fp
+          for bad in edg_native_fp_leaf_bad.c edg_native_fp_leaf_uninit.c edg_native_fp_leaf_bad_join.c; do
+            rm -f bad_fp.o
+            if "$tool" bad_fp.o --c11 "$bad"; then
+              echo "unlegalized EDG FP case accepted: $bad"; exit 1
+            fi
+            test ! -e bad_fp.o
+          done
