@@ -1,0 +1,76 @@
+# Temporary exact-source S4 shared x86 physical retirement measurement.
+name: X7 S4 compiler legacy emitter retirement runtime AB
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-x7-s4-retirement-runtime-ab-20261117.yml'
+permissions:
+  contents: read
+jobs:
+  checked-source-runtime-ab:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: \${{ secrets.CI_KEY }}
+      - name: Trust GitHub SSH
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c709f78bf360e588e597bbbd44780fa2f57762f3
+          path: compiler
+          ssh-key: \${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact compiler candidate revision
+        run: test "$(git -C compiler rev-parse HEAD)" = "c709f78bf360e588e597bbbd44780fa2f57762f3"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-s4-retirement-runtime-ab
+      - name: Validate benchmark corpus and result contract
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile tools/x7_s4_retirement_runtime_gate.py
+          python3 tools/test_x7_s4_retirement_runtime_gate.py -v
+          cargo test -p compiler --test x7_s4_shared_default
+          cargo test -p compiler --test x7_s4_mixed_lto_shared_default
+          echo X7_S4_RETIREMENT_RUNTIME_UNIT_GREEN
+      - name: Existing 48-source executable GCC reference and ABBA compile-size evidence
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p compiler
+          python3 tools/x7_s4_executable_source_gate.py \
+            --compiler target/debug/compiler \
+            --source-sha c709f78bf360e588e597bbbd44780fa2f57762f3 \
+            --out ../x7-s4-retirement-measurements \
+            --scales 8 24 48 \
+            --languages mini_c oberon \
+            --modes plain framed pic pic_framed \
+            --groups 3
+          echo X7_S4_RETIREMENT_GCC_SOURCE_GREEN
+      - name: Paired native/shared/GCC generated-code runtime measurement
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/x7_s4_retirement_runtime_gate.py \
+            --source-artifacts ../x7-s4-retirement-measurements \
+            --source-sha c709f78bf360e588e597bbbd44780fa2f57762f3 \
+            --scales 8 24 48 \
+            --modes plain framed \
+            --iterations 150000 \
+            --groups 3
+          echo X7_S4_RETIREMENT_RUNTIME_EVIDENCE_GREEN
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-s4-retirement-compiler-size-runtime-ab
+          path: x7-s4-retirement-measurements
+          if-no-files-found: warn
