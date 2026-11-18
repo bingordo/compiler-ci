@@ -28,7 +28,7 @@ jobs:
       run:
         shell: edg-container-exec "bash -eo pipefail {0}"
     env:
-      COMPILER_SHA: 22803f0ecda838e7173f3243b00519a1c982052b
+      COMPILER_SHA: e68537d3b751b9f7dd8493a56506d2c9aab15df7
       EDG_SOURCE_SHA: b195677be8b9b56c8337afad6be8064d21a54082
       EDG_BRIDGE_SHA: 7f67a31a9ad5db038c8b1544e49117f23b462e45
       EDG_RELEASE_TAG: edgcpfe-v2026.11.14-upstream-177765bb7731
@@ -45,7 +45,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 22803f0ecda838e7173f3243b00519a1c982052b
+          ref: e68537d3b751b9f7dd8493a56506d2c9aab15df7
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -549,6 +549,66 @@ jobs:
           fi
           test ! -e forbidden.o
           echo 'EDG_CXX5_SCALAR_REFERENCE const_char_ref=GXX_parity volatile_ref=rejected' >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Differential-check const scalar automatic aliases and volatile rejection
+        working-directory: edgcpp/build/gcc-release
+        run: |
+          set -euo pipefail
+          source ./environment.sh
+          driver="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          work="$RUNNER_TEMP/cxx5-const-int-local"
+          mkdir -p "$work"
+          cd "$work"
+          cat >defs.cpp <<'CPP'
+          int const_local(int x) {
+            const int y=x+3;
+            return y*2;
+          }
+          CPP
+          cat >caller.cpp <<'CPP'
+          #include <cstdio>
+          extern int const_local(int);
+          int main() {
+            const int cases[]={-17,0,1,22,100};
+            long sum=0;
+            for (int x:cases) {
+              int got=const_local(x);
+              if (got!=2*(x+3)) return 4;
+              sum+=got;
+            }
+            std::printf("%ld\n",sum);
+            return 0;
+          }
+          CPP
+          g++ -std=c++17 -fno-exceptions -Wall -Wextra -Werror defs.cpp caller.cpp -o reference
+          timeout 15s ./reference >ref.stdout 2>ref.stderr
+          test ! -s ref.stderr
+          gnu_number="$(g++ -dumpfullversion -dumpversion | awk -F. '{print $1*10000+$2*100+$3}')"
+          if ! "$driver" native.o --typeid-native --g++ --c++17 --no_strict_gnu \
+            --no_exceptions --gnu_version "$gnu_number" defs.cpp >native.log 2>&1; then
+            echo "::error::Verified const integer local was rejected"
+            grep -E 'source definition|scalar local|EDG -> compiler-ir' native.log | head -n 16 >&2 || true
+            test ! -e native.o
+            exit 1
+          fi
+          test "$(od -An -tx1 -N4 native.o | tr -d '[:space:]')" = 7f454c46
+          g++ -std=c++17 -fno-exceptions native.o caller.cpp -o native
+          timeout 15s ./native >native.stdout 2>native.stderr
+          test "$(sha256sum native.stdout | awk '{print $1}')" = \
+               "$(sha256sum ref.stdout | awk '{print $1}')"
+          test "$(sha256sum native.stderr | awk '{print $1}')" = \
+               "$(sha256sum ref.stderr | awk '{print $1}')"
+          cat >volatile.cpp <<'CPP'
+          int volatile_local(int x) { volatile int y=x; return y; }
+          CPP
+          rm -f forbidden.o
+          if "$driver" forbidden.o --typeid-native --g++ --c++17 --no_strict_gnu \
+            --no_exceptions --gnu_version "$gnu_number" volatile.cpp >bad.log 2>&1; then
+            echo "::error::Volatile automatic unexpectedly accepted"
+            exit 1
+          fi
+          test ! -e forbidden.o
+          echo 'EDG_CXX5_CONST_LOCAL source_alias=GXX_parity volatile=no_partial_elf' >>"$GITHUB_STEP_SUMMARY"
 
       - name: Differential-check source pointer automatic SSA assignment and increment
         working-directory: edgcpp/build/gcc-release
