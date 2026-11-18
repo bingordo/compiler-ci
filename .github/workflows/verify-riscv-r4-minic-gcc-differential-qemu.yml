@@ -1,6 +1,10 @@
 name: RV64 R4 generated Mini-C GCC differential QEMU
 on:
   workflow_dispatch:
+  # Re-test current compiler main against fresh deterministic seeds,
+  # without consuming compiler repository Actions minutes.
+  schedule:
+    - cron: '19 11 * * 1,3,5'
   push:
     branches: [main]
     paths: ['.github/workflows/verify-riscv-r4-minic-gcc-differential-qemu.yml']
@@ -21,12 +25,15 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 2048e797a1ad1b27e6ba9fa345b99dc3ab9a3d88
+          ref: ${{ github.event_name == 'schedule' && 'main' || '2048e797a1ad1b27e6ba9fa345b99dc3ab9a3d88' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - name: Fail on unexpected source SHA
+        if: github.event_name != 'schedule'
         run: test "$(git -C compiler rev-parse HEAD)" = 2048e797a1ad1b27e6ba9fa345b99dc3ab9a3d88
+      - name: Log reproducible selected source revision
+        run: git -C compiler rev-parse HEAD
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -36,8 +43,13 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m unittest discover -s tools/tests -p test_riscv_source_differential.py -v
-          python3 tools/riscv_source_differential.py --output /tmp/rv64-diff
-          python3 tools/riscv_source_differential.py --output /tmp/rv64-diff-replay
+          seed=1381381684
+          if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
+            seed="$GITHUB_RUN_ID"
+          fi
+          echo "RV64 generator seed=$seed"
+          python3 tools/riscv_source_differential.py --output /tmp/rv64-diff --seed "$seed"
+          python3 tools/riscv_source_differential.py --output /tmp/rv64-diff-replay --seed "$seed"
           diff -qr /tmp/rv64-diff /tmp/rv64-diff-replay
           python3 -c 'import json; x=json.load(open("/tmp/rv64-diff/manifest.json")); assert x["source_count"]==48 and x["total_comparisons"]==1152 and x["shard_count"]==12'
           cargo test -p compiler --test riscv64_source_preview
@@ -106,3 +118,16 @@ jobs:
           done
           test "$passed" -eq 12
           echo "PASSED all 1152 independent C source/GCC QEMU comparisons in 12 shards"
+      - name: Archive generated failing source and QEMU vector reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rv64-r4-differential-repro-${{ github.run_id }}
+          path: |
+            /tmp/rv64-diff/manifest.json
+            /tmp/rv64-diff/plan.tsv
+            /tmp/rv64-diff/src/
+            /tmp/rv64-diff/ref/
+            /tmp/rv64-diff/harness/
+          if-no-files-found: warn
+          retention-days: 14
