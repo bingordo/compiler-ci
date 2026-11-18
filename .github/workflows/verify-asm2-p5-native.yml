@@ -1,0 +1,75 @@
+name: ASM2 P5 checked register operand guard and native build
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-asm2-p5-native.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ca34bd2ae19a1152acb756aa26c89320b4ab9948
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - name: Verify exact head and allow pinned frontend dependencies
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = 'ca34bd2ae19a1152acb756aa26c89320b4ab9948'
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - name: Prepare isolated compiler core workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: asm2-typeid-core
+      - name: Typecheck entire shared SSA, optimizer, legalizer and x86 encoder
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check --workspace
+          cargo test -p compiler-ir -p compiler-opt --lib
+      - name: Build checked Mini-C source frontend and run asm2 native source tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib asm2_ -- --nocapture
+          cargo test -p compiler-backend-x86 --lib asm_basic -- --nocapture
+          cargo test -p compiler-backend-x86 --test asm2_basic_physical -- --nocapture
+
+      - name: Restore full compiler workspace and authenticated private frontends
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          git restore Cargo.toml
+          rm -f Cargo.lock
+          git config --global --unset-all 'url.https://github.com/.insteadOf' || true
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub SSH host
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - name: Typecheck production compiler driver with Mini-C and Oberon
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler
+          echo 'ASM2_P5_NATIVE=PASS (source, optimizer, all backends, GCC runtime, driver)' >> "$GITHUB_STEP_SUMMARY"
+
