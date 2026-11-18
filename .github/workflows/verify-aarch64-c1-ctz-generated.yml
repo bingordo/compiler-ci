@@ -1,0 +1,90 @@
+name: C1 AArch64 real generated CTZ production cutover
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-aarch64-c1-ctz-generated.yml'
+permissions:
+  contents: read
+jobs:
+  generator-and-cross-target:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f800742168c0a034a2469af1e65b8580959e9a23
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Assert exact production source SHA and isolate backend workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "f800742168c0a034a2469af1e65b8580959e9a23"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Verify deterministic generated A64 rule and offline rejection tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/regen_aarch64_native_selector_rules.py --check
+          python3 -m unittest discover -s tools -p 'test_regen_aarch64_native_selector_rules.py' -v
+          python3 -m unittest discover -s tools -p 'test_regen_aarch64_scalar_gp_forms.py' -v
+      - name: Warnings denied TypeId/shared x86 and AArch64 all targets
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          RUSTFLAGS="-D warnings" cargo check -p compiler-backend -p compiler-backend-aarch64 -p compiler-backend-x86 --all-targets
+          cargo test -p compiler-backend --lib -- --test-threads=1
+          cargo test -p compiler-backend-aarch64 --lib -- --test-threads=1
+      - name: Verify shared selector and x86 native rule regression
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib -- --test-threads=1
+  real-native-aarch64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f800742168c0a034a2469af1e65b8580959e9a23
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Assert exact production source and isolate AArch64 workspace
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          test "$(git -C compiler rev-parse HEAD)" = "f800742168c0a034a2469af1e65b8580959e9a23"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          command -v cc
+          command -v objcopy
+      - name: Build production crate warnings denied
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          RUSTFLAGS="-D warnings" cargo check -p compiler-backend-aarch64 --all-targets
+          cargo clippy -p compiler-backend-aarch64 --all-targets -- -D warnings
+      - name: Run original native C CTZ and all backend ELF/assembler/ABI oracles
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-aarch64 --all-targets -- --test-threads=1 --nocapture
+          echo 'PASS C1 first production generated CTZ selector, real rule-hit census and existing native A64 ELF/GAS/C11/oracle suites' >> "$GITHUB_STEP_SUMMARY"
