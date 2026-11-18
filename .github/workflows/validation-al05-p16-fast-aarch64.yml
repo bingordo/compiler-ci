@@ -1,0 +1,62 @@
+name: VALIDATION ONLY P16 selected AArch64 QEMU smoke
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/validation-al05-p16-fast-aarch64.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  p16-aarch64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout validation workflow
+        uses: actions/checkout@v4
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 0c575b96ca3dc29ed942cb5bffb26fd0cd5808fc
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Isolate core Rust workspace
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = '0c575b96ca3dc29ed942cb5bffb26fd0cd5808fc'
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          """)
+          PY
+      - name: Reuse Rust core build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: p16-native-aarch64
+      - name: Install AArch64 GCC and QEMU
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo timeout --signal=TERM --kill-after=10s 3m apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=45 update -qq
+          sudo DEBIAN_FRONTEND=noninteractive timeout --signal=TERM --kill-after=10s 4m apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=45 install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
+          aarch64-linux-gnu-gcc --version
+          qemu-aarch64 --version
+      - name: Verify full selected P16 AArch64 ELF/GAS independent C11
+        working-directory: compiler
+        shell: bash
+        env:
+          AL05_REQUIRE_AARCH64: '1'
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 12m cargo test -p compiler-opt --test al05_p9_mixed_native_bridge al05_p16_coverage_guided_native_aarch64_qemu_elf_gas_c11 -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/al05-p16-aarch64.log"
+          grep -F 'AL05_P16_COVERAGE_NATIVE_TARGET arch=aarch64 format=elf functions=48 changed_cse=24 selected=24 modes=8 seeds=8 coefficients=5 comparisons=22416 traps=96 verdict=PASS' "$RUNNER_TEMP/al05-p16-aarch64.log"
+          grep -F 'AL05_P16_COVERAGE_NATIVE_TARGET arch=aarch64 format=gas functions=48 changed_cse=24 selected=24 modes=8 seeds=8 coefficients=5 comparisons=22416 traps=96 verdict=PASS' "$RUNNER_TEMP/al05-p16-aarch64.log"
