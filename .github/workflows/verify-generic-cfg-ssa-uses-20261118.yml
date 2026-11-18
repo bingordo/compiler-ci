@@ -1,0 +1,64 @@
+name: source-pinned shared CFG SSA use accounting
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/verify-generic-cfg-ssa-uses-20261118.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  generic-ssa-census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9fcefbf8274558b226d15fec3b0cf8faf6f20dda
+          path: baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 0c7c7f66e23cad15907a184d132be74effebd134
+          path: proposed
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require exact checked-out source identities
+        run: |
+          set -euo pipefail
+          test "$(git -C baseline rev-parse HEAD)" = "9fcefbf8274558b226d15fec3b0cf8faf6f20dda"
+          test "$(git -C proposed rev-parse HEAD)" = "0c7c7f66e23cad15907a184d132be74effebd134"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            baseline -> target
+            proposed -> target
+          key: generic-cfg-ssa-uses-20261118
+      - name: Generic CFG/PHI use test and selected x86 full library validation
+        working-directory: proposed
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --lib ssa_uses::tests -- --nocapture
+          cargo test -p compiler-ir --lib
+          cargo test -p compiler-backend --lib shared_scalar_uses_tests -- --nocapture
+          cargo test -p compiler-backend --lib
+          cargo test -p compiler-backend-x86 --lib
+          cargo clippy -p compiler-ir -p compiler-backend --lib -- --no-deps -D warnings
+          # x86's existing test/migration adapters are dead to production.
+          # Exempt only the already-tracked dead_code lint, not other warnings.
+          cargo clippy -p compiler-backend-x86 --lib -- --no-deps -D warnings -A dead_code
+          cargo test -p compiler --test x7_s4_rolling_checksum_source -- --nocapture
+          cargo test -p compiler --test x86_inline_source_ablation -- --nocapture
+      - name: Baseline IR/backend/x86 library regression parity
+        working-directory: baseline
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --lib
+          cargo test -p compiler-backend --lib
+          cargo test -p compiler-backend-x86 --lib
