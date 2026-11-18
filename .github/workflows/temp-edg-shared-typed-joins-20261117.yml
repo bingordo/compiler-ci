@@ -1,0 +1,187 @@
+# Isolated, source-pinned EDG C/C++ and FP shared SSA join acceptance; never merge.
+name: TEMP EDG cross-type SSA joins
+on:
+  pull_request:
+    paths: [.github/workflows/temp-edg-shared-typed-joins-20261117.yml]
+permissions:
+  contents: read
+jobs:
+  fp-edg:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    container:
+      image: ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8
+    defaults:
+      run:
+        shell: edg-container-exec "bash -eo pipefail {0}"
+    env:
+      EDG_SOURCE_SHA: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+      EDG_RELEASE_TAG: edgcpfe-ci-799603e0b5ab
+      EDG_RELEASE_SHA256: fa769825e70766fbefe017806816b2338acd03daa93bb5562369c293972ce64c
+      RUST_TOOLCHAIN_VERSION: 1.99.1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 913604323625969b1a0e567c151ef75a8a17708d
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: bingundu/edgcpp
+          ref: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+          path: edgcpp
+          persist-credentials: false
+      - name: Verify compiler source head
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "913604323625969b1a0e567c151ef75a8a17708d"
+      - name: Prepare native EDG headers/config
+        working-directory: edgcpp
+        run: |
+          export EDG_BASE="$PWD/bases/docker/dev-env/gcc"
+          cmake --preset linux-gcc-release -DEDG_BUILD_LIB=OFF -DEDG_BUILD_CALLABLE_LIBRARY=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          cmake --build build/gcc-release --target error-info --parallel 2
+      - name: Restore checksum-pinned callable EDG archive
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          url="https://github.com/bingundu/edgcpp/releases/download/$EDG_RELEASE_TAG/edgcpfe-ci-x86_64-callable-release-linux-x86_64.tar.gz"
+          mkdir -p build/gcc-release/lib build/prebuilt-edg
+          curl --fail --location --silent --show-error --retry 4 --retry-delay 2 "$url" --output build/prebuilt-edg/archive.tar.gz
+          printf '%s  %s\n' "$EDG_RELEASE_SHA256" build/prebuilt-edg/archive.tar.gz | sha256sum --check --status
+          tar -xzf build/prebuilt-edg/archive.tar.gz -C build/prebuilt-edg
+          grep -Fx "commit=$EDG_SOURCE_SHA" build/prebuilt-edg/BUILD-INFO.txt
+          cp build/prebuilt-edg/lib/libedgcpfe.a build/gcc-release/lib/libedgcpfe.a
+      - name: Install pinned Rust toolchain
+        run: |
+          if ! command -v cargo >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN_VERSION"
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install "$RUST_TOOLCHAIN_VERSION" --profile minimal
+          rustup default "$RUST_TOOLCHAIN_VERSION"
+      - name: Build EDG native TypeId bridge
+        working-directory: compiler
+        env:
+          EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+          EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+          EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+          EDGCPP_EDG_REVISION: ${{ env.EDG_SOURCE_SHA }}
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test --manifest-path tools/edg-driver/Cargo.toml --no-run
+          cargo build --manifest-path tools/edg-driver/Cargo.toml
+      - name: Source-independent TypeId join planner and CFG unit tests
+        working-directory: compiler
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test --manifest-path crates/ir/Cargo.toml --lib
+      - name: EDG native if/while CFG SSA join and loop phi GCC differential
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cp tools/edg-driver/tests/fixtures/edg_native_cfg*.c ../edgcpp/build/gcc-release/
+          (
+            cd ../edgcpp/build/gcc-release
+            source environment.sh
+            binary="../../../compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+            if ! "$binary" edg_cfg_native.o --c11 edg_native_cfg.c >edg_cfg_native.log 2>&1; then
+              cat edg_cfg_native.log
+              exit 1
+            fi
+            test "$(od -An -tx1 -N4 edg_cfg_native.o | tr -d ' \n')" = 7f454c46
+            nm -g --defined-only edg_cfg_native.o | grep -q edg_cfg_while
+            nm -g --defined-only edg_cfg_native.o | grep -q edg_cfg_formal_phi
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_native_cfg.c edg_native_cfg_driver.c -o gcc_edg_cfg
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_cfg_native.o edg_native_cfg_driver.c -o compiler_edg_cfg
+            ./gcc_edg_cfg
+            ./compiler_edg_cfg
+            # The side-effecting condition is supported by current compiler main.
+            # Keep it as a positive executable GCC differential rather than
+            # silently allowing the old "bad" fixture to stop testing semantics.
+            if ! "$binary" edg_cfg_effect.o --c11 edg_native_cfg_bad_condition_effect.c >edg_cfg_effect.log 2>&1; then
+              cat edg_cfg_effect.log
+              exit 1
+            fi
+            printf '%s\n' '#include <stdio.h>' 'int edg_cfg_bad_condition_effect(int,int);' 'int main(void) {' 'const int xs[]={0,0,1,1,1,-3,2};' 'const int ys[]={0,7,0,5,-2,3,-4};' 'const int want[]={0,0,0,6,-1,4,-3};' 'for (unsigned i=0;i<sizeof(xs)/sizeof(xs[0]);i++) {' 'int got=edg_cfg_bad_condition_effect(xs[i],ys[i]);' 'if (got!=want[i]) { fprintf(stderr,"input x=%d y=%d got=%d expected=%d\\n",xs[i],ys[i],got,want[i]); return 1; }' '}' 'return 0;' '}' >edg_cfg_effect_driver.c
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_native_cfg_bad_condition_effect.c edg_cfg_effect_driver.c -o gcc_edg_cfg_effect
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_cfg_effect.o edg_cfg_effect_driver.c -o compiler_edg_cfg_effect
+            echo 'Run GCC source oracle for side-effectful condition'
+            ./gcc_edg_cfg_effect
+            echo 'Run native compiler for side-effectful condition'
+            ./compiler_edg_cfg_effect
+            # Source-owned, path-sensitive SSA definitions across &&, ||,
+            # nested conditions and mutable formals. Must execute identically
+            # to GCC, not merely compile successfully.
+            if ! "$binary" edg_sc_state.o --c11 edg_native_cfg_sc_state.c >edg_sc_state.log 2>&1; then
+              cat edg_sc_state.log
+              exit 1
+            fi
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_native_cfg_sc_state.c edg_native_cfg_sc_state_driver.c -o gcc_edg_sc_state
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_sc_state.o edg_native_cfg_sc_state_driver.c -o compiler_edg_sc_state
+            ./gcc_edg_sc_state
+            ./compiler_edg_sc_state
+            for source in edg_native_cfg_bad_uninit_if.c edg_native_cfg_bad_uninit_loop.c edg_native_cfg_bad_shadow_uninit.c edg_native_cfg_bad_do.c edg_native_cfg_bad_goto.c edg_native_cfg_bad_volatile.c; do
+              rm -f bad_edg_cfg.o bad_edg_cfg.log
+              if "$binary" bad_edg_cfg.o --c11 "$source" >bad_edg_cfg.log 2>&1; then
+                echo "Unsupported source unexpectedly compiled: $source"
+                exit 1
+              fi
+              cat bad_edg_cfg.log
+              test ! -e bad_edg_cfg.o
+            done
+          )
+
+      - name: EDG C99 for loops and scalar compound SSA updates vs GCC
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cp tools/edg-driver/tests/fixtures/edg_native_c99*.c ../edgcpp/build/gcc-release/
+          (
+            cd ../edgcpp/build/gcc-release
+            source environment.sh
+            binary="../../../compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+            if ! "$binary" edg_c99_loops.o --c11 edg_native_c99_loops.c >edg_c99.log 2>&1; then
+              cat edg_c99.log
+              exit 1
+            fi
+            test "$(od -An -tx1 -N4 edg_c99_loops.o | tr -d ' \n')" = 7f454c46
+            nm -g --defined-only edg_c99_loops.o | grep -q edg_c99_for_nested
+            nm -g --defined-only edg_c99_loops.o | grep -q edg_c99_compound_i64
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_native_c99_loops.c edg_native_c99_loops_driver.c -o gcc_edg_c99
+            gcc -std=c11 -O2 -Wall -Wextra -Werror edg_c99_loops.o edg_native_c99_loops_driver.c -o compiler_edg_c99
+            ./gcc_edg_c99
+            ./compiler_edg_c99
+            for source in edg_native_c99_bad_break.c edg_native_c99_bad_continue.c edg_native_c99_bad_pointer_update.c edg_native_c99_bad_value_update.c edg_native_c99_bad_unbounded_for.c; do
+              rm -f bad_edg_c99.o bad_edg_c99.log
+              if "$binary" bad_edg_c99.o --c11 "$source" >bad_edg_c99.log 2>&1; then
+                echo "Unsupported native C99 control/effect semantics unexpectedly compiled: $source"
+                exit 1
+              fi
+              cat bad_edg_c99.log
+              test ! -e bad_edg_c99.o
+            done
+          )
+
+      - name: Native F32 F64 source GCC executable and fail-closed local
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cp tools/edg-driver/tests/fixtures/edg_native_fp_leaf*.c ../edgcpp/build/gcc-release/
+          cd ../edgcpp/build/gcc-release
+          source environment.sh
+          tool="../../../compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          "$tool" native_fp.o --c11 edg_native_fp_leaf.c
+          gcc -std=c11 -O2 -Wall -Wextra -Werror edg_native_fp_leaf.c edg_native_fp_leaf_driver.c -o gcc_fp
+          gcc -std=c11 -O2 -Wall -Wextra -Werror native_fp.o edg_native_fp_leaf_driver.c -o compiler_fp
+          ./gcc_fp
+          ./compiler_fp
+          for bad in edg_native_fp_leaf_bad.c edg_native_fp_leaf_uninit.c edg_native_fp_leaf_bad_join.c; do
+            rm -f bad_fp.o
+            if "$tool" bad_fp.o --c11 "$bad"; then
+              echo "unlegalized EDG FP case accepted: $bad"; exit 1
+            fi
+            test ! -e bad_fp.o
+          done
