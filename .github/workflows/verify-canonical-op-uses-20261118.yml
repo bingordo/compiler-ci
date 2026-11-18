@@ -1,0 +1,63 @@
+name: pinned canonical IR opcode operand visitor
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/verify-canonical-op-uses-20261118.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  canonical-op-uses:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 028716174bf244ff26637d46b0228d659f4397e1
+          path: baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ee68bc57be9c4714b28cbd5dfe4989fb1f4b7835
+          path: proposed
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check source-pin integrity
+        run: |
+          set -euo pipefail
+          test "$(git -C baseline rev-parse HEAD)" = "028716174bf244ff26637d46b0228d659f4397e1"
+          test "$(git -C proposed rev-parse HEAD)" = "ee68bc57be9c4714b28cbd5dfe4989fb1f4b7835"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            baseline -> target
+            proposed -> target
+          key: canonical-op-uses-20261118
+      - name: Generated opcode-use families, full IR/backend/x86 and oracle regression
+        working-directory: proposed
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --lib op_uses_single_visitor -- --nocapture
+          cargo test -p compiler-ir --lib
+          cargo test -p compiler-backend --lib
+          cargo test -p compiler-backend-x86 --lib
+          cargo clippy -p compiler-ir -p compiler-backend --lib -- --no-deps -D warnings
+          cargo clippy -p compiler-backend-x86 --lib -- --no-deps -D warnings -A dead_code
+          cargo test -p compiler --test x7_s4_rolling_checksum_source -- --nocapture
+          cargo test -p compiler --test x86_inline_source_ablation -- --nocapture
+      - name: Baseline IR and x86 library test parity
+        working-directory: baseline
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --lib
+          # Baseline backend unit fixture is known broken by a missing
+          # gp_clobbers field: preserve baseline source; x86 still compiles
+          # generic backend as a production dependency.
+          cargo test -p compiler-backend-x86 --lib
