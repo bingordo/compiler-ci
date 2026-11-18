@@ -1,0 +1,66 @@
+name: Source-pinned AArch64 byte-halfword overlap and dual callbacks review 689
+on:
+  push:
+    branches: [review/aarch64-overlap-dual-callback-689]
+    paths: ['.github/workflows/review-aarch64-overlap-dual-callback-689.yml']
+  pull_request:
+    paths: ['.github/workflows/review-aarch64-overlap-dual-callback-689.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout exact compiler PR source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 187817c8531caf5603bd112be79ff3cf18b7bca2
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source SHA and native AArch64
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "187817c8531caf5603bd112be79ff3cf18b7bca2"
+          test "$(uname -m)" = "aarch64"
+          command -v gcc
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Isolate core workspace
+        working-directory: compiler
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          """)
+          PY
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: review-689-aarch64-overlap-two-callback
+      - name: New mixed i8/i16 cross-word native AArch64 oracle and physical audit
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test review_aarch64_overlap_dual_callback -- --nocapture
+      - name: Existing local byte and halfword PHI callback oracle
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test review_aarch64_loop_byte_phi_callback -- --nocapture
+      - name: Existing two-callback partial byte PHI oracle
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test review_aarch64_byte_phi_indirect_memory -- --nocapture
+      - name: Existing two wide indirect callback frame and pressure controls
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test review_aarch64_two_wide_call_frame -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test typeid_abi_calls_native -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test typeid_historical_pressure -- --nocapture
+      - name: Strict affected libraries and review-test Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-aarch64 --lib -- -D warnings
+          cargo clippy -p compiler-opt --test review_aarch64_overlap_dual_callback -- -D warnings
