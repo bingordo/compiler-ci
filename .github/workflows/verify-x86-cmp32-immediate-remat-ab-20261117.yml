@@ -1,0 +1,116 @@
+name: pinned CMP32 immediate selected-SSA rematerialization A/B
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/verify-x86-cmp32-immediate-remat-ab-20261117.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 65820bfa8708d13d9f43016b035090a3fba09f9e
+          path: old
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2a83755d9b8d3c6be134508b74aca94bc80adeee
+          path: new
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source pin and host CPU
+        run: |
+          set -euo pipefail
+          test "$(git -C old rev-parse HEAD)" = "65820bfa8708d13d9f43016b035090a3fba09f9e"
+          test "$(git -C new rev-parse HEAD)" = "2a83755d9b8d3c6be134508b74aca94bc80adeee"
+          lscpu | grep -E '^Architecture:|^Model name:|^CPU\\(s\\):' || true
+          grep Cpus_allowed_list /proc/self/status
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            old -> target
+            new -> target
+          key: x86-cmp32-immediate-20261117
+      - name: Test full x86 and strict GCC C11/ELF/GAS immediate boundary
+        working-directory: new
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib reviewed_cmp32_immediate_rematerialization_matches_independent_c11 -- --nocapture
+          cargo test -p compiler-backend-x86 --lib
+          cargo clippy -p compiler-backend-x86 --lib -- -D warnings
+          cargo test -p compiler --test x7_s4_rolling_checksum_source -- --nocapture
+          cargo test -p compiler --test x86_inline_source_ablation -- --nocapture
+      - name: Match same larger C11 workload on both source pins
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path=Path('crates/driver/tests/x86_source_runtime_performance.rs')
+          old=(Path('old')/path).read_bytes()
+          new=(Path('new')/path).read_bytes()
+          assert old==new, 'benchmark source drift'
+          needle=b'REPS=7, ITERS=1800'
+          assert old.count(needle)==1
+          for root in ('old','new'):
+              (Path(root)/path).write_bytes(old.replace(needle,b'REPS=7, ITERS=18000'))
+          PY
+          for case in old new; do
+            (cd "$case" && cargo test --release -p compiler --test x86_source_runtime_performance --no-run)
+          done
+      - name: Same-CPU interleaved ABBA x2 independent GCC checksums
+        run: |
+          set -euo pipefail
+          cpu=$(awk '/^Cpus_allowed_list:/ {split($2,a,/[-,]/);print a[1]}' /proc/self/status)
+          test -n "$cpu"
+          echo "AB_PIN_CPU=$cpu"
+          i=0
+          for case in old new new old old new new old; do
+            i=$((i+1))
+            logfile="$RUNNER_TEMP/ab-$i-$case.log"
+            (cd "$case" && taskset -c "$cpu" cargo test --release -p compiler --test x86_source_runtime_performance -- --ignored --nocapture) 2>&1 | tee "$logfile"
+            grep -q 'X86_RUNTIME_FUNCTION mode=mini_default symbol=scan>' "$logfile"
+            grep -q 'X86_SOURCE_RUNTIME mode=mini_default workload=combined ' "$logfile"
+            grep -q 'X86_SOURCE_RUNTIME mode=gcc_O2 workload=combined ' "$logfile"
+          done
+          python3 - "$RUNNER_TEMP" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          from pathlib import Path
+          import sys,statistics
+          root=Path(sys.argv[1])
+          runs=[]
+          for index in range(1,9):
+              case='old' if index in (1,4,5,8) else 'new'
+              path=root/f'ab-{index}-{case}.log'
+              data=path.read_text(errors='replace')
+              def fields(prefix):
+                  rows=[x for x in data.splitlines() if prefix in x]
+                  assert rows,(path,prefix)
+                  return dict(part.split('=',1) for part in rows[-1].split() if '=' in part)
+              a=fields('X86_SOURCE_RUNTIME mode=mini_default workload=combined ')
+              b=fields('X86_SOURCE_RUNTIME mode=gcc_O2 workload=combined ')
+              c=fields('X86_RUNTIME_FUNCTION mode=mini_default symbol=scan>')
+              assert a['checksum']==b['checksum']
+              row=(case,int(a['median_ns']),int(b['median_ns']),c)
+              runs.append(row)
+              print(f"{index} {case}: native={row[1]}ns gcc={row[2]}ns scan_instr={c['instructions']} moves={c['moves']} stack_mem={c['stack_memory']}")
+          for case in ('old','new'):
+              vals=[r[1] for r in runs if r[0]==case]
+              print(f'{case} mean_median_ns={statistics.mean(vals):.2f}')
+          print('No timing thresholds; assess source-pinned machine and runtime changes.')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x86-cmp32-imm-abba
+          path: ${{ runner.temp }}/ab-*.log
+          if-no-files-found: ignore
