@@ -1,0 +1,113 @@
+name: source-pinned generic machine remat x86 and aarch64
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/verify-shared-machine-remat-ab-20261118.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  correctness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e7b79a843fbe6b1d861fa9967c6c279ab97aeba3
+          path: old
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 68f861364f199e0ee4fbc127e8ce821ddb394e6b
+          path: new
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact source pins
+        run: |
+          set -euo pipefail
+          test "$(git -C old rev-parse HEAD)" = "e7b79a843fbe6b1d861fa9967c6c279ab97aeba3"
+          test "$(git -C new rev-parse HEAD)" = "68f861364f199e0ee4fbc127e8ce821ddb394e6b"
+          lscpu | grep -E '^Model name:|^Architecture:' || true
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            old -> target
+            new -> target
+          key: shared-remat-20261118
+      - name: Generic planner and cross-target correctness and strict Clippy
+        working-directory: new
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib remat::tests -- --nocapture
+          cargo test -p compiler-backend --lib
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend-aarch64 --lib
+          cargo clippy -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --lib -- -D warnings
+          cargo test -p compiler --test x86_inline_source_ablation -- --nocapture
+          cargo test -p compiler --test x7_s4_rolling_checksum_source -- --nocapture
+      - name: Exact benchmark overlay on both pinned compiler sources
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path=Path('crates/driver/tests/x86_source_runtime_performance.rs')
+          orig=(Path('old')/path).read_bytes()
+          updated=(Path('new')/path).read_bytes()
+          assert orig==updated, 'benchmark fixture changed between commits'
+          needle=b'REPS=7, ITERS=1800'
+          assert orig.count(needle)==1
+          for root in ('old','new'):
+              (Path(root)/path).write_bytes(orig.replace(needle,b'REPS=7, ITERS=18000'))
+          PY
+          for case in old new; do
+            (cd "$case" && cargo test --release -p compiler --test x86_source_runtime_performance --no-run)
+          done
+      - name: Source-pinned same-CPU old new new old native and GCC oracle
+        run: |
+          set -euo pipefail
+          cpu=$(awk '/^Cpus_allowed_list:/ {split($2,a,/[-,]/); print a[1]}' /proc/self/status)
+          test -n "$cpu"
+          echo "CPU_PIN=$cpu"
+          index=0
+          for case in old new new old; do
+            index=$((index+1))
+            logfile="$RUNNER_TEMP/ab-$index-$case.log"
+            (cd "$case" && taskset -c "$cpu" cargo test --release -p compiler --test x86_source_runtime_performance -- --ignored --nocapture) 2>&1 | tee "$logfile"
+            grep -q 'X86_RUNTIME_FUNCTION mode=mini_default symbol=scan>' "$logfile"
+            grep -q 'X86_SOURCE_RUNTIME mode=mini_default workload=combined ' "$logfile"
+            grep -q 'X86_SOURCE_RUNTIME mode=gcc_O2 workload=combined ' "$logfile"
+          done
+          python3 - "$RUNNER_TEMP" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          from pathlib import Path
+          import sys,statistics
+          root=Path(sys.argv[1])
+          results=[]
+          for index,case in enumerate(('old','new','new','old'),1):
+              data=(root/f'ab-{index}-{case}.log').read_text(errors='replace')
+              def last(prefix):
+                  lines=[l for l in data.splitlines() if prefix in l]
+                  assert lines,(index,case,prefix)
+                  return dict(token.split('=',1) for token in lines[-1].split() if '=' in token)
+              mini=last('X86_SOURCE_RUNTIME mode=mini_default workload=combined ')
+              gcc=last('X86_SOURCE_RUNTIME mode=gcc_O2 workload=combined ')
+              scan=last('X86_RUNTIME_FUNCTION mode=mini_default symbol=scan>')
+              assert mini['checksum']==gcc['checksum']
+              results.append((case,int(mini['median_ns']),scan))
+              print(f'{index} {case}: native_ns={mini["median_ns"]} gcc_ns={gcc["median_ns"]} scan_instr={scan["instructions"]} moves={scan["moves"]} stack_mem={scan["stack_memory"]}')
+          for case in ('old','new'):
+              medians=[ns for name,ns,_ in results if name==case]
+              print(f'{case} avg_median_ns={statistics.mean(medians):.1f}')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: source-pinned-generic-remat-ab
+          path: ${{ runner.temp }}/ab-*.log
+          if-no-files-found: ignore
