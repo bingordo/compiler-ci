@@ -1,0 +1,115 @@
+name: controlled pinned-core x86 scalar ALU ABBA runtime
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/verify-x86-allocated-alu-stable-ab-20261117.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  repeat:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7565a9b3fcf0c66cea1ad0107d68d5d2cdb02535
+          path: old
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b4bd48e3ce30108ba20c9a7bf52781f3176d4ef0
+          path: new
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source SHA and record host/CPU provenance
+        run: |
+          set -euo pipefail
+          test "$(git -C old rev-parse HEAD)" = "7565a9b3fcf0c66cea1ad0107d68d5d2cdb02535"
+          test "$(git -C new rev-parse HEAD)" = "b4bd48e3ce30108ba20c9a7bf52781f3176d4ef0"
+          lscpu | grep -E '^Architecture:|^Model name:|^CPU\\(s\\):|^Thread\\(s\\) per core:' || true
+          grep Cpus_allowed_list /proc/self/status
+          uname -a
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            old -> target
+            new -> target
+          key: x86-allocated-alu-stable-ab-20261117
+      - name: Apply an identical tenfold benchmark-only work multiplier
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path='crates/driver/tests/x86_source_runtime_performance.rs'
+          before=(Path('old')/path).read_bytes()
+          after=(Path('new')/path).read_bytes()
+          assert before==after, "old and new benchmark sources must be byte-identical"
+          needle=b'REPS=7, ITERS=1800'
+          assert before.count(needle)==1, "benchmark contract changed"
+          updated=before.replace(needle,b'REPS=7, ITERS=18000')
+          for root in ['old','new']:
+              (Path(root)/path).write_bytes(updated)
+          assert (Path('old')/path).read_bytes()==(Path('new')/path).read_bytes()
+          print('AB_HARNESS: same source SHA-pinned code, identical 18000-input C11 harness overlay')
+          PY
+      - name: Warm both optimized release harnesses without CPU pinning
+        run: |
+          set -euo pipefail
+          for case in old new; do
+            (cd "$case" && cargo test --release -p compiler --test x86_source_runtime_performance --no-run)
+          done
+      - name: Pinned core interleaved two ABBA cycles with GCC checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          cpu=$(awk '/^Cpus_allowed_list:/ {split($2,a,/[-,]/);print a[1]}' /proc/self/status)
+          test -n "$cpu"
+          echo "AB_PIN_CPU=$cpu"
+          i=0
+          for case in old new new old old new new old; do
+            i=$((i+1))
+            logfile="$RUNNER_TEMP/ab-$i-$case.log"
+            (cd "$case" && taskset -c "$cpu" cargo test --release -p compiler --test x86_source_runtime_performance -- --ignored --nocapture) 2>&1 | tee "$logfile"
+            grep -q 'X86_RUNTIME_FUNCTION mode=mini_default symbol=scan>' "$logfile"
+            grep -q 'X86_SOURCE_RUNTIME mode=mini_default workload=combined ' "$logfile"
+            grep -q 'X86_SOURCE_RUNTIME mode=gcc_O2 workload=combined ' "$logfile"
+          done
+          python3 - "$RUNNER_TEMP" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import re,sys
+          from pathlib import Path
+          root=Path(sys.argv[1])
+          records=[]
+          for file in sorted(root.glob('ab-*-*.log'),
+                             key=lambda p:int(p.name.split('-')[1])):
+              case=file.stem.split('-')[-1]
+              text=file.read_text(errors='replace')
+              def value(mode):
+                  pattern=(r'X86_SOURCE_RUNTIME mode='+mode+
+                           r' workload=combined checksum=(\\d+) median_ns=(\\d+)')
+                  matches=re.findall(pattern,text)
+                  assert matches, (file,mode)
+                  return tuple(map(int,matches[-1]))
+              gcc=value('gcc_O2')
+              native=value('mini_default')
+              assert gcc[0]==native[0],file
+              records.append((file.name,case,native[1],gcc[1]))
+          print('### Pinned x86 ALU old/new, 18,000-input ABBA twice')
+          for file,case,ns,gcc in records:
+              print(f'{file}: native_ns={ns} gcc_ns={gcc} native_over_gcc={ns/gcc:.4f}')
+          assert len(records)==8,records
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pinned-x86-alu-timing-host-provenance
+          path: ${{ runner.temp }}/ab-*.log
+          if-no-files-found: ignore
