@@ -1,0 +1,104 @@
+name: RV64 R4 generated Mini-C GCC differential QEMU
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-riscv-r4-minic-gcc-differential-qemu.yml']
+permissions:
+  contents: read
+jobs:
+  rv64-differential:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Permit private pinned frontend dependency checkout
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Configure GitHub trusted SSH host
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - name: Checkout exact compiler implementation revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 764a4acf4bc28f1bc394a42fe4af5b2e392fae60
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Fail on unexpected source SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = 764a4acf4bc28f1bc394a42fe4af5b2e392fae60
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Validate deterministic generator, ISA tests and real compiler
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools/tests -p test_riscv_source_differential.py -v
+          python3 tools/riscv_source_differential.py --output /tmp/rv64-diff
+          python3 tools/riscv_source_differential.py --output /tmp/rv64-diff-replay
+          diff -qr /tmp/rv64-diff /tmp/rv64-diff-replay
+          python3 -c 'import json; x=json.load(open("/tmp/rv64-diff/manifest.json")); assert x["source_count"]==48 and x["total_comparisons"]==1152 and x["shard_count"]==12'
+          cargo test -p compiler --test riscv64_source_preview
+          cargo test -p compiler --test riscv64_load_ir
+          cargo test -p compiler-backend-riscv64
+          cargo clippy -p compiler --bin compiler -- -D warnings -A clippy::too_many_arguments
+          cargo build -p compiler --bin compiler
+          python3 tools/regen_riscv_native_selector_rules.py --check
+          python3 tools/riscv_udb_rust_leaf_forms.py \
+            --catalog data/riscv_udb_r0_catalog.json \
+            --output crates/backend-riscv64/src/generated_encoding.rs --check
+      - name: Install independent RV64 GNU GCC binutils and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu qemu-user
+      - name: Compile 48 generated Mini-C source and GCC reference pairs
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          root=/tmp/rv64-diff
+          mkdir -p "$root/objects"
+          driver="$PWD/target/debug/compiler"
+          while IFS=$'\t' read -r fn reference isa; do
+            "$driver" "$root/src/$fn.c" --target riscv64 --riscv-source \
+              --riscv-isa "$isa" --emit obj -o "$root/objects/$fn.o"
+            riscv64-linux-gnu-gcc -march=rv64im -mabi=lp64 -O2 \
+              -ffreestanding -fno-builtin -fno-pie -fno-stack-protector \
+              -fwrapv -c "$root/ref/$reference.c" \
+              -o "$root/objects/$reference.o"
+            test -s "$root/objects/$fn.o"
+            test -s "$root/objects/$reference.o"
+          done < "$root/plan.tsv"
+          count="$(find "$root/objects" -name '*.o' | wc -l)"
+          test "$count" -eq 96
+          echo "Compiled 48 RV64 Mini-C source and 48 independent GCC reference objects"
+      - name: 1152 LP64 QEMU source-vs-GCC comparisons in 12 indexed shards
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          root=/tmp/rv64-diff
+          shopt -s nullglob
+          objects=("$root"/objects/*.o)
+          test "${#objects[@]}" -eq 96
+          passed=0
+          for asm in "$root"/harness/diff_*.s; do
+            base="${asm%.s}"
+            riscv64-linux-gnu-as -march=rv64im -mabi=lp64 "$asm" -o "$base.o"
+            riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax -e _start \
+              "$base.o" "${objects[@]}" -o "$base.elf"
+            set +e
+            timeout 20s qemu-riscv64 "$base.elf"
+            status=$?
+            set -e
+            if [ "$status" -ne 0 ]; then
+              echo "RV64 mismatch: $(basename "$base") exit=$status" >&2
+              python3 -c 'import json,sys; n=int(sys.argv[2]); items=json.load(open(sys.argv[1])); print("Failing vector:",items[n-1] if 1<=n<=len(items) else "stack mismatch or non-test exit")' "$base.json" "$status"
+              exit 1
+            fi
+            passed=$((passed+1))
+          done
+          test "$passed" -eq 12
+          echo "PASSED all 1152 independent C source/GCC QEMU comparisons in 12 shards"
