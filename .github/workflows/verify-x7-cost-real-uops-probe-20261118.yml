@@ -1,0 +1,54 @@
+name: X7 cost real uops.info exact-variant evidence
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-x7-cost-real-uops-probe-20261118.yml'
+permissions:
+  contents: read
+jobs:
+  pinned-source-uops-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ed8c6556b7c2c3901cdcb0f69a43c93bb145ae62
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Fetch published uops.info XML and preserve full source digest
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "ed8c6556b7c2c3901cdcb0f69a43c93bb145ae62"
+          curl --fail --location --silent --show-error --retry 3 --max-time 180 \
+            https://uops.info/instructions.xml -o instructions.xml
+          test -s instructions.xml
+          sha256sum instructions.xml | tee uops-source-sha256.txt
+      - name: Import only unique reviewed exact source variants, not mnemonic guesses
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/import_uops_info.py ../instructions.xml \
+            --architecture SKL \
+            --mapping data/x86_uops_variant_mapping.json \
+            --output ../x7-skl-measured-candidates.json | tee ../x7-uops-import-summary.txt
+          python3 tools/validate_x86_costs.py ../x7-skl-measured-candidates.json
+          python3 - <<'PY'
+          import json, pathlib, hashlib
+          report=json.loads(pathlib.Path('../x7-skl-measured-candidates.json').read_text())
+          sha=hashlib.sha256(pathlib.Path('../instructions.xml').read_bytes()).hexdigest()
+          assert report['cpu']=='SKL'
+          for k,v in report['forms'].items():
+              assert v['source'].startswith('uops.info XML sha256='+sha+'; ')
+          print('X7_REAL_UOPS_EXACT_VARIANT_EVIDENCE', len(report['forms']), sha)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-real-uops-exact-variant-evidence
+          path: |
+            x7-skl-measured-candidates.json
+            x7-uops-import-summary.txt
+            uops-source-sha256.txt
+          if-no-files-found: warn
