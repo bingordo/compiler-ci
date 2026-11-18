@@ -1,0 +1,102 @@
+name: ASM2 P13A reviewed GP operand role descriptors and generated GCC parity
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-asm2-p13-operand-forms.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2b965bbb944bea7ec8de9b590fd6add32780ff81
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - name: Verify exact head and allow pinned frontend dependencies
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = '2b965bbb944bea7ec8de9b590fd6add32780ff81'
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: 13e85e118289b9da8900b47d071ac292944b374f
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: mini-c
+      - name: Mini-C checked tied operands and forbidden constraints
+        working-directory: mini-c
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = '13e85e118289b9da8900b47d071ac292944b374f'
+          cargo test -p mini-c-sema --lib asm2_p9_ -- --nocapture
+          cargo test -p mini-c-sema --lib asm2_p11_ -- --nocapture
+          cargo test -p mini-c-sema --lib asm2_p12_ -- --nocapture
+          cargo test -p mini-c-sema --lib asm2_p5_ -- --nocapture
+          cargo clippy -p mini-c-sema --lib -- -D warnings
+      - name: Prepare isolated compiler core workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: asm2-typeid-core
+      - name: Typecheck entire shared SSA, optimizer, legalizer and x86 encoder
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check --workspace
+          cargo test -p compiler-ir -p compiler-opt --lib
+          # Pre-existing compiler-opt typed_if_conversion.rs
+          # has three unrelated while_let_loop warnings at the exact pinned SHA.
+          # Existing X7 late-selector/DAG draft helpers at this pinned head
+          # also trigger dead_code under -D warnings; still typecheck/test.
+          # Optimizer is still fully typechecked and unit-tested above.
+          cargo clippy -p compiler-ir -p compiler-backend -p compiler-backend-x86 --lib -- -D warnings -A clippy::while_let_loop -A dead_code
+      - name: Build checked Mini-C source frontend and run asm2 native source tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib asm2_ -- --nocapture
+          cargo test -p compiler-backend-x86 --lib asm2_tied_copy -- --nocapture
+          cargo test -p compiler-backend-x86 --lib asm2_p11_gp_ -- --nocapture
+          cargo test -p compiler-backend-x86 --lib asm2_p12_user_ -- --nocapture
+          cargo test -p compiler-backend-x86 --lib asm2_p13_ -- --nocapture
+          cargo test -p compiler-backend-x86 --lib asm_basic -- --nocapture
+          cargo test -p compiler-backend-x86 --test asm2_basic_physical -- --nocapture
+
+      - name: Restore full compiler workspace and authenticated private frontends
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          git restore Cargo.toml
+          rm -f Cargo.lock
+          git config --global --unset-all 'url.https://github.com/.insteadOf' || true
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub SSH host
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - name: Typecheck production compiler driver with Mini-C and Oberon
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler
+          echo 'ASM2_P13_OPERAND_FORMS=PASS (source, optimizer, all backends, GCC runtime, driver)' >> "$GITHUB_STEP_SUMMARY"
+
