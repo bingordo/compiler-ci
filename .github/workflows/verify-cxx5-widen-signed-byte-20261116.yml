@@ -2,7 +2,7 @@ name: C++5 source-verified signed-byte AL return and original GCC15 iostream
 
 on:
   push:
-    branches: ['ci/cxx5-pointer-automatic-20261117']
+    branches: ['ci/cxx5-exact-pointer-offset-20261118']
     paths:
       - '.github/workflows/verify-cxx5-widen-signed-byte-20261116.yml'
   pull_request:
@@ -28,7 +28,7 @@ jobs:
       run:
         shell: edg-container-exec "bash -eo pipefail {0}"
     env:
-      COMPILER_SHA: 9745a3de5b083be7704c9dee9223f2366a19e3b2
+      COMPILER_SHA: 8cbb7d7fbc51f67739b975b32838222e15be5fb9
       EDG_SOURCE_SHA: b195677be8b9b56c8337afad6be8064d21a54082
       EDG_BRIDGE_SHA: 7f67a31a9ad5db038c8b1544e49117f23b462e45
       EDG_RELEASE_TAG: edgcpfe-v2026.11.14-upstream-177765bb7731
@@ -45,7 +45,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 9745a3de5b083be7704c9dee9223f2366a19e3b2
+          ref: 8cbb7d7fbc51f67739b975b32838222e15be5fb9
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -352,6 +352,7 @@ jobs:
             else
               echo 'EDG_CXX5_NOEXCEPT original_iostream=advanced_past_vptr_source_tree' >>"$GITHUB_STEP_SUMMARY"
             fi
+            ! grep -Fq 'C pointer arithmetic requires signed I32 source index (PtrOffset sign-extends)' original_noexcept.log
             ! grep -Fq 'source definition std::ctype<char>::widen: routine result type TypeId(550):' original_noexcept.log
             ! grep -Fq 'C array address needs native local source identity: path=0.0.0 ' original_noexcept.log
             ! grep -Fq 'C++ direct member call requires exact EDG &object: owner=TypeId(144)' original_noexcept.log
@@ -1143,3 +1144,40 @@ jobs:
           # source-shape verifier. The fail-closed no-object property,
           # not a stale diagnostic literal, is the invariant.
           echo 'CXX5_BORROWED_THIS virtual_dispatch=fail_closed_no_partial_elf' >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Execute original C++17 signed and unsigned dynamic I64 pointer offsets
+        working-directory: edgcpp/build/gcc-release
+        run: |
+          set -euo pipefail
+          source ./environment.sh
+          driver="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          fixtures="$GITHUB_WORKSPACE/compiler/tools/edg-driver/tests/fixtures"
+          work="$RUNNER_TEMP/cxx5-pointer-offset-i64"
+          mkdir -p "$work"
+          cd "$work"
+          cp "$fixtures/edg_native_cxx5_pointer_offset64.cpp" source.cpp
+          cp "$fixtures/edg_native_cxx5_pointer_offset64_driver.cpp" driver.cpp
+          g++ -std=c++17 -fno-exceptions -Wall -Wextra -Werror source.cpp driver.cpp -o reference
+          timeout 15s ./reference >reference.out 2>reference.err
+          test "$(cat reference.out)" = OK
+          version="$(g++ -dumpfullversion -dumpversion)"
+          gnu_number="$(printf '%s\n' "$version" | awk -F. '{printf "%d", $1*10000+($2+0)*100+($3+0)}')"
+          for mode in selected physical leaves cfg; do
+            args=()
+            case "$mode" in
+              physical) args+=(--typeid-native) ;;
+              leaves|cfg) args+=("--typeid-inline=$mode") ;;
+            esac
+            "$driver" "$mode.o" "${args[@]}" --g++ --c++17 --no_strict_gnu --no_exceptions \
+              --gnu_version "$gnu_number" source.cpp >"$mode.log" 2>&1 || {
+                tail -n 65 "$mode.log" >&2
+                test ! -e "$mode.o"
+                exit 1
+              }
+            test "$(od -An -tx1 -N4 "$mode.o" | tr -d '[:space:]')" = 7f454c46
+            g++ -std=c++17 -fno-exceptions "$mode.o" driver.cpp -o "$mode"
+            timeout 15s "./$mode" >"$mode.out" 2>"$mode.err"
+            test "$(sha256sum reference.out | awk '{print $1}')" = "$(sha256sum "$mode.out" | awk '{print $1}')"
+            test "$(sha256sum reference.err | awk '{print $1}')" = "$(sha256sum "$mode.err" | awk '{print $1}')"
+            echo "CXX5_PTR_OFFSET64 mode=$mode result=real_GXX_executable_parity" >>"$GITHUB_STEP_SUMMARY"
+          done
