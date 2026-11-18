@@ -1,0 +1,121 @@
+name: pinned x86 loop-use weighted allocator A/B
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/verify-x86-loop-weighted-spill-ab-20261117.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify-and-profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: bcb3984072e7497fcb79768e87372d133f966c9b
+          path: old
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 50ec34eb55df5f329615a2a6b1f559b8547456a1
+          path: new
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source pins and CPU
+        run: |
+          set -euo pipefail
+          test "$(git -C old rev-parse HEAD)" = "bcb3984072e7497fcb79768e87372d133f966c9b"
+          test "$(git -C new rev-parse HEAD)" = "50ec34eb55df5f329615a2a6b1f559b8547456a1"
+          lscpu | grep -E '^Architecture:|^Model name:|^CPU\\(s\\):' || true
+          grep Cpus_allowed_list /proc/self/status
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            old -> target
+            new -> target
+          key: x86-loop-spill-use-weight-20261117
+      - name: Strict weighted allocator and independent source oracles
+        working-directory: new
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib
+          cargo test -p compiler-backend-x86 --lib loop_spill_weights_follow_real_scc_not_backward_block_number -- --nocapture
+          cargo test -p compiler-backend-x86 --lib
+          cargo clippy -p compiler-backend -p compiler-backend-x86 --lib -- -D warnings
+          cargo test -p compiler --test x7_s4_rolling_checksum_source -- --nocapture
+          cargo test -p compiler --test x86_inline_source_ablation -- --nocapture
+      - name: Same exact 18000-input timed workload on both sources
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path='crates/driver/tests/x86_source_runtime_performance.rs'
+          old=(Path('old')/path).read_bytes()
+          new=(Path('new')/path).read_bytes()
+          assert old==new, 'benchmark source drift between baseline and weighted allocator'
+          target=b'REPS=7, ITERS=1800'
+          assert old.count(target)==1
+          replaced=old.replace(target,b'REPS=7, ITERS=18000')
+          for root in ('old','new'):
+              (Path(root)/path).write_bytes(replaced)
+          assert (Path('old')/path).read_bytes()==(Path('new')/path).read_bytes()
+          PY
+          for case in old new; do
+            (cd "$case" && cargo test --release -p compiler --test x86_source_runtime_performance --no-run)
+          done
+      - name: Pinned CPU ABBA twice, compare native machine-code and GCC correctness
+        shell: bash
+        run: |
+          set -euo pipefail
+          cpu=$(awk '/^Cpus_allowed_list:/ {split($2,a,/[-,]/);print a[1]}' /proc/self/status)
+          test -n "$cpu"
+          echo "AB_PIN_CPU=$cpu"
+          index=0
+          for case in old new new old old new new old; do
+            index=$((index+1))
+            logfile="$RUNNER_TEMP/ab-$index-$case.log"
+            (cd "$case" && taskset -c "$cpu" cargo test --release -p compiler --test x86_source_runtime_performance -- --ignored --nocapture) 2>&1 | tee "$logfile"
+            grep -q 'X86_RUNTIME_FUNCTION mode=mini_default symbol=scan>' "$logfile"
+            grep -q 'X86_SOURCE_RUNTIME mode=mini_default workload=combined ' "$logfile"
+            grep -q 'X86_SOURCE_RUNTIME mode=gcc_O2 workload=combined ' "$logfile"
+          done
+          python3 - "$RUNNER_TEMP" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          from pathlib import Path
+          import sys,statistics
+          root=Path(sys.argv[1])
+          records=[]
+          for i in range(1,9):
+              case='old' if i in (1,4,5,8) else 'new'
+              path=root/f'ab-{i}-{case}.log'
+              data=path.read_text(errors='replace')
+              def fields(prefix):
+                  matches=[line for line in data.splitlines() if prefix in line]
+                  assert matches,(path,prefix)
+                  return dict(token.split('=',1) for token in matches[-1].split() if '=' in token)
+              native=fields('X86_SOURCE_RUNTIME mode=mini_default workload=combined ')
+              gcc=fields('X86_SOURCE_RUNTIME mode=gcc_O2 workload=combined ')
+              mix=fields('X86_RUNTIME_FUNCTION mode=mini_default symbol=scan>')
+              assert native['checksum']==gcc['checksum']
+              records.append((case,int(native['median_ns']),int(gcc['median_ns']),mix))
+          print('### Same CPU, same source benchmark, 18k inputs ABBA twice')
+          for i,(case,ns,gcc,mix) in enumerate(records,1):
+              print(f'{i} {case}: native={ns}ns GCC={gcc}ns scan_instructions={mix["instructions"]} moves={mix["moves"]} stack_memory={mix["stack_memory"]} calls={mix["calls"]}')
+          for case in ('old','new'):
+              ns=[r[1] for r in records if r[0]==case]
+              print(f'{case}: mean_median_ns={statistics.mean(ns):.1f}')
+          print('No timing pass/fail threshold: other machine types must be tested.')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x86-loop-weighted-allocation-ab-logs
+          path: ${{ runner.temp }}/ab-*.log
+          if-no-files-found: ignore
