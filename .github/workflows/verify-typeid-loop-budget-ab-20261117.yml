@@ -1,0 +1,73 @@
+name: pinned TypeId loop clone budget runtime AB
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/verify-typeid-loop-budget-ab-20261117.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  ab:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a29401736fda296dfe727b5d4ce7ad23ecb28dde
+          path: old
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7ec1bbdaaf0631f32e8051a16ecb74c77241a8db
+          path: new
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify frozen sources
+        run: |
+          test "$(git -C old rev-parse HEAD)" = "a29401736fda296dfe727b5d4ce7ad23ecb28dde"
+          test "$(git -C new rev-parse HEAD)" = "7ec1bbdaaf0631f32e8051a16ecb74c77241a8db"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            old -> target
+            new -> target
+          key: x86-loop-budget-ab-20261117
+      - name: Regression and strict optimizer lint for candidate
+        working-directory: new
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib
+          cargo clippy -p compiler-opt --lib -- -D warnings
+          cargo test -p compiler --test x86_inline_source_ablation -- --nocapture
+          cargo test -p compiler --test x7_s4_rolling_checksum_source -- --nocapture
+      - name: Build old/new and repeat runtime in reversed order
+        shell: bash
+        run: |
+          set -euo pipefail
+          for case in old new new old; do
+            index=1
+            test -f "$RUNNER_TEMP/$case-1.log" && index=2
+            (cd "$case" && cargo test --release -p compiler --test x86_source_runtime_performance -- --ignored --nocapture) 2>&1 | tee "$RUNNER_TEMP/$case-$index.log"
+          done
+          for case in old new; do
+            for index in 1 2; do
+              file="$RUNNER_TEMP/$case-$index.log"
+              grep -q 'X86_RUNTIME_FUNCTION mode=mini_default symbol=scan>' "$file"
+              grep -q 'X86_SOURCE_RUNTIME mode=mini_default workload=combined ' "$file"
+              grep -q 'X86_SOURCE_RUNTIME mode=gcc_O2 workload=combined ' "$file"
+            done
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pinned-typeid-loop-budget-ab
+          path: ${{ runner.temp }}/*-?.log
+          if-no-files-found: ignore
