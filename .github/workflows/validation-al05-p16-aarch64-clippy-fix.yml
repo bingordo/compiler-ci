@@ -1,0 +1,51 @@
+name: VALIDATION ONLY AArch64 strict Clippy compatibility
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/validation-al05-p16-aarch64-clippy-fix.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  aarch64-clippy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Checkout CI validation
+        uses: actions/checkout@v4
+      - name: Checkout exact compiler source after AArch64 Clippy fix
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d3248c99e0b4175dd2efe6596f3a4b7c8041a5f5
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Isolate compiler-core workspace
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 'd3248c99e0b4175dd2efe6596f3a4b7c8041a5f5'
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          """)
+          PY
+      - name: Restore compiler core cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: p16-aarch64-clippy
+      - name: Recheck strict AArch64 backend and P16 native bridge
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 7m cargo clippy -p compiler-opt --test al05_p9_mixed_native_bridge -- -D warnings
+          timeout --signal=TERM --kill-after=10s 3m cargo clippy -p compiler-backend-aarch64 -- -D warnings
