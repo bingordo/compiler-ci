@@ -1,0 +1,71 @@
+# General-purpose source-pinned Python/Rust generator smoke gate. Runs only in compiler-ci.
+name: Generator tooling validation
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/generator-tooling-validation.yml'
+  workflow_dispatch:
+    inputs:
+      typeid_sha:
+        description: 'Exact 40-character compiler commit SHA for TypeId generator suite'
+        type: string
+        required: true
+        default: '0fcdeb8118fa93aac8c4798d8b20a1348216cc06'
+      sse_sha:
+        description: 'Exact 40-character compiler commit SHA for x86 SSE generator suite'
+        type: string
+        required: true
+        default: 'c302600e7140fe8f9f364bae2b2263cc027ba20f'
+permissions:
+  contents: read
+jobs:
+  typeid-generator:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout pinned private compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.typeid_sha || '0fcdeb8118fa93aac8c4798d8b20a1348216cc06' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact SHA and run Python and generated Rust tests
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          expected="${{ inputs.typeid_sha || '0fcdeb8118fa93aac8c4798d8b20a1348216cc06' }}"
+          [[ "$expected" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$expected"
+          python3 -m compileall -q tools/typeid-rule-gen
+          python3 -m unittest discover -s tools/typeid-rule-gen -p 'test_*.py' -v
+          python3 tools/typeid-rule-gen/rules.py tools/typeid-rule-gen/examples.rules --emit-rust > "$RUNNER_TEMP/typeid-tree.rs"
+          rustc --edition=2021 --crate-type=lib "$RUNNER_TEMP/typeid-tree.rs" -o "$RUNNER_TEMP/libtypeid-tree.rlib"
+          python3 tools/typeid-rule-gen/rules.py tools/typeid-rule-gen/examples.rules --emit-ssa-rust > "$RUNNER_TEMP/typeid-ssa.rs"
+          rustc --edition=2021 --crate-type=lib "$RUNNER_TEMP/typeid-ssa.rs" -o "$RUNNER_TEMP/libtypeid-ssa.rlib"
+  x86-isa-generators:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout pinned private compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.sse_sha || 'c302600e7140fe8f9f364bae2b2263cc027ba20f' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Validate pinned catalog mutations and generated artifacts
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          expected="${{ inputs.sse_sha || 'c302600e7140fe8f9f364bae2b2263cc027ba20f' }}"
+          [[ "$expected" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$expected"
+          export PYTHONPATH="$PWD/tools"
+          python3 -m unittest tools/test_regen_x86_sse_packed_forms.py tools/test_regen_x86_sse_vex_forms.py -v
+          python3 tools/regen_x86_sse_packed_forms.py --check
+          python3 tools/regen_x86_sse_vex_forms.py --check
