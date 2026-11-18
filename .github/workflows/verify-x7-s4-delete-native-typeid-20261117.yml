@@ -1,0 +1,64 @@
+name: X7 S4 actual handwritten x86 emitter file deletion
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-x7-s4-delete-native-typeid-20261117.yml']
+permissions:
+  contents: read
+jobs:
+  native-file-removal-build-and-inventory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub SSH
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f0350a11dba13c1450cf2e7f33eb8cd52354423b
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact source and handwritten file absent
+        working-directory: compiler
+        run: |
+          test "$(git rev-parse HEAD)" = f0350a11dba13c1450cf2e7f33eb8cd52354423b
+          test ! -e crates/backend-x86/src/native_typeid.rs
+          ! grep -q '^pub mod native_typeid;' crates/backend-x86/src/lib.rs
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-s4-delete-native-physical
+      - name: Check entire production compiler and backend without handwritten file
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p compiler
+          cargo check -p compiler-backend-x86 --all-features
+          echo X7_S4_NATIVE_FILE_DELETED_PRODUCTION_BUILD_GREEN
+      - name: Diagnose remaining legacy integration test imports (inventory only)
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -uo pipefail
+          cargo test -p compiler-backend-x86 --lib --no-run
+          x86_lib=$?
+          cargo test -p compiler-backend-x86 --tests --no-run 2>&1 | tee ../x7-s4-test-build-inventory.log
+          x86_tests=${PIPESTATUS[0]}
+          cargo test -p compiler --tests --no-run 2>&1 | tee ../x7-s4-driver-build-inventory.log
+          driver_tests=${PIPESTATUS[0]}
+          echo "X7_S4_DELETION_TEST_COMPILE_STATUS backend_lib=$x86_lib backend_tests=$x86_tests driver_tests=$driver_tests"
+          # This job measures obsolete tests; it does not claim they are green.
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-s4-deleted-file-legacy-test-inventory
+          path: |
+            x7-s4-test-build-inventory.log
+            x7-s4-driver-build-inventory.log
+          if-no-files-found: warn
