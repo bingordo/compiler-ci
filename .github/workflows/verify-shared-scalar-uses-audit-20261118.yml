@@ -1,0 +1,61 @@
+name: pinned shared scalar SSA operand census audit
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/verify-shared-scalar-uses-audit-20261118.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  cross-target-use-census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ac2400dcd6feecddfe92519aa58ea551e76bd9f8
+          path: baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 23522cc3edc7b860446ef103b2789c877c7db201
+          path: proposed
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source snapshots
+        run: |
+          set -euo pipefail
+          test "$(git -C baseline rev-parse HEAD)" = "ac2400dcd6feecddfe92519aa58ea551e76bd9f8"
+          test "$(git -C proposed rev-parse HEAD)" = "23522cc3edc7b860446ef103b2789c877c7db201"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          echo "Baseline ac2400dcd6feecddfe92519aa58ea551e76bd9f8"
+          echo "Proposed 23522cc3edc7b860446ef103b2789c877c7db201"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            baseline -> target
+            proposed -> target
+          key: scalar-ssa-use-accounting-20261118
+      - name: Test generic operand inventory and cross-path x86 usage
+        working-directory: proposed
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib shared_scalar_uses_tests -- --nocapture
+          cargo test -p compiler-backend --lib
+          cargo test -p compiler-backend-x86 --lib
+          cargo clippy -p compiler-backend -p compiler-backend-x86 --lib -- -D warnings
+          cargo test -p compiler-backend-x86 --test x7_g10_n10_real_ssa_native -- --nocapture
+          cargo test -p compiler --test x7_s4_rolling_checksum_source -- --nocapture
+          cargo test -p compiler --test x86_inline_source_ablation -- --nocapture
+      - name: Baseline library test parity
+        working-directory: baseline
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib
+          cargo test -p compiler-backend-x86 --lib
