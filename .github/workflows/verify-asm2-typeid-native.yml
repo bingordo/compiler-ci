@@ -1,0 +1,52 @@
+name: ASM2 source TypeId to post-RA inline asm integration
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-asm2-typeid-native.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 773f4778d092486cc6c4002d69d1f2495f46c7b3
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - name: Verify exact head and allow pinned frontend dependencies
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = '773f4778d092486cc6c4002d69d1f2495f46c7b3'
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - name: Prepare isolated compiler core workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: asm2-typeid-core
+      - name: Typecheck entire shared SSA, optimizer, legalizer and x86 encoder
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+      - name: Build checked Mini-C source frontend and run asm2 native source tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib asm2_basic -- --nocapture
+          cargo test -p compiler-backend-x86 --lib asm_basic -- --nocapture
+          cargo test -p compiler-backend-x86 --test asm2_basic_physical -- --nocapture
