@@ -1,0 +1,73 @@
+name: TEMP recursive Mini-C FP CFG all scalar types
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temp-mini-c-fp-recursive-cfg-20261118.yml'
+permissions:
+  contents: read
+concurrency:
+  group: mini-c-fp-recursive-cfg-${{ github.head_ref || 'default' }}
+  cancel-in-progress: true
+jobs:
+  fp-loop-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Authorize pinned private Cargo dependencies
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub SSH host key
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - name: Checkout exact compiler PR head
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d5445ac4b82da15909ac296593a57a6e0d042316
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact compiler revision
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "d5445ac4b82da15909ac296593a57a6e0d042316"
+          echo "Mini-C shared checked source flow SHA d5445ac4b82da15909ac296593a57a6e0d042316" >> "$GITHUB_STEP_SUMMARY"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: mini-c-shared-checked-flow
+      - name: Generic typed CFG edge and loop tests
+        working-directory: compiler
+        run: cargo test -p compiler-ir --lib typed_cfg_builder -- --nocapture
+      - name: Complete generic IR and native x86 library regressions
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-ir --lib
+          cargo test -p compiler-backend-x86 --lib
+      - name: Shared checked source block traversal unit tests (integer and FP)
+        working-directory: compiler
+        run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib source_flow::tests -- --nocapture
+      - name: Full Mini-C library (source control, integer and FP types)
+        working-directory: compiler
+        run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib
+      - name: Ordinary checked Mini-C integer/ptr ELF source and native cases
+        working-directory: compiler
+        run: |
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --test m4_8_source_native
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --test source_declaration_origins
+      - name: Generated cross-type C CFG ELF vs GCC (i32 i64 F32 F64, five shapes)
+        working-directory: compiler
+        run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml --test shared_type_flow -- --nocapture
+      - name: Checked Mini-C F32/F64 GCC ELF/GAS native loops and negatives
+        working-directory: compiler
+        run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml --test fp_scalar -- --nocapture
+      - name: Mini-C TypeId source and native CLI regressions
+        working-directory: compiler
+        run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml --test typeid_cli
+      - name: Strict FP IR and Mini-C lint (existing argument-count lint excepted)
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-ir --lib -- -D warnings
+          cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml --lib -- -D warnings -A clippy::too_many_arguments
