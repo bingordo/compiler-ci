@@ -1,0 +1,53 @@
+name: VALIDATION ONLY P14 x86 generated DAG native smoke
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/validation-al05-p14-fast-x86.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  p14-x86:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout validation workflow repository
+        uses: actions/checkout@v4
+      - name: Checkout exact candidate compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5d6a58f0f318f6aef5c46abd70445e83c1e1c84f
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Isolate compiler-core workspace without external frontends
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = '5d6a58f0f318f6aef5c46abd70445e83c1e1c84f'
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          """)
+          PY
+      - name: Cache core Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: p14-native-x86
+      - name: Strict native-bridge Clippy and generated ELF/GAS C11 oracle
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 6m cargo clippy -p compiler-opt --test al05_p9_mixed_native_bridge -- -D warnings
+          timeout --signal=TERM --kill-after=10s 6m cargo test -p compiler-opt --test al05_p9_mixed_native_bridge al05_p14_generated_dag_native_x86_elf_and_gas_match_c11 -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/p14-fast-x86.log"
+          grep -F 'AL05_P14_GENERATED_NATIVE_TARGET arch=x86_64 format=elf functions=16 changed_cse=8 modes=8 comparisons=7472 traps=32 verdict=PASS' "$RUNNER_TEMP/p14-fast-x86.log"
+          grep -F 'AL05_P14_GENERATED_NATIVE_TARGET arch=x86_64 format=gas functions=16 changed_cse=8 modes=8 comparisons=7472 traps=32 verdict=PASS' "$RUNNER_TEMP/p14-fast-x86.log"
