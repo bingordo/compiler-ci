@@ -1,0 +1,646 @@
+name: C++5 source-verified signed-byte AL return and original GCC15 iostream
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/verify-cxx5-widen-signed-byte-20261116.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cxx5-signed-byte-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cxx5-scalar-provenance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    container:
+      image: ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8
+    defaults:
+      run:
+        shell: edg-container-exec "bash -eo pipefail {0}"
+    env:
+      COMPILER_SHA: 4bf626a44d465ea07ad0d4accc1b60b454f13aa7
+      EDG_SOURCE_SHA: b195677be8b9b56c8337afad6be8064d21a54082
+      EDG_BRIDGE_SHA: 7f67a31a9ad5db038c8b1544e49117f23b462e45
+      EDG_RELEASE_TAG: edgcpfe-v2026.11.14-upstream-177765bb7731
+      EDG_RELEASE_SHA256: 1ce495b629924f31382ecccc891a7a72caae1014ddfa2ba7dd39b44d8b0a9526
+      RUST_TOOLCHAIN_VERSION: 1.99.1
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+      EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+      EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+      EDGCPP_EDG_REVISION: b195677be8b9b56c8337afad6be8064d21a54082
+    steps:
+      - name: Check out exactly pinned compiler integration candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 4bf626a44d465ea07ad0d4accc1b60b454f13aa7
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+
+      - name: Check out source headers matching upstream EDG release
+        uses: actions/checkout@v4
+        with:
+          repository: bingundu/edgcpp
+          ref: b195677be8b9b56c8337afad6be8064d21a54082
+          path: edgcpp
+          persist-credentials: false
+
+      - name: Assert source revisions and unmodified Hello World
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          test "$(git -C edgcpp rev-parse HEAD)" = "$EDG_SOURCE_SHA"
+          grep -Fq 'rev = "7f67a31a9ad5db038c8b1544e49117f23b462e45"' compiler/tools/edg-driver/Cargo.toml
+          ! grep -q 'edgcpp_capture_' edgcpp/src/lower_il.c
+          fixture=compiler/tools/edg-driver/tests/fixtures/edg_native_cxx5_iostream.cpp
+          test -f "$fixture"
+          grep -Fq '#include <iostream>' "$fixture"
+          grep -Fq 'std::cout << "Hello, world!" << std::endl;' "$fixture"
+          printf 'Compiler SHA: %s\nEDG package SHA: %s\nBridge SHA: %s\n' "$COMPILER_SHA" "$EDG_SOURCE_SHA" "$EDG_BRIDGE_SHA" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Configure EDG header tooling without rebuilding full frontend
+        working-directory: edgcpp
+        env:
+          EDG_BASE: ${{ github.workspace }}/edgcpp/bases/docker/dev-env/gcc
+        run: |
+          set -euo pipefail
+          cmake --preset linux-gcc-release -DEDG_BUILD_LIB=OFF -DEDG_BUILD_CALLABLE_LIBRARY=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          cmake --build build/gcc-release --target error-info --parallel 2
+          test -s build/gcc-release/src/includes/err_codes.h
+          test -s build/gcc-release/src/includes/err_data.h
+
+      - name: Restore checksummed upstream EDG callable release
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          mkdir -p build/gcc-release/lib build/prebuilt-edg
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error --retry 4 --retry-delay 2 \
+            "https://github.com/bingundu/edgcpp/releases/download/$EDG_RELEASE_TAG/edgcpfe-ci-upstream-callable-edg-release-20261114-linux-x86_64.tar.gz" \
+            -o build/prebuilt-edg/archive.tar.gz
+          printf '%s  %s\n' "$EDG_RELEASE_SHA256" build/prebuilt-edg/archive.tar.gz | sha256sum -c -
+          tar -xzf build/prebuilt-edg/archive.tar.gz -C build/prebuilt-edg
+          grep -Fx "commit=$EDG_SOURCE_SHA" build/prebuilt-edg/BUILD-INFO.txt
+          grep -Fx 'platform=linux-x86_64' build/prebuilt-edg/BUILD-INFO.txt
+          test -s build/prebuilt-edg/lib/libedgcpfe.a
+          cp build/prebuilt-edg/lib/libedgcpfe.a build/gcc-release/lib/libedgcpfe.a
+
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          if ! command -v cargo >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN_VERSION"
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install "$RUST_TOOLCHAIN_VERSION" --profile minimal
+          rustup default "$RUST_TOOLCHAIN_VERSION"
+
+
+      - name: Resolve public pinned frontend source deps over HTTPS
+        run: |
+          set -euo pipefail
+          # mini-c/oberon are public; avoid unconfigured GitHub SSH trust.
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+          git config --global --get-regexp 'insteadOf' || true
+
+
+      - name: Validate strict native manipulator pointer ABI tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test --manifest-path tools/edg-driver/Cargo.toml cxx5_manipulator_function_pointer_tests -- --nocapture
+          cargo test --manifest-path tools/edg-driver/Cargo.toml cxx_source_boolean_tests -- --nocapture
+          cargo test --manifest-path tools/edg-driver/Cargo.toml cxx5_exact_pointer_call_identity_tests -- --nocapture
+          cargo test --manifest-path tools/edg-driver/Cargo.toml cxx5_signed_byte_result_abi_tests -- --nocapture
+          cargo test --manifest-path tools/edg-driver/Cargo.toml cxx5_borrowed_this_array_tests -- --nocapture
+          cargo test --manifest-path tools/edg-driver/Cargo.toml cxx5_postlower_indirect_gp_prototype_tests -- --nocapture
+          cargo test --manifest-path tools/edg-driver/Cargo.toml -- --nocapture
+          cargo build --manifest-path tools/edg-driver/Cargo.toml
+          test -x tools/edg-driver/target/debug/compiler-edg-driver
+          echo 'EDG_FN_PTR_ABI unit_proofs=passed' >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Link actual EDG routine-address operand against independent G++ owner
+        working-directory: edgcpp/build/gcc-release
+        run: |
+          set -euo pipefail
+          source ./environment.sh
+          driver="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          work="$RUNNER_TEMP/cxx5-fnptr-parity"
+          mkdir -p "$work"
+          cd "$work"
+          cat >main.cpp <<'CPP'
+          struct Stream;
+          extern Stream& manip(Stream&);
+          extern int observe(Stream& (*)(Stream&));
+          int main() { return observe(manip); }
+          CPP
+          cat >owner.cpp <<'CPP'
+          struct Stream { int x; };
+          Stream& manip(Stream& x) { return x; }
+          int observe(Stream& (*callback)(Stream&)) {
+            return callback == &manip ? 0 : 1;
+          }
+          CPP
+          g++ -std=c++17 -Wall -Wextra -Werror -c owner.cpp -o owner.o
+          g++ -std=c++17 -Wall -Wextra -Werror main.cpp owner.o -o reference
+          timeout 15s ./reference
+          version="$(g++ -dumpfullversion -dumpversion)"
+          IFS=. read -r major minor patch <<<"$version"
+          gnu_number=$((10#$major*10000+10#${minor:-0}*100+10#${patch:-0}))
+          "$driver" native.o --dump-edg-global-provenance --typeid-native --g++ --c++17 --no_strict_gnu \
+            --gnu_version "$gnu_number" main.cpp >native.log 2>&1 || {
+              echo 'EDG_FN_PTR_SOURCE_OPERAND_BEGIN' >&2
+              grep -E 'EDG_CXX5_MAIN_CALL|EDG_CXX5_CALL_(EXPR|ROUTINE_ADDRESS)' native.log | head -n 80 >&2 || true
+              tail -n 80 native.log >&2
+              echo 'EDG_FN_PTR_SOURCE_OPERAND_END' >&2
+              test ! -e native.o
+              exit 1
+            }
+          test "$(od -An -tx1 -N4 native.o | tr -d '[:space:]')" = 7f454c46
+          nm -u native.o | tee native.undefined
+          readelf -rW native.o | tee native.relocs
+          test "$(grep -c -E ' U _Z5manipR6Stream$' native.undefined)" -eq 1
+          grep -F '_Z5manipR6Stream' native.relocs
+          g++ native.o owner.o -o native
+          timeout 15s ./native
+          echo 'EDG_FN_PTR_ABI linkable_source_constant=pass owner_executable=pass' >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Reject non-manipulator function-pointer ABI without partial ELF
+        working-directory: edgcpp/build/gcc-release
+        run: |
+          set -euo pipefail
+          source ./environment.sh
+          driver="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          work="$RUNNER_TEMP/cxx5-fnptr-negative"
+          mkdir -p "$work"
+          cd "$work"
+          cat >invalid.cpp <<'CPP'
+          extern int observe(int (*)(int));
+          extern int f(int);
+          int main() { return observe(f); }
+          CPP
+          version="$(g++ -dumpfullversion -dumpversion)"
+          IFS=. read -r major minor patch <<<"$version"
+          gnu_number=$((10#$major*10000+10#${minor:-0}*100+10#${patch:-0}))
+          g++ -std=c++17 -Wall -Wextra -Werror -fsyntax-only invalid.cpp
+          if "$driver" invalid.o --typeid-native --g++ --c++17 --no_strict_gnu \
+            --gnu_version "$gnu_number" invalid.cpp >invalid.log 2>&1; then
+            echo '::error::Non-manipulator function pointer wrongly admitted'
+            exit 1
+          fi
+          test ! -e invalid.o
+          grep -E '(manipulator|scalar memory)' invalid.log
+          echo 'EDG_FN_PTR_ABI unsupported_function_pointer=no_partial_elf' >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Verify original GCC15 iostream exact scalar type rejection and no partial ELF
+        working-directory: edgcpp/build/gcc-release
+        run: |
+          set -euo pipefail
+          source ./environment.sh
+          driver="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          fixture="$GITHUB_WORKSPACE/compiler/tools/edg-driver/tests/fixtures/edg_native_cxx5_iostream.cpp"
+          out="$RUNNER_TEMP/cxx5-original-iostream-scalar"
+          mkdir -p "$out"
+          cd "$out"
+          cp "$fixture" original.cpp
+          g++ -std=c++17 -fno-exceptions original.cpp -o gcc-reference
+          timeout 15s ./gcc-reference >gcc.stdout 2>gcc.stderr
+          printf 'Hello, world!\n' >expected.stdout
+          test "$(sha256sum gcc.stdout | awk '{print $1}')" = "$(sha256sum expected.stdout | awk '{print $1}')"
+          test ! -s gcc.stderr
+          g++ -std=c++17 -v -E -x c++ /dev/null >include-search.log 2>&1
+          mapfile -t dirs < <(awk '
+            /#include <\.\.\.> search starts here:/{active=1;next}
+            /^End of search list/{active=0}
+            active && /^ /{sub(/^[[:space:]]+/,"");print}
+          ' include-search.log)
+          includes=()
+          for dir in "${dirs[@]}"; do
+            if test -d "$dir"; then includes+=("-I$dir"); fi
+          done
+          version="$(g++ -dumpfullversion -dumpversion)"
+          IFS=. read -r major minor patch <<<"$version"
+          gnu_number=$((10#$major*10000+10#${minor:-0}*100+10#${patch:-0}))
+          rm -f original.o
+          set +e
+          "$driver" original.o --dump-edg-global-provenance --typeid-native \
+            --g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number" \
+            "${includes[@]}" original.cpp >original.log 2>&1
+          status=$?
+          set -e
+          echo "EDG_CXX5_SCALAR_PROBE status=$status"
+          grep 'EDG_CXX5_CALL_ROUTINE_ADDRESS' original.log | head -n 8 || true
+          grep -F 'C scalar memory type has no exact native width:' original.log || true
+          tail -n 12 original.log || true
+          test "$status" -ne 0
+          test ! -e original.o
+          grep -Fq 'EDG_CXX5_CALL_ROUTINE_ADDRESS' original.log
+          grep -Eq 'C scalar memory type has no exact native width: requested=TypeId\([0-9]+\) resolved=TypeId\([0-9]+\) native_kind=[0-9]+ integer_records=0 layouts=[0-9]+ details=[0-9]+' original.log
+          grep -Fq 'object_layouts=' original.log
+          grep -Fq 'record_shapes=' original.log
+          grep -Fq 'record_admissions=' original.log
+          grep -Fq 'plain_admissions=' original.log
+          grep -Fq 'source definition std::char_traits<char>::length' original.log
+          grep -F 'C scalar memory type has no exact native width:' original.log >>"$GITHUB_STEP_SUMMARY"
+          echo 'EDG_CXX5_SCALAR_PROBE source_type_reported=yes no_partial_elf=yes gxx_reference=pass' >>"$GITHUB_STEP_SUMMARY"
+
+          # Separate P0 acceptance mode: explicit EDG --no_exceptions matches the
+          # independent G++ -fno-exceptions reference above.
+          rm -f original_noexcept.o
+          set +e
+          "$driver" original_noexcept.o --dump-edg-global-provenance --typeid-native \
+            --g++ --c++17 --no_strict_gnu --no_exceptions --gnu_version "$gnu_number" \
+            "${includes[@]}" original.cpp >original_noexcept.log 2>&1
+          noexcept_status=$?
+          set -e
+          echo "EDG_CXX5_NOEXCEPT status=$noexcept_status"
+          grep -F 'C scalar memory type has no exact native width:' original_noexcept.log || true
+          tail -n 8 original_noexcept.log || true
+          if test "$noexcept_status" -eq 0; then
+            test -s original_noexcept.o
+            g++ original_noexcept.o -o native_noexcept
+            timeout 15s ./native_noexcept >native_noexcept.stdout 2>native_noexcept.stderr
+            test "$(sha256sum native_noexcept.stdout | awk '{print $1}')" = "$(sha256sum gcc.stdout | awk '{print $1}')"
+            test "$(sha256sum native_noexcept.stderr | awk '{print $1}')" = "$(sha256sum gcc.stderr | awk '{print $1}')"
+            echo 'EDG_CXX5_NOEXCEPT original_iostream=executable_parity' >>"$GITHUB_STEP_SUMMARY"
+          else
+            test ! -e original_noexcept.o
+            grep -Fq 'EDG -> compiler-ir rejected source:' original_noexcept.log
+            grep -E 'Error: .*EDG -> compiler-ir rejected source:' original_noexcept.log | head -n 1 >>"$GITHUB_STEP_SUMMARY"
+            ! grep -Fq 'source definition std::ctype<char>::widen: routine result type TypeId(550):' original_noexcept.log
+            ! grep -Fq 'C array address needs native local source identity: path=0.0.0 ' original_noexcept.log
+            ! grep -Fq 'C++ direct member call requires exact EDG &object: owner=TypeId(144)' original_noexcept.log
+            grep -F 'EDG call callee is not a direct C routine designator: function=' original_noexcept.log | head -n 2
+            grep -F 'postlower_target=' original_noexcept.log | head -n 2
+            grep -F 'postlower_dispatch=' original_noexcept.log | head -n 2
+            grep -F 'source_gp_signature=' original_noexcept.log | head -n 2
+            grep -F 'machine_virtual_abi=unproven_from_postlower' original_noexcept.log | head -n 2
+            echo 'EDG_CXX5_NOEXCEPT original_iostream=fail_closed' >>"$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Verify exact AL bool-return ABI against independent G++ definition
+        working-directory: edgcpp/build/gcc-release
+        run: |
+          set -euo pipefail
+          source ./environment.sh
+          driver="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          work="$RUNNER_TEMP/cxx5-bool-al"
+          mkdir -p "$work"
+          cd "$work"
+          cat >main.cpp <<'CPP'
+          extern bool test_bool(int);
+          int main() {
+            if (test_bool(0)) return 7;
+            if (!test_bool(1)) return 9;
+            return 0;
+          }
+          CPP
+          cat >owner.cpp <<'CPP'
+          bool test_bool(int x) { return x!=0; }
+          CPP
+          g++ -std=c++17 -Wall -Wextra -Werror -fno-exceptions -c owner.cpp -o owner.o
+          g++ -std=c++17 -Wall -Wextra -Werror -fno-exceptions main.cpp owner.o -o gxx_reference
+          timeout 15s ./gxx_reference
+          version="$(g++ -dumpfullversion -dumpversion)"
+          IFS=. read -r major minor patch <<<"$version"
+          gnu_number=$((10#$major*10000+10#${minor:-0}*100+10#${patch:-0}))
+          "$driver" native.o --typeid-native --g++ --c++17 --no_strict_gnu \
+            --no_exceptions --gnu_version "$gnu_number" main.cpp >native.log 2>&1 || {
+              tail -n 60 native.log >&2
+              test ! -e native.o
+              exit 1
+            }
+          test "$(od -An -tx1 -N4 native.o | tr -d '[:space:]')" = 7f454c46
+          readelf -rW native.o | grep -F '_Z9test_booli'
+          g++ native.o owner.o -o native
+          timeout 15s ./native
+          echo 'EDG_CXX5_BOOL_AL independent_gxx_owner=yes native_elf=yes executable_parity=yes' >>"$GITHUB_STEP_SUMMARY"
+
+          # SysV _Bool guarantees AL; EAX[31:8] is intentionally poisoned.
+          # The native compiler must ignore the poisoned high bits, as G++ does.
+          cat >noisy.S <<'ASM'
+          .text
+          .globl _Z9test_booli
+          .type _Z9test_booli, @function
+          _Z9test_booli:
+              movl $0x7eadbe00, %eax
+              testl %edi, %edi
+              setne %al
+              ret
+          .section .note.GNU-stack,"",@progbits
+          ASM
+          gcc -c noisy.S -o noisy.o
+          g++ main.cpp noisy.o -o gxx_noisy
+          timeout 15s ./gxx_noisy
+          g++ native.o noisy.o -o native_noisy
+          timeout 15s ./native_noisy
+          echo 'EDG_CXX5_BOOL_AL high_EAX_bits_poisoned=yes gcc_native_parity=yes' >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Prove x86-64 SysV signed-byte AL external-call ABI against independent G++
+        working-directory: edgcpp/build/gcc-release
+        run: |
+          set -euo pipefail
+          source ./environment.sh
+          driver="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          work="$RUNNER_TEMP/cxx5-signed-byte-external"
+          mkdir -p "$work"
+          cd "$work"
+          cat >main.cpp <<'CPP'
+          extern "C" signed char sb_min();
+          extern "C" signed char sb_negative();
+          extern "C" signed char sb_zero();
+          extern "C" signed char sb_one();
+          extern "C" signed char sb_max();
+          int main() {
+            if (sb_min()!=-128) return 11;
+            if (sb_negative()!=-1) return 12;
+            if (sb_zero()!=0) return 13;
+            if (sb_one()!=1) return 14;
+            if (sb_max()!=127) return 15;
+            return 0;
+          }
+          CPP
+          cat >owner.S <<'ASM'
+          .text
+          .globl sb_min
+          .type sb_min,@function
+          sb_min:
+              movl $0x7eadbe80, %eax
+              ret
+          .globl sb_negative
+          .type sb_negative,@function
+          sb_negative:
+              movl $0x7eadbeff, %eax
+              ret
+          .globl sb_zero
+          .type sb_zero,@function
+          sb_zero:
+              movl $0x7eadbe00, %eax
+              ret
+          .globl sb_one
+          .type sb_one,@function
+          sb_one:
+              movl $0x7eadbe01, %eax
+              ret
+          .globl sb_max
+          .type sb_max,@function
+          sb_max:
+              movl $0x7eadbe7f, %eax
+              ret
+          .section .note.GNU-stack,"",@progbits
+          ASM
+          gcc -c owner.S -o owner.o
+          g++ -std=c++17 -fno-exceptions -Wall -Wextra -Werror main.cpp owner.o -o gcc-reference
+          timeout 15s ./gcc-reference
+          version="$(g++ -dumpfullversion -dumpversion)"
+          gnu_number="$(printf '%s\n' "$version" | awk -F. '{printf "%d", $1*10000+($2+0)*100+($3+0)}')"
+          "$driver" native.o --typeid-native --g++ --c++17 --no_exceptions --no_strict_gnu \
+            --gnu_version "$gnu_number" main.cpp >native.log 2>&1 || {
+              tail -n 70 native.log >&2
+              test ! -e native.o
+              exit 1
+            }
+          test "$(od -An -tx1 -N4 native.o | tr -d '[:space:]')" = 7f454c46
+          nm -u native.o | tee native.undefined
+          readelf -rW native.o | tee native.relocs
+          for symbol in sb_min sb_negative sb_zero sb_one sb_max; do
+            grep -Eq "[[:space:]]U $symbol$" native.undefined
+            grep -F "$symbol" native.relocs
+          done
+          g++ -fno-exceptions native.o owner.o -o native
+          timeout 15s ./native
+          echo 'CXX5_SIGNED_AL external_GCC_5_boundaries_poisoned_EAX=executable_parity' >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Prove exact source-defined signed-byte return ABI or reject without partial ELF
+        working-directory: edgcpp/build/gcc-release
+        run: |
+          set -euo pipefail
+          source ./environment.sh
+          driver="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          work="$RUNNER_TEMP/cxx5-signed-byte-defined"
+          mkdir -p "$work"
+          cd "$work"
+          cat >main.cpp <<'CPP'
+          extern "C" signed char make_negative() { return (signed char)-1; }
+          int main() {
+            return make_negative()==-1 ? 0 : 1;
+          }
+          CPP
+          g++ -std=c++17 -fno-exceptions -Wall -Wextra -Werror main.cpp -o gcc-reference
+          timeout 15s ./gcc-reference
+          version="$(g++ -dumpfullversion -dumpversion)"
+          gnu_number="$(printf '%s\n' "$version" | awk -F. '{printf "%d", $1*10000+($2+0)*100+($3+0)}')"
+          "$driver" native.o --typeid-native --g++ --c++17 --no_exceptions --no_strict_gnu \
+            --gnu_version "$gnu_number" main.cpp >native.log 2>&1 || {
+              tail -n 70 native.log >&2
+              test ! -e native.o
+              exit 1
+            }
+          test "$(od -An -tx1 -N4 native.o | tr -d '[:space:]')" = 7f454c46
+          nm --defined-only native.o | grep -F 'make_negative'
+          g++ -fno-exceptions native.o -o native
+          timeout 15s ./native
+          echo 'CXX5_SIGNED_AL source_defined_return=executable_parity' >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Prove native signed-byte formal ignores poisoned high register bits
+        working-directory: edgcpp/build/gcc-release
+        run: |
+          set -euo pipefail
+          source ./environment.sh
+          driver="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          work="$RUNNER_TEMP/cxx5-signed-byte-formal"
+          mkdir -p "$work"
+          cd "$work"
+          cat >impl.cpp <<'CPP'
+          extern "C" int char_formal(signed char c) { return c; }
+          CPP
+          cat >driver.cpp <<'CPP'
+          extern "C" int poison_call(int byte);
+          int main() {
+            if (poison_call(0x80)!=-128) return 11;
+            if (poison_call(0xff)!=-1) return 12;
+            if (poison_call(0x00)!=0) return 13;
+            if (poison_call(0x01)!=1) return 14;
+            if (poison_call(0x7f)!=127) return 15;
+            return 0;
+          }
+          CPP
+          cat >caller.S <<'ASM'
+          .text
+          .globl poison_call
+          .type poison_call,@function
+          poison_call:
+              andl $255, %edi
+              orl $0x7eadbe00, %edi
+              subq $8, %rsp
+              call char_formal
+              addq $8, %rsp
+              ret
+          .section .note.GNU-stack,"",@progbits
+          ASM
+          gcc -c caller.S -o caller.o
+          g++ -std=c++17 -Wall -Wextra -Werror -fno-exceptions -c impl.cpp -o gcc-owner.o
+          g++ -std=c++17 -Wall -Wextra -Werror -fno-exceptions driver.cpp caller.o gcc-owner.o -o gcc-reference
+          timeout 15s ./gcc-reference
+          version="$(g++ -dumpfullversion -dumpversion)"
+          gnu_number="$(printf '%s\n' "$version" | awk -F. '{printf "%d", $1*10000+($2+0)*100+($3+0)}')"
+          "$driver" native.o --typeid-native --g++ --c++17 --no_exceptions --no_strict_gnu \
+            --gnu_version "$gnu_number" impl.cpp >native.log 2>&1 || {
+              tail -n 70 native.log >&2
+              test ! -e native.o
+              exit 1
+            }
+          test "$(od -An -tx1 -N4 native.o | tr -d '[:space:]')" = 7f454c46
+          nm -g --defined-only native.o | grep -F 'char_formal'
+          g++ -fno-exceptions driver.cpp caller.o native.o -o native
+          timeout 15s ./native
+          echo 'CXX5_SIGNED_AL source_formal=poisoned_register_GCC_executable_parity' >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Validate borrowed-this byte array field against independent G++ class owner
+        working-directory: edgcpp/build/gcc-release
+        run: |
+          set -euo pipefail
+          source ./environment.sh
+          driver="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          work="$RUNNER_TEMP/cxx5-borrowed-array"
+          mkdir -p "$work"
+          cd "$work"
+          cat >record.hpp <<'CPP'
+          struct Record {
+            char pad[57];
+            char tab[256];
+            int get(int i);
+          };
+          CPP
+          cat >impl.cpp <<'CPP'
+          #include "record.hpp"
+          int Record::get(int i) { return this->tab[(unsigned char)i]; }
+          CPP
+          cat >driver.cpp <<'CPP'
+          #include "record.hpp"
+          int main() {
+            Record record{};
+            record.tab[10] = 42;
+            if (record.get(10)!=42) return 11;
+            record.tab[255] = (char)0x80;
+            if (record.get(255)!=-128) return 12;
+            if (record.get(511)!=-128) return 13;
+            record.tab[0] = 3;
+            if (record.get(256)!=3) return 14;
+            return 0;
+          }
+          CPP
+          g++ -std=c++17 -fno-exceptions -Wall -Wextra -Werror -c impl.cpp -o gcc-owner.o
+          g++ -std=c++17 -fno-exceptions -Wall -Wextra -Werror driver.cpp gcc-owner.o -o gcc-reference
+          timeout 15s ./gcc-reference
+          version="$(g++ -dumpfullversion -dumpversion)"
+          gnu_number="$(printf '%s\n' "$version" | awk -F. '{printf "%d", $1*10000+($2+0)*100+($3+0)}')"
+          "$driver" native.o --typeid-native --g++ --c++17 --no_exceptions --no_strict_gnu \
+            --gnu_version "$gnu_number" impl.cpp >native.log 2>&1 || {
+              tail -n 80 native.log >&2
+              test ! -e native.o
+              exit 1
+            }
+          test "$(od -An -tx1 -N4 native.o | tr -d '[:space:]')" = 7f454c46
+          nm -g --defined-only native.o | grep -F 'Record'
+          g++ -fno-exceptions driver.cpp native.o -o native
+          timeout 15s ./native
+          echo 'CXX5_BORROWED_ARRAY native_this_field_byte_address=GCC_executable_parity' >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Prove same-owner this-to-member direct call with external G++ method owner
+        working-directory: edgcpp/build/gcc-release
+        run: |
+          set -euo pipefail
+          source ./environment.sh
+          driver="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          work="$RUNNER_TEMP/cxx5-borrowed-this-delegation"
+          mkdir -p "$work"
+          cd "$work"
+          cat >relay.hpp <<'CPP'
+          struct Relay {
+            int seed;
+            int target(int x) const;
+            int forward(int x) const;
+          };
+          CPP
+          cat >impl.cpp <<'CPP'
+          #include "relay.hpp"
+          int Relay::forward(int x) const { return this->target(x); }
+          CPP
+          cat >owner.cpp <<'CPP'
+          #include "relay.hpp"
+          int Relay::target(int x) const { return seed + x * 2; }
+          CPP
+          cat >main.cpp <<'CPP'
+          #include "relay.hpp"
+          int main() {
+            Relay r{7};
+            if (r.forward(3) != 13) return 11;
+            if (r.forward(-8) != -9) return 12;
+            return 0;
+          }
+          CPP
+          g++ -std=c++17 -fno-exceptions -Wall -Wextra -Werror -c owner.cpp -o owner.o
+          g++ -std=c++17 -fno-exceptions -Wall -Wextra -Werror impl.cpp main.cpp owner.o -o reference
+          timeout 15s ./reference
+          version="$(g++ -dumpfullversion -dumpversion)"
+          gnu_number="$(printf '%s\n' "$version" | awk -F. '{printf "%d", $1*10000+($2+0)*100+($3+0)}')"
+          "$driver" native.o --typeid-native --g++ --c++17 --no_exceptions --no_strict_gnu \
+            --gnu_version "$gnu_number" impl.cpp >native.log 2>&1 || {
+              tail -n 65 native.log >&2
+              test ! -e native.o
+              exit 1
+            }
+          test "$(od -An -tx1 -N4 native.o | tr -d '[:space:]')" = 7f454c46
+          nm -u native.o | grep -F 'Relay'
+          readelf -rW native.o | grep -F '_ZNK5Relay6targetEi'
+          g++ -fno-exceptions main.cpp native.o owner.o -o native
+          timeout 15s ./native
+          echo 'CXX5_BORROWED_THIS independent_GCC_member_owner=executable_parity' >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Reject virtual this-member dispatch without native object or partial ELF
+        working-directory: edgcpp/build/gcc-release
+        run: |
+          set -euo pipefail
+          source ./environment.sh
+          driver="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          work="$RUNNER_TEMP/cxx5-virtual-this-negative"
+          mkdir -p "$work"
+          cd "$work"
+          cat >bad.cpp <<'CPP'
+          struct Bad {
+            virtual int target(int) const;
+            int forward(int x) const;
+          };
+          int Bad::forward(int x) const { return this->target(x); }
+          CPP
+          g++ -std=c++17 -fno-exceptions -Wall -Wextra -Werror -fsyntax-only bad.cpp
+          version="$(g++ -dumpfullversion -dumpversion)"
+          gnu_number="$(printf '%s\n' "$version" | awk -F. '{printf "%d", $1*10000+($2+0)*100+($3+0)}')"
+          set +e
+          "$driver" bad.o --typeid-native --g++ --c++17 --no_exceptions --no_strict_gnu \
+            --gnu_version "$gnu_number" bad.cpp >bad.log 2>&1
+          rc=$?
+          set -e
+          echo "CXX5_VIRTUAL_NEGATIVE rc=$rc"
+          tail -n 35 bad.log || true
+          if test -e bad.o; then
+            echo '::error::virtual negative emitted native object'
+            nm -a bad.o | tail -n 25 || true
+          fi
+          test "$rc" -ne 0
+          test ! -e bad.o
+          grep -E '(virtual|unsupported|member|callee|Error:)' bad.log
+          grep -F 'machine_virtual_abi=unproven_from_postlower' bad.log
+          echo 'CXX5_BORROWED_THIS virtual_dispatch=fail_closed_no_partial_elf' >>"$GITHUB_STEP_SUMMARY"
