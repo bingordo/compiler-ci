@@ -48,7 +48,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/edgcpp-rust
-          ref: ${{ inputs.source_ref || '8b70e126b24f0a9fcd1271fde8bcd9a9270400a5' }}
+          ref: ${{ inputs.source_ref || 'fd543ff827256150c81713167aea5e40c9acfb3c' }}
           path: edgcpp-rust
           persist-credentials: false
       - name: Record exact revision
@@ -59,7 +59,7 @@ jobs:
           test "${#sha}" -eq 40
           echo "EDG Rust commit: $sha" | tee -a "$GITHUB_STEP_SUMMARY"
           if [[ "${{ github.event_name }}" != workflow_dispatch ]]; then
-            test "$sha" = 8b70e126b24f0a9fcd1271fde8bcd9a9270400a5
+            test "$sha" = fd543ff827256150c81713167aea5e40c9acfb3c
           fi
       - name: Check out source headers matching the pinned EDG library
         uses: actions/checkout@v4
@@ -199,6 +199,35 @@ jobs:
             -o "$RUNNER_TEMP/deep-native-array-40"
           "$RUNNER_TEMP/deep-native-array-40"
           echo 'Pinned EDG and GCC accept a real 40-dimensional C11 array' >> "$GITHUB_STEP_SUMMARY"
+      - name: Verify deep record image and fail-closed deep array against EDG/GCC
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source build/gcc-release/environment.sh
+          a="$GITHUB_WORKSPACE/edgcpp-rust/tests/fixtures/audit_deep_designated_initializers.c"
+          b="$GITHUB_WORKSPACE/edgcpp-rust/tests/fixtures/audit_deep_designated_record.c"
+          gcc -std=c11 -O0 -Wall -Wextra -Werror "$a" -o "$RUNNER_TEMP/deep-designated-array"
+          gcc -std=c11 -O0 -Wall -Wextra -Werror "$b" -o "$RUNNER_TEMP/deep-designated-record"
+          "$RUNNER_TEMP/deep-designated-array"
+          "$RUNNER_TEMP/deep-designated-record"
+          cd build/gcc-release
+          array_ok=false
+          if EDG_DESIGNATED_CASE=array cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" --example audit_designated_images -- --c11 "$a" 2>&1 | tee "$RUNNER_TEMP/deep-designated-images.log"; then array_ok=true; fi
+          record_ok=false
+          if EDG_DESIGNATED_CASE=record cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" --example audit_designated_images -- --c11 "$b" 2>&1 | tee "$RUNNER_TEMP/deep-designated-record.log"; then record_ok=true; fi
+          echo "Native deep designated array image: $array_ok" >> "$GITHUB_STEP_SUMMARY"
+          echo "Native deep designated record image: $record_ok" >> "$GITHUB_STEP_SUMMARY"
+          # For this 40-dimensional array, either an exact native byte image
+          # or an explicit malformed/incomplete snapshot is admissible.
+          # Never treat missing/truncated image records as successful parsing.
+          if [ "$array_ok" = true ]; then
+            grep -Fq 'EDG_DEEP_DESIGNATOR_IMAGE name=deep_designated_array bytes=4 value=37' "$RUNNER_TEMP/deep-designated-images.log"
+          else
+            grep -Fq 'EDG compilation: MalformedCallback' "$RUNNER_TEMP/deep-designated-images.log"
+          fi
+          test "$record_ok" = true
+          grep -Fq 'EDG_DEEP_DESIGNATOR_IMAGE name=deep_designated_record bytes=4 value=53' "$RUNNER_TEMP/deep-designated-record.log"
       - name: Check iterative Rust aggregate layout, copy and cycle boundaries
         working-directory: edgcpp-rust
         run: |
@@ -352,6 +381,8 @@ jobs:
             ${{ runner.temp }}/cout-include-search.log
             ${{ runner.temp }}/edg-graph-scope-scaling.log
             ${{ runner.temp }}/deep-native-array-40.log
+            ${{ runner.temp }}/deep-designated-images.log
+            ${{ runner.temp }}/deep-designated-record.log
             ${{ runner.temp }}/lifetime-c11.log
             ${{ runner.temp }}/lifetime-cpp20.log
           if-no-files-found: ignore
