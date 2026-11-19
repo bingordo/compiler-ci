@@ -1,0 +1,82 @@
+name: x86 i32 remat pinned real-source ABBA and runtime
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/verify-x86-i32-remat-source-abba-20261119.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-typeid-remat-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 85
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout benchmark harness at pinned source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 23a9c01062d75eaa27d0b18067ca1f31ddc57bc6
+          path: bench
+          ssh-key: \${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact pre-2276 baseline
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b5a953ab14098727763f204bb416dea07baa4c74
+          path: baseline
+          ssh-key: \${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact 2276 merged candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 0e3f783698697f0b67fb6ecc4ecb443625149886
+          path: candidate
+          ssh-key: \${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify three independent source pins and local harness contract
+        run: |
+          set -euo pipefail
+          test "$(git -C bench rev-parse HEAD)" = "23a9c01062d75eaa27d0b18067ca1f31ddc57bc6"
+          test "$(git -C baseline rev-parse HEAD)" = "b5a953ab14098727763f204bb416dea07baa4c74"
+          test "$(git -C candidate rev-parse HEAD)" = "0e3f783698697f0b67fb6ecc4ecb443625149886"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          python3 -m unittest discover -s bench/tools -p test_x86_i32_remat_source_abba.py -v
+          python3 -m py_compile bench/tools/x86_i32_remat_source_abba.py
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: candidate -> ../target
+          key: x86-i32-remat-end2end-source-20261119
+      - name: Build exact pre-2276 compiler (release)
+        run: |
+          set -euo pipefail
+          cargo build --release -p compiler --bin compiler --manifest-path baseline/Cargo.toml --target-dir target
+          mkdir -p "$RUNNER_TEMP/i32-remat"
+          cp target/release/compiler "$RUNNER_TEMP/i32-remat/baseline"
+          test -x "$RUNNER_TEMP/i32-remat/baseline"
+      - name: Build exact post-2276 compiler (release)
+        run: |
+          set -euo pipefail
+          cargo build --release -p compiler --bin compiler --manifest-path candidate/Cargo.toml --target-dir target
+          cp target/release/compiler "$RUNNER_TEMP/i32-remat/candidate"
+          test -x "$RUNNER_TEMP/i32-remat/candidate"
+      - name: Checked-source Mini-C TypeId binaries, independent GCC, actual ELF, ABBA runtime
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark-output
+          python3 bench/tools/x86_i32_remat_source_abba.py \
+            --baseline "$RUNNER_TEMP/i32-remat/baseline" \
+            --candidate "$RUNNER_TEMP/i32-remat/candidate" \
+            --rounds 3 --runtime-rounds 3 \
+            --output benchmark-output/x86-i32-remat-source-abba.json
+      - name: Upload actual JSON data (all results including no-change)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x86-i32-remat-source-abba-20261119
+          path: benchmark-output/x86-i32-remat-source-abba.json
+          if-no-files-found: warn
