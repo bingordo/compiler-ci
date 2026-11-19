@@ -1,0 +1,119 @@
+name: pinned generated scalar ADD SUB immediate remat
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/verify-scalar-alu-imm-remat-20261118.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-source-verified-alu-immediates:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 80
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 0cac9520760634499373e1b9fb765db17b707cea
+          path: baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 222d774515dd03ff5560d41eb51eb92539da79ad
+          path: proposed
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify immutable checkout commits and machine
+        run: |
+          set -euo pipefail
+          test "$(git -C baseline rev-parse HEAD)" = "0cac9520760634499373e1b9fb765db17b707cea"
+          test "$(git -C proposed rev-parse HEAD)" = "222d774515dd03ff5560d41eb51eb92539da79ad"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          lscpu | grep -E '^Model name:|^Architecture:' || true
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            baseline -> target
+            proposed -> target
+          key: x86-source-generated-add-sub-imm-20261118
+      - name: Generated ADD SUB boundaries and native C11 GAS and direct ELF oracle
+        working-directory: proposed
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib scalar_immediate::tests -- --nocapture
+          cargo test -p compiler-backend-x86 --lib reviewed_scalar_alu_immediate -- --nocapture
+          cargo test -p compiler-backend-x86 --lib reviewed_cmp32_immediate_rematerialization -- --nocapture
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend --lib
+          cargo test -p compiler-backend-aarch64 --lib
+          cargo clippy -p compiler-backend --lib -- --no-deps -D warnings
+          # Existing migration-only x86 dormant entrypoints use an audited
+          # dead_code exception; all new warnings stay denied.
+          cargo clippy -p compiler-backend-x86 --lib -- --no-deps -D warnings -A dead_code
+          cargo test -p compiler --test x7_s4_rolling_checksum_source -- --nocapture
+          cargo test -p compiler --test x86_inline_source_ablation -- --nocapture
+      - name: Baseline core x86 and AArch64 test parity
+        working-directory: baseline
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend-aarch64 --lib
+      - name: Pinned GCC and native old new new old performance guard
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          fixture=Path('crates/driver/tests/x86_source_runtime_performance.rs')
+          original=(Path('baseline')/fixture).read_bytes()
+          assert original==(Path('proposed')/fixture).read_bytes()
+          literal=b'REPS=7, ITERS=1800'
+          assert original.count(literal)==1
+          for root in ('baseline','proposed'):
+              (Path(root)/fixture).write_bytes(original.replace(literal,b'REPS=7, ITERS=18000'))
+          PY
+          for case in baseline proposed; do
+            (cd "$case" && cargo test --release -p compiler --test x86_source_runtime_performance --no-run)
+          done
+          cpu=$(awk '/^Cpus_allowed_list:/ {split($2,a,/[-,]/); print a[1]}' /proc/self/status)
+          test -n "$cpu"
+          n=0
+          for case in baseline proposed proposed baseline; do
+            n=$((n+1))
+            log="$RUNNER_TEMP/alu-imm-ab-$n-$case.log"
+            (cd "$case" && taskset -c "$cpu" cargo test --release -p compiler --test x86_source_runtime_performance -- --ignored --nocapture) 2>&1 | tee "$log"
+            grep -q 'X86_SOURCE_RUNTIME mode=mini_default workload=combined' "$log"
+            grep -q 'X86_SOURCE_RUNTIME mode=gcc_O2 workload=combined' "$log"
+          done
+          python3 - "$RUNNER_TEMP" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          from pathlib import Path
+          import statistics,sys
+          root=Path(sys.argv[1])
+          rows=[]
+          for n,case in enumerate(('baseline','proposed','proposed','baseline'),1):
+              data=(root/f'alu-imm-ab-{n}-{case}.log').read_text().splitlines()
+              def entry(prefix):
+                  matches=[line for line in data if prefix in line]
+                  assert matches,(n,case,prefix)
+                  return dict(x.split('=',1) for x in matches[-1].split() if '=' in x)
+              mini=entry('X86_SOURCE_RUNTIME mode=mini_default workload=combined')
+              gcc=entry('X86_SOURCE_RUNTIME mode=gcc_O2 workload=combined')
+              scan=entry('X86_RUNTIME_FUNCTION mode=mini_default symbol=scan>')
+              assert mini['checksum']==gcc['checksum']
+              rows.append((case,int(mini['median_ns']),mini['checksum'],scan))
+              print(f"{case} run={n} median_ns={mini['median_ns']} scan_inst={scan['instructions']} moves={scan['moves']} stack={scan['stack_memory']}")
+          assert len({row[2] for row in rows})==1, 'old/new checksum mismatch'
+          for case in ('baseline','proposed'):
+              print(f"{case} mean_median_ns={statistics.mean(x[1] for x in rows if x[0]==case):.1f}")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: source-pinned-scalar-alu-immediate
+          path: ${{ runner.temp }}/alu-imm-ab-*.log
+          if-no-files-found: ignore
