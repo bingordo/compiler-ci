@@ -1,0 +1,118 @@
+name: pinned generic pure expression remat consolidation
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/verify-generic-pure-remat-20261118.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  proof-and-parity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 70ab521a3903309280ca331fda6bc6a2baa65c7e
+          path: old
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 4e5ebf77ce5b84080ccb2390a1e2bac32674d2e3
+          path: new
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin and inspect exact revisions
+        run: |
+          set -euo pipefail
+          test "$(git -C old rev-parse HEAD)" = "70ab521a3903309280ca331fda6bc6a2baa65c7e"
+          test "$(git -C new rev-parse HEAD)" = "4e5ebf77ce5b84080ccb2390a1e2bac32674d2e3"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          lscpu | grep -E '^Model name:|^Architecture:' || true
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            old -> target
+            new -> target
+          key: generic-pure-ssa-remat-20261118
+      - name: Generic pure remat, comparison, x86, AArch64 and GCC source oracles
+        working-directory: new
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib remat::tests -- --nocapture
+          cargo test -p compiler-backend --lib compare_uses::tests -- --nocapture
+          cargo test -p compiler-backend --lib
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend-aarch64 --lib
+          cargo clippy -p compiler-backend --lib -- --no-deps -D warnings
+          cargo clippy -p compiler-backend-x86 --lib -- --no-deps -D warnings -A dead_code
+          cargo clippy -p compiler-backend-aarch64 --lib -- --no-deps -D warnings -A dead_code
+          cargo test -p compiler --test x86_inline_source_ablation -- --nocapture
+          cargo test -p compiler --test x7_s4_rolling_checksum_source -- --nocapture
+      - name: Baseline generic backend x86 AArch64 library parity
+        working-directory: old
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend-aarch64 --lib
+      - name: Identical native x86 source and GCC ABBA runtime parity
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("crates/driver/tests/x86_source_runtime_performance.rs")
+          before=(Path("old")/p).read_bytes()
+          after=(Path("new")/p).read_bytes()
+          assert before==after
+          assert before.count(b"REPS=7, ITERS=1800")==1
+          for src in ("old","new"):
+              (Path(src)/p).write_bytes(before.replace(
+                  b"REPS=7, ITERS=1800",b"REPS=7, ITERS=18000"))
+          PY
+          for src in old new; do
+            (cd "$src" && cargo test --release -p compiler --test x86_source_runtime_performance --no-run)
+          done
+          cpu=$(awk '/^Cpus_allowed_list:/ {split($2,a,/[-,]/); print a[1]}' /proc/self/status)
+          test -n "$cpu"
+          i=0
+          for src in old new new old; do
+            i=$((i+1))
+            file="$RUNNER_TEMP/pure-remat-$i-$src.log"
+            (cd "$src" && taskset -c "$cpu" cargo test --release -p compiler --test x86_source_runtime_performance -- --ignored --nocapture) 2>&1 | tee "$file"
+            grep -q 'X86_SOURCE_RUNTIME mode=mini_default workload=combined' "$file"
+            grep -q 'X86_SOURCE_RUNTIME mode=gcc_O2 workload=combined' "$file"
+          done
+          python3 - "$RUNNER_TEMP" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          from pathlib import Path
+          import statistics,sys
+          root=Path(sys.argv[1])
+          found=[]
+          for i,src in enumerate(("old","new","new","old"),1):
+              lines=(root/f"pure-remat-{i}-{src}.log").read_text().splitlines()
+              def row(prefix):
+                  rec=[s for s in lines if prefix in s]
+                  assert rec,(src,i,prefix)
+                  return dict(p.split("=",1) for p in rec[-1].split() if "=" in p)
+              mini=row("X86_SOURCE_RUNTIME mode=mini_default workload=combined")
+              gcc=row("X86_SOURCE_RUNTIME mode=gcc_O2 workload=combined")
+              scan=row("X86_RUNTIME_FUNCTION mode=mini_default symbol=scan>")
+              assert mini["checksum"]==gcc["checksum"]
+              found.append((src,int(mini["median_ns"]),mini["checksum"],scan))
+              print(f"{src} run {i} median_ns={mini['median_ns']} scan={scan['instructions']} moves={scan['moves']} stack={scan['stack_memory']}")
+          assert len({x[2] for x in found})==1
+          assert found[0][3]==found[1][3], "unexpected source-refactor code quality change"
+          for src in ("old","new"):
+              print(src,statistics.mean(x[1] for x in found if x[0]==src))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pinned-pure-remat-ab
+          path: ${{ runner.temp }}/pure-remat-*.log
+          if-no-files-found: ignore
