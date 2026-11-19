@@ -46,6 +46,11 @@ on:
         type: string
         required: true
         default: 'af6a33d847f49f46c03f37f7479f0c20a873f38e'
+      evex_production_sha:
+        description: 'Exact compiler SHA for 249-case production x86 EVEX vs GNU-as oracle'
+        type: string
+        required: true
+        default: '1b96d120076b6e4119626c74399014891e42b796'
 permissions:
   contents: read
 jobs:
@@ -286,3 +291,50 @@ jobs:
           python3 tools/regen_x86_sse_evex_ternlog_forms.py --check
           python3 tools/regen_x86_sse_evex_shift_imm_forms.py --check
           python3 tools/x86_evex_ternlog_shift_gas_oracle.py
+
+  x86-evex-production-vs-gas:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 22
+    steps:
+      - name: Checkout candidate with actual production x86 EVEX encoder
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.evex_production_sha || '1b96d120076b6e4119626c74399014891e42b796' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check source SHA and independently generated physical cases
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          expected="${{ inputs.evex_production_sha || '1b96d120076b6e4119626c74399014891e42b796' }}"
+          [[ "$expected" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$expected"
+          export PYTHONPATH="$PWD/tools"
+          python3 -m unittest discover -s tools -p 'test_x86_evex_production_gas_parity.py' -v
+          python3 tools/x86_evex_mask_compare_gas_oracle.py
+          python3 tools/x86_evex_ternlog_shift_gas_oracle.py
+      - name: Restrict compiler Rust workspace to physical x86 backend
+        shell: bash
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: generator-evex-prod-gas
+      - name: Compare all 249 compiler production encodings with GNU as
+        shell: bash
+        working-directory: compiler
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/tools"
+          python3 tools/x86_evex_production_gas_parity.py
