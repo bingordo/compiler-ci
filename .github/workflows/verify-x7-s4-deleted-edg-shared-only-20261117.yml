@@ -1,0 +1,103 @@
+# Temporary exact-source external EDG + shared x86 cutover verification.
+name: X7 S4 native emitter deleted EDG C C++ G++ shared-only
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-x7-s4-deleted-edg-shared-only-20261117.yml'
+permissions:
+  contents: read
+jobs:
+  edg-source-gxx-native-selected:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    container:
+      image: ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8
+    defaults:
+      run:
+        shell: edg-container-exec "bash -eo pipefail {0}"
+    env:
+      EDG_SOURCE_SHA: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+      EDG_RELEASE_TAG: edgcpfe-ci-799603e0b5ab
+      EDG_RELEASE_SHA256: fa769825e70766fbefe017806816b2338acd03daa93bb5562369c293972ce64c
+      RUST_TOOLCHAIN_VERSION: 1.99.1
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 01a8c7fc69e7a75ee18e05b6a25ac57b89ea3fee
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingundu/edgcpp
+          ref: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+          path: edgcpp
+          persist-credentials: false
+      - name: Assert exact source pins
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "01a8c7fc69e7a75ee18e05b6a25ac57b89ea3fee"
+          test "$(git -C edgcpp rev-parse HEAD)" = "$EDG_SOURCE_SHA"
+      - name: Configure matching native EDG build metadata
+        working-directory: edgcpp
+        env:
+          EDG_BASE: ${{ github.workspace }}/edgcpp/bases/docker/dev-env/gcc
+        run: |
+          cmake --preset linux-gcc-release \
+            -DEDG_BUILD_LIB=OFF \
+            -DEDG_BUILD_CALLABLE_LIBRARY=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          cmake --build build/gcc-release --target error-info --parallel 2
+      - name: Restore pinned EDG native archive and verify original source hash
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          url="https://github.com/bingundu/edgcpp/releases/download/$EDG_RELEASE_TAG/edgcpfe-ci-x86_64-callable-release-linux-x86_64.tar.gz"
+          mkdir -p build/gcc-release/lib build/prebuilt-edg
+          curl --fail --location --silent --show-error --retry 4 --retry-delay 2 \
+            "$url" --output build/prebuilt-edg/archive.tar.gz
+          printf '%s  %s\n' "$EDG_RELEASE_SHA256" build/prebuilt-edg/archive.tar.gz | sha256sum --check --status
+          tar -xzf build/prebuilt-edg/archive.tar.gz -C build/prebuilt-edg
+          grep -Fx "commit=$EDG_SOURCE_SHA" build/prebuilt-edg/BUILD-INFO.txt
+          grep -Fx 'platform=linux-x86_64' build/prebuilt-edg/BUILD-INFO.txt
+          test -s build/prebuilt-edg/lib/libedgcpfe.a
+          cp build/prebuilt-edg/lib/libedgcpfe.a build/gcc-release/lib/libedgcpfe.a
+      - name: Install exact supported Rust toolchain
+        run: |
+          if ! command -v cargo >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN_VERSION"
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install "$RUST_TOOLCHAIN_VERSION" --profile minimal
+          rustup default "$RUST_TOOLCHAIN_VERSION"
+      - name: Compile and run EDG adapter unit tests at source pin
+        working-directory: compiler
+        env:
+          EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+          EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+          EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+          EDGCPP_EDG_REVISION: ${{ env.EDG_SOURCE_SHA }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test --manifest-path tools/edg-driver/Cargo.toml
+          cargo build --manifest-path tools/edg-driver/Cargo.toml
+      - name: Real source EDG C and C++0 native-versus-shared ELF and linked G++
+        working-directory: compiler
+        env:
+          EDG_RUN_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release
+          EDG_NATIVE_DRIVER: ${{ github.workspace }}/compiler/tools/edg-driver/target/debug/compiler-edg-driver
+          EDG_ADMISSION_ARTIFACTS: ${{ runner.temp }}/x7-s4-edg
+        run: |
+          set -euo pipefail
+          bash tools/edg-driver/tests/x7_s4_selected_edg_acceptance.sh
+          echo X7_S4_EDG_DELETED_NATIVE_SOURCE_GREEN
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-s4-edg-deleted-native-shared-only
+          path: ${{ runner.temp }}/x7-s4-edg
+          if-no-files-found: warn
