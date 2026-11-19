@@ -1,0 +1,54 @@
+# Temporary source-pinned benchmarking gate. Do not merge into compiler-ci main.
+name: TypeId serialization codec benchmark (pinned)
+on:
+  push:
+    branches: [ci/typeid-serialization-benchmark-20261118]
+    paths:
+      - '.github/workflows/typeid-serialization-benchmark-20261118.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  serialization:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      SOURCE_SHA: eda622bdd8d4644829091c30c55528445317ebdc
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: eda622bdd8d4644829091c30c55528445317ebdc
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm immutable source and isolate IR workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          printf '[workspace]\nresolver = "2"\nmembers = ["crates/ir"]\n' > compiler/Cargo.toml
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-serialization-bench
+      - name: IR benchmark CLI and codec regression tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test ir_codec_bench_cli -- --nocapture
+          cargo test -p compiler-ir --test native_binary_v1
+          cargo test -p compiler-ir --test native_binary_corruption_matrix
+          cargo test -p compiler-ir --test lto_target_envelope
+      - name: Strict library, benchmark and affected-test Clippy
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-ir --lib --bin ir-codec-bench --test ir_codec_bench_cli -- -D warnings
+      - name: Release benchmark smoke baseline (informational timing)
+        working-directory: compiler
+        run: |
+          cargo run --release -p compiler-ir --bin ir-codec-bench -- crates/ir/tests/fixtures/native_cfg_v3.ir 1000
