@@ -1,0 +1,135 @@
+name: EDG C global weak and section provenance bridge acceptance
+
+on:
+  push:
+    branches: ['ci/edg-c-global-flags-20261118']
+    paths:
+      - '.github/workflows/verify-edg-c-global-flags-20261118.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/verify-edg-c-global-flags-20261118.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: edg-c-global-flags-20261118
+  cancel-in-progress: true
+
+jobs:
+  startup-schedule-decoder:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container:
+      image: ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8
+    defaults:
+      run:
+        shell: edg-container-exec "bash -eo pipefail {0}"
+    env:
+      EDG_BRIDGE_SHA: f40c9bd5cac2ffe59c81809eb1812a490b65d7a8
+      EDG_SOURCE_SHA: b195677be8b9b56c8337afad6be8064d21a54082
+      EDG_RELEASE_TAG: edgcpfe-v2026.11.14-upstream-177765bb7731
+      EDG_RELEASE_SHA256: 1ce495b629924f31382ecccc891a7a72caae1014ddfa2ba7dd39b44d8b0a9526
+      RUST_TOOLCHAIN_VERSION: 1.99.1
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+
+    steps:
+      - name: Checkout the exact EDG Rust patch
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/edgcpp-rust
+          ref: f40c9bd5cac2ffe59c81809eb1812a490b65d7a8
+          path: edgcpp-rust
+          persist-credentials: false
+
+      - name: Checkout exact EDG headers
+        uses: actions/checkout@v4
+        with:
+          repository: bingundu/edgcpp
+          ref: b195677be8b9b56c8337afad6be8064d21a54082
+          path: edgcpp
+          persist-credentials: false
+
+      - name: Assert source pins and configure EDG metadata
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EDG_SOURCE_SHA"
+          test "$(git -C ../edgcpp-rust rev-parse HEAD)" = "$EDG_BRIDGE_SHA"
+          export EDG_BASE="$GITHUB_WORKSPACE/edgcpp/bases/docker/dev-env/gcc"
+          cmake --preset linux-gcc-release -DEDG_BUILD_LIB=OFF -DEDG_BUILD_CALLABLE_LIBRARY=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          cmake --build build/gcc-release --target error-info --parallel 2
+          test -s build/gcc-release/src/includes/err_codes.h
+          test -s build/gcc-release/src/includes/err_data.h
+
+      - name: Verify and install exact prebuilt EDG callable archive
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          mkdir -p build/gcc-release/lib build/prebuilt-edg
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error --retry 4 --retry-delay 2             "https://github.com/bingundu/edgcpp/releases/download/$EDG_RELEASE_TAG/edgcpfe-ci-upstream-callable-edg-release-20261114-linux-x86_64.tar.gz"             -o build/prebuilt-edg/archive.tar.gz
+          printf '%s  %s\n' "$EDG_RELEASE_SHA256" build/prebuilt-edg/archive.tar.gz | sha256sum -c -
+          tar -xzf build/prebuilt-edg/archive.tar.gz -C build/prebuilt-edg
+          grep -Fx "commit=$EDG_SOURCE_SHA" build/prebuilt-edg/BUILD-INFO.txt
+          grep -Fx 'platform=linux-x86_64' build/prebuilt-edg/BUILD-INFO.txt
+          test -s build/prebuilt-edg/lib/libedgcpfe.a
+          cp build/prebuilt-edg/lib/libedgcpfe.a build/gcc-release/lib/libedgcpfe.a
+
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          if ! command -v cargo >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |               sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN_VERSION"
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install "$RUST_TOOLCHAIN_VERSION" --profile minimal
+          rustup default "$RUST_TOOLCHAIN_VERSION"
+
+      - name: Verify native EDG GNU C global flags and fail-closed wire decoding
+        working-directory: edgcpp-rust
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          export EDGCPP_SOURCE_DIR="$GITHUB_WORKSPACE/edgcpp"
+          export EDGCPP_COMPILE_COMMANDS="$GITHUB_WORKSPACE/edgcpp/build/gcc-release/compile_commands.json"
+          export EDGCPP_LIB_DIR="$GITHUB_WORKSPACE/edgcpp/build/gcc-release/lib"
+          export EDGCPP_EDG_REVISION="$EDG_SOURCE_SHA"
+          python3 tools/gen_wire_schema.py --check
+          grep -q 'is_weak:1' ../edgcpp/src/il_def.h
+          grep -q 'section;' ../edgcpp/src/il_def.h
+          cargo test --features codegen --lib native_global_attribute_flags_preserve_weak_alias_and_section_presence -- --nocapture 2>&1 | tee "$RUNNER_TEMP/edg-global-flags.log"
+          grep -Eq 'test result: ok[.] 1 passed; 0 failed' "$RUNNER_TEMP/edg-global-flags.log"
+          cargo test --features codegen --lib audit_wire_identity_index_tests -- --nocapture
+          cargo test --features codegen --test native_backend_contract -- --nocapture
+          # Execute the actual pinned EDG callable library against three
+          # self-contained public GNU C fixtures. Synthetic wire tests alone
+          # cannot prove native attribute fields survived EDG lowering.
+          printf 'int probe_scalar_global = 7; int probe_scalar_read(void) { return probe_scalar_global; }\n' > "$RUNNER_TEMP/attr-plain.c"
+          printf '__attribute__((weak)) int probe_scalar_global = 7; int probe_scalar_read(void) { return probe_scalar_global; }\n' > "$RUNNER_TEMP/attr-weak.c"
+          printf '__attribute__((section(".data.edg_probe"))) int probe_scalar_global = 7; int probe_scalar_read(void) { return probe_scalar_global; }\n' > "$RUNNER_TEMP/attr-section.c"
+          gcc_version="$(gcc -dumpfullversion -dumpversion)"
+          IFS=. read -r major minor patch <<<"$gcc_version"
+          gnu_number=$((10#${major}*10000 + 10#${minor:-0}*100 + 10#${patch:-0}))
+          (
+            cd "$GITHUB_WORKSPACE/edgcpp/build/gcc-release"
+            source environment.sh
+            for kind in plain weak section; do
+              timeout --signal=TERM --kill-after=10s 90s \
+                cargo run --quiet --features codegen \
+                  --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" \
+                  --example parse -- --gcc --c11 --no_strict_gnu \
+                  --gnu_version "$gnu_number" "$RUNNER_TEMP/attr-$kind.c" \
+                  > "$RUNNER_TEMP/attr-$kind.log" 2>&1
+              grep -F 'EDG_NATIVE_GLOBAL_ATTR' "$RUNNER_TEMP/attr-$kind.log" |
+                grep -F 'name=Some("probe_scalar_global")' |
+                tee "$RUNNER_TEMP/attr-$kind-result.log"
+            done
+          )
+          grep -qF 'weak=false weakref=false alias=false section_present=false' "$RUNNER_TEMP/attr-plain-result.log"
+          grep -qF 'weak=true weakref=false alias=false section_present=false' "$RUNNER_TEMP/attr-weak-result.log"
+          grep -qF 'weak=false weakref=false alias=false section_present=true' "$RUNNER_TEMP/attr-section-result.log"
+          echo 'Verified real EDG source distinguishes plain, weak and section C globals' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Native GNU C global attribute flags and wire negatives passed' >>"$GITHUB_STEP_SUMMARY"
