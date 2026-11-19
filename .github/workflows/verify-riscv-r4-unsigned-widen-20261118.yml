@@ -1,0 +1,191 @@
+name: RV64 R4 generated unsigned widening GCC QEMU
+on:
+  workflow_dispatch:
+  # Exact implementation pin; official Actions only in compiler-ci.
+  push:
+    branches: [main, 'ci/riscv-r4-unsigned-widen-20261118']
+    paths: ['.github/workflows/verify-riscv-r4-unsigned-widen-20261118.yml']
+permissions:
+  contents: read
+jobs:
+  rv64-differential:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Permit private pinned frontend dependency checkout
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Configure GitHub trusted SSH host
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - name: Checkout exact compiler implementation revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 020106fb4a0fa956e2d36c398bd16a45789312e0
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Fail on unexpected source SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = 020106fb4a0fa956e2d36c398bd16a45789312e0
+      - name: Log reproducible selected source revision
+        run: git -C compiler rev-parse HEAD
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Validate deterministic generator, ISA tests and real compiler
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools/tests -p test_riscv_source_differential.py -v
+          python3 -m unittest discover -s tools -p test_riscv_native_selector_rules.py -v
+          seed=1381381684
+          echo "RV64 generator seed=$seed"
+          python3 tools/riscv_source_differential.py --output /tmp/rv64-diff --seed "$seed"
+          python3 tools/riscv_source_differential.py --output /tmp/rv64-diff-replay --seed "$seed"
+          diff -qr /tmp/rv64-diff /tmp/rv64-diff-replay
+          python3 -c 'import json; x=json.load(open("/tmp/rv64-diff/manifest.json")); assert x["source_count"]==48 and x["total_comparisons"]==1152 and x["shard_count"]==12'
+          cargo test -p compiler --test riscv64_source_preview
+          cargo test -p compiler --test riscv64_load_ir
+          # Existing selector.rs schematic rustdoc is not executable Rust; scope to code tests.
+          cargo test -p compiler-backend-riscv64 --lib --tests
+          cargo clippy -p compiler-backend-riscv64 --lib -- -D warnings
+          # On this pinned main revision the unrelated x86 driver has
+          # unused imports, dead code and a needless return in flight.
+          # Keep the RISC-V crate strict; scope those three exceptions to
+          # the non-RV64 driver binary for this acceptance workflow.
+          cargo clippy -p compiler --bin compiler -- -D warnings \
+            -A clippy::too_many_arguments -A unused-imports \
+            -A dead-code -A clippy::needless_return
+          cargo build -p compiler --bin compiler
+          python3 tools/regen_riscv_native_selector_rules.py --check
+          python3 tools/riscv_udb_rust_leaf_forms.py \
+            --catalog data/riscv_udb_r0_catalog.json \
+            --output crates/backend-riscv64/src/generated_encoding.rs --check
+      - name: Install independent RV64 GNU GCC binutils and QEMU
+        run: |
+          # Ubuntu hosted runner already has apt indexes. Avoid a slow,
+          # unnecessary global index refresh; bound infrastructure delays.
+          sudo env DEBIAN_FRONTEND=noninteractive timeout 600s apt-get install -y \
+            --no-install-recommends gcc-riscv64-linux-gnu \
+            binutils-riscv64-linux-gnu qemu-user
+      - name: Independent SLLI/SRLI byte parity and real QEMU zero-extension oracle
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for tag in zextneg zextmin zextmax zextzero; do
+            cargo run -p compiler-backend-riscv64 --example rv64_leaf -- \
+              "/tmp/rv64_${tag}.o" "/tmp/rv64_${tag}.s" "${tag}" --isa=rv64i
+            grep -E 'slli x[0-9]+, x[0-9]+, 32' "/tmp/rv64_${tag}.s"
+            grep -E 'srli x[0-9]+, x[0-9]+, 32' "/tmp/rv64_${tag}.s"
+            riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+              "/tmp/rv64_${tag}.s" -o "/tmp/rv64_${tag}_gas.o"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${tag}.o" "/tmp/rv64_${tag}_native.bin"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${tag}_gas.o" "/tmp/rv64_${tag}_gas.bin"
+            cmp "/tmp/rv64_${tag}_native.bin" "/tmp/rv64_${tag}_gas.bin"
+            riscv64-linux-gnu-readelf -A "/tmp/rv64_${tag}.o" | \
+              grep -F 'Tag_RISCV_arch: "rv64i2p1"'
+          done
+          cat > /tmp/rv64_zext_main.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            mv s0, sp
+            call rv64_zext_neg
+            li t0, 4294967289
+            bne a0, t0, fail
+            bne sp, s0, fail
+            call rv64_zext_min
+            li t0, 2147483648
+            bne a0, t0, fail
+            bne sp, s0, fail
+            call rv64_zext_max
+            li t0, 2147483647
+            bne a0, t0, fail
+            bne sp, s0, fail
+            call rv64_zext_zero
+            bne a0, x0, fail
+            bne sp, s0, fail
+            li a0, 0
+            j exit
+          fail:
+            li a0, 1
+          exit:
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+            /tmp/rv64_zext_main.s -o /tmp/rv64_zext_main.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax -e _start \
+            /tmp/rv64_zext_main.o /tmp/rv64_zextneg.o /tmp/rv64_zextmin.o \
+            /tmp/rv64_zextmax.o /tmp/rv64_zextzero.o -o /tmp/rv64_zext.elf
+          timeout 15s qemu-riscv64 /tmp/rv64_zext.elf
+          echo 'Four reviewed RV64I SLLI/SRLI i32-to-u64 zero-extension cases passed GAS/QEMU'
+      - name: Compile 48 generated Mini-C source and GCC reference pairs including unsigned widening
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          root=/tmp/rv64-diff
+          mkdir -p "$root/objects"
+          driver="$PWD/target/debug/compiler"
+          while IFS=$'\t' read -r fn reference isa; do
+            "$driver" "$root/src/$fn.c" --target riscv64 --riscv-source \
+              --riscv-isa "$isa" --emit obj -o "$root/objects/$fn.o"
+            riscv64-linux-gnu-gcc -march=rv64im -mabi=lp64 -O2 \
+              -ffreestanding -fno-builtin -fno-pie -fno-stack-protector \
+              -fwrapv -c "$root/ref/$reference.c" \
+              -o "$root/objects/$reference.o"
+            test -s "$root/objects/$fn.o"
+            test -s "$root/objects/$reference.o"
+          done < "$root/plan.tsv"
+          count="$(find "$root/objects" -name '*.o' | wc -l)"
+          test "$count" -eq 96
+          echo "Compiled 48 RV64 Mini-C source and 48 independent GCC reference objects"
+      - name: 1152 LP64 QEMU source-vs-GCC comparisons with unsigned widening
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          root=/tmp/rv64-diff
+          shopt -s nullglob
+          objects=("$root"/objects/*.o)
+          test "${#objects[@]}" -eq 96
+          passed=0
+          for asm in "$root"/harness/diff_*.s; do
+            base="${asm%.s}"
+            riscv64-linux-gnu-as -march=rv64im -mabi=lp64 "$asm" -o "$base.o"
+            riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax -e _start \
+              "$base.o" "${objects[@]}" -o "$base.elf"
+            set +e
+            timeout 20s qemu-riscv64 "$base.elf"
+            status=$?
+            set -e
+            if [ "$status" -ne 0 ]; then
+              echo "RV64 mismatch: $(basename "$base") exit=$status" >&2
+              python3 -c 'import json,sys; n=int(sys.argv[2]); items=json.load(open(sys.argv[1])); print("Failing vector:",items[n-1] if 1<=n<=len(items) else "stack mismatch or non-test exit")' "$base.json" "$status"
+              exit 1
+            fi
+            passed=$((passed+1))
+          done
+          test "$passed" -eq 12
+          echo "PASSED all 1152 independent C source/GCC QEMU comparisons in 12 shards"
+      - name: Archive generated failing source and QEMU vector reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rv64-r4-differential-repro-${{ github.run_id }}
+          path: |
+            /tmp/rv64-diff/manifest.json
+            /tmp/rv64-diff/plan.tsv
+            /tmp/rv64-diff/src/
+            /tmp/rv64-diff/ref/
+            /tmp/rv64-diff/harness/
+          if-no-files-found: warn
+          retention-days: 14
