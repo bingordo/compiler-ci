@@ -1,0 +1,99 @@
+name: C1 AArch64 source-ranked calls and ordered local zeroing selection
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-aarch64-c1-calls-zero.yml'
+permissions:
+  contents: read
+jobs:
+  generator-and-cross-target:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 67506dcb47f9586074c0a45991b7e82f634f9839
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Assert exact production source SHA and isolate backend workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "67506dcb47f9586074c0a45991b7e82f634f9839"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Verify deterministic generated A64 rule and offline rejection tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          if ! python3 tools/regen_aarch64_native_selector_rules.py --check; then
+            cp crates/backend-aarch64/src/generated_native_selector_rules.rs /tmp/current-a64-rules.rs
+            python3 tools/regen_aarch64_native_selector_rules.py --write
+            diff -u /tmp/current-a64-rules.rs crates/backend-aarch64/src/generated_native_selector_rules.rs | head -100 || true
+            exit 1
+          fi
+          python3 -m unittest discover -s tools -p 'test_regen_aarch64_native_selector_rules.py' -v
+          python3 -m unittest discover -s tools -p 'test_regen_aarch64_scalar_gp_forms.py' -v
+      - name: Warnings denied TypeId/shared x86 and AArch64 all targets
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          RUSTFLAGS="-D warnings" cargo check -p compiler-backend -p compiler-backend-aarch64 --all-targets
+          cargo check -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend --lib -- --test-threads=1
+          cargo test -p compiler-backend-aarch64 --lib -- --test-threads=1
+      - name: Verify shared selector and x86 native rule regression
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib -- --test-threads=1
+  real-native-aarch64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 67506dcb47f9586074c0a45991b7e82f634f9839
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Assert exact production source and isolate AArch64 workspace
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          test "$(git -C compiler rev-parse HEAD)" = "67506dcb47f9586074c0a45991b7e82f634f9839"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          command -v cc
+          command -v objcopy
+      - name: Build production crate warnings denied
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          RUSTFLAGS="-D warnings" cargo check -p compiler-backend-aarch64 --all-targets
+          # Clippy 1.100 adds style lints for unrelated existing integration tests.
+          # Compile every test with -D warnings and execute all tests below;
+          # keep Clippy strict on the production AArch64 library.
+          cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
+      - name: Run AAPCS64 fixed-GP BL/BLR, short/loop zero and native ELF/ABI oracles
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-aarch64 --all-targets -- --test-threads=1 --nocapture
+          echo 'PASS C1 generated fixed-GP call and ordered local-zero rules, real rule-hit census, all native A64 C11/ABI/ELF/GAS/oracles' >> "$GITHUB_STEP_SUMMARY"
