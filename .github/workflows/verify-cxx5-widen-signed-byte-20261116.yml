@@ -28,7 +28,7 @@ jobs:
       run:
         shell: edg-container-exec "bash -eo pipefail {0}"
     env:
-      COMPILER_SHA: ea8d9a3f93688e2a6df06694ff7d0f17d6d43607
+      COMPILER_SHA: effe2b687bf2c0a748643d3473e48888da1b896c
       EDG_SOURCE_SHA: b195677be8b9b56c8337afad6be8064d21a54082
       EDG_BRIDGE_SHA: 7f67a31a9ad5db038c8b1544e49117f23b462e45
       EDG_RELEASE_TAG: edgcpfe-v2026.11.14-upstream-177765bb7731
@@ -45,7 +45,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ea8d9a3f93688e2a6df06694ff7d0f17d6d43607
+          ref: effe2b687bf2c0a748643d3473e48888da1b896c
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -250,6 +250,47 @@ jobs:
             test "$(sha256sum expected.err | cut -d' ' -f1)" = "$(sha256sum "$mode.err" | cut -d' ' -f1)"
           done
           echo 'CXX5_P0 i64_unsigned_subscript=full_gxx_runtime_parity modes=plain,leaves,cfg' >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Execute source pointer assignment-as-value against G++
+        working-directory: edgcpp/build/gcc-release
+        run: |
+          set -euo pipefail
+          source ./environment.sh
+          work="$RUNNER_TEMP/cxx5-pointer-assign-value"
+          mkdir -p "$work"
+          cd "$work"
+          fixtures="$GITHUB_WORKSPACE/compiler/tools/edg-driver/tests/fixtures"
+          cp "$fixtures/edg_native_cxx5_pointer_assign_value.cpp" source.cpp
+          cp "$fixtures/edg_native_cxx5_pointer_assign_value_driver.cpp" driver.cpp
+          driver="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          version="$(g++ -dumpfullversion -dumpversion)"
+          gnu_number="$(printf '%s\n' "$version" | awk -F. '{printf "%d", $1*10000+($2+0)*100+($3+0)}')"
+          g++ -std=c++17 -fno-exceptions -O2 -Wall -Wextra -Werror source.cpp driver.cpp -o reference
+          ./reference >expected.out 2>expected.err
+          test "$(cat expected.out)" = "OK"
+          "$driver" native.o --typeid-native --g++ --c++17 --no_exceptions --no_strict_gnu \
+            --gnu_version "$gnu_number" source.cpp >compile.log 2>&1 || {
+              cat compile.log >&2
+              exit 1
+            }
+          test "$(od -An -tx1 -N4 native.o | tr -d '[:space:]')" = 7f454c46
+          g++ -std=c++17 -fno-exceptions native.o driver.cpp -o native
+          ./native >actual.out 2>actual.err
+          test "$(sha256sum expected.out | cut -d' ' -f1)" = "$(sha256sum actual.out | cut -d' ' -f1)"
+          test "$(sha256sum expected.err | cut -d' ' -f1)" = "$(sha256sum actual.err | cut -d' ' -f1)"
+          for mode in leaves cfg; do
+            "$driver" "native-$mode.o" --typeid-native "--typeid-inline=$mode" \
+              --g++ --c++17 --no_exceptions --no_strict_gnu \
+              --gnu_version "$gnu_number" source.cpp >"$mode.log" 2>&1 || {
+                cat "$mode.log" >&2
+                exit 1
+              }
+            g++ "native-$mode.o" driver.cpp -o "native-$mode"
+            "./native-$mode" >"$mode.out" 2>"$mode.err"
+            test "$(sha256sum expected.out | cut -d' ' -f1)" = "$(sha256sum "$mode.out" | cut -d' ' -f1)"
+            test "$(sha256sum expected.err | cut -d' ' -f1)" = "$(sha256sum "$mode.err" | cut -d' ' -f1)"
+          done
+          echo 'CXX5_P0 pointer_assignment_as_value=full_gxx_runtime_parity modes=plain,leaves,cfg' >>"$GITHUB_STEP_SUMMARY"
 
       - name: Execute EDG-native function pointer formal via real SysV indirect call
         working-directory: edgcpp/build/gcc-release
