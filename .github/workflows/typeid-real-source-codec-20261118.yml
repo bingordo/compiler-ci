@@ -1,0 +1,71 @@
+# Temporary immutable-source IR codec profile. Do not merge this workflow.
+name: TypeId real-source serialization corpus
+on:
+  push:
+    branches: [ci/typeid-real-source-codec-20261118]
+    paths:
+      - '.github/workflows/typeid-real-source-codec-20261118.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  real-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: 3adb223aa275064bf279ced508ebca964ca147ae
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Check out exact private compiler revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 3adb223aa275064bf279ced508ebca964ca147ae
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source, configure public frontend fetch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          python3 -m unittest discover -s compiler/tools/tests -p 'test_bench_typeid_source_codec.py' -v
+      - name: Reuse release compiler objects
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-real-source-codec
+      - name: Build production compiler and codec bench
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo build --release -p compiler --bin compiler
+          cargo build --release -p compiler-ir --bin ir-codec-bench --bin ir-tool
+      - name: Capture real source snapshots and verified codec metrics
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/bench_typeid_source_codec.py \
+            --compiler target/release/compiler \
+            --ir-tool target/release/ir-tool \
+            --bench target/release/ir-codec-bench \
+            --output-dir "$RUNNER_TEMP/ir-corpus" \
+            --iterations 30 \
+            crates/driver/tests/fixtures/wasm32_checked_minic.c \
+            tests/fixtures/inliner/rolling_checksum.c \
+            | tee "$RUNNER_TEMP/ir-codec-source-summary.log"
+          test -s "$RUNNER_TEMP/ir-corpus/metrics.json"
+          grep -F 'IR_CODEC_SOURCE_SUMMARY sources=2' "$RUNNER_TEMP/ir-codec-source-summary.log"
+      - name: Publish machine-readable benchmark summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: typeid-real-source-codec-metrics
+          path: |
+            ${{ runner.temp }}/ir-corpus/metrics.json
+            ${{ runner.temp }}/ir-codec-source-summary.log
+          if-no-files-found: ignore
+          retention-days: 30
