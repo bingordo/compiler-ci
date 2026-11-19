@@ -1,0 +1,60 @@
+name: Shared remat observer exact ELF parity and source rejection reasons
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/verify-remat-observer-20261119.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  remat-observer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: bbe10c0526e2edc89e2386e191e25ff200c5efbd
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned source and standalone grammar oracles
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "bbe10c0526e2edc89e2386e191e25ff200c5efbd"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          python3 -m unittest discover -s compiler/tools -p 'test_x86_i32_remat_trace_cases.py' -v
+          python3 -m unittest discover -s compiler/tools -p 'test_x86_i32_remat_source_abba.py' -v
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: shared-remat-observer-20261119
+      - name: Test generic planner and x86 behavior, cross-backend, strict Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib remat::tests:: -- --nocapture
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend-aarch64 --lib
+          cargo clippy -p compiler-backend --lib -- --no-deps -D warnings
+          cargo clippy -p compiler-backend-x86 --lib -- --no-deps -D warnings -A dead_code
+      - name: Build actual Mini-C TypeId production compiler
+        working-directory: compiler
+        run: cargo build --release -p compiler --bin compiler
+      - name: Verify exact object bytes with diagnostics off and on; source-specific causes
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/x86_i32_remat_trace_cases.py \
+            --compiler compiler/target/release/compiler \
+            --output remat-observer-results.json
+      - name: Upload all source-level decision logs and physical object evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x86-remat-observer-source-evidence-20261119
+          path: remat-observer-results.json
+          if-no-files-found: warn
