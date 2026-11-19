@@ -48,7 +48,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/edgcpp-rust
-          ref: ${{ inputs.source_ref || '9661e53715090ae93368820cf95ac47f58fa58c9' }}
+          ref: ${{ inputs.source_ref || '65db78987af09906b5758a2968112a9c1fdc7619' }}
           path: edgcpp-rust
           persist-credentials: false
       - name: Record exact revision
@@ -59,7 +59,7 @@ jobs:
           test "${#sha}" -eq 40
           echo "EDG Rust commit: $sha" | tee -a "$GITHUB_STEP_SUMMARY"
           if [[ "${{ github.event_name }}" != workflow_dispatch ]]; then
-            test "$sha" = 9661e53715090ae93368820cf95ac47f58fa58c9
+            test "$sha" = 65db78987af09906b5758a2968112a9c1fdc7619
           fi
       - name: Check out source headers matching the pinned EDG library
         uses: actions/checkout@v4
@@ -175,6 +175,31 @@ jobs:
           cargo test --features codegen --lib exact_prototype_required_and_large_signatures_rejected -- --nocapture
           rustup component add clippy
           cargo clippy --features codegen --lib -- -D clippy::correctness
+      - name: Probe source-owned deep C11 array types against pinned EDG and GCC
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source build/gcc-release/environment.sh
+          dims=""
+          for i in $(seq 1 40); do dims="${dims}[1]"; done
+          printf 'int deep_array%s;\nint main(void) { return sizeof deep_array != sizeof(int); }\n' "$dims" \
+            >build/gcc-release/deep-native-array-40.c
+          cd build/gcc-release
+          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" \
+            --example parse -- --c11 deep-native-array-40.c >"$RUNNER_TEMP/deep-native-array-40.log" 2>&1
+          grep -Fq 'EDG status: 0' "$RUNNER_TEMP/deep-native-array-40.log"
+          gcc -std=c11 -O0 -Wall -Wextra -Werror deep-native-array-40.c \
+            -o "$RUNNER_TEMP/deep-native-array-40"
+          "$RUNNER_TEMP/deep-native-array-40"
+          echo 'Pinned EDG and GCC accept a real 40-dimensional C11 array' >> "$GITHUB_STEP_SUMMARY"
+      - name: Check iterative Rust aggregate layout, copy and cycle boundaries
+        working-directory: edgcpp-rust
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test --lib --features codegen audit_deep_native_array_layout_tests -- --nocapture
+
       - name: Validate ordered EDG startup wire records
         working-directory: edgcpp-rust
         run: |
@@ -320,6 +345,7 @@ jobs:
             ${{ runner.temp }}/cout-base-offset.log
             ${{ runner.temp }}/cout-include-search.log
             ${{ runner.temp }}/edg-graph-scope-scaling.log
+            ${{ runner.temp }}/deep-native-array-40.log
             ${{ runner.temp }}/lifetime-c11.log
             ${{ runner.temp }}/lifetime-cpp20.log
           if-no-files-found: ignore
