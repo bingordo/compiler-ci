@@ -1,0 +1,51 @@
+# Source-pinned IR serialization regression; do not merge this temporary workflow.
+name: IR LTO sidecar binding admission (source pinned)
+on:
+  push:
+    branches: [ci/ir-sidecar-bind-admission-20261118]
+    paths:
+      - '.github/workflows/ir-sidecar-bind-admission-20261118.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sidecar-admission:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      SOURCE_SHA: 809c93712a2d2d31d429df7a9bcfdaab4ec8119b
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Check out exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 809c93712a2d2d31d429df7a9bcfdaab4ec8119b
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify immutable source and isolate IR crate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          printf '[workspace]\nresolver = "2"\nmembers = ["crates/ir"]\n' > compiler/Cargo.toml
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: lto-sidecar-bind-admission
+      - name: Run sidecar and LTO regression tests
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test lto_target_envelope -- --nocapture
+          cargo test -p compiler-ir --test lto_envelope_merge -- --nocapture
+          cargo test -p compiler-ir --test native_binary_corruption_matrix -- --nocapture
+          cargo test -p compiler-ir
+      - name: Strict IR clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir --all-targets -- -D warnings
