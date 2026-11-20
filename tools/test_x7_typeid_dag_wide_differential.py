@@ -8,7 +8,7 @@ from x7_typeid_dag_wide_differential import EDGE_VALUES, HARNESS, generated_case
 
 class WideDifferentialTests(unittest.TestCase):
     def test_corpus_stable_and_strict_source_count(self):
-        root = Path(__file__).resolve().parents[2] / "compiler"
+        root = Path(__file__).resolve().parents[1] / "compiler"
         a = generated_cases(root)
         b = generated_cases(root)
         self.assertEqual(a, b)
