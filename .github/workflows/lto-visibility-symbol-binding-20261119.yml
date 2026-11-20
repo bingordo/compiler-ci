@@ -1,0 +1,57 @@
+# Temporary exact-compiler-SHA validation: visibility metadata admission.
+name: LTO visibility symbol binding (pinned)
+on:
+  push:
+    branches: [ci/lto-visibility-symbol-binding-20261119]
+    paths:
+      - '.github/workflows/lto-visibility-symbol-binding-20261119.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  visibility:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 28
+    env:
+      SOURCE_SHA: 2720bc2e7dde84415070eeb87c54edfd6450f1b5
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2720bc2e7dde84415070eeb87c54edfd6450f1b5
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source SHA and configure public frontend dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: lto-visibility-symbol-binding
+      - name: IR LTO metadata contract and binary admission regression
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test lto_target_envelope -- --nocapture
+          cargo test -p compiler-ir --test lto_envelope_merge
+          cargo test -p compiler-ir --test native_binary_v1
+      - name: Strict scoped Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir --lib --test lto_target_envelope -- -D warnings
+      - name: Production Mini-C LTO and source-level ELF visibility matrix
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test lto_elf_visibility -- --nocapture
+          cargo test -p compiler --test lto_source_sidecar -- --nocapture
+          cargo test -p compiler --test lto_coemit -- --nocapture
+      - name: Validate mixed linker co-emitted visibility
+        working-directory: compiler
+        run: cargo test -p compiler --test lto_mixed_link -- --nocapture
