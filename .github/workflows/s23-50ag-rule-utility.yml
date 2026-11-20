@@ -1,0 +1,163 @@
+name: S23.50ag generated rule incremental utility and source snapshots
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-50ag-rule-utility.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  generated-utility:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact private compiler SHA (no compiler Actions)
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5c842858801edc1eea7582b91a4510ce977460eb
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin source and Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 5c842858801edc1eea7582b91a4510ce977460eb
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          mkdir -p results
+          rustc --version
+          python3 --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: s2350ag-utility-88
+      - name: Run source generator self-tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools/typeid-rule-gen -p 'test_native_casegen.py' -v
+          python3 -m unittest discover -s tools/typeid-rule-gen -p 'test_native_nearmiss_codegen.py' -v
+      - name: Measure all 8540 source-driven TypeId default-on vs handwritten-only cases
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --features experimental-typeid-generated-rewrites \
+            --test native_s2350ag_generated_utility -- --nocapture \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/s2350ag-generated-utility.log"
+          python3 - "$GITHUB_WORKSPACE/results/s2350ag-generated-utility.log" <<'PY'
+          import re,sys
+          text=open(sys.argv[1]).read()
+          rows=re.findall(r'S2350AG_FAMILY name=(\S+) cases=(\d+) better=(\d+) equal=(\d+) worse=(\d+) saved=(\d+) added=(\d+) handwritten_insts=(\d+) default_insts=(\d+)',text)
+          assert len(rows)==88, len(rows)
+          m=re.search(r'S2350AG_SUMMARY families=(\d+) orientations=(\d+) cases=(\d+) better=(\d+) equal=(\d+) worse=(\d+) saved=(\d+) added=(\d+) input_insts=(\d+) handwritten_insts=(\d+) default_insts=(\d+) handwritten_rewrites=(\d+) default_rewrites=(\d+)',text)
+          assert m is not None
+          values=list(map(int,m.groups()))
+          assert values[:3]==[88,2135,8540],values
+          assert values[3]+values[4]+values[5]==8540
+          assert values[3]>0 and values[5]==0 and values[7]==0,values
+          assert sum(int(r[1]) for r in rows)==8540
+          assert sum(int(r[6]) for r in rows)==0
+          print('S2350AG_SOURCE_COUNT_PASS families=88 cases=8540')
+          PY
+      - name: Check existing independent bitvector oracle and native SSA admission
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test native_s2350ad_generated_semantics -- --nocapture
+          cargo test -p compiler-opt --test native_s2350z_generated_matrix -- --nocapture
+          cargo test -p compiler-opt --test native_s2350aa_generated_nearmisses -- --nocapture
+      - name: Strict scoped Clippy and handwritten-only build
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --test native_s2350ag_generated_utility -- \
+            -D warnings -A unused-variables
+          cargo check -p compiler-opt --no-default-features
+      - name: Save incremental utility measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2350ag-utility-88rule-synthetic
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
+  verified-source-cost:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout same exact private compiler SHA (no compiler Actions)
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5c842858801edc1eea7582b91a4510ce977460eb
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and initialize result workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 5c842858801edc1eea7582b91a4510ce977460eb
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          mkdir -p results
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: s2350ag-verified-source-88
+      - name: Reuse immutable S23.48 source TypeId snapshots
+        uses: actions/download-artifact@v4
+        with:
+          name: s23-48-exact-source-typeid-stage-attribution
+          run-id: 43349934825
+          repository: bingordo/compiler-ci
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: captured
+      - name: Verify source provenance and denominator
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s captured/typeid_snapshots/manifest.tsv
+          test -s captured/s23-47-source-capture.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          x=json.loads(Path("captured/s23-47-source-capture.json").read_text())
+          assert (x['attempted'],x['accepted'],x['rejected'])==(46,44,2)
+          assert len(x['accepted_cases'])==44
+          assert len(Path('captured/typeid_snapshots/manifest.tsv').read_text().splitlines())==44
+          print("S2350AG_PROVENANCE cases=44 stages=88 preserved")
+          PY
+      - name: Refresh S23.51 optimizer round cost against current 88-rule source
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          S2351_SNAPSHOT_DIR="$GITHUB_WORKSPACE/captured/typeid_snapshots" \
+            cargo test --release -p compiler-opt \
+            --features experimental-typeid-generated-rewrites \
+            --test native_s2351_matcher_cost -- --nocapture \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/s2350ag-source-cost.log"
+          python3 tools/s23_51_parse_matcher_cost.py \
+            --capture "$GITHUB_WORKSPACE/captured/s23-47-source-capture.json" \
+            --log "$GITHUB_WORKSPACE/results/s2350ag-source-cost.log" \
+            --output "$GITHUB_WORKSPACE/results/s2350ag-source-cost.json" \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/s2350ag-source-summary.log"
+          grep '^S2351_ACCOUNTING attempted=46 accepted=44 rejected=2 cases=88' \
+            "$GITHUB_WORKSPACE/results/s2350ag-source-summary.log"
+          grep '^S2351_COHORT ' \
+            "$GITHUB_WORKSPACE/results/s2350ag-source-summary.log" >> "$GITHUB_STEP_SUMMARY"
+      - name: Save current-source profiler measurements and provenance
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2350ag-verified-source-88rule-cost
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
