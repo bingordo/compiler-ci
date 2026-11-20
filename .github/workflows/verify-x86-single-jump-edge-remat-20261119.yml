@@ -1,0 +1,68 @@
+name: x86 GP32 sole-jump PHI edge source-to-native remat pilot and oracle
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/verify-x86-single-jump-edge-remat-20261119.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-phi-edge-remat:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 80
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact pilot source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 39840cab9dcbebd641245dae53e5b3874ceaf005
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin check and pure checked-source tests
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "39840cab9dcbebd641245dae53e5b3874ceaf005"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          python3 -m unittest discover -s compiler/tools -p 'test_x86_edge_imm_native_ab.py' -v
+          python3 -m unittest discover -s compiler/tools -p 'test_x86_i32_remat_trace_cases.py' -v
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x86-sole-jump-edge-remat-20261119
+      - name: Generated structural SSA proof, physical scheduling, all backend tests and strict Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib edge_imm::tests:: -- --nocapture
+          cargo test -p compiler-backend-x86 --lib parallel_copy::tests::
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend --lib remat::tests::
+          cargo clippy -p compiler-backend-x86 --lib -- --no-deps -D warnings
+          cargo clippy -p compiler-backend --lib -- --no-deps -D warnings
+      - name: Build current real production Mini-C TypeId compiler
+        working-directory: compiler
+        run: cargo build --release -p compiler --bin compiler
+      - name: Nine checked source samples, both native objects and separate GCC runtime oracle
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          python3 compiler/tools/x86_edge_imm_native_ab.py \
+            --compiler compiler/target/release/compiler \
+            --output results/sole-jump-edge-remat-native-ab.json
+      - name: Verify unchanged reference trace source consistency
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/x86_i32_remat_trace_cases.py \
+            --compiler compiler/target/release/compiler \
+            --output results/sole-jump-edge-remat-trace.json
+      - name: Upload complete native A/B objects and planner evidence JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x86-gp32-single-jump-edge-remat-20261119
+          path: results/*.json
+          if-no-files-found: warn
