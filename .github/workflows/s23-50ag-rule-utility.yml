@@ -19,7 +19,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 5c842858801edc1eea7582b91a4510ce977460eb
+          ref: 3268c71af1615c3fe5a867582b979f97c1c1a0da
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C compiler rev-parse HEAD)" = 5c842858801edc1eea7582b91a4510ce977460eb
+          test "$(git -C compiler rev-parse HEAD)" = 3268c71af1615c3fe5a867582b979f97c1c1a0da
           git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
           mkdir -p results
           rustc --version
@@ -97,7 +97,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 5c842858801edc1eea7582b91a4510ce977460eb
+          ref: 3268c71af1615c3fe5a867582b979f97c1c1a0da
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -105,7 +105,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C compiler rev-parse HEAD)" = 5c842858801edc1eea7582b91a4510ce977460eb
+          test "$(git -C compiler rev-parse HEAD)" = 3268c71af1615c3fe5a867582b979f97c1c1a0da
           git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
           mkdir -p results
       - uses: Swatinem/rust-cache@v2
@@ -153,6 +153,70 @@ jobs:
             "$GITHUB_WORKSPACE/results/s2350ag-source-summary.log"
           grep '^S2351_COHORT ' \
             "$GITHUB_WORKSPACE/results/s2350ag-source-summary.log" >> "$GITHUB_STEP_SUMMARY"
+      - name: Reconcile source rule hits with retained TypeId utility
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$GITHUB_WORKSPACE/results/s2350ag-source-cost.log" \
+            "$GITHUB_WORKSPACE/results/s2350ag-source-utility.json" <<'PY'
+          import json
+          import sys
+          from collections import Counter
+          from pathlib import Path
+          rows, matches = [], []
+          for line in Path(sys.argv[1]).read_text().splitlines():
+              if line.startswith("S2350AG_REAL_SOURCE "):
+                  fields=dict(x.split("=",1) for x in line.split()[1:])
+                  assert set(fields)=={"id","cohort","stage","root_hits","handwritten_insts",
+                                      "default_insts","saved","added"},fields
+                  row={k:(int(v) if k in {"root_hits","handwritten_insts",
+                         "default_insts","saved","added"} else v) for k,v in fields.items()}
+                  assert row["stage"] in {"entry","prenative"}
+                  assert row["saved"]==max(row["handwritten_insts"]-row["default_insts"],0)
+                  assert row["added"]==max(row["default_insts"]-row["handwritten_insts"],0)
+                  rows.append(row)
+              elif line.startswith("S2350AG_REAL_RULE "):
+                  fields=dict(x.split("=",1) for x in line.split()[1:])
+                  assert set(fields)=={"id","cohort","stage","rule","hits"},fields
+                  fields["hits"]=int(fields["hits"])
+                  matches.append(fields)
+          assert len(rows)==88, len(rows)
+          assert len({(r["id"],r["stage"]) for r in rows})==88
+          assert sum(r["root_hits"] for r in rows)==68
+          assert sum(r["root_hits"] for r in rows)==sum(r["hits"] for r in matches)
+          assert all(r["handwritten_insts"]==r["default_insts"]
+                     for r in rows if r["root_hits"]==0)
+          assert all(r["cohort"]=="authored_boolean_control"
+                     for r in rows if r["root_hits"]>0)
+          histogram=dict(sorted(Counter({}).items()))
+          counter=Counter()
+          for match in matches:
+              counter[match["rule"]]+=match["hits"]
+          histogram=dict(sorted(counter.items()))
+          data={
+            "schema":"compiler.s2350ag-verified-source-utility.v1",
+            "compiler_sha":"3268c71af1615c3fe5a867582b979f97c1c1a0da",
+            "provenance":"s2347_s2348_verified_snapshots_44_cases_88_stages",
+            "stage_cases":len(rows),
+            "source_root_hits":sum(r["root_hits"] for r in rows),
+            "source_saved_insts":sum(r["saved"] for r in rows),
+            "source_added_insts":sum(r["added"] for r in rows),
+            "rule_hits":histogram,
+            "cases":rows,
+          }
+          Path(sys.argv[2]).write_text(json.dumps(data,indent=2,sort_keys=True)+"\n")
+          print("S2350AG_REAL_SUMMARY source_stages=88 root_hits=68 "
+                f"saved={data['source_saved_insts']} added={data['source_added_insts']} "
+                f"rule_families={len(histogram)}")
+          print("S2350AG_REAL_HISTOGRAM",histogram)
+          PY
+      - name: Strict scoped S23.51 attribution Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --test native_s2351_matcher_cost -- \
+            -D warnings -A unused-variables
       - name: Save current-source profiler measurements and provenance
         if: always()
         uses: actions/upload-artifact@v4
