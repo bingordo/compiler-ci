@@ -126,7 +126,7 @@ probe_generated_c() {
   set -e
   ended=$(date +%s)
   if [[ -s "$timed_log" ]]; then
-    rss=$(sed -n 's/^PEAK_RSS_KB=\\([0-9][0-9]*\\)$/\\1/p' "$timed_log" | head -n 1)
+    rss=$(awk -F= '/^PEAK_RSS_KB=[0-9]+$/ {print $2; exit}' "$timed_log")
     [[ -n "$rss" ]] || rss="unavailable"
   fi
   echo "${prefix}_EXIT=$rc"
