@@ -96,43 +96,67 @@ for kind in alignment linkage abi naked control_globals weak_function section_fu
   grep -m 1 '^EDG_PROBE_RESULT ' "/audit-tmp/edg-gnu-${kind}.log" || true
 done
 
-# Probe a SMALL real generated TU first; previously we attempted the 53.6
-# MiB compiler-ir output and EDG segfaulted (139) before TypeId lowering.
-# Keep private source lines, symbols and EDG's enormous raw IL dump off logs.
-echo "EDG_C_SAMPLE_BYTES=$(stat -c %s "$AUDIT_SOURCE")"
-set +e
-(
-  cd /workspace/edgcpp/build/gcc-release
-  timeout --signal=TERM --kill-after=10s 90s \
-    "$parser" --gcc --c11 --no_strict_gnu --gnu_version "$gnu_number" "${include_args[@]}" "$AUDIT_SOURCE"
-) > /audit-tmp/edg-generated-c-parse.log 2>&1
-parse_rc=$?
-set -e
-echo "EDG_C_PARSE_EXIT=$parse_rc"
-grep -m 1 '^EDG_PROBE_RESULT ' /audit-tmp/edg-generated-c-parse.log || true
-if (( parse_rc >= 128 )); then
-  echo "EDG_C_PARSE_CLASS=process_signal_or_crash"
-elif (( parse_rc != 0 )); then
-  echo "EDG_C_PARSE_CLASS=frontend_or_bridge_rejection"
-else
-  echo "EDG_C_PARSE_CLASS=accepted"
-fi
+# Record bounded, source-free process evidence separately from the EDG
+# parser's own diagnostics. In particular, distinguish timeout's 124/137
+# status from a genuine signal and memory pressure from fast parser failure.
+# GNU time is optional in the pinned container: absence is reported as an
+# unknown memory measurement, not mistaken for zero RSS.
+probe_generated_c() {
+  local prefix="$1" input="$2" limit="$3" logfile="$4"
+  local started ended rc rss="unavailable" timed_log="${logfile}.resources"
+  echo "${prefix}_BYTES=$(stat -c %s "$input")"
+  started=$(date +%s)
+  set +e
+  if [[ -x /usr/bin/time ]]; then
+    (
+      cd /workspace/edgcpp/build/gcc-release
+      timeout --signal=TERM --kill-after=10s "$limit" \
+        /usr/bin/time -f 'PEAK_RSS_KB=%M' -o "$timed_log" \
+          "$parser" --gcc --c11 --no_strict_gnu --gnu_version "$gnu_number" "${include_args[@]}" "$input"
+    ) > "$logfile" 2>&1
+    rc=$?
+  else
+    (
+      cd /workspace/edgcpp/build/gcc-release
+      timeout --signal=TERM --kill-after=10s "$limit" \
+        "$parser" --gcc --c11 --no_strict_gnu --gnu_version "$gnu_number" "${include_args[@]}" "$input"
+    ) > "$logfile" 2>&1
+    rc=$?
+  fi
+  set -e
+  ended=$(date +%s)
+  if [[ -s "$timed_log" ]]; then
+    rss=$(awk -F= '/^PEAK_RSS_KB=[0-9]+$/ {print $2; exit}' "$timed_log")
+    [[ -n "$rss" ]] || rss="unavailable"
+  fi
+  echo "${prefix}_EXIT=$rc"
+  echo "${prefix}_WALL_SECONDS=$((ended-started))"
+  echo "${prefix}_PEAK_RSS_KB=$rss"
+  grep -m 1 '^EDG_PROBE_RESULT ' "$logfile" || true
+  case "$rc" in
+    0) echo "${prefix}_CLASS=accepted" ;;
+    124|137) echo "${prefix}_CLASS=timeout_or_forced_kill" ;;
+    139) echo "${prefix}_CLASS=segmentation_fault" ;;
+    134) echo "${prefix}_CLASS=abort_signal" ;;
+    1|2) echo "${prefix}_CLASS=frontend_or_bridge_rejection" ;;
+    *) if (( rc >= 128 )); then
+         echo "${prefix}_CLASS=other_signal"
+       else
+         echo "${prefix}_CLASS=other_nonzero"
+       fi ;;
+  esac
+}
 
-# Keep the previous large-input crash as an independently reported scaling
-# gate, separate from any successful small-input syntax/ABI result.
+# Probe a SMALL real generated TU first; the previously failing 53.6 MiB
+# compiler-ir output is separately measured, and never treated as accepted
+# just because the smaller source parses. No private source excerpts logged.
+echo "EDG_C_SAMPLE_BYTES=$(stat -c %s "$AUDIT_SOURCE")"
+probe_generated_c EDG_C_PARSE "$AUDIT_SOURCE" 90s /audit-tmp/edg-generated-c-parse.log
+
 if [[ -n "${AUDIT_LARGE_SOURCE:-}" && -s "$AUDIT_LARGE_SOURCE" &&
       "$AUDIT_LARGE_SOURCE" != "$AUDIT_SOURCE" ]]; then
   echo "EDG_C_LARGE_BYTES=$(stat -c %s "$AUDIT_LARGE_SOURCE")"
-  set +e
-  (
-    cd /workspace/edgcpp/build/gcc-release
-    timeout --signal=TERM --kill-after=10s 90s \
-      "$parser" --gcc --c11 --no_strict_gnu --gnu_version "$gnu_number" "${include_args[@]}" "$AUDIT_LARGE_SOURCE"
-  ) > /audit-tmp/edg-large-c-parse.log 2>&1
-  large_rc=$?
-  set -e
-  echo "EDG_C_LARGE_PARSE_EXIT=$large_rc"
-  grep -m 1 '^EDG_PROBE_RESULT ' /audit-tmp/edg-large-c-parse.log || true
+  probe_generated_c EDG_C_LARGE_PARSE "$AUDIT_LARGE_SOURCE" 90s /audit-tmp/edg-large-c-parse.log
 fi
 
 # Frontend acceptance alone proves nothing about attribute-aware ELF.
