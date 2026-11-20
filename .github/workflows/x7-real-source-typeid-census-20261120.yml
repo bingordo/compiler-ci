@@ -1,0 +1,127 @@
+name: X7 source-pinned real C TypeId selector census
+on:
+  pull_request:
+    paths: ['.github/workflows/x7-real-source-typeid-census-20261120.yml']
+permissions:
+  contents: read
+jobs:
+  source-typeid-census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 69c1e92ba4645a829f70b6e38e0f21f046c5842c
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin compiler, configure public frontend dependency and build
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "69c1e92ba4645a829f70b6e38e0f21f046c5842c"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+          rustc --version
+          cargo build --release --manifest-path compiler/Cargo.toml -p compiler --bin compiler
+      - name: 12 pinned musl sources and 5 authored Boolean probes with opt-in selector trace
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess, sys, tempfile
+          from pathlib import Path
+          root=Path("compiler").resolve()
+          sys.path.insert(0,str(root/"tools"))
+          from s23_native_profile_source import PROBE_SOURCE, NAMES, pinned_sources
+          from x7_typeid_selection_telemetry import summarize
+          sources,digest=pinned_sources(root)
+          binary=root/"target/release/compiler"
+          assert binary.is_file() and len(NAMES)==12
+          with tempfile.TemporaryDirectory() as temp:
+              td=Path(temp)
+              probe=td/"five_controlled_boolean_functions.c"
+              probe.write_text(PROBE_SOURCE)
+              cases={**sources,"controlled_five_boolean":probe}
+              # Grouped TU of unchanged original function bodies, explicitly
+              # artificial (not a faithful original upstream TU).
+              group=td/"combined_extracted.c"
+              group.write_bytes(b"\n".join(sources[n].read_bytes() for n in NAMES)+b"\n")
+              cases["combined_extracted"]=group
+              summary={}
+              all_events=[]
+              for name,src in cases.items():
+                  responses=[]
+                  for enabled in (False, True):
+                      output=td/(name+("-trace" if enabled else "-plain")+".o")
+                      cmd=[str(binary),str(src),"--language","mini-c",
+                           "--ir","typeid","--emit","obj","-o",str(output)]
+                      env=os.environ.copy()
+                      if enabled: env["X7_TYPEID_SELECT_TRACE"]="1"
+                      else: env.pop("X7_TYPEID_SELECT_TRACE",None)
+                      p=subprocess.run(cmd,env=env,text=True,capture_output=True,
+                          timeout=70,check=False)
+                      if p.returncode:
+                          raise RuntimeError(f"{name}: compiler failed exit={p.returncode} stderr={p.stderr[-2000:]}")
+                      if not output.is_file():
+                          raise RuntimeError(f"{name}: missing object file")
+                      events=[line for line in p.stderr.splitlines() if line.startswith("X7_TYPEID_SELECT")]
+                      if not enabled and events:
+                          raise RuntimeError(f"{name}: trace emitted without opt-in")
+                      if enabled:
+                          (Path("results")/(name+".trace.log")).write_text("\n".join(events)+"\n")
+                          all_events.extend(events)
+                      responses.append((hashlib.sha256(output.read_bytes()).hexdigest(),
+                                        output.stat().st_size, summarize(events)))
+                  if responses[0][:2]!=responses[1][:2]:
+                      raise RuntimeError(f"{name}: opt-in trace changed output object")
+                  trace=responses[1][2]
+                  summary[name]={"source_sha256":hashlib.sha256(src.read_bytes()).hexdigest(),
+                      "elf_object_sha256":responses[0][0],
+                      "object_bytes":responses[0][1],
+                      "selector":trace}
+                  print("X7_REAL_SOURCE",name,"attempts",trace["attempts"],
+                        "hits",trace["hits"],"misses",trace["misses"],flush=True)
+              aggregate=summarize(all_events)
+              report={"schema_version":1,
+                  "compiler_sha":"69c1e92ba4645a829f70b6e38e0f21f046c5842c",
+                  "corpus":"12 pinned musl function extracts + artificial combined TU + 5 authored boolean probes",
+                  "musl_source_digest":digest,"source_cases":summary,
+                  "aggregate":aggregate,
+                  "trace_off_object_parity_verified":True,
+                  "actual_runtime_compiler_runs":len(cases)*2,
+                  "new_generated_dag_candidate_selection_proven":False}
+              Path("results/summary.json").write_text(json.dumps(report,indent=2,sort_keys=True)+"\n")
+              assert len(summary)==14
+              assert aggregate["attempts"]==sum(x["selector"]["attempts"] for x in summary.values())
+              print("X7_REAL_CENSUS_TOTAL",json.dumps(
+                  {k:aggregate[k] for k in ("attempts","hits","misses")},sort_keys=True))
+          PY
+          python3 - <<'PY'
+          import json
+          d=json.load(open("results/summary.json"))
+          a=d["aggregate"]
+          assert d["trace_off_object_parity_verified"]
+          assert not d["new_generated_dag_candidate_selection_proven"]
+          assert a["hits"]>0 and a["attempts"]>0
+          with open("results/report.md","w") as f:
+              f.write("# X7 actual source TypeId selection census\n\n")
+              f.write("Compiler source: `"+d["compiler_sha"]+"`\n\n")
+              f.write("Pinned musl source digest: `"+d["musl_source_digest"]+"`\n\n")
+              f.write(f"Actual selection attempts: {a['attempts']}, hits: {a['hits']}, misses: {a['misses']}.\n\n")
+              f.write("Trace disabled produced identical object bytes. No generated-pattern admission is implied.\n\n")
+              f.write("| Case | Hits | Misses | Attempts |\n|---|---:|---:|---:|\n")
+              for name,rec in sorted(d["source_cases"].items()):
+                  s=rec["selector"]
+                  f.write(f"| {name} | {s['hits']} | {s['misses']} | {s['attempts']} |\n")
+          PY
+          cat results/report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-real-source-typeid-census
+          path: results/
+          retention-days: 30
