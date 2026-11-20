@@ -150,10 +150,12 @@ probe_generated_c() {
 # Probe a SMALL real generated TU first; the previously failing 53.6 MiB
 # compiler-ir output is separately measured, and never treated as accepted
 # just because the smaller source parses. No private source excerpts logged.
+echo "EDG_C_SAMPLE_BYTES=$(stat -c %s "$AUDIT_SOURCE")"
 probe_generated_c EDG_C_PARSE "$AUDIT_SOURCE" 90s /audit-tmp/edg-generated-c-parse.log
 
 if [[ -n "${AUDIT_LARGE_SOURCE:-}" && -s "$AUDIT_LARGE_SOURCE" &&
       "$AUDIT_LARGE_SOURCE" != "$AUDIT_SOURCE" ]]; then
+  echo "EDG_C_LARGE_BYTES=$(stat -c %s "$AUDIT_LARGE_SOURCE")"
   probe_generated_c EDG_C_LARGE_PARSE "$AUDIT_LARGE_SOURCE" 90s /audit-tmp/edg-large-c-parse.log
 fi
 
