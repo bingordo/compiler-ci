@@ -75,7 +75,7 @@ def generated_cases(compiler_root):
     def expr(rng, depth):
         if depth == 0 or rng.randrange(7) == 0:
             return rng.choice(LEAVES)
-        return "(" + expr(rng, depth - 1) + rng.choice(OPS) + expr(rng, depth - 1) + ")"
+        return "(" + expr(rng, depth - 1) + " " + rng.choice(OPS) + " " + expr(rng, depth - 1) + ")"
     for n in range(48):
         rng = random.Random(SEED + n)
         body = expr(rng, 3)
