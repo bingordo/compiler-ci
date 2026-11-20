@@ -102,7 +102,7 @@ done
 # GNU time is optional in the pinned container: absence is reported as an
 # unknown memory measurement, not mistaken for zero RSS.
 probe_generated_c() {
-  local prefix="$1" input="$2" limit="$3" logfile="$4"
+  local prefix="$1" input="$2" limit="$3" logfile="$4" stack_kb="${5:-}"
   local started ended rc rss="unavailable" timed_log="${logfile}.resources"
   echo "${prefix}_BYTES=$(stat -c %s "$input")"
   started=$(date +%s)
@@ -110,6 +110,7 @@ probe_generated_c() {
   if [[ -x /usr/bin/time ]]; then
     (
       cd /workspace/edgcpp/build/gcc-release
+      if [[ -n "$stack_kb" ]]; then ulimit -s "$stack_kb"; fi
       timeout --signal=TERM --kill-after=10s "$limit" \
         /usr/bin/time -f 'PEAK_RSS_KB=%M' -o "$timed_log" \
           "$parser" --gcc --c11 --no_strict_gnu --gnu_version "$gnu_number" "${include_args[@]}" "$input"
@@ -118,6 +119,7 @@ probe_generated_c() {
   else
     (
       cd /workspace/edgcpp/build/gcc-release
+      if [[ -n "$stack_kb" ]]; then ulimit -s "$stack_kb"; fi
       timeout --signal=TERM --kill-after=10s "$limit" \
         "$parser" --gcc --c11 --no_strict_gnu --gnu_version "$gnu_number" "${include_args[@]}" "$input"
     ) > "$logfile" 2>&1
@@ -129,6 +131,7 @@ probe_generated_c() {
     rss=$(awk -F= '/^PEAK_RSS_KB=[0-9]+$/ {print $2; exit}' "$timed_log")
     [[ -n "$rss" ]] || rss="unavailable"
   fi
+  last_generated_c_probe_rc=$rc
   echo "${prefix}_EXIT=$rc"
   echo "${prefix}_WALL_SECONDS=$((ended-started))"
   echo "${prefix}_PEAK_RSS_KB=$rss"
@@ -157,6 +160,16 @@ if [[ -n "${AUDIT_LARGE_SOURCE:-}" && -s "$AUDIT_LARGE_SOURCE" &&
       "$AUDIT_LARGE_SOURCE" != "$AUDIT_SOURCE" ]]; then
   echo "EDG_C_LARGE_BYTES=$(stat -c %s "$AUDIT_LARGE_SOURCE")"
   probe_generated_c EDG_C_LARGE_PARSE "$AUDIT_LARGE_SOURCE" 90s /audit-tmp/edg-large-c-parse.log
+  # Only after a genuine SIGSEGV: compare with a 64 MiB parser stack.
+  # Stack sensitivity is evidence, not proof of stack overflow.
+  # Avoid retrying successes, language rejections or timeouts.
+  if (( last_generated_c_probe_rc == 139 )); then
+    echo "EDG_C_LARGE_STACK64M_RETRY=triggered_after_sigsegv"
+    probe_generated_c EDG_C_LARGE_STACK64M_PARSE "$AUDIT_LARGE_SOURCE" 90s \
+      /audit-tmp/edg-large-c-stack64m-parse.log 65536
+  else
+    echo "EDG_C_LARGE_STACK64M_RETRY=not_applicable"
+  fi
 fi
 
 # Frontend acceptance alone proves nothing about attribute-aware ELF.
