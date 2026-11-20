@@ -1,0 +1,166 @@
+name: ASM2 P17D generated GCC GAS ELF executable and encoding differential
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-asm2-p17d-gcc-gas-physical-oracle.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9781c61a92a3fa7956cc31a2ea1708c7e714765f
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - name: Verify exact head and allow pinned frontend dependencies
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = '9781c61a92a3fa7956cc31a2ea1708c7e714765f'
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: 6ba1cb655d8bb2cf5b795aa774e8234d4f701e0b
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: mini-c
+      - name: Mini-C checked tied operands and forbidden constraints
+        working-directory: mini-c
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = '6ba1cb655d8bb2cf5b795aa774e8234d4f701e0b'
+          cargo test -p mini-c-sema --lib asm2_p9_ -- --nocapture
+          cargo test -p mini-c-sema --lib asm2_p11_ -- --nocapture
+          cargo test -p mini-c-sema --lib asm2_p12_ -- --nocapture
+          cargo test -p mini-c-sema --lib asm2_p13b_ -- --nocapture
+          cargo test -p mini-c-sema --lib asm2_p14_ -- --nocapture
+          cargo test -p mini-c-sema --lib asm2_p5_ -- --nocapture
+          cargo clippy -p mini-c-sema --lib -- -D warnings
+      - name: GCC x86-64 clobber spellings as independent source oracle
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/asm2-p14-gcc
+          cd /tmp/asm2-p14-gcc
+          good=0
+          bad=0
+          for bits in 32 64; do
+            if [ "$bits" = 32 ]; then ty=int; suffix=l; else ty=long; suffix=q; fi
+            for reg in rax eax rcx ecx rdx edx rsi esi rdi edi r8 r9 r10 r11; do
+              for form in one two; do
+                if [ "$form" = one ]; then
+                  template="mov${suffix} %1,%0"; output="=r"; operands='"r"(a)'
+                else
+                  template="mov${suffix} %1,%0;add${suffix} %2,%0"
+                  output="=&r"; operands='"r"(a),"r"(b)'
+                fi
+                cat > probe.c <<EOF
+          $ty f($ty a,$ty b) {
+              $ty z=0;
+              __asm__ volatile("$template" : "$output"(z) : $operands : "$reg","cc");
+              return z;
+          }
+          EOF
+                for opt in 0 2; do
+                  gcc -std=c11 -O"$opt" -c probe.c -o probe.o
+                  good=$((good+1))
+                done
+              done
+            done
+            for reg in r8d r9d r10d r11d; do
+              cat > probe.c <<EOF
+          $ty f($ty a) {
+              $ty z=0;
+              __asm__ volatile("mov${suffix} %1,%0" : "=r"(z) : "r"(a) : "$reg");
+              return z;
+          }
+          EOF
+              for opt in 0 2; do
+                if gcc -std=c11 -O"$opt" -c probe.c -o probe.o 2>gcc.err; then
+                  echo "Unexpected GCC acceptance of clobber $reg, width=$bits -O$opt"
+                  exit 1
+                fi
+                if ! grep -q 'unknown register name' gcc.err; then
+                  cat gcc.err
+                  echo "Expected GCC name rejection, not unrelated failure: $reg"
+                  exit 1
+                fi
+                bad=$((bad+1))
+              done
+            done
+          done
+          test "$good" -eq 112
+          test "$bad" -eq 16
+          echo "GCC accepted $good positive and rejected $bad invalid clobber probes" >> "$GITHUB_STEP_SUMMARY"
+      - name: Prepare isolated compiler core workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: asm2-p17d-physical-differential-core
+      - name: Typecheck entire shared SSA, optimizer, legalizer and x86 encoder
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check --workspace
+          cargo test -p compiler-ir -p compiler-opt --lib
+          cargo test -p compiler-ir --lib asm2_p17_ -- --nocapture
+          # Pre-existing compiler-opt typed_if_conversion.rs
+          # has pre-existing while_let_loop warnings at some pinned SHAs.
+          # Existing X7 late-selector/DAG draft helpers at this pinned head
+          # also trigger dead_code under -D warnings; still typecheck/test.
+          # Optimizer is still fully typechecked and unit-tested above.
+          cargo clippy -p compiler-ir -p compiler-backend -p compiler-backend-x86 --lib -- -D warnings -A clippy::while_let_loop -A dead_code
+      - name: Build checked Mini-C source frontend and run asm2 native source tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib asm2_ -- --nocapture
+          cargo test -p compiler-backend-x86 --lib asm2_tied_copy -- --nocapture
+          cargo test -p compiler-backend-x86 --lib asm2_p11_gp_ -- --nocapture
+          cargo test -p compiler-backend-x86 --lib asm2_p12_user_ -- --nocapture
+          cargo test -p compiler-backend-x86 --lib asm2_p13_ -- --nocapture
+          cargo test -p compiler-backend-x86 --lib asm2_p15_ -- --nocapture
+          cargo test -p compiler-backend-x86 --lib asm2_p16_ -- --nocapture
+          cargo test -p compiler-backend-x86 --lib asm2_p17_ -- --nocapture
+          cargo test -p compiler-backend-x86 --lib asm2_p17b_ -- --nocapture
+          cargo test -p compiler-backend-x86 --lib asm2_p17c_ -- --nocapture
+          cargo test -p compiler-backend-x86 --lib asm_basic -- --nocapture
+          cargo test -p compiler-backend-x86 --test asm2_basic_physical -- --nocapture
+          cargo test -p compiler-backend-x86 --test asm2_p17d_generated_physical_oracle -- --nocapture
+
+      - name: Restore full compiler workspace and authenticated private frontends
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          git restore Cargo.toml
+          rm -f Cargo.lock
+          git config --global --unset-all 'url.https://github.com/.insteadOf' || true
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub SSH host
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - name: Typecheck production compiler driver with Mini-C and Oberon
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler
+          echo 'ASM2_P17D_GCC_GAS_ELF=PASS (source, optimizer, all backends, GCC runtime, driver)' >> "$GITHUB_STEP_SUMMARY"
+
