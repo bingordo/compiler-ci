@@ -1,0 +1,120 @@
+name: X7 late physical matcher rejection census
+on:
+  workflow_dispatch:
+  pull_request:
+    paths: ['.github/workflows/x7-late-matcher-rejection-census-20261120.yml']
+permissions:
+  contents: read
+jobs:
+  late-selector:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 59705e60a6781eb4af98f3012f09209303824a68
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Exact compiler source and public frontend
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "59705e60a6781eb4af98f3012f09209303824a68"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+      - name: Rust late matcher, parser, and regression tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          PYTHONPATH=tools python3 -m unittest -v test_x7_late_selection_telemetry
+          cargo test -p compiler-backend-x86 --lib x7_late_selector::tests --quiet
+          cargo build --release -p compiler --bin compiler
+      - name: Real Mini-C TypeId source trace on/off parity
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          mkdir -p ../results
+          f=tools/mini-c-driver/tests/fixtures/m6_musl/isascii.c
+          test -f "$f"
+          X7_LATE_SELECT_TRACE=1 target/release/compiler "$f" --language mini-c --ir typeid --emit obj -o ../results/with-trace.o 2> ../results/with-trace.log
+          env -u X7_LATE_SELECT_TRACE target/release/compiler "$f" --language mini-c --ir typeid --emit obj -o ../results/no-trace.o 2> ../results/no-trace.log
+          cmp ../results/with-trace.o ../results/no-trace.o
+          ! grep -q '^X7_LATE_SELECT' ../results/no-trace.log
+          python3 tools/x7_late_selection_telemetry.py ../results/with-trace.log --out ../results/late-census.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('../results/late-census.json'))
+          assert d["new_production_rules"]==0
+          assert not d["candidate_dag_hashes_observed"]
+          print("X7_LATE_REAL_SOURCE", d["inspected_windows"],d["selected_windows"],d["rejected_windows"])
+          PY
+      - name: Checked-source corpus late matcher decision sweep
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess, sys, tempfile
+          from pathlib import Path
+          sys.path.insert(0,"tools")
+          from x7_late_selection_telemetry import summarize
+          from source_compile_corpus import c_source
+          from s23_native_profile_source import PROBE_SOURCE
+          path=Path("tools/mini-c-driver/tests/fixtures/m6_musl")
+          samples={p.stem:p.read_bytes() for p in sorted(path.glob("*.c"))}
+          samples["authored_boolean_probe"]=PROBE_SOURCE.encode()
+          for shape,n in (("array_loop",8),("array_loop",24),
+                           ("branch_chain",8),("branch_chain",24),
+                           ("call_graph",8)):
+              samples[f"generated_{shape}_{n}"]=c_source(shape,n).encode()
+          assert len(samples)>=15
+          all_events=[]
+          results={}
+          with tempfile.TemporaryDirectory() as td:
+              root=Path(td)
+              for name,src in sorted(samples.items()):
+                  source=root/(name+".c")
+                  source.write_bytes(src)
+                  case=[]
+                  for enabled in (False,True):
+                      output=root/(name+("-on" if enabled else "-off")+".o")
+                      env=os.environ.copy()
+                      if enabled:env["X7_LATE_SELECT_TRACE"]="1"
+                      else:env.pop("X7_LATE_SELECT_TRACE",None)
+                      cp=subprocess.run(["target/release/compiler",str(source),
+                          "--language","mini-c","--ir","typeid","--emit","obj",
+                          "-o",str(output)],env=env,text=True,capture_output=True,
+                          timeout=50,check=False)
+                      if cp.returncode:
+                          raise RuntimeError(f"{name} trace={enabled} exit={cp.returncode}: {cp.stderr[-2000:]}")
+                      rows=[x for x in cp.stderr.splitlines() if x.startswith("X7_LATE_SELECT")]
+                      if not enabled and rows:raise RuntimeError(f"{name}: trace-off leaked")
+                      case.append((hashlib.sha256(output.read_bytes()).hexdigest(),summarize(rows)))
+                      if enabled:all_events.extend(rows)
+                  if case[0][0]!=case[1][0]:
+                      raise RuntimeError(f"{name}: trace changed object code")
+                  info=case[1][1]
+                  results[name]={"source_sha256":hashlib.sha256(src).hexdigest(),
+                      "object_sha256":case[0][0],"decision":info}
+                  print("X7_LATE_SOURCE",name,"inspected",info["inspected_windows"],
+                      "selected",info["selected_windows"],
+                      "rejected",info["rejected_windows"],flush=True)
+          aggregate=summarize(all_events)
+          report={"compiler_sha":"59705e60a6781eb4af98f3012f09209303824a68",
+              "case_count":len(results),"case_results":results,
+              "aggregate":aggregate,"trace_off_object_parity":True,
+              "source_candidate_dag_hashes_observed":False}
+          Path("../results/late-corpus.json").write_text(json.dumps(report,indent=2,sort_keys=True)+"\\n")
+          print("X7_LATE_CORPUS_TOTAL",aggregate["inspected_windows"],
+                aggregate["selected_windows"],aggregate["rejected_windows"],flush=True)
+          print("X7_LATE_REASONS",json.dumps(aggregate["by_decision_policy_width"],sort_keys=True),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-late-source-matcher-census
+          path: results/
+          retention-days: 30
