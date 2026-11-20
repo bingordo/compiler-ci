@@ -1,0 +1,118 @@
+name: X7 inspect actual loaded-left ALU physical windows
+on:
+  pull_request:
+    paths: ['.github/workflows/x7-alu-left-physical-inspection-20261120.yml']
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2cbbb2a25b501652ab3f905175cd3db0e7c397ab
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin source and prepare public frontend
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "2cbbb2a25b501652ab3f905175cd3db0e7c397ab"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+      - name: Build unmodified compiler and two exact generated array-loop sources
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          mkdir -p ../results
+          python3 - <<'PY'
+          from pathlib import Path
+          import sys
+          sys.path.insert(0,"tools")
+          from source_compile_corpus import c_source
+          for size in (8,24):
+              Path(f"../results/array_loop_{size}.c").write_text(c_source("array_loop",size))
+          PY
+          cargo build --release -p compiler --bin compiler
+          cp target/release/compiler ../results/compiler-baseline
+          for n in 8 24; do
+            X7_LATE_SELECT_TRACE=1 target/release/compiler ../results/array_loop_${n}.c --language mini-c --ir typeid --emit obj -o ../results/baseline_${n}.o 2> ../results/baseline_${n}.log
+          done
+      - name: Temporary read-only diagnostic inside checked-out source (not committed to compiler)
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("crates/backend-x86/src/x7_late_selector.rs")
+          s=p.read_text()
+          marker='    eprintln!("X7_LATE_SHAPE\\tshape={shape}");'
+          assert s.count(marker)==1, (s.count(marker), marker)
+          instrumentation=r'''
+    if shape=="legacy_alu_uses_load_as_left" {
+        let one=items.get(start);
+        let two=items.get(start+1);
+        let three=items.get(start+2);
+        let four=items.get(start+3);
+        let (readset,writeset,flags,mem,barrier)=match two {
+            Some(Item::Op(inst))=>{
+                let e=code::scheduling_effects(inst);
+                (e.register_reads,e.register_writes,format!("{:?}",e.flag_writes),
+                    e.touches_memory,e.control_barrier)
+            }
+            _=>(0,0,String::from("-"),false,true)
+        };
+        eprintln!("X7_ALU_LEFT_DETAIL start={start} load={one:?} alu={two:?} after1={three:?} after2={four:?} reads={readset:#06x} writes={writeset:#06x} flags={flags} memory={mem} barrier={barrier}");
+    }
+'''
+          s=s.replace(marker,marker+"\n"+instrumentation)
+          p.write_text(s)
+          PY
+          cargo build --release -p compiler --bin compiler
+          for n in 8 24; do
+            X7_LATE_SELECT_TRACE=1 target/release/compiler ../results/array_loop_${n}.c --language mini-c --ir typeid --emit obj -o ../results/diagnostic_${n}.o 2> ../results/diagnostic_${n}.log
+            cmp ../results/baseline_${n}.o ../results/diagnostic_${n}.o
+          done
+      - name: Reconcile exactly two physical events and make report
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,re
+          from pathlib import Path
+          cases={}
+          total=0
+          for n in (8,24):
+              file=Path(f"../results/diagnostic_{n}.log")
+              lines=file.read_text().splitlines()
+              details=[line for line in lines if line.startswith("X7_ALU_LEFT_DETAIL ")]
+              shapes=[line for line in lines if line=="X7_LATE_SHAPE\tshape=legacy_alu_uses_load_as_left"]
+              if len(details)!=len(shapes) or len(details)!=1:
+                  raise RuntimeError(f"array_loop_{n}: expected exactly one matching ALU detail, got {len(details)} details {len(shapes)} shapes")
+              cases[str(n)]={"detail":details[0],"count":len(details)}
+              total+=len(details)
+              print(f"X7_ALU_LEFT_EXACT_{n}",details[0],flush=True)
+          assert total==2
+          Path("../results/summary.json").write_text(json.dumps({
+              "compiler_sha":"2cbbb2a25b501652ab3f905175cd3db0e7c397ab",
+              "temporary_instrumentation_only":True,
+              "production_compiler_source_unchanged":True,
+              "byte_identical_object_diagnostic_vs_baseline":True,
+              "two_actual_cases":cases,
+              "admission_and_legality_proven":False
+          },sort_keys=True,indent=2)+"\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-exact-alu-left-two-cases
+          path: |
+            results/summary.json
+            results/array_loop_*.c
+            results/*.log
+          retention-days: 30
