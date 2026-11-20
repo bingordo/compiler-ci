@@ -1,0 +1,164 @@
+name: X7 opt-in TypeId source DAG actual C native differential
+on:
+  workflow_dispatch:
+  pull_request:
+    paths: ['.github/workflows/x7-native-typeid-dag-optin-20261120.yml']
+permissions:
+  contents: read
+jobs:
+  native-proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5f2abb15a72e865d9fb47d53651bd0914cbf310d
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and expose public git dependencies
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "5f2abb15a72e865d9fb47d53651bd0914cbf310d"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+          gcc --version | head -1
+          rustc --version
+      - name: Compile and test both generated DAG modes in Rust
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib --features x7-typeid-source-dag-optin optin_generated_rules_only_rewrites_proven_dag_without_unreviewed_fusions -- --nocapture
+          cargo test -p compiler-backend-x86 --lib --features x7-typeid-source-dag-optin native_typeid_and_legacy_use_same_generated_add32_add64_rules -- --nocapture
+          cargo test -p compiler-backend-x86 --lib --features x7-typeid-source-dag-optin --quiet
+          cargo check -p compiler-backend-x86 --features x7-typeid-source-dag-optin
+          cargo clippy -p compiler-backend-x86 --lib --features x7-typeid-source-dag-optin -- -D clippy::correctness -D clippy::suspicious -A clippy::empty_line_after_doc_comments
+      - name: Build same-commit default and feature-on real TypeId compiler executables
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          mkdir -p ../results
+          cargo build --release -p compiler --bin compiler
+          cp target/release/compiler ../results/normal-compiler
+          cargo build --release -p compiler --bin compiler --features compiler-backend-x86/x7-typeid-source-dag-optin
+          cp target/release/compiler ../results/optin-compiler
+          test "$(sha256sum ../results/normal-compiler | cut -d' ' -f1)" != "$(sha256sum ../results/optin-compiler | cut -d' ' -f1)"
+      - name: Compile C into direct ELF and GAS, link and execute against independent GCC
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json,os,subprocess,sys,tempfile
+          from pathlib import Path
+          sys.path.insert(0,"tools")
+          from source_compile_corpus import c_source
+          from s23_real_source_abba import elf_text_size
+          baseline=Path("../results/normal-compiler").resolve()
+          candidate=Path("../results/optin-compiler").resolve()
+          authored={
+              "add_sub_neg":"int kernel(int x,int y){ return x - (0 - y); }",
+              "add_mul_neg":"int kernel(int x,int y){ return x - (-1 * y); }",
+              "add_double_sub":"int kernel(int x,int y){ return x - (y - (y + y)); }",
+              "boolean_plus":"int kernel(int x,int y){ return x + y - (x & y); }",
+          }
+          sources={name:text for name,text in authored.items()}
+          for kind,n in (("array_loop",8),("array_loop",24),
+                         ("branch_chain",8),("call_graph",8)):
+              sources[f"{kind}_{n}"]=c_source(kind,n)
+          assert len(sources)==8
+          results={}
+          with tempfile.TemporaryDirectory() as tmp:
+              td=Path(tmp)
+              harness=td/"harness.c"
+              harness.write_text(r"""
+              #include <stdio.h>
+              #include <stdint.h>
+              extern int kernel(int,int);
+              int main(void) {
+                  static const int v[]={-2147483647-1,-2147483647,-1073741824,-65536,-123,-31,-3,-1,0,1,2,5,17,99,12345,65535,1073741824,2147483647};
+                  uint64_t h=1469598103934665603ULL;
+                  for(unsigned i=0;i<sizeof(v)/sizeof(v[0]);i++)
+                    for(unsigned j=0;j<sizeof(v)/sizeof(v[0]);j++) {
+                      uint32_t z=(uint32_t)kernel(v[i],v[j]);
+                      h=(h^z)*1099511628211ULL;
+                    }
+                  printf("%llu\n",(unsigned long long)h);
+                  return 0;
+              }
+              """)
+              def run(argv,timeout=50):
+                  p=subprocess.run([str(x) for x in argv],text=True,
+                      capture_output=True,timeout=timeout,check=False)
+                  if p.returncode:
+                      raise RuntimeError(f"{argv!r} exit={p.returncode} stderr={p.stderr[-1800:]} stdout={p.stdout[-400:]}")
+                  return p.stdout
+              for name,body in sorted(sources.items()):
+                  src=td/(name+".c");src.write_text(body)
+                  ref=td/(name+"_gcc.o")
+                  run(["gcc","-O2","-fwrapv","-fno-builtin","-c",src,"-o",ref])
+                  exe=td/(name+"_gcc")
+                  run(["gcc","-O2","-no-pie",harness,ref,"-o",exe])
+                  expected=run([exe],timeout=15)
+                  variants={}
+                  for label,binary in (("default",baseline),("optin",candidate)):
+                      obj=td/(name+"_"+label+".o")
+                      run([binary,src,"--language","mini-c","--ir","typeid",
+                           "--emit","obj","-o",obj],timeout=70)
+                      exe=td/(name+"_"+label)
+                      run(["gcc","-O2","-no-pie",harness,obj,"-o",exe])
+                      actual=run([exe],timeout=15)
+                      if actual!=expected:
+                          raise RuntimeError(f"{name} {label} disagrees with GCC ref: got={actual!r} expected={expected!r}")
+                      size=elf_text_size(obj)
+                      variants[label]={"text_bytes":size,
+                          "object_sha256":hashlib.sha256(obj.read_bytes()).hexdigest()}
+                  delta=variants["default"]["text_bytes"]-variants["optin"]["text_bytes"]
+                  print("X7_DAG_REAL_C",name,"default",variants["default"]["text_bytes"],
+                        "optin",variants["optin"]["text_bytes"],
+                        "saved_bytes",delta,flush=True)
+                  results[name]={"source_sha256":hashlib.sha256(src.read_bytes()).hexdigest(),
+                      "variants":variants,"saved_text_bytes":delta,
+                      "gcc_execution_match":True}
+                  # Use the same feature-on native pipeline for GAS and ELF.
+                  if name in ("add_sub_neg","add_mul_neg","array_loop_8"):
+                      asm=td/(name+".s");gas=td/(name+".gas.o")
+                      run([candidate,src,"--language","mini-c","--ir","typeid",
+                           "--emit","asm","-o",asm])
+                      if name in ("add_sub_neg","add_mul_neg"):
+                          normal_asm=td/(name+"_normal.s")
+                          run([baseline,src,"--language","mini-c","--ir","typeid",
+                               "--emit","asm","-o",normal_asm])
+                          Path("../results/"+name+"_normal.s").write_bytes(normal_asm.read_bytes())
+                          Path("../results/"+name+"_optin.s").write_bytes(asm.read_bytes())
+                      run(["gcc","-c",asm,"-o",gas])
+                      exe=td/(name+"_gas")
+                      run(["gcc","-O2","-no-pie",harness,gas,"-o",exe])
+                      if run([exe],timeout=15)!=expected:
+                          raise RuntimeError(f"{name} candidate ELF and GAS differ")
+          total=sum(r["saved_text_bytes"] for r in results.values())
+          changed=sum(r["variants"]["default"]["object_sha256"]!=
+                      r["variants"]["optin"]["object_sha256"] for r in results.values())
+          report={"compiler_sha":"5f2abb15a72e865d9fb47d53651bd0914cbf310d","optin_feature":"x7-typeid-source-dag-optin",
+              "reference":"GCC -O2 -fwrapv -fno-builtin",
+              "cases":results,"total_saved_text_bytes":total,
+              "changed_cases":changed,"native_gcc_parity":True,
+              "sampled_gas_elf_execution_parity":True,
+              "default_build_unchanged_by_feature":True,
+              "source_new_pattern_admitted":False}
+          Path("../results/x7-dag-optin.json").write_text(json.dumps(report,sort_keys=True,indent=2)+"\n")
+          print("X7_DAG_REAL_C_SUMMARY",json.dumps({
+              "cases":len(results),"changed":changed,"saved_text_bytes":total},sort_keys=True))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-typeid-generated-dag-real-c-ab
+          path: |
+            results/x7-dag-optin.json
+            results/*_normal.s
+            results/*_optin.s
+          retention-days: 30
