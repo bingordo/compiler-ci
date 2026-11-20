@@ -1,0 +1,59 @@
+name: X7 late physical matcher rejection census
+on:
+  pull_request:
+    paths: ['.github/workflows/x7-late-matcher-rejection-census-20261120.yml']
+permissions:
+  contents: read
+jobs:
+  late-selector:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9575a1894beccf8cc9296f15aa5bc935da3edb6c
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Exact compiler source and public frontend
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "9575a1894beccf8cc9296f15aa5bc935da3edb6c"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+      - name: Rust late matcher, parser, and regression tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          PYTHONPATH=tools python3 -m unittest -v test_x7_late_selection_telemetry
+          cargo test -p compiler-backend-x86 --lib x7_late_selector::tests --quiet
+          cargo build --release -p compiler --bin compiler
+      - name: Real Mini-C TypeId source trace on/off parity
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          mkdir -p ../results
+          f=tools/mini-c-driver/tests/fixtures/m6_musl/isascii.c
+          test -f "$f"
+          X7_LATE_SELECT_TRACE=1 target/release/compiler "$f" --language mini-c --ir typeid --emit obj -o ../results/with-trace.o 2> ../results/with-trace.log
+          env -u X7_LATE_SELECT_TRACE target/release/compiler "$f" --language mini-c --ir typeid --emit obj -o ../results/no-trace.o 2> ../results/no-trace.log
+          cmp ../results/with-trace.o ../results/no-trace.o
+          ! grep -q '^X7_LATE_SELECT' ../results/no-trace.log
+          python3 tools/x7_late_selection_telemetry.py ../results/with-trace.log --out ../results/late-census.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('../results/late-census.json'))
+          assert d["new_production_rules"]==0
+          assert not d["candidate_dag_hashes_observed"]
+          print("X7_LATE_REAL_SOURCE", d["inspected_windows"],d["selected_windows"],d["rejected_windows"])
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-late-source-matcher-census
+          path: results/
+          retention-days: 30
