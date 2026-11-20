@@ -372,3 +372,163 @@ jobs:
           path: results/
           if-no-files-found: warn
           retention-days: 14
+
+  source-abba:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout unchanged compiler base
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 6338155d4e60ddafd56b5f3b0b04c11b23088914
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout matcher-only compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c3b04b7b49909fbf69e9742a67c2ffc735c3cdcb
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check same rule source and exact SHAs, configure Cargo
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C before rev-parse HEAD)" = 6338155d4e60ddafd56b5f3b0b04c11b23088914
+          test "$(git -C after rev-parse HEAD)" = c3b04b7b49909fbf69e9742a67c2ffc735c3cdcb
+          cmp before/tools/typeid-rule-gen/examples.rules after/tools/typeid-rule-gen/examples.rules
+          cmp before/crates/opt/src/generated_typeid_shadow.rs after/crates/opt/src/generated_typeid_shadow.rs
+          cmp before/crates/opt/tests/native_s2351_matcher_cost.rs after/crates/opt/tests/native_s2351_matcher_cost.rs
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          mkdir -p results
+          rustc --version
+      - name: Fetch immutable checked source snapshot artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: s23-48-exact-source-typeid-stage-attribution
+          run-id: 43349934825
+          repository: bingordo/compiler-ci
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: captured
+      - name: Check original 44 checked source cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s captured/typeid_snapshots/manifest.tsv
+          test "$(wc -l < captured/typeid_snapshots/manifest.tsv)" = 44
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          d=json.loads(Path("captured/s23-47-source-capture.json").read_text())
+          assert (d["attempted"],d["accepted"],d["rejected"])==(46,44,2)
+          print("S2351B_SOURCE_CAPTURE accepted=44 stages=88")
+          PY
+      - name: Precompile both 88-family release optimizer tests, outside samples
+        shell: bash
+        run: |
+          set -euo pipefail
+          for version in before after; do
+            (cd "$version" && cargo test --release -p compiler-opt \
+              --features experimental-typeid-generated-rewrites \
+              --test native_s2351_matcher_cost --no-run)
+          done
+      - name: Alternate same-run source optimizer benchmark A B B A
+        shell: bash
+        run: |
+          set -euo pipefail
+          index=0
+          for version in before after after before; do
+            index=$((index + 1))
+            echo "S2351B_ABBA_BEGIN sample=$index version=$version"
+            (cd "$version" && S2351_SNAPSHOT_DIR="$GITHUB_WORKSPACE/captured/typeid_snapshots" \
+              cargo test --release -p compiler-opt \
+              --features experimental-typeid-generated-rewrites \
+              --test native_s2351_matcher_cost -- --nocapture) \
+              2>&1 | tee "results/abba-$index-$version.log"
+          done
+      - name: Validate identical checked-source outcomes and summarize matched/miss timing
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - results/s2351b-abba.json <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          from statistics import median
+          names=("abba-1-before","abba-2-after","abba-3-after","abba-4-before")
+          runs=[]
+          stable=("id","cohort","stage","functions","instructions",
+                  "root_supported","root_missed","shadow_hits",
+                  "handwritten_changes","generated_changes")
+          timing=("handwritten_ns","shadow_handwritten_ns","generated_handwritten_ns")
+          for name in names:
+              rows={}
+              sources={}
+              data=Path("results",name+".log").read_text()
+              assert "S2351_SUMMARY cohort=verified_s2347_snapshots cases=44 stages=88" in data,name
+              for line in data.splitlines():
+                  if line.startswith("S2351_CASE "):
+                      row=dict(x.split("=",1) for x in line.split()[1:])
+                      key=(row["id"],row["stage"])
+                      assert key not in rows,(name,key)
+                      rows[key]=row
+                  elif line.startswith("S2350AG_REAL_SOURCE "):
+                      row=dict(x.split("=",1) for x in line.split()[1:])
+                      key=(row["id"],row["stage"])
+                      assert key not in sources,(name,key)
+                      sources[key]=row
+              assert len(rows)==88 and len(sources)==88,(name,len(rows),len(sources))
+              assert sum(int(r["shadow_hits"]) for r in rows.values())==68
+              assert set(rows)==set(sources)
+              runs.append((rows,sources))
+          keys=set(runs[0][0])
+          for rows,sources in runs[1:]:
+              assert set(rows)==keys
+              for key in keys:
+                  assert tuple(rows[key][f] for f in stable)==tuple(runs[0][0][key][f] for f in stable),(key,"matched rule outcome changed")
+                  assert sources[key]==runs[0][1][key],(key,"retained SSA result changed")
+          # Interleave repeated sample order before/after/after/before.
+          groups={"all":sorted(keys),
+                  "matched":sorted(k for k in keys if int(runs[0][0][k]["shadow_hits"])>0),
+                  "missed":sorted(k for k in keys if int(runs[0][0][k]["shadow_hits"])==0)}
+          assert (len(groups["matched"]),len(groups["missed"]))==(3,85)
+          output={"schema":"compiler.s2351b-source-abba.v1",
+                  "base_sha":"6338155d4e60ddafd56b5f3b0b04c11b23088914",
+                  "candidate_sha":"c3b04b7b49909fbf69e9742a67c2ffc735c3cdcb",
+                  "source_cases":44,"stage_cases":88,
+                  "root_hits":68,"same_rule_source":True,
+                  "same_rewrite_and_retained_ssa_counts":True,
+                  "measure":"full verified optimizer round including clone, not whole compile",
+                  "groups":{}}
+          for group,subset in groups.items():
+              def case_ratio(key, mode):
+                  # Median of two repeated runs per revision; never use a
+                  # successful sample from one input with a different input.
+                  old=median(int(runs[i][0][key][mode]) for i in (0,3))
+                  new=median(int(runs[i][0][key][mode]) for i in (1,2))
+                  return new/max(1,old)
+              result={"cases":len(subset)}
+              for mode in timing:
+                  ratios=[case_ratio(k,mode) for k in subset]
+                  result[mode+"_median_candidate_over_base"]=median(ratios)
+              output["groups"][group]=result
+              print("S2351B_ABBA group="+group+" cases="+str(len(subset))+
+                    " generated_ratio="+format(result["generated_handwritten_ns_median_candidate_over_base"],".4f")+
+                    " shadow_ratio="+format(result["shadow_handwritten_ns_median_candidate_over_base"],".4f")+
+                    " handwritten_control_ratio="+format(result["handwritten_ns_median_candidate_over_base"],".4f"))
+          Path(sys.argv[1]).write_text(json.dumps(output,indent=2,sort_keys=True)+"\n")
+          PY
+      - name: Preserve ABBA source profiles
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2351b-88-source-abba
+          path: results/
+          if-no-files-found: warn
+          retention-days: 21
