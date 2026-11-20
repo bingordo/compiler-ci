@@ -1,0 +1,106 @@
+name: x86 LHS remat exact upstream pre-post source A/B oracle
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/verify-x86-lhs-upstream-ab-20261120.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  actual-upstream-sources:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 85
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact immutable source A/B tool cohort
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 221b5fcdd3022639414d15787b6d61a4d9a254c5
+          path: audit
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact pre-PR baseline compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 4469cbec783deb9e50c15cbdb95f61509e4e138c
+          path: baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact merged PR 2331 compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 450ef4914c14514e3c4fb0d8efedb7c0fd44b53a
+          path: candidate
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout original SHA-pinned musl
+        uses: actions/checkout@v4
+        with:
+          repository: ifduyue/musl
+          ref: 7813e9119eb5fe681b6750b8a033a0490bca0941
+          path: musl
+          persist-credentials: false
+      - name: Checkout original SHA-pinned Lua
+        uses: actions/checkout@v4
+        with:
+          repository: lua/lua
+          ref: c42d820bc0c3bc4f2ad536e19d2f05405af10387
+          path: lua
+          persist-credentials: false
+      - name: Checkout original SHA-pinned zlib
+        uses: actions/checkout@v4
+        with:
+          repository: madler/zlib
+          ref: 99623ef7097352da7993ba614161fd6a311e046e
+          path: zlib
+          persist-credentials: false
+      - name: Verify all original source pins and pure-denominator unit tests
+        run: |
+          set -euo pipefail
+          test "$(git -C audit rev-parse HEAD)" = "221b5fcdd3022639414d15787b6d61a4d9a254c5"
+          test "$(git -C baseline rev-parse HEAD)" = "4469cbec783deb9e50c15cbdb95f61509e4e138c"
+          test "$(git -C candidate rev-parse HEAD)" = "450ef4914c14514e3c4fb0d8efedb7c0fd44b53a"
+          test "$(git -C musl rev-parse HEAD)" = "7813e9119eb5fe681b6750b8a033a0490bca0941"
+          test "$(git -C lua rev-parse HEAD)" = "c42d820bc0c3bc4f2ad536e19d2f05405af10387"
+          test "$(git -C zlib rev-parse HEAD)" = "99623ef7097352da7993ba614161fd6a311e046e"
+          python3 -m unittest discover -s audit/tools -p 'test_x86_lhs_remat_pinned_upstream_ab.py' -v
+          python3 -m unittest discover -s audit/tools -p 'test_x86_i32_remat_trace_cases.py' -v
+          python3 -m py_compile audit/tools/x86_lhs_remat_pinned_upstream_ab.py
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: baseline -> target
+          key: x86-lhs-upstream-old-20261120
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: candidate -> target
+          key: x86-lhs-upstream-new-20261120
+      - name: Build exact historical baseline compiler in release mode
+        working-directory: baseline
+        run: cargo build --release -p compiler --bin compiler
+      - name: Build exact merged PR compiler in release mode
+        working-directory: candidate
+        run: cargo build --release -p compiler --bin compiler
+      - name: Compare all 124 exact original files, native ELF, source hash and 4 GCC runtime oracles
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          python3 audit/tools/x86_lhs_remat_pinned_upstream_ab.py \
+            --script-root audit \
+            --baseline-root baseline --candidate-root candidate \
+            --baseline-bin baseline/target/release/compiler \
+            --candidate-bin candidate/target/release/compiler \
+            --musl-root musl --lua-root lua --zlib-root zlib \
+            --output results/x86-lhs-remat-124-source-exact-ab.json
+      - name: Upload complete original file acceptance and physical compiler A/B
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x86-lhs-remat-124-original-source-exact-ab-20261120
+          path: results/x86-lhs-remat-124-source-exact-ab.json
+          if-no-files-found: warn
