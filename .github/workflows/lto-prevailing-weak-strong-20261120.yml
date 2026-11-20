@@ -1,0 +1,61 @@
+name: Pinned LTO prevailing weak and strong integration
+on:
+  push:
+    branches: [ci/lto-prevailing-weak-strong-20261120]
+    paths: ['.github/workflows/lto-prevailing-weak-strong-20261120.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  prevailing:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 38
+    env:
+      SOURCE_SHA: 47c224416131468a6d7d8c171894785141edf0da
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Check out exact compiler source commit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 47c224416131468a6d7d8c171894785141edf0da
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm source identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: lto-prevailing-weak-strong
+      - name: TypeId LTO symbol resolution, validation, and wire tests
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test lto_envelope_merge -- --nocapture
+          cargo test -p compiler-ir --test lto_merge
+          cargo test -p compiler-ir --test lto_target_envelope
+          cargo test -p compiler-ir --test lto_global_resolution
+          cargo test -p compiler-ir --test lto_function_resolution
+      - name: Strict changed IR Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir --lib --test lto_envelope_merge -- -D warnings
+      - name: Production two-TU weak/strong and weak/weak linker oracle
+        working-directory: compiler
+        run: cargo test -p compiler --test lto_prevailing_weak_strong -- --nocapture
+      - name: Existing source sidecars, co-emission and LTO linker regressions
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test lto_elf_visibility
+          cargo test -p compiler --test lto_source_sidecar
+          cargo test -p compiler --test lto_coemit
+          cargo test -p compiler --test lto_mixed_link
