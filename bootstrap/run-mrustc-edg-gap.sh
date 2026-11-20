@@ -110,8 +110,8 @@ probe_generated_c() {
   if [[ -x /usr/bin/time ]]; then
     (
       cd /workspace/edgcpp/build/gcc-release
-      /usr/bin/time -f 'PEAK_RSS_KB=%M' -o "$timed_log" \
-        timeout --signal=TERM --kill-after=10s "$limit" \
+      timeout --signal=TERM --kill-after=10s "$limit" \
+        /usr/bin/time -f 'PEAK_RSS_KB=%M' -o "$timed_log" \
           "$parser" --gcc --c11 --no_strict_gnu --gnu_version "$gnu_number" "${include_args[@]}" "$input"
     ) > "$logfile" 2>&1
     rc=$?
