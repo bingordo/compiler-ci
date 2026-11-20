@@ -27,7 +27,7 @@ jobs:
           git config --global --add url."https://github.com/".insteadOf "git@github.com:"
           rustc --version
           cargo build --release --manifest-path compiler/Cargo.toml -p compiler --bin compiler
-      - name: 12 pinned musl sources and 5 authored Boolean probes with opt-in selector trace
+      - name: Checked-in Mini-C musl-derived fixtures and 5 authored Boolean probes with opt-in selector trace
         run: |
           set -euo pipefail
           mkdir -p results
@@ -36,11 +36,16 @@ jobs:
           from pathlib import Path
           root=Path("compiler").resolve()
           sys.path.insert(0,str(root/"tools"))
-          from s23_native_profile_source import PROBE_SOURCE, NAMES, pinned_sources
+          from s23_native_profile_source import PROBE_SOURCE
           from x7_typeid_selection_telemetry import summarize
-          sources,digest=pinned_sources(root)
+          fixtures=root/"tools/mini-c-driver/tests/fixtures/m6_musl"
+          sources={p.stem:p for p in sorted(fixtures.glob("*.c"))}
+          assert len(sources)>=8, "missing checked-in Mini-C musl-derived fixtures"
+          digest=hashlib.sha256(b"".join(
+              name.encode()+b"\\0"+p.read_bytes() for name,p in sorted(sources.items())
+          )).hexdigest()
           binary=root/"target/release/compiler"
-          assert binary.is_file() and len(NAMES)==12
+          assert binary.is_file()
           with tempfile.TemporaryDirectory() as temp:
               td=Path(temp)
               probe=td/"five_controlled_boolean_functions.c"
@@ -49,7 +54,7 @@ jobs:
               # Grouped TU of unchanged original function bodies, explicitly
               # artificial (not a faithful original upstream TU).
               group=td/"combined_extracted.c"
-              group.write_bytes(b"\n".join(sources[n].read_bytes() for n in NAMES)+b"\n")
+              group.write_bytes(b"\n".join(sources[n].read_bytes() for n in sorted(sources))+b"\n")
               cases["combined_extracted"]=group
               summary={}
               all_events=[]
@@ -88,14 +93,14 @@ jobs:
               aggregate=summarize(all_events)
               report={"schema_version":1,
                   "compiler_sha":"69c1e92ba4645a829f70b6e38e0f21f046c5842c",
-                  "corpus":"12 pinned musl function extracts + artificial combined TU + 5 authored boolean probes",
-                  "musl_source_digest":digest,"source_cases":summary,
+                  "corpus":"checked-in m6_musl Mini-C fixtures + artificial combined TU + 5 authored boolean probes",
+                  "fixture_content_digest":digest,"source_cases":summary,
                   "aggregate":aggregate,
                   "trace_off_object_parity_verified":True,
                   "actual_runtime_compiler_runs":len(cases)*2,
                   "new_generated_dag_candidate_selection_proven":False}
               Path("results/summary.json").write_text(json.dumps(report,indent=2,sort_keys=True)+"\n")
-              assert len(summary)==14
+              assert len(summary)==len(sources)+2
               assert aggregate["attempts"]==sum(x["selector"]["attempts"] for x in summary.values())
               print("X7_REAL_CENSUS_TOTAL",json.dumps(
                   {k:aggregate[k] for k in ("attempts","hits","misses")},sort_keys=True))
@@ -110,7 +115,7 @@ jobs:
           with open("results/report.md","w") as f:
               f.write("# X7 actual source TypeId selection census\n\n")
               f.write("Compiler source: `"+d["compiler_sha"]+"`\n\n")
-              f.write("Pinned musl source digest: `"+d["musl_source_digest"]+"`\n\n")
+              f.write("Checked-in Mini-C fixture digest: `"+d["fixture_content_digest"]+"`\n\n")
               f.write(f"Actual selection attempts: {a['attempts']}, hits: {a['hits']}, misses: {a['misses']}.\n\n")
               f.write("Trace disabled produced identical object bytes. No generated-pattern admission is implied.\n\n")
               f.write("| Case | Hits | Misses | Attempts |\n|---|---:|---:|---:|\n")
