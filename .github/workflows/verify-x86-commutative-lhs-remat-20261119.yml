@@ -1,0 +1,60 @@
+name: x86 source-left commutative constant generated remat native proof
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/verify-x86-commutative-lhs-remat-20261119.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  x86-remat-left:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler branch source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5b22abf86c9a9e252addac6d86dfbbd1015ee1d8
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "5b22abf86c9a9e252addac6d86dfbbd1015ee1d8"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          python3 -m unittest discover -s compiler/tools -p 'test_x86_i32_remat_trace_cases.py' -v
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x86-commutative-lhs-remat-20261119
+      - name: Generated full x86 library and independent C11 native oracles
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib commutative_left_immediate_native_tests:: -- --nocapture
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend --lib remat::tests::
+          cargo clippy -p compiler-backend-x86 --lib -- --no-deps -D warnings
+          cargo clippy -p compiler-backend --lib -- --no-deps -D warnings
+      - name: Build production Mini-C TypeId compiler release
+        working-directory: compiler
+        run: cargo build --release -p compiler --bin compiler
+      - name: Verify checked source trace still matches normal native ELF
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark-output
+          python3 compiler/tools/x86_i32_remat_trace_cases.py \
+            --compiler compiler/target/release/compiler \
+            --output benchmark-output/x86-remat-lhs-source-trace.json
+      - name: Upload source parity report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x86-commutative-left-remat-native-proof-20261119
+          path: benchmark-output/*.json
+          if-no-files-found: warn
