@@ -1,0 +1,72 @@
+name: X7 pinned Intel non-SIB 64-bit Effective_Address SMT PR2320
+on:
+  pull_request:
+    paths: ['.github/workflows/x7-nonsib64-ea-smt-pr2320.yml']
+permissions:
+  contents: read
+jobs:
+  intel-iform-effects:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      X7_S3L_OPERATION_AST: /tmp/x7-cert/operations.json
+      X7_S3L_SMT_REPORT: /tmp/x7-cert/semantics-z3.json
+      X7_S3L_INTEL_XML_DIR: /tmp/intel-x7-iforms
+      X7_S3L_INTEL_STDLIB_GZ: /tmp/x7-pinned-definitions.xml.gz
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 174300f40fc1bc01e27beae2fab56376fbf12160
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check exact source-form parser and negative controls
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "174300f40fc1bc01e27beae2fab56376fbf12160"
+          python3 -m unittest discover -s tools -p 'test_x86_intel_iform_effect_audit.py' -v
+          python3 -m py_compile tools/x86_intel_iform_effect_audit.py tools/verify_x86_intel_iform_effects.py
+      - name: Download original pinned Intel operation AST and independent Z3 certificates
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3l-l2b-l3a-9-ops-generic-helper-smt-source-evidence
+          run-id: 43687620382
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-cert
+      - name: Fetch original source-frozen Intel ADD operation/iform XML
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/intel-x7-iforms
+          curl -fsSL --retry 2 --max-time 45 \
+            "https://raw.githubusercontent.com/intel/SDM/35eface1b7ee003a1cda95005ec5fd83de658a64/data/instruction/ADD.xml" \
+            -o /tmp/intel-x7-iforms/ADD.xml
+      - name: Fetch exact pinned Intel standard library helper source
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 2 --max-time 60 \
+            "https://raw.githubusercontent.com/intel/SDM/35eface1b7ee003a1cda95005ec5fd83de658a64/data/definitions.xml.gz" \
+            -o "$X7_S3L_INTEL_STDLIB_GZ"
+      - name: Validate source address bridge against real bounded memory-SSA SMT
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/x7-ssa-proof-venv
+          /tmp/x7-ssa-proof-venv/bin/pip install -q z3-solver
+          /tmp/x7-ssa-proof-venv/bin/python -m unittest discover -s tools -p 'test_x86_s3l_memory_address_bridge.py' -v
+          /tmp/x7-ssa-proof-venv/bin/python -m unittest discover -s tools -p 'test_x86_s3l_real_rmw_iform_join.py' -v
+          /tmp/x7-ssa-proof-venv/bin/python -m unittest discover -s tools -p 'test_x86_s3l_rip_helper_semantics.py' -v
+          /tmp/x7-ssa-proof-venv/bin/python -m unittest discover -s tools -p 'test_x86_s3l_effective_address_nonsib.py' -v
+          /tmp/x7-ssa-proof-venv/bin/python -m py_compile tools/x86_s3l_effective_address_nonsib.py
+          /tmp/x7-ssa-proof-venv/bin/python -m py_compile tools/x86_s3l_rip_helper_semantics.py
+          /tmp/x7-ssa-proof-venv/bin/python -m py_compile tools/x86_s3l_memory_address_bridge.py
+      - name: Audit real, commit-pinned Intel SDM form XML without vendoring
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/intel-x7-iforms
+          intel_rev=35eface1b7ee003a1cda95005ec5fd83de658a64
+          for form in ADD MOV XOR SUB AND OR; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 45 \
+              "https://raw.githubusercontent.com/intel/SDM/${intel_rev}/data/instruction/${form}.xml" \
+              --output "/tmp/intel-x7-iforms/${form}.xml"
+          done
+          python3 tools/verify_x86_intel_iform_effects.py --xml-dir /tmp/intel-x7-iforms
