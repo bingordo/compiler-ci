@@ -1,0 +1,62 @@
+name: x86 GP32 PHI immediate parallel-copy proof and unchanged source output
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/verify-x86-edge-imm-parcopy-proof-20261119.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  phi-immediate-scheduler:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 80
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler implementation (NOT compiler repo CI)
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 506caaeda1bb0c3ae902a77d89e3be6b3595f99d
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source pin and source probe syntax
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "506caaeda1bb0c3ae902a77d89e3be6b3595f99d"
+          python3 -m unittest discover -s compiler/tools -p 'test_x86_i32_remat_trace_cases.py' -v
+          python3 -m unittest discover -s compiler/tools -p 'test_x86_i32_remat_source_frontier.py' -v
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x86-edge-imm-parcopy-proof-20261119
+      - name: Exhaustive GP32 immediate+home copies; physical MOV flag contract; all existing x86 tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib parallel_copy::tests:: -- --nocapture
+          cargo test -p compiler-backend-x86 --lib edge_immediate_copy_tests:: -- --nocapture
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend --lib remat::tests::
+          cargo clippy -p compiler-backend-x86 --lib -- --no-deps -D warnings
+          cargo clippy -p compiler-backend --lib -- --no-deps -D warnings
+      - name: Build actual unchanged production Mini-C TypeId compiler
+        working-directory: compiler
+        run: cargo build --release -p compiler --bin compiler
+      - name: Existing independent checked Mini-C regression cases retain exact trace/no-trace ELF
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark-output
+          python3 compiler/tools/x86_i32_remat_trace_cases.py \
+            --compiler compiler/target/release/compiler \
+            --output benchmark-output/x86-edge-immediate-scheduler-source-parity.json
+      - name: Upload native source acceptance observations
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x86-edge-imm-parcopy-proof-20261119
+          path: benchmark-output/x86-edge-immediate-scheduler-source-parity.json
+          if-no-files-found: warn
