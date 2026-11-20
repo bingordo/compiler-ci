@@ -1,0 +1,71 @@
+# Source-pinned end-to-end C program coverage, not just W9 micro-tests.
+name: Wasm C program usability coverage
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/wasm-source-capability-audit.yml'
+  workflow_dispatch:
+    inputs:
+      compiler_sha:
+        description: 'Exact compiler commit to audit'
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  source-coverage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.compiler_sha || '46bfeb54a4722987b4415f3e43d51cf2bd6a0e69' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pins and isolate production driver
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "${{ inputs.compiler_sha || '46bfeb54a4722987b4415f3e43d51cf2bd6a0e69' }}"
+          grep -F '6ba1cb655d8bb2cf5b795aa774e8234d4f701e0b' compiler/crates/driver/Cargo.toml
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86","crates/backend-aarch64","crates/backend-riscv64","crates/backend-wasm","crates/driver"]
+          EOF
+          rm -f compiler/Cargo.lock
+          python3 --version
+          gcc --version | head -1
+      - name: Node.js reference WebAssembly engine
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Cache checked source compiler build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: wasm-source-usability-audit-20261120
+      - name: Build production compiler driver
+        working-directory: compiler
+        run: cargo build -p compiler --bin compiler
+      - name: Audit real source programs against GCC, native TypeId and Node Wasm
+        working-directory: compiler
+        run: |
+          python3 tools/wasm-coverage/run.py \
+            --compiler target/debug/compiler \
+            --output coverage/wasm-source-coverage.json
+      - name: Publish machine-readable case results even when audit detects a mismatch
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-source-coverage
+          path: compiler/coverage/wasm-source-coverage.json
+          if-no-files-found: warn
+          retention-days: 30
