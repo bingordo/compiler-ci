@@ -50,7 +50,7 @@ jobs:
           echo "Scheduled compiler main revision: $sha" >> "$GITHUB_STEP_SUMMARY"
 
   core:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -89,6 +89,49 @@ jobs:
       - name: Verify core and x86 backend
         working-directory: compiler
         run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+
+  legacy-memory-oracle-cutover:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a73d50a0dbfc7b7b29327c01d6ff1f1cad945921
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and restrict core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "a73d50a0dbfc7b7b29327c01d6ff1f1cad945921"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: migration-ir-memory-oracle
+      - name: Default optimizer, backends and memory oracle feature check
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --lib
+          cargo check -p compiler-backend-x86 -p compiler-backend-aarch64
+          cargo check -p compiler-opt --lib --no-default-features --features legacy-function-memory-oracle
+      - name: Historical and TypeId memory regression suites
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test dse --test typed_dse --test local_memory_native --test typed_local_memory
+          cargo test -p compiler-opt --test global_memory --test typed_global_memory --test memory_native --test memory_execution_oracle
 
   pr-core:
     needs: discover
