@@ -209,13 +209,15 @@ def execute(default,optin,out):
 
 if __name__=="__main__":
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--default",required=True)
-    p.add_argument("--optin",required=True)
-    p.add_argument("--out",required=True)
+    p.add_argument("--default")
+    p.add_argument("--optin")
+    p.add_argument("--out")
     p.add_argument("--syntax-only",action="store_true")
     args=p.parse_args()
     if args.syntax_only:
         gcc_syntax_check()
         print("X7_MTU_SOURCE_SYNTAX_OK",len(SEEDS),3)
     else:
+        if not all((args.default,args.optin,args.out)):
+            p.error("--default, --optin, and --out are required for native execution")
         execute(args.default,args.optin,args.out)
