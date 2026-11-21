@@ -1,0 +1,64 @@
+name: LTO v7 v8 COMMON source-pinned integration
+on:
+  push:
+    branches: [ci/lto-common-v7-v8-20261120]
+    paths: ['.github/workflows/lto-common-v7-v8-20261120.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  common-lto:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: 9c4761e3dab51c4f7f9112ad976c4192f3395b5b
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9c4761e3dab51c4f7f9112ad976c4192f3395b5b
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler commit and frontend checkout policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: lto-common-v7-v8
+      - name: Exact IR v1 through v8 metadata and admission regressions
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test lto_target_envelope -- --nocapture
+          cargo test -p compiler-ir --test lto_envelope_merge -- --nocapture
+          cargo test -p compiler-ir --test lto_merge
+      - name: Scoped strict IR Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir --lib --test lto_target_envelope --test lto_envelope_merge -- -D warnings
+      - name: Production source and bound multiunit COMMON ELF execution
+        working-directory: compiler
+        run: cargo test -p compiler --test lto_common_elf -- --nocapture
+      - name: Native COMMON, preemption and mixed-link compatibility
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test native_fcommon_elf
+          cargo test -p compiler --test lto_prevailing_weak_strong
+          cargo test -p compiler --test lto_elf_visibility
+          cargo test -p compiler --test lto_source_sidecar
+          cargo test -p compiler --test lto_coemit
+          cargo test -p compiler --test lto_mixed_link
+      - name: Production driver and opt library build
+        working-directory: compiler
+        run: |
+          cargo check -p compiler --bin compiler
+          cargo check -p compiler-opt --lib
