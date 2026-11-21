@@ -170,6 +170,10 @@ def validate(default,optin,out):
     out.parent.mkdir(parents=True,exist_ok=True)
     assert syntax_check()==48
     results=[]
+    corpus_dir=out.parent/"memory-cfg-sources"
+    corpus_dir.mkdir(parents=True,exist_ok=True)
+    for family,index,body in cases():
+        (corpus_dir/f"{family}_{index:02}.c").write_text(body)
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp=Path(tmpdir)
         harness=tmp/"harness.c"
