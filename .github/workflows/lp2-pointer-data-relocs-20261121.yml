@@ -1,0 +1,70 @@
+name: LP2 GNU TypeId owned data pointer relocation acceptance
+on:
+  push:
+    branches: [ci/lp2-pointer-data-relocs-20261121]
+    paths: ['.github/workflows/lp2-pointer-data-relocs-20261121.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: be15db0880fc9b5028d9c77e20acf7a3eaaaab25
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: be15db0880fc9b5028d9c77e20acf7a3eaaaab25
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          ld --version | head -1
+      - name: Install GNU plugin interface
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y binutils-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: lp2-gnu-plugin-pointer-relocs
+      - name: Test pure Rust core and strict Clippy
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-lto-plugin-core --all-targets -- --nocapture
+          cargo clippy -p compiler-lto-plugin-core --all-targets -- -D warnings
+      - name: Build canonical Rust dynamic ABI and source compiler
+        working-directory: compiler
+        run: |
+          cargo build -p compiler-lto-plugin-core --lib --bin fat-lto-admit
+          cargo build -p compiler --bin compiler
+      - name: Build opt-in production-slice C ABI adapter
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cc -std=c11 -O2 -fPIC -shared -Wall -Wextra -Werror \
+            tools/lto-plugin-probe/simple_typeid_plugin.c \
+            -L "$PWD/target/debug" -lcompiler_lto_plugin_core \
+            "-Wl,-rpath,$PWD/target/debug" \
+            -o "$RUNNER_TEMP/lp2-simple-typeid.so"
+          test -f "$RUNNER_TEMP/lp2-simple-typeid.so"
+      - name: GNU ld real TypeId optimization and ELF replacement incl archives
+        working-directory: compiler
+        run: |
+          python3 tools/test_lto_fat_object.py \
+            --compiler target/debug/compiler \
+            --rust-admit target/debug/fat-lto-admit \
+            --simple-plugin "$RUNNER_TEMP/lp2-simple-typeid.so"
+      - name: Original LP1 callback and archive regression
+        working-directory: compiler
+        run: python3 tools/test_lto_linker_plugin_probe.py
