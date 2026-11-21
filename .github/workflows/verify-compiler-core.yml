@@ -50,7 +50,7 @@ jobs:
           echo "Scheduled compiler main revision: $sha" >> "$GITHUB_STEP_SUMMARY"
 
   core:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -89,6 +89,49 @@ jobs:
       - name: Verify core and x86 backend
         working-directory: compiler
         run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+
+  legacy-induction-phi-cutover:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout pinned compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d7086b50ffb509b778514ba56b6bfb3488d01831
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source revision and core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "d7086b50ffb509b778514ba56b6bfb3488d01831"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: migration-ir-induction-phi
+      - name: Check production and historical feature matrix
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --lib
+          cargo check -p compiler-backend-x86 -p compiler-backend-aarch64
+          cargo check -p compiler-opt --lib --no-default-features --features legacy-function-induction-oracle,legacy-function-phi-oracle
+      - name: Run induction and phi historical and TypeId oracles
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test induction_native --test induction_analysis --test typed_induction_native
+          cargo test -p compiler-opt --test phi_native --test typed_phi_cfg --test typed_phi_dead_linear --test typed_transitive_phi
 
   pr-core:
     needs: discover
