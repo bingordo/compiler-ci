@@ -1,0 +1,108 @@
+name: X7 IP7g Intel LEA SIB source and physical crosscheck
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/x7-ip7g-lea32-sib-crosscheck-20261121.yml'
+permissions:
+  contents: read
+jobs:
+  original-source-and-physical:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 418e41a035d25cb30297808c88955880732a9aeb
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source revision and install proof dependencies
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "418e41a035d25cb30297808c88955880732a9aeb"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq z3 python3-z3
+          z3 -version
+          PYTHONPATH=/usr/lib/python3/dist-packages python3 -c 'import z3; print(z3.get_version_string())'
+          rustc --version
+          gcc --version | head -1
+      - name: Download exact pinned Intel LEA and definitions source
+        run: |
+          set -euo pipefail
+          mkdir -p intel results
+          revision=35eface1b7ee003a1cda95005ec5fd83de658a64
+          curl --fail --location --retry 3 --silent --show-error --max-time 90 \
+            "https://raw.githubusercontent.com/intel/SDM/$revision/data/instruction/LEA.xml" \
+            --output intel/LEA.xml
+          curl --fail --location --retry 3 --silent --show-error --max-time 90 \
+            "https://raw.githubusercontent.com/intel/SDM/$revision/data/definitions.xml.gz" \
+            --output intel/definitions.xml.gz
+          python3 - <<'PY'
+          import hashlib
+          lea=open("intel/LEA.xml","rb").read()
+          blob=b"blob "+str(len(lea)).encode()+b"\0"+lea
+          assert hashlib.sha1(blob).hexdigest()=="0ac72a6a69b95dd1e1ca58c520e3f3d42b84dc3f"
+          stdlib=open("intel/definitions.xml.gz","rb").read()
+          assert hashlib.sha256(stdlib).hexdigest()=="c5607c5774d45e2300410e519a65c7d48981afc55a50c4219ee9e6b2eb1f301e"
+          print("X7_IP7G_PINNED_INTEL_LEA_STDLIB_PASS")
+          PY
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-ip7g-lea32-sib-20261121
+      - name: Original Intel LEA32 and SIB source proof receipts
+        working-directory: compiler
+        env:
+          PYTHONPATH: tools:/usr/lib/python3/dist-packages
+          X7_IP7F_LEA_XML: ../intel/LEA.xml
+          X7_IP7G_INTEL_STDLIB_GZ: ../intel/definitions.xml.gz
+        run: |
+          set -euo pipefail
+          python3 tools/regen_x86_forms.py --check
+          python3 -m unittest -v test_x7_ip7f_lea32_source_proof test_x7_ip7g_lea32_sib_bridge
+          python3 tools/x7_ip7g_lea32_sib_bridge.py \
+            --intel-lea "$X7_IP7F_LEA_XML" \
+            --intel-stdlib "$X7_IP7G_INTEL_STDLIB_GZ" \
+            > ../results/x7-ip7g-sib-source-link.json
+          python3 - <<'PY'
+          import json
+          r=json.load(open("../results/x7-ip7g-sib-source-link.json"))
+          assert r["source_lea32_value_smt_proofs"]==8
+          assert r["conditional_value_proofs_all_unsat"]
+          assert [m["mod"] for m in r["sib_source_mod_class_proofs"]]==[0,1,2]
+          assert all(m["source_sib_value_smt"]=="unsat" for m in r["sib_source_mod_class_proofs"])
+          assert r["read_gpr64_source_selector_smt"]==r["rip64_source_helper_smt"]=="unsat"
+          for k in ("full_isa_effective_address_chain_proved",
+                    "source_to_actual_x86_64_rex_sib_bytes_proved",
+                    "register_allocation_and_spill_legality_proved",
+                    "original_arithmetic_flags_liveness_proved",
+                    "size_and_cpu_profitability_proved", "selection_eligible"):
+              assert r[k] is False, k
+          assert r["new_production_rules"]==0
+          print("X7_IP7G_INTEL_SOURCE_SIB_HELPER_LINK_UNSAT_NOT_ADMITTED")
+          PY
+      - name: Physical GAS/direct ELF matrix, C11 and backend regression
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test x7_ip7g_lea32_sib_crosscheck \
+            --features x7-ip7-workload-profile -- --nocapture
+          cargo test -p compiler-backend-x86 --test x7_ip7d_lea32_physical \
+            --features x7-ip7-workload-profile -- --nocapture
+          cargo test -p compiler-backend-x86 --lib \
+            --features x7-ip7-workload-profile --quiet
+          cargo clippy -p compiler-backend-x86 --tests --features x7-ip7-workload-profile -- \
+            -D clippy::correctness -D clippy::suspicious -A clippy::empty_line_after_doc_comments
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-ip7g-intel-lea32-sib-source-link
+          path: results/x7-ip7g-sib-source-link.json
+          retention-days: 30
