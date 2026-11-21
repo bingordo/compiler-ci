@@ -1,0 +1,82 @@
+name: X7 source-verified register operand latencies
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/x7-pinned-operand-latencies-20261121.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  exact-xml-operand-provenance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9d03df18e761a807aaf043e6fefe3cd9c1c16f67
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "9d03df18e761a807aaf043e6fefe3cd9c1c16f67"
+      - name: Download exactly reviewed source XML, never substitute stale values
+        run: |
+          set -euo pipefail
+          curl -fL --retry 2 --max-time 600 https://uops.info/instructions.xml -o instructions.xml
+          test "$(sha256sum instructions.xml | cut -d' ' -f1)" = "e5e702caaf04c4fc1f75192a9bbe4d8554b3e174f7933a14d124cc33ca677ab3"
+      - name: Check operand-by-operand extracted timings and generated Rust table from XML
+        working-directory: compiler
+        run: python3 tools/regen_x86_operand_latencies.py --xml ../instructions.xml --check
+      - name: Adversarial operand role, alias, incomplete timing and provenance tests
+        working-directory: compiler
+        run: python3 -m unittest discover -s tools -p test_x86_operand_latencies.py -v
+      - name: Check original x86 CPU measured-uop tables remain source-stable
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/regen_x86_physical_costs.py --check
+          python3 tools/validate_x86_costs.py data/x86_costs_skl.json data/x86_costs_zen4.json
+  x86-measured-register-critical-path:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9d03df18e761a807aaf043e6fefe3cd9c1c16f67
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler SHA and git transport
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "9d03df18e761a807aaf043e6fefe3cd9c1c16f67"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-exact-operand-pair-latency-20261121
+      - name: Shared fully priced primary cost ranker and exact latency secondary test
+        working-directory: compiler
+        run: cargo test -p compiler-backend --lib
+      - name: Full x86 backend including real measured per-operand flags and register chains
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --lib --features compiler-opt/legacy-function-cse-oracle
+      - name: Disabled-feature x86 compile and scoped Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-backend-x86 --no-default-features
+          cargo clippy -p compiler-backend -p compiler-backend-x86 --lib -- -D warnings -A unused-imports -A dead-code -A unused-variables -A clippy::empty_line_after_doc_comments -A clippy::needless_lifetimes -A clippy::collapsible_match
+      - name: Real TypeId SKL/Zen4 CPU choice native ELF/GAS GCC C11 oracle
+        working-directory: compiler
+        run: cargo test -p compiler --test x86_cost_selection_source -- --nocapture
+      - name: Original read-only physical telemetry should stay byte-identical
+        working-directory: compiler
+        run: cargo test -p compiler --test x86_late_cost_source -- --nocapture
