@@ -1,0 +1,49 @@
+name: Validate memcpy REP MOVSB physical PR 2382
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/validate-memcpy-repmovsb-pr2382.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e780e4bb085f808be9fb149a45d8cb799e22bb29
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact PR source SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = e780e4bb085f808be9fb149a45d8cb799e22bb29
+      - name: Verify generated x86 opcode forms
+        working-directory: compiler
+        run: python3 tools/regen_x86_forms.py --check
+      - name: Isolate compiler core for independent validation
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: memcpy-pr2382-physical
+      - name: Focused x86 physical, GAS and direct ELF tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --lib rep_movsb -- --nocapture
+      - name: Full x86 crate tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86
+      - name: Strict x86 Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-x86 --all-targets -- -D warnings
