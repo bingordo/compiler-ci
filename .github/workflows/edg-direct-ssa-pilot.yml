@@ -52,7 +52,7 @@ jobs:
           # Compiler PR #1877 is merged; use production main for regression.
           # Compiler EH-0 PR #1893 is merged; production main has the D1 guard.
           # Original C++17 iostream probes merged in compiler #1899.
-          ref: ${{ inputs.source_ref || 'a137fa1ecdc2d69ba6c282a7e75aa3b99173406c' }}
+          ref: ${{ inputs.source_ref || '96abab13017b803c0a5dcea5667941a80cd64596' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -71,7 +71,7 @@ jobs:
           compiler_sha="$(git -C compiler rev-parse HEAD)"
           echo "$compiler_sha" | tee -a "$GITHUB_STEP_SUMMARY"
           if [[ "${{ github.event_name }}" != workflow_dispatch ]]; then
-            test "$compiler_sha" = "a137fa1ecdc2d69ba6c282a7e75aa3b99173406c"
+            test "$compiler_sha" = "96abab13017b803c0a5dcea5667941a80cd64596"
           fi
 
       - name: Configure matching EDG native metadata only
@@ -187,7 +187,7 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           cargo test --manifest-path tools/edg-driver/Cargo.toml
           cargo test --manifest-path tools/edg-driver/Cargo.toml \
-            lvalue_adjust_has_one_stable_semantic_classification -- --nocapture \
+            lvalue_adjust_ -- --nocapture \
             2>&1 | tee "$RUNNER_TEMP/edg-semantic57-regression.log"
           grep -Eq 'test result: ok[.] [1-9][0-9]* passed; 0 failed' \
             "$RUNNER_TEMP/edg-semantic57-regression.log"
@@ -246,15 +246,36 @@ jobs:
             gcc -std=c11 -O2 -Wall -Wextra -Werror native_edg.o edg_native_ir_pilot_driver.c -o compiler_edg_native_ir
             ./gcc_edg_native_ir
             ./compiler_edg_native_ir
-            # Source-checked C integer automatic locals are supported by D1.
+            # These historical "bad" fixtures are no longer necessarily
+            # unsupported. An admitted feature MUST execute identically
+            # to independently compiled GCC; a rejected feature MUST emit
+            # no object. Neither outcome is inferred from its filename.
             for source in edg_native_ir_bad_global.c edg_native_ir_bad_fp.c; do
               rm -f bad_native_edg.o bad_native_edg.log
+              case "$source" in
+                edg_native_ir_bad_global.c)
+                  printf '%s\n' 'extern int edg_native_bad_global(void);' \
+                    'int main(void) { return edg_native_bad_global()!=99; }' \
+                    >native_feature_check.c ;;
+                edg_native_ir_bad_fp.c)
+                  printf '%s\n' 'extern double edg_native_bad_float(double);' \
+                    'int main(void) { return edg_native_bad_float(3.25)!=4.25; }' \
+                    >native_feature_check.c ;;
+              esac
+              gcc -std=c11 -O2 -Wall -Wextra -Werror \
+                "$source" native_feature_check.c -o gcc_feature_oracle
+              ./gcc_feature_oracle
               if "$binary" bad_native_edg.o --c11 "$source" >bad_native_edg.log 2>&1; then
-                echo "Unsupported EDG/compiler-ir source unexpectedly compiled: $source"
-                exit 1
+                test "$(od -An -tx1 -N4 bad_native_edg.o | tr -d ' \n')" = 7f454c46
+                gcc -std=c11 -O2 -Wall -Wextra -Werror \
+                  bad_native_edg.o native_feature_check.c -o native_feature_oracle
+                ./native_feature_oracle
+                echo "EDG feature $source: native/GCC executable parity" >>"$GITHUB_STEP_SUMMARY"
+              else
+                test ! -e bad_native_edg.o
+                grep -E 'compiler-ir|native pilot|unsupported|EDG|C operation|C expression|C return|source' bad_native_edg.log
+                echo "EDG feature $source: explicit source rejection, no partial object" >>"$GITHUB_STEP_SUMMARY"
               fi
-              grep -E 'compiler-ir|native pilot|unsupported|EDG|C operation|C expression|C return|source' bad_native_edg.log
-              test ! -e bad_native_edg.o
             done
           )
 
