@@ -51,6 +51,11 @@ on:
         type: string
         required: true
         default: '5d8237b1ae296408e02fd75bc68a7b5948c5a716'
+      vex_production_sha:
+        description: 'Exact compiler SHA for independent 48-form x86 VEX production/GNU-as oracle'
+        type: string
+        required: true
+        default: 'b98ac328a059c5e269a68c2f2f65fa186575eed7'
 permissions:
   contents: read
 jobs:
@@ -340,3 +345,51 @@ jobs:
           cargo test -p compiler-backend-x86 --example x86_evex_production_oracle -- --nocapture
           export PYTHONPATH="$PWD/tools"
           python3 tools/x86_evex_production_gas_parity.py
+
+  x86-vex-production-vs-gas:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 22
+    steps:
+      - name: Checkout exact VEX production encoder candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.vex_production_sha || 'b98ac328a059c5e269a68c2f2f65fa186575eed7' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify VEX source pin, generated forms and independent negative tests
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          expected="${{ inputs.vex_production_sha || 'b98ac328a059c5e269a68c2f2f65fa186575eed7' }}"
+          [[ "$expected" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$expected"
+          export PYTHONPATH="$PWD/tools"
+          python3 -m py_compile tools/x86_vex_production_gas_oracle.py tools/test_x86_vex_production_gas_oracle.py
+          python3 -m unittest discover -s tools -p 'test_x86_vex_production_gas_oracle.py' -v
+          python3 tools/regen_x86_sse_vex_forms.py --check
+      - name: Restrict Rust workspace to production x86 physical encoder
+        shell: bash
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: generator-vex-prod-gas
+      - name: Run production VEX negative tests and compare 384 encodings to GNU as
+        shell: bash
+        working-directory: compiler
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --example x86_vex_production_gas_oracle -- --nocapture
+          export PYTHONPATH="$PWD/tools"
+          python3 tools/x86_vex_production_gas_oracle.py
