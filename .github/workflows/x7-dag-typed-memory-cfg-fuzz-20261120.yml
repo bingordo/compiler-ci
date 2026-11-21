@@ -1,0 +1,110 @@
+name: X7 source DAG memory alias CFG and pass fuzz native acceptance
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/x7-dag-typed-memory-cfg-fuzz-20261120.yml'
+      - 'tools/x7_dag_memory_cfg_differential.py'
+permissions:
+  contents: read
+jobs:
+  memory-cfg-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1cd615f00bb2cb7e685ff0eaaa59b8d1203429cf
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Exact source revision and pinned public frontend
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 1cd615f00bb2cb7e685ff0eaaa59b8d1203429cf
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+          gcc --version | head -1
+      - name: Parse all 48 deterministic memory/CFG sources with independent GCC C11
+        run: |
+          set -euo pipefail
+          python3 -m py_compile tools/x7_dag_memory_cfg_differential.py
+          python3 tools/x7_dag_memory_cfg_differential.py --syntax-only
+      - name: Build same-SHA TypeId compiler feature-off and source-DAG feature-on
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          (cd compiler && cargo build --release -p compiler --bin compiler)
+          cp compiler/target/release/compiler results/compiler-default
+          (cd compiler && cargo build --release -p compiler --bin compiler \
+            --features compiler-backend-x86/x7-typeid-source-dag-optin)
+          cp compiler/target/release/compiler results/compiler-optin
+          test "$(sha256sum results/compiler-default | cut -d' ' -f1)" != \
+               "$(sha256sum results/compiler-optin | cut -d' ' -f1)"
+      - name: Actual TypeId DAG vs GCC memory alias, array overlap, CFG native checks
+        run: |
+          set -euo pipefail
+          python3 tools/x7_dag_memory_cfg_differential.py \
+            --default results/compiler-default \
+            --optin results/compiler-optin \
+            --out results/x7-memory-cfg.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('results/x7-memory-cfg.json'))
+          assert d["source_count"]==48
+          assert d["increased_count"]==0
+          assert d["every_native_execution_matches_gcc"]
+          assert d["input_cases_per_source"]>=500
+          assert set(d["families"])=={"pointer_alias_call","array_overlap","diamond_loop"}
+          print("X7_MEMCFG_NATIVE_PASS",d["source_count"],d["reduced_count"],
+                d["increased_count"],d["net_saved_text_bytes"])
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-source-dag-memory-cfg-repro
+          path: |
+            results/x7-memory-cfg.json
+            results/memory-cfg-sources/
+          retention-days: 30
+  pass-fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1cd615f00bb2cb7e685ff0eaaa59b8d1203429cf
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned production optimizer source
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 1cd615f00bb2cb7e685ff0eaaa59b8d1203429cf
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+      - name: TypeId per-pass generated alias/CFG/memory and native interaction fuzz
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt \
+            --test typeid_fuzz_memory_cfg_targeted \
+            --test typeid_fuzz_local_cfg_targeted \
+            --test typeid_fuzz_targeted -- --nocapture
+          cargo test -p compiler-opt \
+            --test typeid_fuzz_interactions -- --nocapture
+      - name: Feature-on generic generated DAG matcher and shared SSA safety
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib \
+            --features x7-typeid-source-dag-optin --quiet
