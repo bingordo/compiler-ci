@@ -1,0 +1,68 @@
+name: Verify GCC driver adapter (source-only)
+
+# Python parser tests and independent host C preprocessing/dependency smoke.
+# This does NOT build the private native compiler or prove CMake integration.
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-gcc-driver-adapter.yml'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact compiler commit or review branch to validate
+        required: false
+        type: string
+        default: feature/gcc-driver-compile-adapter-20261121
+
+permissions:
+  contents: read
+
+jobs:
+  gcc-adapter:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout reviewed private compiler driver source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || '8594a8560ca4e29c3b8e914ed718b86e477fefa3' }}
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+          sparse-checkout: |
+            tools/compiler-gcc.py
+            tests/test_compiler_gcc.py
+      - name: Run source-only adapter tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C compiler rev-parse HEAD | tee "$RUNNER_TEMP/gcc-driver-source-sha"
+          python3 -m py_compile compiler/tools/compiler-gcc.py compiler/tests/test_compiler_gcc.py
+          python3 -m unittest discover -s compiler/tests -p 'test_compiler_gcc.py' -v \
+            2>&1 | tee "$RUNNER_TEMP/gcc-driver-tests.log"
+      - name: Verify GCC -MD/-MT/-MF host preprocessing independently
+        shell: bash
+        run: |
+          set -euo pipefail
+          d="$(mktemp -d)"
+          trap 'rm -rf "$d"' EXIT
+          printf '#include "demo.h"\nint demo(void) { return ANSWER; }\n' > "$d/demo.c"
+          printf '#define ANSWER 42\n' > "$d/demo.h"
+          gcc -std=gnu11 -E -P -x c -MD -MT demo.o -MF "$d/demo.d" \
+            "$d/demo.c" > "$d/demo.i"
+          grep -F 'demo.o:' "$d/demo.d"
+          grep -F 'demo.h' "$d/demo.d"
+          grep -F 'return 42;' "$d/demo.i"
+          echo "Host GCC CPP/dependency contract verified; native frontend and linking untested" \
+            >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload exact source revision and test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gcc-driver-adapter-source-log
+          path: |
+            ${{ runner.temp }}/gcc-driver-source-sha
+            ${{ runner.temp }}/gcc-driver-tests.log
+          if-no-files-found: ignore
+          retention-days: 7
