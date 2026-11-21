@@ -7,35 +7,76 @@ on:
 permissions:
   contents: read
 jobs:
-  generate-source-pinned:
+  verify-indexed-source-provenance:
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: f5749197d729e1390968a7d4568734dc9d7a2a22
+          ref: d62f23fb83aa773e764911ef51e71fdeae9efc40
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - name: Verify exact compiler source
-        run: test "$(git -C compiler rev-parse HEAD)" = "f5749197d729e1390968a7d4568734dc9d7a2a22"
+        run: test "$(git -C compiler rev-parse HEAD)" = "d62f23fb83aa773e764911ef51e71fdeae9efc40"
       - name: Download only approved upstream uops.info XML
         run: |
           set -euo pipefail
           curl -fL --retry 2 --max-time 600 https://uops.info/instructions.xml -o instructions.xml
           test "$(sha256sum instructions.xml | cut -d' ' -f1)" = "e5e702caaf04c4fc1f75192a9bbe4d8554b3e174f7933a14d124cc33ca677ab3"
-      - name: Reproduce CPU-specific indexed uops and per-form TP
+      - name: Check indexed SIB per-CPU uops and form TP against upstream XML
+        working-directory: compiler
+        run: python3 tools/regen_x86_indexed_costs.py --xml ../instructions.xml --check
+      - name: Negative indexed cost, no-fallback, provenance, and encoding-form tests
+        working-directory: compiler
+        run: python3 -m unittest discover -s tools -p test_x86_indexed_costs.py -v
+      - name: Recheck pinned nominal μop and exact register/memory latency data
         working-directory: compiler
         run: |
           set -euo pipefail
-          python3 tools/regen_x86_indexed_costs.py --xml ../instructions.xml --write
-          python3 - <<'PY'
-          from pathlib import Path
-          for label,path in [
-            ("GENJSON","data/x86_indexed_costs.json"),
-            ("GENRUST","crates/backend-x86/src/generated_indexed_physical_costs.rs"),
-          ]:
-              for line in Path(path).read_text().splitlines():
-                  print(label+":"+line,flush=True)
-          PY
+          python3 tools/regen_x86_physical_costs.py --check
+          python3 tools/validate_x86_costs.py data/x86_costs_skl.json data/x86_costs_zen4.json
+          python3 tools/regen_x86_operand_latencies.py --xml ../instructions.xml --check
+          python3 tools/regen_x86_memory_operand_latencies.py --xml ../instructions.xml --check
+  x86-physical-model-and-native-oracles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d62f23fb83aa773e764911ef51e71fdeae9efc40
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler source and HTTPS transport
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "d62f23fb83aa773e764911ef51e71fdeae9efc40"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-indexed-source-cost-20261121
+      - name: Full shared backend cost ranker and PGO validator unit suite
+        working-directory: compiler
+        run: cargo test -p compiler-backend --lib
+      - name: Full x86 backend, indexed cost fail-closed and generated native suites
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --lib --features compiler-opt/legacy-function-cse-oracle,compiler-opt/legacy-function-scalar-oracle
+      - name: No-default x86 check and scoped strict Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-backend-x86 --no-default-features
+          cargo clippy -p compiler-backend -p compiler-backend-x86 --lib -- -D warnings -A unused-imports -A dead-code -A unused-variables -A clippy::empty_line_after_doc_comments -A clippy::needless_lifetimes -A clippy::collapsible_match
+      - name: CPU-selected real TypeId ELF/GAS GCC C11 oracle
+        working-directory: compiler
+        run: cargo test -p compiler --test x86_cost_selection_source -- --nocapture
+      - name: Read-only x86 source cost telemetry byte parity
+        working-directory: compiler
+        run: cargo test -p compiler --test x86_late_cost_source -- --nocapture
