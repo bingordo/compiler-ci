@@ -21,7 +21,21 @@ for checkout in /workspace/edgcpp /workspace/edgcpp-rust /workspace/compiler; do
 done
 
 test "$(git -C edgcpp rev-parse HEAD)" = "$EDGCPP_EDG_REVISION"
-test "$(git -C edgcpp-rust rev-parse HEAD)" = 6bcf1508555fcc0c892c1e8e00929dda26154931
+# Use the exact EDG bridge that the candidate compiler actually pins,
+# so the source/parser census and native TypeId gate cover one coherent ABI.
+# A stale standalone EDG bridge would misclassify already-fixed native gaps.
+EDG_BRIDGE_SHA="$(python3 - <<'PY'
+import re, tomllib
+with open('/workspace/compiler/tools/edg-driver/Cargo.toml','rb') as file:
+    dep = tomllib.load(file)['dependencies']['edgcpp']
+assert dep['git'] == 'https://github.com/bingordo/edgcpp-rust.git'
+sha = dep['rev']
+assert re.fullmatch(r'[0-9a-f]{40}', sha)
+print(sha)
+PY
+)"
+test "$(git -C edgcpp-rust rev-parse HEAD)" = "$EDG_BRIDGE_SHA"
+echo "EDG_C_SOURCE_BRIDGE_SHA=$EDG_BRIDGE_SHA"
 test -f "$AUDIT_SOURCE"
 if ! command -v cargo >/dev/null 2>&1; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
