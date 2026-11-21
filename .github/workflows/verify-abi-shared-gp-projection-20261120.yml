@@ -1,0 +1,129 @@
+name: ABI shared GP physical call projection (#2427)
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-abi-shared-gp-projection-20261120.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  arm64-native:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a537b57c43cc297fb79ea7f3998b5e8c6e847c4a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Exact source and native AArch64 runner
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = a537b57c43cc297fb79ea7f3998b5e8c6e847c4a
+          test "$(uname -m)" = aarch64
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/backend","crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: abi-shared-gp-projection-native-20261120
+      - name: Check AArch64 adapter, run shared and native GP tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-backend-aarch64 --all-targets
+          cargo test -p compiler-backend-aarch64 --lib gp_abi -- --nocapture
+          cargo test -p compiler-backend --lib abi_gp
+          cargo test -p compiler-backend --lib abi_plan
+          cargo test -p compiler-backend-aarch64 --lib
+          cargo test -p compiler-backend-aarch64 --test typeid_abi_calls_native
+          cargo test -p compiler-backend-aarch64 --test gp_varargs
+          cargo test -p compiler-backend-aarch64 --test ptr64_calls
+      - name: Strict AArch64 library Clippy, and rustfmt on new adapter
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-backend-aarch64 -p compiler-backend --lib -- -D warnings
+          rustfmt --edition 2021 --check crates/backend-aarch64/src/gp_abi.rs
+          rustfmt --edition 2021 --check crates/backend/src/abi_gp.rs
+  cross-c-qemu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a537b57c43cc297fb79ea7f3998b5e8c6e847c4a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin exact source, isolate ABI/backend crates
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = a537b57c43cc297fb79ea7f3998b5e8c6e847c4a
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/backend","crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Install AArch64 GCC, binutils and QEMU for executable C11 oracles
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu libc6-dev-arm64-cross linux-libc-dev-arm64-cross qemu-user
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: abi-shared-gp-projection-qemu-20261120
+      - name: Exercise live TypeId AAPCS64 ELF/GAS C interop, including direct and indirect calls
+        working-directory: compiler
+        env:
+          COMPILER_REQUIRE_AARCH64_QEMU: "1"
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-aarch64 --test typeid_abi_calls_native -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test gp_varargs -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test ptr64_calls -- --nocapture
+  shared-x86:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a537b57c43cc297fb79ea7f3998b5e8c6e847c4a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Exact pin and isolated workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = a537b57c43cc297fb79ea7f3998b5e8c6e847c4a
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/backend"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: abi-shared-gp-projection-x86-20261120
+      - name: Preserve independent cross-target ABI classification
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib abi_plan
+          cargo test -p compiler-backend --lib abi_classify
+          cargo clippy -p compiler-backend --lib -- -D warnings
