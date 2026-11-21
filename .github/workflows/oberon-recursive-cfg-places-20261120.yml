@@ -1,0 +1,90 @@
+name: Oberon recursive CFG indexed-place lowering
+on:
+  push:
+    paths:
+      - '.github/workflows/oberon-recursive-cfg-places-20261120.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  cfg-places:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 0d40f830b3bb0cf6e5cb9a38abd1c3d70b753b51
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout pinned frontend and generator
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/oberon
+          ref: 4b98c16d95cd7c75c16785f92863a637ff8ffa97
+          path: oberon
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source revisions and use local frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 0d40f830b3bb0cf6e5cb9a38abd1c3d70b753b51
+          test "$(git -C oberon rev-parse HEAD)" = 4b98c16d95cd7c75c16785f92863a637ff8ffa97
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('compiler/crates/driver/Cargo.toml')
+          s=p.read_text()
+          old='oberon-front-ir = { git = "ssh://git@github.com/bingordo/oberon.git", rev = "4b98c16d95cd7c75c16785f92863a637ff8ffa97" }'
+          assert s.count(old)==1, "compiler frontend SHA does not match tested checkout"
+          p.write_text(s.replace(old,
+              'oberon-front-ir = { path = "../../../oberon/oberon/crates/front-ir" }'))
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            compiler -> target
+            oberon/oberon -> target
+          key: oberon-recursive-cfg-places-v1
+      - name: Native compiler build and TypeId validation
+        run: cargo check --manifest-path compiler/Cargo.toml -p compiler --bin compiler
+      - name: Nested 1D 2D 3D short-circuit lvalue executable C oracle
+        run: cargo test --manifest-path compiler/Cargo.toml -p compiler --bin compiler native_cfg_recursive_indexed_places_and_nested_calls_elf_gas -- --nocapture
+      - name: Existing multidimensional INC DEC once-evaluation oracle
+        run: cargo test --manifest-path compiler/Cargo.toml -p compiler --bin compiler native_multidim_inc_dec_indexes_once_in_elf_and_gas -- --nocapture
+      - name: Existing BOOLEAN value side-effect oracle
+        run: cargo test --manifest-path compiler/Cargo.toml -p compiler --bin compiler native_boolean_values_locals_globals_and_short_circuit_elf_gas -- --nocapture
+      - name: Existing Oberon source-vs-C corpus
+        run: cargo test --manifest-path compiler/Cargo.toml -p compiler --bin compiler m6_checked_oberon_source_vs_c_oracle -- --nocapture
+      - name: Strict native compiler Clippy
+        run: cargo clippy --manifest-path compiler/Cargo.toml -p compiler --all-targets -- -D warnings
+      - name: Build rich generator and reference C Cranelift backend
+        run: cargo build --manifest-path oberon/oberon/Cargo.toml --bin obgen --bin obc
+      - name: Native compiler build for rich differential runner
+        run: cargo build --manifest-path compiler/Cargo.toml -p compiler --bin compiler
+      - name: 4 rich source seeds x 44 cases native ELF GAS and reference backends
+        shell: bash
+        run: |
+          set -euo pipefail
+          export OBGEN="$PWD/oberon/oberon/target/debug/obgen"
+          export OBC="$PWD/oberon/oberon/target/debug/obc"
+          export COMPILER="$PWD/compiler/target/debug/compiler"
+          export FUZZ_WORK="$PWD/findings/rich"
+          FUZZ_VARIANT=rich FUZZ_BASE=1 FUZZ_SEEDS=4 bash compiler/tests/oberon_fuzz.sh
+      - name: Retain source programs and logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oberon-recursive-cfg-places-failures
+          path: findings/rich
+          if-no-files-found: ignore
+          retention-days: 14
