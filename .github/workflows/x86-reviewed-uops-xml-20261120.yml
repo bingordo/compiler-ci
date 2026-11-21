@@ -1,0 +1,63 @@
+name: x86 reviewed uops.info source SHA validation
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/x86-reviewed-uops-xml-20261120.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  measured-profile-provenance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 485b3da2fd91a4e4b207bddf28f6a8a9d972ef53
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source pin
+        run: test "$(git -C compiler rev-parse HEAD)" = "485b3da2fd91a4e4b207bddf28f6a8a9d972ef53"
+      - name: Offline XML importer and actual CLI source-provenance rejection
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 -m compileall -q tools/import_uops_info.py tools/validate_x86_costs.py tools/test_import_uops_info.py
+          python3 -m unittest discover -s tools -p test_import_uops_info.py -v
+          python3 tools/validate_x86_costs.py data/x86_costs_generic.json data/x86_costs_skl.json data/x86_costs_zen4.json
+  physical-backend-regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 485b3da2fd91a4e4b207bddf28f6a8a9d972ef53
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin and configure public dependency transport
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "485b3da2fd91a4e4b207bddf28f6a8a9d972ef53"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x86-reviewed-uops-20261120
+      - name: Physical cost unit tests and complete x86 backend library
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib physical_costs::tests
+          cargo test -p compiler-backend-x86 --lib
+      - name: Scoped strict Clippy (only documented pre-existing exceptions)
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-backend-x86 --lib -- -D warnings -A unused-variables -A clippy::empty_line_after_doc_comments
