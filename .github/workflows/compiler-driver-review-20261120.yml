@@ -1,0 +1,48 @@
+# Source-pinned validation of the compiler driver review patch.
+name: Compiler driver review fixes
+on:
+  push:
+    branches: [ci/compiler-driver-review-20261120]
+    paths: ['.github/workflows/compiler-driver-review-20261120.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      SOURCE_SHA: '340b440ff1a22435edb6d91c8801df9294905b01'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and isolate driver workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "Compiler source SHA: $SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86","crates/backend-aarch64","crates/backend-riscv64","crates/backend-wasm","crates/driver"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: compiler-driver-review
+      - name: Validate driver options, input preservation and native default
+        working-directory: compiler
+        run: cargo test -p compiler --test ir_default_cli
+      - name: Validate Mini-C and shared object/assembly paths
+        working-directory: compiler
+        run: cargo test -p compiler --test mini_c_cli -- --skip cli_rejects_not_yet_lowered_checked_operators_without_partial_objects
+      - name: Check the generated memory-form gate
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --lib reviewed_generated_gate_matrix_matches_existing_compiler_feature_contract
