@@ -1,0 +1,63 @@
+name: RV64 ADDI-chain machine SSA regression
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-rv64-addi-ssa-guards-20261121.yml']
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact compiler branch or SHA
+        required: true
+        type: string
+        default: '5cf67cb6cc4bebc82258197c206b15ca0411fed5'
+permissions:
+  contents: read
+jobs:
+  rv64-addi-guards:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || '5cf67cb6cc4bebc82258197c206b15ca0411fed5' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact default test revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git -C compiler rev-parse HEAD)"
+          echo "Validated source SHA: $actual" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            test "$actual" = '5cf67cb6cc4bebc82258197c206b15ca0411fed5'
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Minimal TypeId-native workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-riscv64"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: rv64-addi-ssa-guards-20261121
+      - name: Run focused and full RV64 regression suites
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-riscv64 --lib addi_chain_respects_phi_edges_and_shared_uses -- --exact --nocapture || \
+            cargo test -p compiler-backend-riscv64 --lib addi_chain_respects_phi_edges_and_shared_uses -- --nocapture
+          cargo test -p compiler-backend-riscv64 --lib addi_chain_keeps_out_of_range_sum -- --nocapture
+          cargo test -p compiler-backend-riscv64 --all-targets
+          cargo clippy -p compiler-backend-riscv64 --all-targets -- -D warnings
+          python3 tools/regen_riscv_native_selector_rules.py --check
