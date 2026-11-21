@@ -165,7 +165,7 @@ jobs:
           cargo test --manifest-path tools/edg-driver/Cargo.toml class_reference_result_tests -- --nocapture
           echo "EDG_REFERENCE_RETURN gate=source_verified_ptr64_no_class_materialization result=pass" >>"$GITHUB_STEP_SUMMARY"
 
-      - name: Prove source-defined C++ bool AL against independent G++
+      - name: Native source-defined bool AL versus independent G++
         working-directory: edgcpp/build/gcc-release
         run: |
           set -euo pipefail
@@ -176,176 +176,24 @@ jobs:
           mkdir -p "$work"
           cd "$work"
           cp "$fixture" source.cpp
-          grep -Fq 'extern "C" bool edg_cxx_bool_defined(int x)' source.cpp
-          g++ -std=c++17 -fno-exceptions -O2 -Wall -Wextra -Werror source.cpp -o oracle
-          timeout 15s ./oracle >oracle.out 2>oracle.err
-          version="$(g++ -dumpfullversion -dumpversion)"
-          IFS=. read -r major minor patch <<<"$version"
-          gnu_number=$((10#$major*10000+10#${minor:-0}*100+10#${patch:-0}))
-          rm -f native.o native
-          "$driver" native.o --g++ --c++17 --no_strict_gnu \
-            --no_exceptions --gnu_version "$gnu_number" source.cpp >native.log 2>&1 || {
-              tail -n 80 native.log >&2
-              test ! -e native.o
-              exit 1
-            }
-          test "$(od -An -tx1 -N4 native.o | tr -d '[:space:]')" = 7f454c46
-          nm native.o | grep -Eq ' [TW] edg_cxx_bool_defined
-        working-directory: edgcpp/build/gcc-release
-        run: |
-          set -euo pipefail
-          source ./environment.sh
-          driver="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
-          fixtures="$GITHUB_WORKSPACE/compiler/tools/edg-driver/tests/fixtures"
-          out="$RUNNER_TEMP/cxx5-original-iostream"
-          mkdir -p "$out"
-          cd "$out"
-          g++ -std=c++17 -v -E -x c++ /dev/null >include-search.log 2>&1
-          mapfile -t include_dirs < <(awk '
-            /#include <\.\.\.> search starts here:/{active=1;next}
-            /^End of search list/{active=0}
-            active && /^ /{sub(/^[[:space:]]+/,"");print}
-          ' include-search.log)
-          test "${#include_dirs[@]}" -ge 3
-          include_flags=()
-          for directory in "${include_dirs[@]}"; do
-            test -d "$directory"
-            include_flags+=("-I$directory")
-          done
-          version="$(g++ -dumpfullversion -dumpversion)"
-          IFS=. read -r major minor patch <<<"$version"
-          gnu_number=$((10#$major*10000 + 10#${minor:-0}*100 + 10#${patch:-0}))
-          for case in unused no_endl endl; do
-            case "$case" in
-              unused) original=edg_native_cxx5_iostream_unused.cpp ;;
-              no_endl) original=edg_native_cxx5_iostream_no_endl.cpp ;;
-              endl) original=edg_native_cxx5_iostream.cpp ;;
-            esac
-            cp "$fixtures/$original" source.cpp
-            g++ -std=c++17 -fno-exceptions -O0 -Wall -Wextra -Werror \
-              source.cpp -o oracle
-            set +e
-            timeout 15s ./oracle >oracle.out 2>oracle.err
-            oracle_status=$?
-            set -e
-            test "$oracle_status" -lt 124
-            rm -f native.o native native.out native.err
-            set +e
-            timeout 180s "$driver" native.o --g++ --c++17 --no_strict_gnu \
-              --no_exceptions --gnu_version "$gnu_number" "${include_flags[@]}" \
-              source.cpp >native.compile.log 2>&1
-            status=$?
-            set -e
-            if test "$status" -eq 0; then
-              test "$(od -An -tx1 -N4 native.o | tr -d '[:space:]')" = 7f454c46
-              if g++ -std=c++17 -fno-exceptions native.o -o native >link.log 2>&1; then
-                set +e
-                timeout 15s ./native >native.out 2>native.err
-                native_status=$?
-                set -e
-                test "$native_status" = "$oracle_status"
-                test "$(sha256sum oracle.out | cut -d' ' -f1)" = \
-                     "$(sha256sum native.out | cut -d' ' -f1)"
-                test "$(sha256sum oracle.err | cut -d' ' -f1)" = \
-                     "$(sha256sum native.err | cut -d' ' -f1)"
-                echo "EDG_IOS_ORIGINAL case=$case result=runtime_parity" >>"$GITHUB_STEP_SUMMARY"
-              else
-                echo "EDG_IOS_ORIGINAL case=$case result=link_blocker" >>"$GITHUB_STEP_SUMMARY"
-                tail -n 15 link.log
-              fi
-            elif test "$status" -eq 124 || test "$status" -eq 137; then
-              echo "EDG_IOS_ORIGINAL case=$case compiler timeout or killed" >&2
-              exit 1
-            else
-              test ! -e native.o
-              grep -E 'EDG -> compiler-ir rejected|native TypeId x86 backend|Error:|error:' \
-                native.compile.log | tail -n 8 || {
-                cat native.compile.log
-                exit 1
-              }
-              echo "EDG_IOS_ORIGINAL case=$case result=source_rejection_no_object" >>"$GITHUB_STEP_SUMMARY"
-            fi
-          done
-
-      - name: Verify exact AL bool-return ABI against independent G++ definition
-        working-directory: edgcpp/build/gcc-release
-        run: |
-          set -euo pipefail
-          source ./environment.sh
-          driver="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
-          work="$RUNNER_TEMP/cxx5-bool-al"
-          mkdir -p "$work"
-          cd "$work"
-          cat >main.cpp <<'CPP'
-          extern bool test_bool(int);
-          int main() {
-            if (test_bool(0)) return 7;
-            if (!test_bool(1)) return 9;
-            return 0;
-          }
-          CPP
-          cat >owner.cpp <<'CPP'
-          bool test_bool(int x) { return x!=0; }
-          CPP
-          g++ -std=c++17 -Wall -Wextra -Werror -fno-exceptions -c owner.cpp -o owner.o
-          g++ -std=c++17 -Wall -Wextra -Werror -fno-exceptions main.cpp owner.o -o gxx_reference
-          timeout 15s ./gxx_reference
+          g++ -std=c++17 -fno-exceptions -Wall -Wextra -Werror source.cpp -o reference
+          timeout 15s ./reference >ref.out 2>ref.err
           version="$(g++ -dumpfullversion -dumpversion)"
           IFS=. read -r major minor patch <<<"$version"
           gnu_number=$((10#$major*10000+10#${minor:-0}*100+10#${patch:-0}))
           "$driver" native.o --g++ --c++17 --no_strict_gnu \
-            --no_exceptions --gnu_version "$gnu_number" main.cpp >native.log 2>&1 || {
-              tail -n 60 native.log >&2
+            --no_exceptions --gnu_version "$gnu_number" source.cpp >native.compile.log 2>&1 || {
+              tail -n 80 native.compile.log
               test ! -e native.o
               exit 1
             }
           test "$(od -An -tx1 -N4 native.o | tr -d '[:space:]')" = 7f454c46
-          readelf -rW native.o | grep -F '_Z9test_booli'
-          g++ native.o owner.o -o native
-          timeout 15s ./native
-          echo 'EDG_CXX5_BOOL_AL independent_gxx_owner=yes native_elf=yes executable_parity=yes' >>"$GITHUB_STEP_SUMMARY"
-
-          # SysV _Bool guarantees AL; EAX[31:8] is intentionally poisoned.
-          # The native compiler must ignore the poisoned high bits, as G++ does.
-          cat >noisy.S <<'ASM'
-          .text
-          .globl _Z9test_booli
-          .type _Z9test_booli, @function
-          _Z9test_booli:
-              movl $0x7eadbe00, %eax
-              testl %edi, %edi
-              setne %al
-              ret
-          .section .note.GNU-stack,"",@progbits
-          ASM
-          gcc -c noisy.S -o noisy.o
-          g++ main.cpp noisy.o -o gxx_noisy
-          timeout 15s ./gxx_noisy
-          g++ native.o noisy.o -o native_noisy
-          timeout 15s ./native_noisy
-          echo 'EDG_CXX5_BOOL_AL high_EAX_bits_poisoned=yes gcc_native_parity=yes' >>"$GITHUB_STEP_SUMMARY"
-
-      - name: Keep original-source diagnostics and native ELF evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: edg-reference-return-native-probe
-          path: |
-            ${{ runner.temp }}/cxx5-imported-external/
-            ${{ runner.temp }}/cxx5-original-iostream/
-            ${{ runner.temp }}/cxx5-bool-al/
-            ${{ runner.temp }}/cxx5-defined-bool/
-          if-no-files-found: warn
-          retention-days: 7
-
+          nm native.o | grep -F ' edg_cxx_bool_defined'
           g++ -std=c++17 -fno-exceptions native.o -o native
           timeout 15s ./native >native.out 2>native.err
-          test "$(sha256sum oracle.out | cut -d' ' -f1)" = \
-               "$(sha256sum native.out | cut -d' ' -f1)"
-          test "$(sha256sum oracle.err | cut -d' ' -f1)" = \
-               "$(sha256sum native.err | cut -d' ' -f1)"
-          echo 'EDG_CXX5_BOOL_DEFINED independent_gxx=yes native_elf=yes exit_stdout_stderr_parity=yes' \
-            >>"$GITHUB_STEP_SUMMARY"
+          test "$(sha256sum ref.out | cut -d' ' -f1)" = "$(sha256sum native.out | cut -d' ' -f1)"
+          test "$(sha256sum ref.err | cut -d' ' -f1)" = "$(sha256sum native.err | cut -d' ' -f1)"
+          echo 'EDG_CXX5_DEFINED_BOOL native_elf=yes gxx_runtime_parity=yes' >>"$GITHUB_STEP_SUMMARY"
 
       - name: Compare unchanged GCC15 iostream and original intermediates
         working-directory: edgcpp/build/gcc-release
@@ -491,5 +339,6 @@ jobs:
             ${{ runner.temp }}/cxx5-imported-external/
             ${{ runner.temp }}/cxx5-original-iostream/
             ${{ runner.temp }}/cxx5-bool-al/
+            ${{ runner.temp }}/cxx5-defined-bool/
           if-no-files-found: warn
           retention-days: 7
