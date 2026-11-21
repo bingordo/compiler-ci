@@ -50,7 +50,7 @@ jobs:
           echo "Scheduled compiler main revision: $sha" >> "$GITHUB_STEP_SUMMARY"
 
   core:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -89,6 +89,42 @@ jobs:
       - name: Verify core and x86 backend
         working-directory: compiler
         run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+
+  legacy-pre-oracle-cutover:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b7ebaba851a9291e27fe6019a8a3d02505366574
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin source and isolate native optimizer workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "b7ebaba851a9291e27fe6019a8a3d02505366574"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: migration-ir-legacy-pre-feature
+      - name: Verify default TypeId optimizer and independent PRE oracles
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --lib
+          cargo test -p compiler-opt --test pre_native --test pre_licm_semantic_matrix --lib
+          cargo check -p compiler-opt --all-targets
 
   pr-core:
     needs: discover
