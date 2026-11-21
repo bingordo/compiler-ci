@@ -1,0 +1,84 @@
+name: X7 executable CPU throughput and dependency cost model
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/x7-cpu-throughput-dependency-20261121.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  shared-and-x86-cost-unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 3b7ec07fec85493ecbd46b8616a9488f3f1dc774
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact candidate and public dependency transport
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "3b7ec07fec85493ecbd46b8616a9488f3f1dc774"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-measured-throughput-dependency-20261121
+      - name: Verify pinned CPU physical-cost tables and reviewed XED variants
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/regen_x86_physical_costs.py --check
+          python3 tools/validate_x86_costs.py data/x86_costs_skl.json data/x86_costs_zen4.json
+      - name: Shared fixed-point cost ranking and profile schema tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend --lib
+      - name: Full x86 backend CPU cost / physical legality tests
+        working-directory: compiler
+        run: |
+          # Concurrent legacy-IR retirement gates existing CSE oracle
+          # used by historical x86 unit tests; enable only for this run.
+          cargo test -p compiler-backend-x86 --lib --features compiler-opt/legacy-function-cse-oracle
+      - name: X86 disabled-feature build and scoped Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-backend-x86 --no-default-features
+          # Existing unrelated compiler-opt/ASM/ELF warnings, as documented
+          # in the prior fully accepted cost-model and PGO jobs.
+          cargo clippy -p compiler-backend -p compiler-backend-x86 --lib -- -D warnings -A unused-imports -A dead-code -A unused-variables -A clippy::empty_line_after_doc_comments -A clippy::needless_lifetimes -A clippy::collapsible_match
+  native-cpu-selection-oracles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 3b7ec07fec85493ecbd46b8616a9488f3f1dc774
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact candidate and dependency transport
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "3b7ec07fec85493ecbd46b8616a9488f3f1dc774"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-measured-native-cost-dependency-20261121
+      - name: Explicit SKL and ZEN4 selected native TypeId ELF/GAS CPU model
+        working-directory: compiler
+        run: cargo test -p compiler --test x86_cost_selection_source -- --nocapture
+      - name: Preserve original source read-only telemetry byte parity
+        working-directory: compiler
+        run: cargo test -p compiler --test x86_late_cost_source -- --nocapture
