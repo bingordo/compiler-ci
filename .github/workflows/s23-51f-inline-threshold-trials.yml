@@ -1,0 +1,159 @@
+name: S23.51f shared prefix probe inlining threshold trials
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-51f-inline-threshold-trials.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inlining-threshold-trial:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c3b04b7b49909fbf69e9742a67c2ffc735c3cdcb
+          path: b
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 426afcb05fe33f5a6676e8271ca7f57165a6d8d5
+          path: c
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1ceb2aa1b3d3e60ca831e47bd8fb35b9b998b225
+          path: now
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check exact SHA and identical 88-family rule databases
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C b rev-parse HEAD)" = c3b04b7b49909fbf69e9742a67c2ffc735c3cdcb
+          test "$(git -C c rev-parse HEAD)" = 426afcb05fe33f5a6676e8271ca7f57165a6d8d5
+          test "$(git -C now rev-parse HEAD)" = 1ceb2aa1b3d3e60ca831e47bd8fb35b9b998b225
+          cmp b/tools/typeid-rule-gen/examples.rules c/tools/typeid-rule-gen/examples.rules
+          cmp c/tools/typeid-rule-gen/examples.rules now/tools/typeid-rule-gen/examples.rules
+          # Deliberately compare two different cache emitter implementations.
+          ! cmp -s c/tools/typeid-rule-gen/ssa_codegen.py now/tools/typeid-rule-gen/ssa_codegen.py
+          mkdir -p results
+      - name: Materialize source-pinned generated Rust and optimized instantiated object
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > results/instantiate.rs <<'RS'
+          struct TestView { a:u32, b:u32 }
+          impl SsaView for TestView {
+              type Value=u32;
+              fn binary(&self,id:u32,width:u32,op:Opcode)->Option<(u32,u32)> {
+                  if width!=64 { return None; }
+                  match (id,op) {
+                      (100,_) => Some((self.a,self.b)),
+                      (101,Opcode::And) => Some((self.b,self.a)),
+                      (102,Opcode::Or) => Some((self.a,self.b)),
+                      (103,Opcode::Xor) => Some((self.a,self.b)),
+                      _ => None
+                  }
+              }
+              fn unary(&self,id:u32,width:u32,op:Opcode)->Option<u32> {
+                  (width==64 && op==Opcode::Not && id==104).then_some(self.a)
+              }
+              fn constant(&self,id:u32,width:u32)->Option<i128> {
+                  (width==64 && id==105).then_some(0)
+              }
+          }
+          #[no_mangle]
+          pub extern "C" fn s2351f_matcher_footprint(kind:u8,a:u32,b:u32)->u32 {
+              let opcode=match kind {
+                  0=>Opcode::Add,1=>Opcode::Sub,2=>Opcode::Mul,3=>Opcode::And,
+                  4=>Opcode::Or,5=>Opcode::Xor,_=>Opcode::Not,
+              };
+              let view=TestView{a,b};
+              let root=if kind>=6 {104} else {100};
+              let result=shadow_match(&view,root,64,opcode);
+              match result {
+                  None=>0,Some((_,Proposal::Alias(id)))=>id,
+                  Some((_,Proposal::Constant(n)))=>n as u32,
+                  Some((_,Proposal::Binary{lhs,..}))=>lhs,
+                  Some((_,Proposal::TwoOp{outer_lhs,..}))=>outer_lhs
+              }
+          }
+          RS
+          python3 - <<'PY'
+          import subprocess,time,json,shutil
+          from pathlib import Path
+          records=[]
+          original=(Path('now')/'tools/typeid-rule-gen/ssa_codegen.py').read_text()
+          assert 'prefix_count[key] >= 4' in original
+          shutil.copytree('now/tools/typeid-rule-gen','study-gen')
+          variants=('b','c','now')+tuple(
+              f'trial_{n}_{hint}' for n in (4,8,16,32)
+              for hint in ('always','auto'))
+          for tag in variants:
+              if tag.startswith('trial_'):
+                  _,threshold,hint=tag.split('_')
+                  code=original.replace('prefix_count[key] >= 4',
+                                        f'prefix_count[key] >= {threshold}')
+                  Path('study-gen/ssa_codegen.py').write_text(code)
+                  generator=Path('study-gen/rules.py')
+                  rules=Path('study-gen/examples.rules')
+              else:
+                  root=Path(tag)
+                  generator=root/'tools/typeid-rule-gen/rules.py'
+                  rules=root/'tools/typeid-rule-gen/examples.rules'
+              result=subprocess.run(['python3',str(generator),str(rules),'--emit-ssa-rust'],
+                         capture_output=True,check=True)
+              generated_bytes=result.stdout
+              if tag.startswith('trial_'):
+                  # This is a CI-only search of inlining thresholds/hints,
+                  # never a production compiler generation override.
+                  if hint=='always':
+                      generated_bytes=generated_bytes.replace(
+                          b'#[inline(never)]',b'#[inline(always)]')
+                  else:
+                      generated_bytes=generated_bytes.replace(
+                          b'#[inline(never)]',b'')
+              generated=Path('results')/(tag+'.rs')
+              generated.write_bytes(generated_bytes+Path('results/instantiate.rs').read_bytes())
+              before=time.monotonic_ns()
+              subprocess.run(['rustc','--crate-name','s2351f_footprint','--edition=2021',
+                   '-C','opt-level=2','-C','codegen-units=1',
+                   '--crate-type=lib','--emit=obj',str(generated),
+                   '-o','results/'+tag+'.o'],check=True)
+              elapsed=time.monotonic_ns()-before
+              obj_bytes=int(Path('results',tag+'.o').stat().st_size)
+              sections=subprocess.run(['size','-A','results/'+tag+'.o'],
+                   capture_output=True,text=True,check=True).stdout
+              text_bytes=sum(int(row.split()[1]) for row in sections.splitlines()
+                   if len(row.split())>=2 and row.split()[0].startswith('.text'))
+              record={'revision':tag,'generated_rust_bytes':len(generated_bytes),
+                   'instantiated_object_bytes':obj_bytes,
+                   'instantiated_text_section_bytes':text_bytes,
+                   'rustc_codegen_elapsed_ns':elapsed}
+              records.append(record)
+              print('S2351F_THRESHOLD revision={revision} generated_rust_bytes={generated_rust_bytes} '
+                    'text_bytes={instantiated_text_section_bytes} '
+                    'object_bytes={instantiated_object_bytes}'.format(**record),
+                    flush=True)
+          assert records[1]['instantiated_text_section_bytes']==41788
+          data={'schema':'compiler.s2351f-inline-threshold-trial.v1',
+              'scope':'fixed generic seven-opcode Rust instantiation, no perf claim',
+              'measurements':records}
+          Path('results/s2351f-inline-thresholds.json').write_text(
+               json.dumps(data,indent=2)+'\n')
+          PY
+      - name: Save source-pinned inlining threshold trials
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2351f-inlining-threshold-trials
+          path: results/s2351f-inline-thresholds.json
+          if-no-files-found: error
+          retention-days: 28
