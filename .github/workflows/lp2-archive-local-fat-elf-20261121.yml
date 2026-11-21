@@ -1,0 +1,56 @@
+name: LP2 member-local ELF bound TypeId LTO overlay
+on:
+  push:
+    branches: [ci/lp2-archive-local-fat-elf-20261121]
+    paths: ['.github/workflows/lp2-archive-local-fat-elf-20261121.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: 2de98526a80e7efacf6000b3383034f668925dec
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2de98526a80e7efacf6000b3383034f668925dec
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned exact source SHA and linker version
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          ld --version | head -1
+          cc --version | head -1
+      - name: Install GNU plugin header
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y binutils-dev
+      - name: Check both Python tools and C probe build
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile tools/lto_fat_object.py tools/test_lto_fat_object.py
+          cc -std=c11 -O2 -fPIC -shared -Wall -Wextra -Werror \
+            tools/lto-plugin-probe/trace_plugin.c -o "$RUNNER_TEMP/lp2-probe.so"
+      - name: Build real source compiler (only on compiler-ci)
+        working-directory: compiler
+        run: cargo build -p compiler --bin compiler
+      - name: Verify exact bound v2-v8 metadata, ELF/archive fallback and plugin observation
+        working-directory: compiler
+        run: |
+          python3 tools/test_lto_fat_object.py \
+            --compiler target/debug/compiler --probe "$RUNNER_TEMP/lp2-probe.so"
+      - name: LP1 GNU callback/archive regression
+        working-directory: compiler
+        run: python3 tools/test_lto_linker_plugin_probe.py
