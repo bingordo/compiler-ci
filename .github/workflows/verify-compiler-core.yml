@@ -50,7 +50,7 @@ jobs:
           echo "Scheduled compiler main revision: $sha" >> "$GITHUB_STEP_SUMMARY"
 
   core:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -89,6 +89,48 @@ jobs:
       - name: Verify core and x86 backend
         working-directory: compiler
         run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+
+  legacy-sccp-oracle-cutover:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact compiler commit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 73e8e7286a039c3197979bffc1a465fa696c4fe3
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and restrict workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "73e8e7286a039c3197979bffc1a465fa696c4fe3"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: migration-ir-legacy-sccp-feature
+      - name: Check default production and opt-in SCCP
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --lib
+          cargo check -p compiler-backend-x86 -p compiler-backend-aarch64
+          cargo check -p compiler-opt --lib --no-default-features --features legacy-function-sccp-oracle
+      - name: Test historical and native SCCP
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test typed_sccp --test sccp_sparse_native
 
   pr-core:
     needs: discover
