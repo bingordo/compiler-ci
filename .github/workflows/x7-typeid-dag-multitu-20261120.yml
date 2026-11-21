@@ -1,0 +1,78 @@
+name: X7 TypeId source-DAG three-TU cross-call GCC differential
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/x7-typeid-dag-multitu-20261120.yml'
+      - 'tools/x7_dag_multitu_differential.py'
+permissions:
+  contents: read
+jobs:
+  multi-tu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 58f5ee35ed8773b67ee0f4fdff6f8355709fc676
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify compiler source and configure pinned frontend
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 58f5ee35ed8773b67ee0f4fdff6f8355709fc676
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+          gcc --version | head -1
+          rustc --version
+      - name: Independently GCC syntax validate all generated multi-TU files
+        run: |
+          set -euo pipefail
+          python3 -m py_compile tools/x7_dag_multitu_differential.py
+          python3 tools/x7_dag_multitu_differential.py --syntax-only
+      - name: Prove generated DAG pattern regression on exact source
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib \
+            --features x7-typeid-source-dag-optin \
+            optin_generated_rules_only_rewrites_proven_dag_without_unreviewed_fusions -- --nocapture
+      - name: Same-SHA default and feature-on release TypeId compilers
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          (cd compiler && cargo build --release -p compiler --bin compiler)
+          cp compiler/target/release/compiler results/compiler-default
+          (cd compiler && cargo build --release -p compiler --bin compiler \
+            --features compiler-backend-x86/x7-typeid-source-dag-optin)
+          cp compiler/target/release/compiler results/compiler-optin
+          test "$(sha256sum results/compiler-default | cut -d' ' -f1)" != "$(sha256sum results/compiler-optin | cut -d' ' -f1)"
+      - name: Native GCC -fwrapv oracle on 20 multi-TU source seeds and PIC/RBP/GAS
+        run: |
+          set -euo pipefail
+          python3 tools/x7_dag_multitu_differential.py \
+            --default results/compiler-default \
+            --optin results/compiler-optin \
+            --out results/x7-multitu.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('results/x7-multitu.json'))
+          assert d['cases']==42 and d['unique_seeds']==20
+          assert d['separate_translation_units']==3 and d['sysv_8_arg_call']
+          assert d['native_reference_agreement'] and not d['text_increases']
+          assert d['text_reductions']>0
+          print('X7_MTU_NATIVE_VALIDATED',d['unique_seeds'],
+                'configurations',d['cases'],'saved',d['net_saved_text_bytes'])
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-native-multitu-source-differential
+          path: results/x7-multitu.json
+          retention-days: 30
