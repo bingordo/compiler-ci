@@ -1,0 +1,58 @@
+name: Shared remat partial profitability source-pinned acceptance
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/remat-partial-profitability-20261120.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  shared-planner-x86-aarch64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler PR candidate (only compiler-ci runs Actions)
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ed56560d41cbff3d27e4f61a409137b1abf56ad7
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Fail closed unless exact candidate is checked out
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "ed56560d41cbff3d27e4f61a409137b1abf56ad7"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: remat-partial-profitability-20261120
+      - name: Shared remat new regression and full backend library tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib remat::tests -- --nocapture
+          cargo test -p compiler-backend --lib
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend-aarch64 --lib
+      - name: Strict shared and target backend Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --lib -- -D warnings
+      - name: Production native x86 TypeId and GCC differential integration
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test x86_inline_source_ablation -- --nocapture
+          cargo test -p compiler --test x7_s4_rolling_checksum_source -- --nocapture
+      - name: Record exact checked revision
+        if: always()
+        run: |
+          echo "Compiler source: ed56560d41cbff3d27e4f61a409137b1abf56ad7" >> "$GITHUB_STEP_SUMMARY"
+          git -C compiler status --porcelain
