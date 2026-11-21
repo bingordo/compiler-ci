@@ -1,0 +1,142 @@
+name: ABI shared GP target register lookup (#2433)
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/verify-abi-shared-gp-registers-20261120.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  x86-native-abi:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 97a48154d78c40526aa78f4487201cb6ed1e12de
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin source to exact candidate and isolate source ABI crates
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 97a48154d78c40526aa78f4487201cb6ed1e12de
+          test "$(uname -m)" = x86_64
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: abi-gp-registers-x86-20261120
+      - name: Run shared physical GP tests and x86 scalar independent call oracle
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib abi_gp
+          cargo test -p compiler-backend --lib abi_plan
+          cargo test -p compiler-backend-x86 --lib scalar_abi
+          cargo test -p compiler-backend-x86 --lib shared_fixed_scalar_parity
+          cargo test -p compiler-backend-x86 --test m4_7_scalar_sse_stream_native
+          cargo test -p compiler-backend-x86 --test native_typeid_function_signatures -- \
+            --skip typed_indirect_callee_provenance_rejects_mismatch_and_forgery
+      - name: Strict shared backend Clippy and source-targeted formatting
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-backend --lib -- -D warnings
+          rustfmt --edition 2021 --check crates/backend/src/abi_gp.rs crates/backend-x86/src/scalar_abi.rs
+      - name: x86 backend library integration Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-backend-x86 --lib -- \
+            -D warnings -A private_interfaces \
+            -A clippy::suspicious_assignment_formatting \
+            -A unused_variables -A clippy::too_many_arguments
+
+  rv64-gp-admission:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 97a48154d78c40526aa78f4487201cb6ed1e12de
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin source, isolate RISC-V backend and source ABI
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 97a48154d78c40526aa78f4487201cb6ed1e12de
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/backend","crates/backend-riscv64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: abi-gp-registers-rv64-20261120
+      - name: Test RISC-V GP admission, native TypeId calls and leaf ELF
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-riscv64 --lib abi_integer_argument_tests
+          cargo test -p compiler-backend-riscv64 --lib
+          cargo test -p compiler-backend-riscv64 --test calls
+          cargo test -p compiler-backend-riscv64 --test leaf
+          cargo clippy -p compiler-backend-riscv64 --lib -- -D warnings
+          rustfmt --edition 2021 --check crates/backend-riscv64/src/target.rs
+
+  aarch64-checked-shared:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 97a48154d78c40526aa78f4487201cb6ed1e12de
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin source and native ARM host
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 97a48154d78c40526aa78f4487201cb6ed1e12de
+          test "$(uname -m)" = aarch64
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/backend","crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: abi-gp-registers-arm64-20261120
+      - name: Check shared GP projector and existing native AAPCS64 call emitter
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib abi_gp
+          cargo test -p compiler-backend-aarch64 --lib gp_abi
+          cargo test -p compiler-backend-aarch64 --test typeid_abi_calls_native
+          cargo test -p compiler-backend-aarch64 --test gp_varargs
+          cargo clippy -p compiler-backend -p compiler-backend-aarch64 --lib -- -D warnings
