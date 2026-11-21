@@ -1,0 +1,119 @@
+name: Driver native ABI tests (prebuilt)
+on:
+  push:
+    branches: [ci/prebuilt-driver-provenance-20261120]
+    paths: ['.github/workflows/test-prebuilt-driver-provenance.yml']
+permissions:
+  contents: read
+concurrency:
+  group: prebuilt-driver-provenance-validation
+  cancel-in-progress: true
+jobs:
+  changed:
+    runs-on: ubuntu-24.04
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+      publication_sha: ${{ steps.source.outputs.publication }}
+      needs_test: ${{ steps.cache.outputs['cache-hit'] != 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: expr-rule-gen-binaries
+          path: binary-source
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          sparse-checkout: |
+            dist/driver-native
+      - name: Wrong expected source fails before reaching a cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/source-check.sh" <<'CHECK_SOURCE'
+          set -euo pipefail
+          sha="$(cat binary-source/dist/driver-native/source-sha.txt)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          publication="$(git -C binary-source rev-parse HEAD)"
+          if [ -n "$EXPECTED_SHA" ] && [ "$sha" != "$EXPECTED_SHA" ]; then
+            echo "::error::Expected compiler source $EXPECTED_SHA but publication contains $sha"
+            exit 1
+          fi
+          printf 'sha=%s\npublication=%s\n' "$sha" "$publication" >> "$GITHUB_OUTPUT"
+          CHECK_SOURCE
+          actual="$(cat binary-source/dist/driver-native/source-sha.txt)"
+          wrong="0000000000000000000000000000000000000000"
+          if [ "$actual" = "$wrong" ]; then wrong="1111111111111111111111111111111111111111"; fi
+          export EXPECTED_SHA="$wrong" GITHUB_OUTPUT="$RUNNER_TEMP/test-provenance-output"
+          if bash "$RUNNER_TEMP/source-check.sh"; then
+            echo 'The provenance check unexpectedly accepted a different source revision'
+            exit 1
+          fi
+          test ! -e "$GITHUB_OUTPUT"
+      - name: Check the published source before cache lookup
+        id: source
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_source_sha }}
+        run: |
+          set -euo pipefail
+          sha="$(cat binary-source/dist/driver-native/source-sha.txt)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          publication="$(git -C binary-source rev-parse HEAD)"
+          if [ -n "$EXPECTED_SHA" ] && [ "$sha" != "$EXPECTED_SHA" ]; then
+            echo "::error::Expected compiler source $EXPECTED_SHA but publication contains $sha"
+            exit 1
+          fi
+          printf 'sha=%s\npublication=%s\n' "$sha" "$publication" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v4
+        id: cache
+        with:
+          path: .driver-native-verified
+          key: driver-native-verified-${{ steps.source.outputs.publication }}-v2
+          lookup-only: true
+      - name: Report cached verification
+        if: steps.cache.outputs.cache-hit == 'true'
+        run: echo 'Cached driver native pass for source ${{ steps.source.outputs.sha }} at publication ${{ steps.source.outputs.publication }}' >> "$GITHUB_STEP_SUMMARY"
+  verify:
+    needs: changed
+    if: ${{ needs.changed.outputs.needs_test == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ needs.changed.outputs.publication_sha }}
+          path: binary-source
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          sparse-checkout: |
+            dist/driver-native
+      - name: Verify provenance and unpack
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ needs.changed.outputs.source_sha }}
+          PUBLICATION_SHA: ${{ needs.changed.outputs.publication_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git -C binary-source rev-parse HEAD)" = "$PUBLICATION_SHA"
+          cd binary-source/dist/driver-native
+          test "$(cat source-sha.txt)" = "$SOURCE_SHA"
+          sha256sum -c sha256.txt
+          mkdir -p "$RUNNER_TEMP/driver-native"
+          tar -xzf driver-native-linux-x86_64.tar.gz -C "$RUNNER_TEMP/driver-native"
+          test -x "$RUNNER_TEMP/driver-native/driver-native-tests"
+          echo "Compiler source: $(cat source-sha.txt)"
+      - name: Execute driver native ABI suite
+        shell: bash
+        run: |
+          "$RUNNER_TEMP/driver-native/driver-native-tests" --nocapture
+      - name: Record passing source SHA
+        shell: bash
+        run: |
+          mkdir -p .driver-native-verified
+          printf '%s\n' '${{ needs.changed.outputs.source_sha }}' > .driver-native-verified/source-sha.txt
+      - uses: actions/cache/save@v4
+        with:
+          path: .driver-native-verified
+          key: driver-native-verified-${{ needs.changed.outputs.publication_sha }}-v2
+
