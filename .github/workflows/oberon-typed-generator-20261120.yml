@@ -1,0 +1,77 @@
+name: Oberon recursive typed AST generated differential
+on:
+  push:
+    paths:
+      - '.github/workflows/oberon-typed-generator-20261120.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  typed-differential:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout typed generator candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/oberon
+          ref: 2b1613f9dddefeda99fef87766827bb49ba8c2a4
+          path: oberon
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout typed differential runner candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 784ccca8d426be7b197263f80633e0e8b8b65ea6
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Exact pin and checked-out dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C oberon rev-parse HEAD)" = 2b1613f9dddefeda99fef87766827bb49ba8c2a4
+          test "$(git -C compiler rev-parse HEAD)" = 784ccca8d426be7b197263f80633e0e8b8b65ea6
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('compiler/crates/driver/Cargo.toml')
+          s=p.read_text()
+          a='oberon-front-ir = { git = "ssh://git@github.com/bingordo/oberon.git", rev = "2b1613f9dddefeda99fef87766827bb49ba8c2a4" }'
+          assert s.count(a)==1, 'typed frontend must have an exact pin'
+          p.write_text(s.replace(a,'oberon-front-ir = { path = "../../../oberon/oberon/crates/front-ir" }'))
+          PY
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            compiler -> target
+            oberon/oberon -> target
+          key: oberon-typed-generator-v1
+      - name: Typed AST generator construction, bounds, and reproducibility tests
+        run: cargo test --manifest-path oberon/oberon/Cargo.toml --bin obgen compiler_typed -- --nocapture
+      - name: Build generated program reference backends
+        run: cargo build --manifest-path oberon/oberon/Cargo.toml --bin obgen --bin obc
+      - name: Build native compiler
+        run: cargo build --manifest-path compiler/Cargo.toml -p compiler --bin compiler
+      - name: Run recursive typed AST seeds with C runtime reference and metamorphic C/Cranelift tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          export OBGEN="$PWD/oberon/oberon/target/debug/obgen"
+          export OBC="$PWD/oberon/oberon/target/debug/obc"
+          export COMPILER="$PWD/compiler/target/debug/compiler"
+          export FUZZ_WORK="$PWD/findings/typed"
+          FUZZ_VARIANT=typed FUZZ_BASE=1 FUZZ_SEEDS=4 bash compiler/tests/oberon_fuzz.sh
+      - name: Save seeded inputs and compilation logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oberon-typed-differential-failures
+          path: findings/typed
+          if-no-files-found: ignore
+          retention-days: 14
