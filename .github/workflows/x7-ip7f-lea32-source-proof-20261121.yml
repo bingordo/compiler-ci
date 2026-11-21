@@ -1,0 +1,91 @@
+name: X7 IP7f pinned Intel LEA32 source and conditional Z3
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/x7-ip7f-lea32-source-proof-20261121.yml'
+permissions:
+  contents: read
+jobs:
+  pinned-source-proof-and-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 500b730d78ed4404b1a216ca83c2adf4851fa70a
+          path: compiler
+          ssh-key: \${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned compiler source and install SMT solver
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "500b730d78ed4404b1a216ca83c2adf4851fa70a"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq z3
+          z3 -version
+          rustc --version
+          gcc --version | head -1
+      - name: Download original Intel LEA source from pinned upstream revision
+        run: |
+          set -euo pipefail
+          mkdir -p intel results
+          curl --fail --location --retry 3 --silent --show-error --max-time 90 \
+            "https://raw.githubusercontent.com/intel/SDM/35eface1b7ee003a1cda95005ec5fd83de658a64/data/instruction/LEA.xml" \
+            --output intel/LEA.xml
+          test -s intel/LEA.xml
+          python3 - <<'PY'
+          import hashlib
+          data=open("intel/LEA.xml","rb").read()
+          blob=b"blob "+str(len(data)).encode()+b"\0"+data
+          assert hashlib.sha1(blob).hexdigest()=="0ac72a6a69b95dd1e1ca58c520e3f3d42b84dc3f"
+          print("PINNED_INTEL_LEA_GIT_BLOB_SHA1",hashlib.sha1(blob).hexdigest())
+          PY
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-ip7f-intel-lea32-source-20261121
+      - name: Check generator canonical form and exact source/SMT mutants
+        working-directory: compiler
+        env:
+          X7_IP7F_LEA_XML: ../intel/LEA.xml
+          PYTHONPATH: tools
+        run: |
+          set -euo pipefail
+          python3 tools/regen_x86_forms.py --check
+          python3 -m unittest -v test_x7_ip7f_lea32_source_proof
+          python3 tools/x7_ip7f_lea32_source_proof.py --intel-lea "$X7_IP7F_LEA_XML" \
+            > ../results/x7-ip7f-lea32-conditional-proof.json
+          python3 - <<'PY'
+          import json
+          r=json.load(open("../results/x7-ip7f-lea32-conditional-proof.json"))
+          assert len(r["conditional_value_proofs"])==8
+          assert all(x["smt_outcome"]=="unsat" for x in r["conditional_value_proofs"])
+          assert r["source"]["complete_effective_address_helper_proved"] is False
+          assert r["assumed_agen_relation_not_proved"] is True
+          assert r["physical_register_allocation_proved"] is False
+          assert r["original_arithmetic_flags_dead_proved"] is False
+          assert r["selection_eligible"] is False and r["new_production_rules"]==0
+          print("X7_IP7F_CONDITIONAL_LEA32_SMT_GREEN_8_NOT_ADMITTED")
+          PY
+      - name: Regress physical LEA32 ELF GAS C11 and full backend
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib --features x7-ip7-workload-profile x7_ip7_lea_census -- --nocapture
+          cargo test -p compiler-backend-x86 --test x7_ip7d_lea32_physical --features x7-ip7-workload-profile -- --nocapture
+          cargo test -p compiler-backend-x86 --lib --features x7-ip7-workload-profile --quiet
+          cargo clippy -p compiler-backend-x86 --lib --features x7-ip7-workload-profile -- \
+            -D clippy::correctness -D clippy::suspicious -A clippy::empty_line_after_doc_comments
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-ip7f-intel-lea32-conditional-proof
+          path: results/x7-ip7f-lea32-conditional-proof.json
+          retention-days: 30
