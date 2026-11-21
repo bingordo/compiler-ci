@@ -1,0 +1,67 @@
+name: X7 IP7d LEA32 physical GAS ELF C11 execution and size receipt
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/x7-ip7d-lea32-physical-gas-elf-20261121.yml
+permissions:
+  contents: read
+jobs:
+  lea32-physical:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ca45bb35c2ee7f43d365fd4679df9182b532f1b3
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm immutable source pin and independent native C compiler
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = ca45bb35c2ee7f43d365fd4679df9182b532f1b3
+          cc --version | head -1
+          as --version | head -1
+          rustc --version
+          cargo --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-ip7d-lea32-physical-v1
+      - name: Actual LEA32 GAS and direct ELF, 5000-vector C11 oracle, physical size
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --features x7-ip7-workload-profile \
+            --test x7_ip7d_lea32_physical \
+            -- --nocapture 2>&1 | tee "$RUNNER_TEMP/ip7d-physical.txt"
+          grep -q '^X7_IP7D_NATIVE_GAS_ELF_FLAGS_C11_PASS cases=5000 families=2' "$RUNNER_TEMP/ip7d-physical.txt"
+          test "$(grep -c '^X7_IP7D_LEA32_PHYSICAL_COST ' "$RUNNER_TEMP/ip7d-physical.txt")" -eq 2
+      - name: Validate RFLAGS bit-level semantics and existing 64-bit LEA regressions
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --features x7-ip7-workload-profile,compiler-opt/legacy-function-cse-oracle,compiler-opt/legacy-function-scalar-oracle \
+            --lib flags::tests -- --nocapture
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --features x7-ip7-workload-profile,compiler-opt/legacy-function-cse-oracle,compiler-opt/legacy-function-scalar-oracle \
+            --lib code::tests -- --nocapture
+      - name: Check default driver still builds without experimental form selection
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo build -p compiler --bin compiler
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-ip7d-lea32-native-gas-elf-cost-receipt
+          path: ${{ runner.temp }}/ip7d-physical.txt
+          if-no-files-found: warn
+          retention-days: 45
