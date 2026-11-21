@@ -1,4 +1,4 @@
-name: EDG C source-defined scalar global writable ELF bootstrap
+name: EDG C source-defined global writes and compound mutations
 
 on:
   pull_request:
@@ -24,9 +24,9 @@ jobs:
       run:
         shell: edg-container-exec "bash -eo pipefail {0}"
     env:
-      COMPILER_SHA: 7ad248334e855dca41e80dacd5b35cf79ff6dcca
+      COMPILER_SHA: e3599e15f81489e74d1ba7bf56a5d0b3526ab73f
       EDG_SOURCE_SHA: b195677be8b9b56c8337afad6be8064d21a54082
-      EDG_BRIDGE_SHA: 135cae8688452ca3132ad0c6cb39ec588b40fd8d
+      EDG_BRIDGE_SHA: fc5adba5dc9061cc24517544c23ee92ab0151b5e
       EDG_RELEASE_TAG: edgcpfe-v2026.11.14-upstream-177765bb7731
       EDG_RELEASE_SHA256: 1ce495b629924f31382ecccc891a7a72caae1014ddfa2ba7dd39b44d8b0a9526
       RUST_TOOLCHAIN_VERSION: 1.99.1
@@ -41,7 +41,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 7ad248334e855dca41e80dacd5b35cf79ff6dcca
+          ref: e3599e15f81489e74d1ba7bf56a5d0b3526ab73f
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -59,7 +59,7 @@ jobs:
           set -euo pipefail
           test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
           test "$(git -C edgcpp rev-parse HEAD)" = "$EDG_SOURCE_SHA"
-          grep -Fq 'rev = "135cae8688452ca3132ad0c6cb39ec588b40fd8d"' compiler/tools/edg-driver/Cargo.toml
+          grep -Fq 'rev = "fc5adba5dc9061cc24517544c23ee92ab0151b5e"' compiler/tools/edg-driver/Cargo.toml
           ! grep -q 'edgcpp_capture_' edgcpp/src/lower_il.c
           test -f compiler/tools/edg-driver/src/lowering/scalar_globals.rs
           grep -Fq 'flags.is_weak || flags.is_weakref || flags.is_gnu_alias' compiler/tools/edg-driver/src/lowering/scalar_globals.rs
@@ -126,19 +126,41 @@ jobs:
           cd "$work"
           cat >original.c <<'C'
           int probe_scalar_global = 7;
+          long long probe_wide_global = 4294967299LL;
           void probe_scalar_set(int x) { probe_scalar_global = x; }
           int probe_scalar_read(void) { return probe_scalar_global; }
+          void probe_scalar_add(int x) { probe_scalar_global += x; }
+          void probe_scalar_inc(void) { probe_scalar_global++; }
+          void probe_scalar_dec(void) { --probe_scalar_global; }
+          void probe_wide_set(long long x) { probe_wide_global = x; }
+          long long probe_wide_read(void) { return probe_wide_global; }
           C
           cat >harness.c <<'C'
           extern int probe_scalar_global;
+          extern long long probe_wide_global;
           void probe_scalar_set(int);
           int probe_scalar_read(void);
+          void probe_scalar_add(int);
+          void probe_scalar_inc(void);
+          void probe_scalar_dec(void);
+          void probe_wide_set(long long);
+          long long probe_wide_read(void);
           int main(void) {
               if (probe_scalar_global != 7 || probe_scalar_read() != 7) return 1;
               probe_scalar_set(42);
               if (probe_scalar_global != 42 || probe_scalar_read() != 42) return 2;
               probe_scalar_set(-19);
               if (probe_scalar_global != -19 || probe_scalar_read() != -19) return 3;
+              probe_scalar_add(8);
+              if (probe_scalar_global != -11 || probe_scalar_read() != -11) return 4;
+              probe_scalar_inc();
+              if (probe_scalar_global != -10 || probe_scalar_read() != -10) return 5;
+              probe_scalar_dec();
+              if (probe_scalar_global != -11 || probe_scalar_read() != -11) return 6;
+              if (probe_wide_global != 4294967299LL || probe_wide_read() != 4294967299LL) return 7;
+              probe_wide_set(-(1LL << 40));
+              if (probe_wide_global != -(1LL << 40) ||
+                  probe_wide_read() != -(1LL << 40)) return 8;
               return 0;
           }
           C
@@ -163,7 +185,8 @@ jobs:
           objdump -s -j .data native.o | tee elf-data.txt
           grep -Eq 'OBJECT[[:space:]]+GLOBAL.*probe_scalar_global$' elf-symbols.txt
           grep -Fq probe_scalar_global elf-relocs.txt
+          grep -Eq 'OBJECT[[:space:]]+GLOBAL.*probe_wide_global$' elf-symbols.txt
           grep -Fq '07000000' elf-data.txt
           gcc -std=c11 -Wall -Wextra -Werror harness.c native.o -o native
           timeout 10s ./native
-          echo 'Writable GNU C11 source global emitted by shared x86 ELF and independently GCC-linked' >>"$GITHUB_STEP_SUMMARY"
+          echo 'GNU C11 I32/I64 global stores, compound mutations and GCC-linked ELF runtime passed' >>"$GITHUB_STEP_SUMMARY"
