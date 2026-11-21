@@ -1,0 +1,147 @@
+name: S23.51h original grandchild cache threshold trials
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-51h-grandchild-thresholds.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  grandchild-threshold-trial:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c3b04b7b49909fbf69e9742a67c2ffc735c3cdcb
+          path: b
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 426afcb05fe33f5a6676e8271ca7f57165a6d8d5
+          path: c
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7336ee49db50597dbf91bbaf4b26200decaa0685
+          path: now
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check exact SHA and identical 88-family rule databases
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C b rev-parse HEAD)" = c3b04b7b49909fbf69e9742a67c2ffc735c3cdcb
+          test "$(git -C c rev-parse HEAD)" = 426afcb05fe33f5a6676e8271ca7f57165a6d8d5
+          test "$(git -C now rev-parse HEAD)" = 7336ee49db50597dbf91bbaf4b26200decaa0685
+          cmp b/tools/typeid-rule-gen/examples.rules c/tools/typeid-rule-gen/examples.rules
+          cmp c/tools/typeid-rule-gen/examples.rules now/tools/typeid-rule-gen/examples.rules
+          # Deliberately compare two different cache emitter implementations.
+          ! cmp -s c/tools/typeid-rule-gen/ssa_codegen.py now/tools/typeid-rule-gen/ssa_codegen.py
+          mkdir -p results
+      - name: Materialize source-pinned generated Rust and optimized instantiated object
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > results/instantiate.rs <<'RS'
+          struct TestView { a:u32, b:u32 }
+          impl SsaView for TestView {
+              type Value=u32;
+              fn binary(&self,id:u32,width:u32,op:Opcode)->Option<(u32,u32)> {
+                  if width!=64 { return None; }
+                  match (id,op) {
+                      (100,_) => Some((self.a,self.b)),
+                      (101,Opcode::And) => Some((self.b,self.a)),
+                      (102,Opcode::Or) => Some((self.a,self.b)),
+                      (103,Opcode::Xor) => Some((self.a,self.b)),
+                      _ => None
+                  }
+              }
+              fn unary(&self,id:u32,width:u32,op:Opcode)->Option<u32> {
+                  (width==64 && op==Opcode::Not && id==104).then_some(self.a)
+              }
+              fn constant(&self,id:u32,width:u32)->Option<i128> {
+                  (width==64 && id==105).then_some(0)
+              }
+          }
+          #[no_mangle]
+          pub extern "C" fn s2351h_matcher_footprint(kind:u8,a:u32,b:u32)->u32 {
+              let opcode=match kind {
+                  0=>Opcode::Add,1=>Opcode::Sub,2=>Opcode::Mul,3=>Opcode::And,
+                  4=>Opcode::Or,5=>Opcode::Xor,_=>Opcode::Not,
+              };
+              let view=TestView{a,b};
+              let root=if kind>=6 {104} else {100};
+              let result=shadow_match(&view,root,64,opcode);
+              match result {
+                  None=>0,Some((_,Proposal::Alias(id)))=>id,
+                  Some((_,Proposal::Constant(n)))=>n as u32,
+                  Some((_,Proposal::Binary{lhs,..}))=>lhs,
+                  Some((_,Proposal::TwoOp{outer_lhs,..}))=>outer_lhs
+              }
+          }
+          RS
+          python3 - <<'PY'
+          import subprocess,time,json,shutil
+          from pathlib import Path
+          records=[]
+          original=(Path('now')/'tools/typeid-rule-gen/ssa_codegen.py').read_text()
+          marker='grandchild_count.items() if frequency >= 8'
+          assert original.count(marker)==1
+          shutil.copytree('now/tools/typeid-rule-gen','study-gen')
+          variants=('b','c','now')+tuple('trial_'+str(n) for n in (2,4,6,8,9,10,11))
+          for tag in variants:
+              if tag.startswith('trial_'):
+                  limit=int(tag.split('_')[1])
+                  code=original.replace(marker,
+                                        'grandchild_count.items() if frequency >= '+str(limit))
+                  Path('study-gen/ssa_codegen.py').write_text(code)
+                  generator=Path('study-gen/rules.py')
+                  rules=Path('study-gen/examples.rules')
+              else:
+                  root=Path(tag)
+                  generator=root/'tools/typeid-rule-gen/rules.py'
+                  rules=root/'tools/typeid-rule-gen/examples.rules'
+              generated_bytes=subprocess.run(
+                  ['python3',str(generator),str(rules),'--emit-ssa-rust'],
+                  capture_output=True,check=True).stdout
+              generated=Path('results')/(tag+'.rs')
+              generated.write_bytes(generated_bytes+Path('results/instantiate.rs').read_bytes())
+              before=time.monotonic_ns()
+              subprocess.run(['rustc','--crate-name','s2351h_footprint','--edition=2021',
+                 '-C','opt-level=2','-C','codegen-units=1',
+                 '--crate-type=lib','--emit=obj',str(generated),'-o','results/'+tag+'.o'],check=True)
+              elapsed=time.monotonic_ns()-before
+              size=int(Path('results',tag+'.o').stat().st_size)
+              sections=subprocess.run(['size','-A','results/'+tag+'.o'],
+                  text=True,capture_output=True,check=True).stdout
+              text_bytes=sum(int(line.split()[1]) for line in sections.splitlines()
+                  if len(line.split())>=2 and line.split()[0].startswith('.text'))
+              record={'revision':tag,'generated_rust_bytes':len(generated_bytes),
+                   'instantiated_object_bytes':size,
+                   'instantiated_text_section_bytes':text_bytes,
+                   'rustc_codegen_elapsed_ns':elapsed}
+              records.append(record)
+              print('S2351H_THRESHOLD revision={revision} generated_rust_bytes={generated_rust_bytes} '
+                    'text_bytes={instantiated_text_section_bytes} '
+                    'object_bytes={instantiated_object_bytes}'.format(**record),flush=True)
+          assert records[1]['instantiated_text_section_bytes']==41788
+          assert records[2]['instantiated_text_section_bytes']==records[6]['instantiated_text_section_bytes']
+          data={'schema':'compiler.s2351h-grandchild-threshold-trials.v1',
+            'measurements':records,
+            'scope':'fixed synthetic seven-opcode matcher object only'}
+          Path('results/s2351h-thresholds.json').write_text(json.dumps(data,indent=2)+'\n')
+          PY
+      - name: Save source-pinned grandchild cache threshold variants
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2351h-grandchild-thresholds
+          path: results/s2351h-thresholds.json
+          if-no-files-found: error
+          retention-days: 28
