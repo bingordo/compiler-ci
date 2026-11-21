@@ -1,0 +1,123 @@
+name: x86 X7 proven straight-line native call weights
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/x7-linear-call-weights-20261121.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  real-native-call-weights:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 029f4b22c8325312fa08a81a60c3879d3c67055e
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact-source pin and set public dependency transport
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "029f4b22c8325312fa08a81a60c3879d3c67055e"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-linear-call-weight-20261121
+      - name: Fail-closed synthetic and negative controls
+        working-directory: compiler
+        run: python3 -m unittest discover -s tools -p test_x86_x7_call_weighted.py -v
+      - name: Real source ELF/GAS CPU invariance and single-path proof
+        working-directory: compiler
+        run: cargo test -p compiler --test x86_late_cost_source -- --nocapture
+      - name: Compile real TypeId objects and count completed calls through independent GCC C11
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p compiler --bin compiler
+          mkdir -p "$RUNNER_TEMP/x7-weight"
+          for cpu in SKL ZEN4; do
+            COMPILER_X86_X7_COST_CPU="$cpu" target/debug/compiler \
+              tests/fixtures/x86_x7_cost_calls.c --language mini-c \
+              --target x86_64 --emit obj -o "$RUNNER_TEMP/x7-weight/$cpu.o" \
+              2> "$RUNNER_TEMP/x7-weight/$cpu.compiler.log"
+            cc -std=c11 -O2 -Wall -Wextra -Werror \
+              tests/fixtures/x86_x7_cost_calls_harness.c \
+              "$RUNNER_TEMP/x7-weight/$cpu.o" -o "$RUNNER_TEMP/x7-weight/run-$cpu"
+            "$RUNNER_TEMP/x7-weight/run-$cpu" > "$RUNNER_TEMP/x7-weight/$cpu.calls.log"
+            python3 tools/x86_x7_call_weighted.py \
+              --compiler-log "$RUNNER_TEMP/x7-weight/$cpu.compiler.log" \
+              --calls-log "$RUNNER_TEMP/x7-weight/$cpu.calls.log" \
+              --cpu "$cpu" --compiler-sha "029f4b22c8325312fa08a81a60c3879d3c67055e" \
+              --json "$RUNNER_TEMP/x7-weight/$cpu.result.json"
+            python3 - "$RUNNER_TEMP/x7-weight/$cpu.result.json" <<'PY'
+          import json,sys
+          data=json.load(open(sys.argv[1]))
+          by_name={v["function"]:v for v in data["function_results"]}
+          assert {"fold","choose","guarded_fold"} <= by_name.keys(), by_name
+          fold=by_name["fold"]
+          assert fold["single_path_proved"] is True, fold
+          assert fold["status"]=="call_weighted_static_proxy_only",fold
+          assert fold["completed_calls"]==2048 and fold["proven_window_executions"]>=2048,fold
+          assert by_name["choose"]["completed_calls"]==512
+          assert by_name["choose"]["status"]!="call_weighted_static_proxy_only"
+          assert by_name["guarded_fold"]["completed_calls"]==512
+          assert by_name["guarded_fold"]["status"]!="call_weighted_static_proxy_only"
+          print(json.dumps(data,sort_keys=True))
+          PY
+          done
+          cmp "$RUNNER_TEMP/x7-weight/SKL.o" "$RUNNER_TEMP/x7-weight/ZEN4.o"
+          # A duplicated completion log must fail rather than double-credit.
+          cat "$RUNNER_TEMP/x7-weight/SKL.calls.log" \
+              "$RUNNER_TEMP/x7-weight/SKL.calls.log" > "$RUNNER_TEMP/x7-weight/duplicate.log"
+          if python3 tools/x86_x7_call_weighted.py \
+            --compiler-log "$RUNNER_TEMP/x7-weight/SKL.compiler.log" \
+            --calls-log "$RUNNER_TEMP/x7-weight/duplicate.log" \
+            --cpu SKL --compiler-sha "029f4b22c8325312fa08a81a60c3879d3c67055e"; then
+            echo "duplicate dynamic observation incorrectly accepted" >&2
+            exit 1
+          fi
+      - name: Independent native rolling-checksum TypeId/GCC/ELF/GAS oracle
+        working-directory: compiler
+        run: cargo test -p compiler --test x7_s4_rolling_checksum_source -- --nocapture
+  x86-backend-proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 029f4b22c8325312fa08a81a60c3879d3c67055e
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "029f4b22c8325312fa08a81a60c3879d3c67055e"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-linear-call-backend-20261121
+      - name: Complete x86 backend tests including branch/control mutants
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --lib
+      - name: No-default-features x86 and scoped Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-backend-x86 --no-default-features
+          # Existing unrelated compiler-opt unused re-export, and two
+          # pre-existing scoped lint exceptions; do not change other streams.
+          cargo clippy -p compiler-backend-x86 --lib -- -D warnings -A unused-imports -A unused-variables -A clippy::empty_line_after_doc_comments
