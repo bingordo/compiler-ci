@@ -39,11 +39,43 @@ jobs:
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
 
+      - name: Resolve exact frontend source pins from checked-out compiler
+        id: frontend-pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          from pathlib import Path
+          import re
+          import tomllib
+
+          with Path("compiler/crates/driver/Cargo.toml").open("rb") as f:
+              deps = tomllib.load(f)["dependencies"]
+          names = {
+              "oberon-front-ir": "oberon",
+              "mini-c-syntax": "mini-c",
+              "mini-c-sema": "mini-c",
+              "mini-c-preprocess": "mini-c",
+          }
+          by_repo = {}
+          for crate, repo in names.items():
+              dep = deps[crate]
+              assert dep["git"] == f"ssh://git@github.com/bingordo/{repo}.git"
+              sha = dep["rev"]
+              assert re.fullmatch(r"[0-9a-f]{40}", sha), (crate, sha)
+              if repo in by_repo:
+                  assert by_repo[repo] == sha, f"conflicting {repo} frontend pins"
+              by_repo[repo] = sha
+          assert deps["mini-c-preprocess"]["features"] == ["internal-rcc"]
+          print(f"oberon_sha={by_repo['oberon']}")
+          print(f"mini_c_sha={by_repo['mini-c']}")
+          PY
+
       - name: Checkout pinned Oberon frontend source
         uses: actions/checkout@v4
         with:
           repository: bingordo/oberon
-          ref: 88979bfeda0ec08f9453010771df70ee5d28169c
+          ref: ${{ steps.frontend-pins.outputs.oberon_sha }}
           path: oberon
           persist-credentials: false
 
@@ -51,16 +83,16 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/mini-c
-          ref: 6ba1cb655d8bb2cf5b795aa774e8234d4f701e0b
+          ref: ${{ steps.frontend-pins.outputs.mini_c_sha }}
           path: mini-c
           persist-credentials: false
-      - name: Checkout current Mini-C for generated-C compatibility audit
+      - name: Checkout compiler-pinned Mini-C for generated-C compatibility audit
         uses: actions/checkout@v4
         with:
           repository: bingordo/mini-c
-          # Atomic qualifier syntax now fails explicitly as S0105 instead
-          # of appearing to be an unknown ordinary type (Mini-C PR #192).
-          ref: 94f90acc5bbab25a1d14b00df930deb1a5620909
+          # Use precisely the grammar and checker revision required by the
+          # bootstrapped driver rather than a historical parser snapshot.
+          ref: ${{ steps.frontend-pins.outputs.mini_c_sha }}
           path: mini-c-compat
           persist-credentials: false
       - name: Checkout pinned mrustc
