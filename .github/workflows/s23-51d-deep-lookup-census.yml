@@ -1,0 +1,259 @@
+name: S23.51d observed deep TypeId lookups and matcher source size
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-51d-deep-lookup-census.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  observed-source-probes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler measurement candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: fda869a9a2763939286b6a5fdb15a895759c6a86
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin candidate and initialize evidence workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = fda869a9a2763939286b6a5fdb15a895759c6a86
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          mkdir -p results
+          rustc --version
+          cargo --version
+      - name: Download immutable S23.47 and S23.48 checked-source stages
+        uses: actions/download-artifact@v4
+        with:
+          name: s23-48-exact-source-typeid-stage-attribution
+          run-id: 43349934825
+          repository: bingordo/compiler-ci
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: captured
+      - name: Verify original manifest, accepted source count and population
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          j=json.loads(Path("captured/s23-47-source-capture.json").read_text())
+          assert (j["attempted"],j["accepted"],j["rejected"])==(46,44,2),j
+          assert len(j["accepted_cases"])==44
+          m=Path("captured/typeid_snapshots/manifest.tsv").read_text().splitlines()
+          assert len(m)==44,len(m)
+          assert all(len(line.split("\t"))==3 for line in m)
+          print("S2351D_SOURCE_PROVENANCE cases=44 stages=88")
+          PY
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: s2351d-deep-probe-census
+      - name: Count exact production-generated root, direct-child and other lookups
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          S2351_SNAPSHOT_DIR="$GITHUB_WORKSPACE/captured/typeid_snapshots" \
+            cargo test -p compiler-opt --lib \
+            s2351d_count_deeper_source_probes_without_changing_matched_ir \
+            -- --nocapture \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/s2351d-verified-source-probes.log"
+      - name: Parse exact-width source-probe counts and verify 88 stage population
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - results/s2351d-verified-source-probes.log results/s2351d-source-census.json <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+          text=Path(sys.argv[1]).read_text()
+          pattern=(r"S2351D_PROBES scope=(\S+) label=(\S+) roots=(\d+) matches=(\d+) "
+                   r"root_reads=(\d+) first_child_reads=(\d+) other_reads=(\d+) "
+                   r"repeated_first_child=(\d+) repeated_other=(\d+) distinct_other=(\d+)")
+          keys=("scope","label","roots","matches","root_reads","first_child_reads",
+                "other_reads","repeated_first_child","repeated_other","distinct_other")
+          rows=[]
+          for match in re.finditer(pattern,text):
+              row={k:(v if k in {"scope","label"} else int(v))
+                   for k,v in zip(keys,match.groups())}
+              assert row["root_reads"]==row["roots"]
+              rows.append(row)
+          stages=[r for r in rows if r["scope"] in ("entry","prenative")]
+          summary=[r for r in rows if r["scope"]=="summary"]
+          assert len(stages)==88 and len(summary)==1,(len(stages),len(summary))
+          assert len([r for r in stages if r["scope"]=="entry"])==44
+          assert len([r for r in stages if r["scope"]=="prenative"])==44
+          totals={k:sum(r[k] for r in stages) for k in keys[2:]}
+          assert all(totals[k]==summary[0][k] for k in keys[2:]),(totals,summary)
+          assert totals["roots"]>=3971
+          assert "S2351D_COVERAGE source_cases=44 stages=88" in text
+          m=re.search(r"S2351D_GENERATED family_count=88 source_bytes=(\d+)",text)
+          assert m, "missing generated matcher source byte count"
+          data={
+            "schema":"compiler.s2351d-source-probe-census.v1",
+            "compiler_sha":"fda869a9a2763939286b6a5fdb15a895759c6a86",
+            "source_capture_run":43349934825,
+            "source_cases":44,"source_stages":88,
+            "generated_rust_bytes":int(m.group(1)),
+            "totals":totals,
+            "per_stage":stages
+          }
+          Path(sys.argv[2]).write_text(json.dumps(data,indent=2,sort_keys=True)+"\n")
+          print("S2351D_OBSERVED",
+                "roots="+str(totals["roots"]),
+                "matches="+str(totals["matches"]),
+                "first_child_reads="+str(totals["first_child_reads"]),
+                "other_reads="+str(totals["other_reads"]),
+                "repeated_other="+str(totals["repeated_other"]),
+                "generated_bytes="+str(data["generated_rust_bytes"]))
+          PY
+      - name: Check original matcher generator and focused existing native tests
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools/typeid-rule-gen -p test_ssa_codegen.py -v
+          cargo test -p compiler-opt --test native_s2350ag_generated_utility -- --nocapture \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/s2351d-original-utility.log"
+          cargo test -p compiler-opt --test native_s2350ad_generated_semantics -- --nocapture \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/s2351d-original-semantics.log"
+      - name: Preserve checked-source depth evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2351d-observed-44-source-cases
+          path: results/
+          if-no-files-found: warn
+          retention-days: 28
+  source-and-object-size:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c3b04b7b49909fbf69e9742a67c2ffc735c3cdcb
+          path: b
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c371d49b5ea61c77d968a16ee2ab3d99ddc469ad
+          path: c
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: fda869a9a2763939286b6a5fdb15a895759c6a86
+          path: now
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check exact SHA and identical 88-family rule databases
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C b rev-parse HEAD)" = c3b04b7b49909fbf69e9742a67c2ffc735c3cdcb
+          test "$(git -C c rev-parse HEAD)" = c371d49b5ea61c77d968a16ee2ab3d99ddc469ad
+          test "$(git -C now rev-parse HEAD)" = fda869a9a2763939286b6a5fdb15a895759c6a86
+          cmp b/tools/typeid-rule-gen/examples.rules c/tools/typeid-rule-gen/examples.rules
+          cmp c/tools/typeid-rule-gen/examples.rules now/tools/typeid-rule-gen/examples.rules
+          cmp c/tools/typeid-rule-gen/ssa_codegen.py now/tools/typeid-rule-gen/ssa_codegen.py
+          mkdir -p results
+      - name: Materialize source-pinned generated Rust and optimized instantiated object
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > results/instantiate.rs <<'RS'
+          struct TestView { a:u32, b:u32 }
+          impl SsaView for TestView {
+              type Value=u32;
+              fn binary(&self,id:u32,width:u32,op:Opcode)->Option<(u32,u32)> {
+                  if width!=64 { return None; }
+                  match (id,op) {
+                      (100,_) => Some((self.a,self.b)),
+                      (101,Opcode::And) => Some((self.b,self.a)),
+                      (102,Opcode::Or) => Some((self.a,self.b)),
+                      (103,Opcode::Xor) => Some((self.a,self.b)),
+                      _ => None
+                  }
+              }
+              fn unary(&self,id:u32,width:u32,op:Opcode)->Option<u32> {
+                  (width==64 && op==Opcode::Not && id==104).then_some(self.a)
+              }
+              fn constant(&self,id:u32,width:u32)->Option<i128> {
+                  (width==64 && id==105).then_some(0)
+              }
+          }
+          #[no_mangle]
+          pub extern "C" fn s2351d_matcher_footprint(kind:u8,a:u32,b:u32)->u32 {
+              let opcode=match kind {
+                  0=>Opcode::Add,1=>Opcode::Sub,2=>Opcode::Mul,3=>Opcode::And,
+                  4=>Opcode::Or,5=>Opcode::Xor,_=>Opcode::Not,
+              };
+              let view=TestView{a,b};
+              let root=if kind>=6 {104} else {100};
+              let result=shadow_match(&view,root,64,opcode);
+              match result {
+                  None=>0,Some((_,Proposal::Alias(id)))=>id,
+                  Some((_,Proposal::Constant(n)))=>n as u32,
+                  Some((_,Proposal::Binary{lhs,..}))=>lhs,
+                  Some((_,Proposal::TwoOp{outer_lhs,..}))=>outer_lhs
+              }
+          }
+          RS
+          python3 - <<'PY'
+          import subprocess,time,json
+          from pathlib import Path
+          records=[]
+          for tag in ('b','c','now'):
+              root=Path(tag)
+              generator=root/'tools/typeid-rule-gen/rules.py'
+              rules=root/'tools/typeid-rule-gen/examples.rules'
+              result=subprocess.run(['python3',str(generator),str(rules),'--emit-ssa-rust'],
+                       capture_output=True,check=True)
+              generator_bytes=result.stdout
+              generated=Path('results')/(tag+'.rs')
+              generated.write_bytes(generator_bytes+Path('results/instantiate.rs').read_bytes())
+              before=time.monotonic_ns()
+              subprocess.run(['rustc','--edition=2021','-C','opt-level=2',
+                  '-C','codegen-units=1','--crate-type=lib','--emit=obj',
+                  str(generated),'-o','results/'+tag+'.o'],check=True)
+              elapsed=time.monotonic_ns()-before
+              size=int(Path('results',tag+'.o').stat().st_size)
+              records.append({'revision':tag,
+                'generated_rust_bytes':len(generator_bytes),
+                'instantiated_object_bytes':size,
+                'rustc_codegen_elapsed_ns':elapsed})
+          assert records[1]['generated_rust_bytes']==records[2]['generated_rust_bytes']
+          assert records[1]['instantiated_object_bytes']==records[2]['instantiated_object_bytes']
+          assert records[0]['generated_rust_bytes']>0
+          data={'schema':'compiler.s2351d-matcher-size.v1','measurements':records,
+                'object_scope':'single optimized 7-opcode generic-matcher Rust instantiation'}
+          Path('results/s2351d-sizes.json').write_text(json.dumps(data,indent=2)+"\n")
+          for row in records:
+              print('S2351D_SIZE revision={revision} generated_rust_bytes={generated_rust_bytes} '
+                    'instantiated_object_bytes={instantiated_object_bytes} '
+                    'rustc_codegen_elapsed_ns={rustc_codegen_elapsed_ns}'.format(**row))
+          PY
+      - name: Save matcher source and instantiated object size comparison
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2351d-exact-matcher-size-comparison
+          path: results/s2351d-sizes.json
+          if-no-files-found: error
+          retention-days: 28
