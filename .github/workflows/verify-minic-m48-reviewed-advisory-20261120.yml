@@ -1,0 +1,104 @@
+name: Mini-C M48 reviewed nothrow/leaf conservative native source acceptance
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/verify-minic-m48-reviewed-advisory-20261120.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  m48-advisory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 85
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact candidate compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 520771d146e41bb9db32cc404842d24f7267a657
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact prechange baseline compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 64600d5ad4e7ebcbb8a81af31107a72d4ae7bf4f
+          path: baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout pinned original musl translation units
+        uses: actions/checkout@v4
+        with:
+          repository: ifduyue/musl
+          ref: 7813e9119eb5fe681b6750b8a033a0490bca0941
+          path: musl
+          persist-credentials: false
+      - name: Checkout pinned original Lua
+        uses: actions/checkout@v4
+        with:
+          repository: lua/lua
+          ref: c42d820bc0c3bc4f2ad536e19d2f05405af10387
+          path: lua
+          persist-credentials: false
+      - name: Checkout pinned original zlib
+        uses: actions/checkout@v4
+        with:
+          repository: madler/zlib
+          ref: 99623ef7097352da7993ba614161fd6a311e046e
+          path: zlib
+          persist-credentials: false
+      - name: Exact source pin check and fail-closed A/B unit tests
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "520771d146e41bb9db32cc404842d24f7267a657"
+          test "$(git -C baseline rev-parse HEAD)" = "64600d5ad4e7ebcbb8a81af31107a72d4ae7bf4f"
+          test "$(git -C musl rev-parse HEAD)" = "7813e9119eb5fe681b6750b8a033a0490bca0941"
+          test "$(git -C lua rev-parse HEAD)" = "c42d820bc0c3bc4f2ad536e19d2f05405af10387"
+          test "$(git -C zlib rev-parse HEAD)" = "99623ef7097352da7993ba614161fd6a311e046e"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          python3 -m unittest discover -s compiler/tools -p 'test_mini_c_m48_advisory_source_ab.py' -v
+          python3 -m unittest discover -s compiler/tools -p 'test_x86_lhs_remat_pinned_upstream_ab.py' -v
+          python3 -m py_compile compiler/tools/mini_c_m48_advisory_source_ab.py
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: minic-m48-reviewed-advisory-20261120
+      - name: Run actual Mini-C checked GNU symbol bridge tests and strict Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib m48_source::tests:: -- --nocapture
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib
+          cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml --lib -- --no-deps -D warnings
+      - name: Build candidate production compiler release
+        working-directory: compiler
+        run: cargo build --release -p compiler --bin compiler
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: baseline -> target
+          key: minic-m48-reviewed-advisory-baseline-20261120
+      - name: Build original baseline production compiler release
+        working-directory: baseline
+        run: cargo build --release -p compiler --bin compiler
+      - name: Compare all 124 exact unchanged sources, native ELF and five independent GCC oracles
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          python3 compiler/tools/mini_c_m48_advisory_source_ab.py \
+            --script-root compiler \
+            --baseline-root baseline --candidate-root compiler \
+            --baseline-bin baseline/target/release/compiler \
+            --candidate-bin compiler/target/release/compiler \
+            --musl-root musl --lua-root lua --zlib-root zlib \
+            --output results/mini-c-m48-reviewed-advisory-124-source-ab.json
+      - name: Upload exact original source and first-error acceptance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: minic-m48-reviewed-advisory-124-source-ab-20261120
+          path: results/mini-c-m48-reviewed-advisory-124-source-ab.json
+          if-no-files-found: warn
