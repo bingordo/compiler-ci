@@ -1,0 +1,104 @@
+name: X7 IP6 optimizer-produced TypeId rule frequency native profitability
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/x7-ip6-optimizer-corpus-profile-20261121.yml'
+permissions:
+  contents: read
+jobs:
+  profile-source-rules:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 95bf8e3afdb37613c9499395e13cb07a1380813f
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned compiler SHA and isolate root workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 95bf8e3afdb37613c9499395e13cb07a1380813f
+          cd compiler
+          printf '[workspace]\nresolver = "2"\nmembers = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]\n' > Cargo.toml
+      - name: Native matcher and optimizer-produced S23 corpus baseline
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --features x7-typeid-source-dag-optin --lib \
+            dag_match::tests --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --features x7-typeid-source-dag-optin \
+            --test native_s23_profitability \
+            x7_ip6_optimizer_produced_typeid_rule_frequency_and_native_cost \
+            --offline -- --nocapture 2>&1 | tee /tmp/x7-ip6-baseline.log
+      - name: Native matcher and optimizer-produced S23 corpus isolated AND probe
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --features x7-ip4-auto-dag-probe --lib \
+            dag_match::tests --offline -- --nocapture
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --features x7-ip4-auto-dag-probe \
+            --test native_s23_profitability \
+            x7_ip6_optimizer_produced_typeid_rule_frequency_and_native_cost \
+            --offline -- --nocapture 2>&1 | tee /tmp/x7-ip6-probe.log
+      - name: Reconcile rule IDs, native sizes, register spills and timing receipts
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          data={}
+          for mode in ("baseline","probe"):
+              txt=Path(f"/tmp/x7-ip6-{mode}.log").read_text()
+              assert "test result: ok. 1 passed" in txt,(mode,txt[-1500:])
+              for line in txt.splitlines():
+                  if "X7_IP6_CORPUS mode=" not in line:
+                      continue
+                  s=line.split("X7_IP6_CORPUS mode=",1)[1]
+                  fields={"mode":s.split()[0]}
+                  for token in s.split()[1:]:
+                      if "=" in token:
+                          k,v=token.split("=",1)
+                          fields[k]=v
+                  assert fields["mode"]==mode,fields
+                  assert fields["corpus"] in ("s23_general","s23_boolean")
+                  assert fields["phase"] in ("raw","optimized")
+                  k=fields["corpus"],fields["phase"]
+                  assert (mode,k) not in data,(mode,k)
+                  data[mode,k]=fields
+              assert sum(1 for k in data if k[0]==mode)==4,(mode,data)
+          for corpus in ("s23_general","s23_boolean"):
+              for phase in ("raw","optimized"):
+                  k=(corpus,phase)
+                  before=data["baseline",k]
+                  after=data["probe",k]
+                  assert int(before["selected_ip4"])==0,(k,before)
+                  assert int(before["source_xor_sites"])==int(after["source_xor_sites"])
+                  assert int(before["funcs"])==int(after["funcs"])
+                  assert int(before["funcs"])>0
+                  assert int(after["selected_ip4"])>=0
+                  for field in ("original_scalar_ops","source_xor_sites"):
+                      assert before[field]==after[field],(k,field)
+                  orig=int(before["text_bytes"]); new=int(after["text_bytes"])
+                  assert new<=orig,(k,orig,new,"new experimental generated patterns caused a code-size regression")
+                  for x in (before,after):
+                      assert int(x["median_emit_ns"])>0
+                      assert int(x["spill_slots_after"])>=0
+                      assert int(x["selected_scalar_ops"])<=int(x["original_scalar_ops"])
+                  print("X7_IP6_CORPUS_RECONCILED",corpus,phase,
+                        f"functions={before['funcs']}",
+                        f"xor_sites={before['source_xor_sites']}",
+                        f"auto_rule_hits={after['selected_ip4']}",
+                        f"text={orig}->{new}",
+                        f"spills={before['spill_slots_after']}->{after['spill_slots_after']}",
+                        f"median_emit_ns={before['median_emit_ns']}->{after['median_emit_ns']}",
+                        f"per_rule={after['per_rule']}")
+          print("X7_IP6_TYPEID_OPTIMIZER_CORPUS_A_B_PASS")
+          PY
