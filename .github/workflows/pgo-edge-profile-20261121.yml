@@ -1,0 +1,76 @@
+name: PGO edge-first profile contract and x86 cost-model acceptance
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/pgo-edge-profile-20261121.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  shared-pgo-cost-model:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 3982ed405027ca0982f221999440d06dc5b70749
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin complete source and permit public dependency transport
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "3982ed405027ca0982f221999440d06dc5b70749"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: pgo-edge-profile-20261121-backend
+      - name: Shared generic backend including all CFG edge flow and cost tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend --lib
+      - name: Scoped strict shared backend and x86 cost model Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          # Existing unrelated ELF constructor and compiler-opt/ASM warnings.
+          cargo clippy -p compiler-backend -p compiler-backend-x86 --lib -- -D warnings -A unused-imports -A dead-code -A unused-variables -A clippy::empty_line_after_doc_comments -A clippy::needless_lifetimes -A clippy::collapsible_match
+      - name: Disabled-feature x86 integration
+        working-directory: compiler
+        run: cargo check -p compiler-backend-x86 --no-default-features
+  x86-regression-and-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 3982ed405027ca0982f221999440d06dc5b70749
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Exact source pin
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "3982ed405027ca0982f221999440d06dc5b70749"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: pgo-edge-profile-20261121-x86
+      - name: Full x86 backend and measured CPU selection tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --lib
+      - name: Real Mini-C source selected CPU native ELF and GAS GCC oracle
+        working-directory: compiler
+        run: cargo test -p compiler --test x86_cost_selection_source -- --nocapture
+      - name: Preserve source read-only profile results and complete ELF/GAS parity
+        working-directory: compiler
+        run: cargo test -p compiler --test x86_late_cost_source -- --nocapture
