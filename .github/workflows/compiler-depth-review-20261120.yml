@@ -54,3 +54,106 @@ jobs:
               python3 -m unittest discover -s tools -p test_review_coverage.py -v
               python3 tools/review_coverage.py --json > /tmp/compiler-depth-review-coverage.json ;;
           esac
+      - name: Check RISC-V executed behavior and assembler parity
+        if: matrix.area == 'riscv'
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq binutils-riscv64-linux-gnu qemu-user
+          #!/usr/bin/env bash
+          # Run from the compiler checkout with RV64 GNU binutils and qemu-user installed.
+          set -euo pipefail
+          
+          artifact_dir="$(mktemp -d)"
+          example=crates/backend-riscv64/examples/depth_rv64_dead_ingress.rs
+          if [ -e "$example" ]; then
+              rmdir "$artifact_dir"
+              exit 1
+          fi
+          trap 'rm -f "$example"; rm -rf "$artifact_dir"' EXIT
+          cat > "$example" <<'EOF'
+          #[allow(dead_code)]
+          #[path = "../tests/fixtures/mod.rs"]
+          mod fixtures;
+          
+          use compiler_backend::NativeTypeIdBackend;
+          use compiler_backend_riscv64::{Rv64, Rv64Isa};
+          use compiler_ir::{Terminator, ValueId, linkage::ModuleLinkage};
+          
+          fn main() -> Result<(), Box<dyn std::error::Error>> {
+              let dir = std::env::args().nth(1).expect("artifact directory");
+              let dir = std::path::Path::new(&dir);
+              let backend = Rv64::with_isa(Rv64Isa::Rv64I);
+              for (name, mut module, block, value) in [
+                  ("rv64_keep_first", fixtures::add_module(), 0, ValueId(0)),
+                  ("rv64_keep_fifth", fixtures::eight_arg_pressure_sum_module(16), 0, ValueId(4)),
+                  ("rv64_keep_phi", fixtures::same_target_module(), 1, ValueId(3)),
+                  ("rv64_keep_live_through", fixtures::same_target_module(), 1, ValueId(0)),
+              ] {
+                  module.functions[0].name = name.to_owned();
+                  module.definitions[0].symbol = name.to_owned();
+                  module.linkage = ModuleLinkage::all_external_names([name])?;
+                  let block = &mut module.functions[0].blocks[block];
+                  block.instructions.clear();
+                  block.end = Terminator::Return(value);
+                  module.validate()?;
+                  std::fs::write(dir.join(format!("{name}.elf.o")), backend.emit_typeid_object(&module)?)?;
+                  std::fs::write(dir.join(format!("{name}.s")), backend.emit_typeid_assembly(&module)?)?;
+              }
+              Ok(())
+          }
+          EOF
+          cargo run -q -p compiler-backend-riscv64 --example depth_rv64_dead_ingress -- "$artifact_dir"
+          
+          cat > "$artifact_dir/start.s" <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          .macro check name, first, second, expected, status
+              li a0, \first
+              li a1, \second
+              li a2, -19
+              li a3, 37
+              li a4, -2147483649
+              li a5, 143
+              li a6, -87
+              li a7, 129
+              call \name
+              li t0, \expected
+              beq a0, t0, 1f
+              li a0, \status
+              j exit
+          1:
+          .endm
+          _start:
+              check rv64_keep_first, 10, 21, 10, 1
+              check rv64_keep_fifth, 10, 21, -2147483649, 2
+              check rv64_keep_phi, 10, 21, 10, 3
+              check rv64_keep_phi, 21, 10, 10, 4
+              check rv64_keep_live_through, 10, 21, 10, 5
+              check rv64_keep_live_through, 21, 10, 21, 6
+              li a0, 0
+          exit:
+              li a7, 93
+              ecall
+          EOF
+          
+          assemble() {
+              riscv64-linux-gnu-as -march=rv64i -mabi=lp64 "$1" -o "$2"
+          }
+          assemble "$artifact_dir/start.s" "$artifact_dir/start.o"
+          for name in rv64_keep_first rv64_keep_fifth rv64_keep_phi rv64_keep_live_through; do
+              assemble "$artifact_dir/$name.s" "$artifact_dir/$name.gas.o"
+              for view in elf gas; do
+                  riscv64-linux-gnu-objcopy -O binary -j .text             "$artifact_dir/$name.$view.o" "$artifact_dir/$name.$view.bin"
+              done
+              cmp "$artifact_dir/$name.elf.bin" "$artifact_dir/$name.gas.bin"
+          done
+          for view in elf gas; do
+              riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax -e _start         "$artifact_dir/start.o" "$artifact_dir"/rv64_keep_*."$view".o         -o "$artifact_dir/check.$view"
+              timeout 15s qemu-riscv64 "$artifact_dir/check.$view"
+          done
+          echo 'RV64 QEMU: six live ingress/PHI cases passed through both ELF and GAS'
