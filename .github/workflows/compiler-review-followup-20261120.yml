@@ -1,0 +1,50 @@
+name: Compiler review follow-up corrections
+on:
+  push:
+    branches: [ci/compiler-review-followup-20261120]
+    paths: ['.github/workflows/compiler-review-followup-20261120.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        area: [driver, optimizer, generators]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      SOURCE_SHA: 'b84eac64a8527bf0f01c5d7f08b75a8ec2c365f5'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Test exact revision
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          case '${{ matrix.area }}' in
+            driver)
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+              cargo test -p compiler --bin compiler graph_
+              cargo test -p compiler --bin compiler mixed_lto_consumes_checked_snapshot_after_publication_changes
+              cargo test -p compiler --test ir_default_cli aarch64_source_preprocessor_uses_selected_target
+              cargo test -p compiler --test lto_cli --test lto_mixed_link --test lto_ordered_build ;;
+            optimizer)
+              printf '[workspace]\nresolver = "2"\nmembers = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]\n' > Cargo.toml
+              cargo test -p compiler-opt --test review_byte_phi_indirect_memory ;;
+            generators)
+              export PYTHONPATH="$PWD/tools"
+              python3 -m unittest tools/test_regen_x86_sse_evex_forms.py tools/test_regen_x86_sse_vex_forms.py tools/test_x7_s4_retirement_runtime_gate.py tools/test_x7_s4_executable_source_gate.py -v
+              python3 tools/regen_x86_sse_evex_forms.py --check
+              python3 tools/regen_x86_sse_vex_forms.py --check ;;
+          esac
