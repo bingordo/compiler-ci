@@ -61,6 +61,11 @@ on:
         type: string
         required: true
         default: '14599dd67bb763aa3c7d13371a713a0f4f96297a'
+      x86_cost_source_sha:
+        description: 'Exact compiler SHA for cross-tool uops.info XML provenance validation'
+        type: string
+        required: true
+        default: '22af3e606506729c9f17166f511166e119b5a3d7'
 permissions:
   contents: read
 jobs:
@@ -451,3 +456,34 @@ jobs:
           cargo test -p compiler-backend-x86 --example x86_simd_production_gas_oracle -- --nocapture
           export PYTHONPATH="$PWD/tools"
           python3 tools/x86_simd_production_gas_oracle.py
+
+  x86-cost-source-consistency:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Checkout exact reviewed x86 cost-provenance candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.x86_cost_source_sha || '22af3e606506729c9f17166f511166e119b5a3d7' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Validate shared XML allowlist and all cost and latency consumers
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          expected="${{ inputs.x86_cost_source_sha || '22af3e606506729c9f17166f511166e119b5a3d7' }}"
+          [[ "$expected" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$expected"
+          export PYTHONPATH="$PWD/tools"
+          python3 -m py_compile tools/validate_x86_costs.py tools/regen_x86_physical_costs.py tools/regen_x86_operand_latencies.py tools/regen_x86_memory_operand_latencies.py tools/regen_x86_match_costs.py tools/test_x86_cost_source_gate.py
+          python3 -m unittest discover -s tools -p 'test_x86_cost_source_gate.py' -v
+          python3 -m unittest discover -s tools -p 'test_x86_match_costs.py' -v
+          python3 -m unittest discover -s tools -p 'test_x86_operand_latencies.py' -v
+          python3 -m unittest discover -s tools -p 'test_x86_memory_operand_latencies.py' -v
+          python3 -m unittest discover -s tools -p 'test_import_uops_info.py' -v
+          python3 tools/regen_x86_match_costs.py --check
+          python3 tools/regen_x86_physical_costs.py --check
+          python3 tools/validate_x86_costs.py data/x86_costs_skl.json data/x86_costs_zen4.json
