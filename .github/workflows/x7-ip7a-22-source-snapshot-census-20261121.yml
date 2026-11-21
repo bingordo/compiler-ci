@@ -1,0 +1,85 @@
+name: X7 IP7a unchanged Mini-C Oberon and musl TypeId workload census
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/x7-ip7a-22-source-snapshot-census-20261121.yml'
+permissions:
+  contents: read
+jobs:
+  x7-real-corpus:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: dd705bb8097f192cef8b491d728d9684b89c2dbc
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source, compiler toolchain and pinned original C fixture list
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "dd705bb8097f192cef8b491d728d9684b89c2dbc"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          python3 -m unittest discover -s compiler/tools -p 'test_x7_ip7a_source_snapshots.py' -v
+          rustc --version
+          cargo --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-ip7a-workload-inventory-v1
+      - name: Test read-only per-unit TypeId aggregation and reject malformed source identities
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --example x7_ip7_corpus_inventory \
+            --features x7-ip7-workload-profile -- --nocapture
+          cargo build -p compiler-backend-x86 --example x7_ip7_corpus_inventory \
+            --features x7-ip7-workload-profile
+      - name: Build genuine compiler source frontends and default TypeId optimizer
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo build -p compiler --bin compiler
+      - name: Compile 22 independent unchanged source TUs and rank verified raw/final TypeId
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/x7_ip7a_source_snapshots.py \
+            --compiler compiler/target/debug/compiler \
+            --scanner compiler/target/debug/examples/x7_ip7_corpus_inventory \
+            --root compiler \
+            --out "$RUNNER_TEMP/x7-ip7a-corpus" \
+            2>&1 | tee "$RUNNER_TEMP/x7-ip7a-source-check.log"
+          grep -qx X7_IP7A_REAL_SNAPSHOT_CORPUS_PASS "$RUNNER_TEMP/x7-ip7a-source-check.log"
+          grep -qx X7_IP7_CORPUS_READONLY_PASS "$RUNNER_TEMP/x7-ip7a-corpus/rank.txt"
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,os
+          root=Path(os.environ["RUNNER_TEMP"])/"x7-ip7a-corpus"
+          manifest=json.loads((root/"manifest.json").read_text())
+          rank=(root/"rank.txt").read_text().splitlines()
+          assert len(manifest)==22
+          assert len([r for r in rank if r.startswith("X7_IP7_UNIT ")])==22
+          assert len([r for r in rank if r.startswith("X7_IP7_RANK ")])>0
+          for r in manifest:
+              assert len(r["source_sha256"])==64
+              assert len(r["raw_typeid_sha256"])==64
+              assert len(r["optimized_typeid_sha256"])==64
+          print("X7_IP7A_RANK_AND_PINNED_SOURCE_MANIFEST_VALID_PASS")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-ip7a-22-source-typeid-snapshot-corpus
+          path: |
+            ${{ runner.temp }}/x7-ip7a-corpus/manifest.json
+            ${{ runner.temp }}/x7-ip7a-corpus/rank.txt
+            ${{ runner.temp }}/x7-ip7a-source-check.log
+          if-no-files-found: warn
+          retention-days: 45
