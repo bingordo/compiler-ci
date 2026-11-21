@@ -1,0 +1,57 @@
+name: X7 IP2 verified multi-node semantic DAG source witnesses
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/x7-ip2-multinode-source-witness-20261120.yml'
+permissions:
+  contents: read
+jobs:
+  ip2-multinode:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 0296e97b90260edb0f1757ba6f0ae28f6f31c904
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact candidate, install independent Python and CLI Z3
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 0296e97b90260edb0f1757ba6f0ae28f6f31c904
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends z3
+          z3 -version
+          python3 -m venv "$RUNNER_TEMP/x7-ip2-z3"
+          "$RUNNER_TEMP/x7-ip2-z3/bin/python" -m pip install --disable-pip-version-check --quiet 'z3-solver==4.13.4.0'
+          "$RUNNER_TEMP/x7-ip2-z3/bin/python" -c 'import z3; print("IP2_Z3_VERSION", z3.get_version_string())'
+      - name: Exact Intel helper source value, multi-node DAG, negative mutations and physical guards
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/compiler/tools"
+          PY="$RUNNER_TEMP/x7-ip2-z3/bin/python"
+          "$PY" -m compileall -q compiler/tools/x7_ip2_helper_source_smt.py compiler/tools/test_x7_ip2_helper_source_smt.py compiler/tools/test_x7_ip2_source_verified_dag.py
+          "$PY" -m unittest -v \
+            test_x7_ip2_helper_source_smt \
+            test_x7_ip2_source_verified_dag \
+            test_x7_ip2_original_source_graph \
+            test_x7_ip2_semantic_certificate_join \
+            test_x7_ip2_ir_equivalence \
+            test_x7_ip2_physical_receipt_join
+      - name: Assert source candidate remains diagnostic-only and does not enable runtime
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          verify = Path("compiler/tools/x7_ip2_helper_source_smt.py").read_text()
+          generate = Path("compiler/tools/x7_ip2_source_verified_dag.py").read_text()
+          assert 'original_helper_value_to_ir_smt' in verify
+          assert 'production_selection_eligible": False' in verify
+          assert '"machine_selection_eligible": False' in generate
+          assert '"new_production_rules": 0' in verify
+          print("X7_MULTINODE_SOURCE_WITNESS_NONADMISSION_CONFIRMED")
+          PY
