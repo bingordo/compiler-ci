@@ -1,0 +1,67 @@
+name: LP2 Rust member-local TypeId admission and GNU archive callback
+on:
+  push:
+    branches: [ci/lp2-rust-fat-member-admission-20261121]
+    paths: ['.github/workflows/lp2-rust-fat-member-admission-20261121.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: e040f76a589f4cc91d6f7d01b4c24d2a48f8eaec
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e040f76a589f4cc91d6f7d01b4c24d2a48f8eaec
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler SHA and tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          ld --version | head -1
+      - name: Install system linker plugin ABI headers
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y binutils-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: lp2-fat-rust-reader
+      - name: Compile C callback probe with warnings as errors
+        working-directory: compiler
+        run: |
+          cc -std=c11 -O2 -fPIC -shared -Wall -Wextra -Werror \
+            tools/lto-plugin-probe/trace_plugin.c -o "$RUNNER_TEMP/lp2-probe.so"
+      - name: Rust format, library and all unit/regression tests
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo test -p compiler-lto-plugin-core --all-targets -- --nocapture
+          cargo clippy -p compiler-lto-plugin-core --all-targets -- -D warnings
+      - name: Compile actual Mini-C compiler and Rust member diagnostic
+        working-directory: compiler
+        run: |
+          cargo build -p compiler --bin compiler
+          cargo build -p compiler-lto-plugin-core --bin fat-lto-admit
+      - name: Real bound sidecar ELF+archive Rust admission and TypeId execution
+        working-directory: compiler
+        run: |
+          python3 tools/test_lto_fat_object.py \
+            --compiler target/debug/compiler \
+            --rust-admit target/debug/fat-lto-admit \
+            --probe "$RUNNER_TEMP/lp2-probe.so"
+      - name: LP1 linker plugin ABI and archive regression
+        working-directory: compiler
+        run: python3 tools/test_lto_linker_plugin_probe.py
