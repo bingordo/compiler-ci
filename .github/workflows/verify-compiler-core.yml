@@ -50,7 +50,7 @@ jobs:
           echo "Scheduled compiler main revision: $sha" >> "$GITHUB_STEP_SUMMARY"
 
   core:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -89,6 +89,49 @@ jobs:
       - name: Verify core and x86 backend
         working-directory: compiler
         run: cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+
+  mixed-function-entrypoint-cutover:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout pinned compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 716c2de21d4a66f3d500e220d2e22a7eb2fe91ec
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and restrict core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "716c2de21d4a66f3d500e220d2e22a7eb2fe91ec"
+          python3 compiler/tools/check_mixed_function_export_boundary.py
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: mixed-legacy-function-api-cutover
+      - name: Production native API and historical feature compile
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --lib --bin ir-opt
+          cargo check -p compiler-backend-x86 -p compiler-backend-aarch64
+          cargo check -p compiler-opt --lib --no-default-features --features legacy-function-mixed-oracle
+      - name: CTFE array and module reachability oracle suites
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test typed_ctfe --test typed_array_fold --test array_fold_native --test typed_aggregate_pipeline
 
   pr-core:
     needs: discover
