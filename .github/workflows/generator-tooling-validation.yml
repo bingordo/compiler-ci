@@ -56,6 +56,11 @@ on:
         type: string
         required: true
         default: '5fe33a47afb10984932836dbc1ed2ef7a439eeef'
+      simd_production_sha:
+        description: 'Exact compiler SHA for legacy SSE/VEX move/shift/packed GNU differential'
+        type: string
+        required: true
+        default: '14599dd67bb763aa3c7d13371a713a0f4f96297a'
 permissions:
   contents: read
 jobs:
@@ -393,3 +398,53 @@ jobs:
           cargo test -p compiler-backend-x86 --example x86_vex_production_gas_oracle -- --nocapture
           export PYTHONPATH="$PWD/tools"
           python3 tools/x86_vex_production_gas_oracle.py
+
+  x86-simd-production-vs-gas:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 22
+    steps:
+      - name: Checkout exact compiler physical SSE/VEX batch candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.simd_production_sha || '14599dd67bb763aa3c7d13371a713a0f4f96297a' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check exact source SHA, reviewed manifests and generated negative tests
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          expected="${{ inputs.simd_production_sha || '14599dd67bb763aa3c7d13371a713a0f4f96297a' }}"
+          [[ "$expected" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$expected"
+          export PYTHONPATH="$PWD/tools"
+          python3 -m py_compile tools/x86_simd_production_gas_oracle.py tools/test_x86_simd_production_gas_oracle.py
+          python3 -m unittest discover -s tools -p 'test_x86_simd_production_gas_oracle.py' -v
+          python3 tools/regen_x86_sse_packed_forms.py --check
+          python3 tools/regen_x86_sse_move_forms.py --check
+          python3 tools/regen_x86_sse_shift_imm_forms.py --check
+      - name: Restrict Rust workspace to physical x86 backend
+        shell: bash
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: generator-simd-prod-gas
+      - name: Check three real production encoders against 348 independent GNU instructions
+        shell: bash
+        working-directory: compiler
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --example x86_simd_production_gas_oracle -- --nocapture
+          export PYTHONPATH="$PWD/tools"
+          python3 tools/x86_simd_production_gas_oracle.py
