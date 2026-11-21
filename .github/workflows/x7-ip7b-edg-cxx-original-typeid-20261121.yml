@@ -1,0 +1,141 @@
+name: X7 IP7b genuine EDG C++ TypeId workload snapshots and unchanged ELF
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/x7-ip7b-edg-cxx-original-typeid-20261121.yml
+permissions:
+  contents: read
+jobs:
+  direct-edg-cxx:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    container:
+      image: ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8
+    defaults:
+      run:
+        shell: edg-container-exec "bash -eo pipefail {0}"
+    env:
+      EDG_SOURCE_SHA: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+      EDG_RELEASE_TAG: edgcpfe-ci-799603e0b5ab
+      EDG_RELEASE_SHA256: fa769825e70766fbefe017806816b2338acd03daa93bb5562369c293972ce64c
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUST_TOOLCHAIN_VERSION: 1.99.1
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler feature source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 24b16eb70b303366b65c92ca2fb877c724e7e6b6
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout original pinned EDG callable frontend
+        uses: actions/checkout@v4
+        with:
+          repository: bingundu/edgcpp
+          ref: 799603e0b5ab272d9418e2d44a53a95bc73dfdc4
+          path: edgcpp
+          persist-credentials: false
+      - name: Assert exact source pins
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "24b16eb70b303366b65c92ca2fb877c724e7e6b6"
+          test "$(git -C edgcpp rev-parse HEAD)" = "$EDG_SOURCE_SHA"
+      - name: Build matching original EDG native metadata only
+        working-directory: edgcpp
+        env:
+          EDG_BASE: ${{ github.workspace }}/edgcpp/bases/docker/dev-env/gcc
+        run: |
+          set -euo pipefail
+          cmake --preset linux-gcc-release -DEDG_BUILD_LIB=OFF \
+            -DEDG_BUILD_CALLABLE_LIBRARY=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          cmake --build build/gcc-release --target error-info --parallel 2
+      - name: Restore matching original EDG library (pinned SHA256)
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          url="https://github.com/bingundu/edgcpp/releases/download/$EDG_RELEASE_TAG/edgcpfe-ci-x86_64-callable-release-linux-x86_64.tar.gz"
+          mkdir -p build/gcc-release/lib build/prebuilt-edg
+          curl --fail --location --silent --show-error --retry 4 --retry-delay 2 \
+            "$url" --output build/prebuilt-edg/archive.tar.gz
+          printf '%s  %s\n' "$EDG_RELEASE_SHA256" build/prebuilt-edg/archive.tar.gz | sha256sum --check --status
+          tar -xzf build/prebuilt-edg/archive.tar.gz -C build/prebuilt-edg
+          grep -Fx "commit=$EDG_SOURCE_SHA" build/prebuilt-edg/BUILD-INFO.txt
+          test -s build/prebuilt-edg/lib/libedgcpfe.a
+          cp build/prebuilt-edg/lib/libedgcpfe.a build/gcc-release/lib/libedgcpfe.a
+      - name: Install pinned supported Rust toolchain
+        run: |
+          set -euo pipefail
+          if ! command -v cargo >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN_VERSION"
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install "$RUST_TOOLCHAIN_VERSION" --profile minimal
+          rustup default "$RUST_TOOLCHAIN_VERSION"
+          rustc --version
+      - name: Isolated read-only snapshot fingerprint scanner and negative unit tests
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          mkdir -p "$RUNNER_TEMP/x7scan/crates"
+          cp -a compiler/crates/ir compiler/crates/opt compiler/crates/backend \
+            compiler/crates/backend-x86 "$RUNNER_TEMP/x7scan/crates/"
+          cargo test --manifest-path "$RUNNER_TEMP/x7scan/crates/backend-x86/Cargo.toml" \
+            --example x7_ip7_corpus_inventory --features x7-ip7-workload-profile \
+            -- --nocapture
+          cargo build --manifest-path "$RUNNER_TEMP/x7scan/crates/backend-x86/Cargo.toml" \
+            --example x7_ip7_corpus_inventory --features x7-ip7-workload-profile
+      - name: Build actual EDG C++ driver with isolated default-off snapshot gate
+        working-directory: compiler
+        env:
+          EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+          EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+          EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+          EDGCPP_EDG_REVISION: ${{ env.EDG_SOURCE_SHA }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo build --manifest-path tools/edg-driver/Cargo.toml \
+            --features x7-ip7-workload-profile
+          test -x tools/edg-driver/target/debug/compiler-edg-driver
+      - name: Six original EDG C++ source witnesses -> byte-identical ELF and checked TypeId census
+        working-directory: edgcpp/build/gcc-release
+        run: |
+          set -euo pipefail
+          source ./environment.sh
+          python3 "$GITHUB_WORKSPACE/compiler/tools/x7_ip7b_edg_cpp_corpus.py" \
+            --driver "$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver" \
+            --scanner "$RUNNER_TEMP/x7scan/crates/backend-x86/target/debug/examples/x7_ip7_corpus_inventory" \
+            --root "$GITHUB_WORKSPACE/compiler" \
+            --out "$RUNNER_TEMP/x7-ip7b-edg-cxx" \
+            --cwd "$(pwd)" \
+            2>&1 | tee "$RUNNER_TEMP/x7-ip7b-edg.log"
+          grep -qx 'X7_IP7B_REAL_CPP_TYPEID_SNAPSHOT_PASS' "$RUNNER_TEMP/x7-ip7b-edg.log"
+          test "$(grep -c '^X7_IP7B_EDG_OBJECT_IDENTICAL ' "$RUNNER_TEMP/x7-ip7b-edg.log")" -eq 6
+          python3 - <<'PY'
+          import json,os,pathlib
+          d=pathlib.Path(os.environ['RUNNER_TEMP'])/'x7-ip7b-edg-cxx'
+          m=json.loads((d/'manifest.json').read_text())
+          assert len(m)==6
+          assert len({x['family'] for x in m})==6
+          assert len({x['source_sha256'] for x in m})==6
+          rank=(d/'rank.txt').read_text()
+          assert 'X7_IP7_CORPUS units=6 families=6 ' in rank
+          assert 'X7_IP7_CORPUS_READONLY_PASS' in rank
+          print('X7_IP7B_EDG_PINNED_CPP_AND_IR_MANIFEST_PASS')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-ip7b-edg-cxx-original-typeid-snapshots
+          path: |
+            ${{ runner.temp }}/x7-ip7b-edg-cxx/manifest.json
+            ${{ runner.temp }}/x7-ip7b-edg-cxx/rank.txt
+            ${{ runner.temp }}/x7-ip7b-edg.log
+          if-no-files-found: warn
+          retention-days: 45
