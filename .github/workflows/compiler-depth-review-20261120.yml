@@ -1,0 +1,56 @@
+name: Compiler depth review regression tests
+on:
+  push:
+    branches: [ci/compiler-depth-review-20261120]
+    paths: ['.github/workflows/compiler-depth-review-20261120.yml']
+permissions:
+  contents: read
+jobs:
+  regressions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        area: [ir, optimizer, riscv, driver, tracker]
+    env:
+      SOURCE_SHA: '0515393b0fc2ee5686c8122e014485f47b53395e'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          fetch-depth: 0
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and prepare checkout
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          if [ "${{ matrix.area }}" = driver ]; then
+            members='["crates/ir","crates/opt","crates/backend","crates/backend-x86","crates/backend-aarch64","crates/backend-riscv64","crates/backend-wasm","crates/driver"]'
+          else
+            members='["crates/ir","crates/opt","crates/backend","crates/backend-x86","crates/backend-riscv64"]'
+          fi
+          printf '[workspace]\nresolver = "2"\nmembers = %s\n' "$members" > Cargo.toml
+      - name: Run focused tests
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ matrix.area }}" in
+            ir) cargo test -p compiler-ir --test lto_private_symbols --test native_module_text_v3 --test typed_module_abi --test typed_opcode_types --test typed_memory_provenance ;;
+            optimizer) cargo test -p compiler-opt --test typed_if_conversion_native --test typed_if_conversion_pure ;;
+            riscv) cargo test -p compiler-backend-riscv64 --test leaf ;;
+            driver)
+              cargo test -p compiler --test ir_default_cli oberon_array_update_materializes_address_taken_value_parameter
+              cargo test -p compiler --test lto_mixed_link ;;
+            tracker)
+              python3 -m unittest discover -s tools -p test_review_coverage.py -v
+              python3 tools/review_coverage.py --json > /tmp/compiler-depth-review-coverage.json ;;
+          esac
