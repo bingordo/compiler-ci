@@ -1,0 +1,58 @@
+# Temporary FP-5 exact-source AArch64 test workflow. Do not merge to main.
+name: TEMP FP5 AArch64 fixed scalar GP FP ABI and native GCC
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temp-fp5-aarch64-scalar-abi-20261121.yml'
+permissions:
+  contents: read
+jobs:
+  aarch64-fp:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 30656ea8022d87dbfca34065084ef203af828459
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler FP source
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "30656ea8022d87dbfca34065084ef203af828459"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Prepare isolated AArch64 workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p aarch64-workspace/crates aarch64-workspace/tools
+          cp -a compiler/crates/ir compiler/crates/opt compiler/crates/backend \
+            compiler/crates/backend-x86 compiler/crates/backend-aarch64 \
+            compiler/crates/backend-wasm compiler/crates/driver aarch64-workspace/crates/
+          cp -a compiler/examples compiler/tests aarch64-workspace/
+          cp -a compiler/tools aarch64-workspace/
+          cat > aarch64-workspace/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend",
+                     "crates/backend-x86", "crates/backend-aarch64",
+                     "crates/backend-wasm", "crates/driver"]
+          EOF
+      - name: Strict AArch64 all-target typecheck
+        working-directory: aarch64-workspace
+        run: RUSTFLAGS="-D warnings" cargo check -p compiler-backend-aarch64 --all-targets
+      - name: New fixed scalar GP FP ABI projection tests
+        working-directory: aarch64-workspace
+        run: cargo test -p compiler-backend-aarch64 --test scalar_abi -- --nocapture
+      - name: Real native ARM64 IEEE F32 F64 callable GCC oracle
+        working-directory: aarch64-workspace
+        run: cargo test -p compiler-backend-aarch64 --test fp_leaf_native -- --nocapture
+      - name: Complete AArch64 backend regression suite
+        working-directory: aarch64-workspace
+        run: cargo test -p compiler-backend-aarch64 --all-targets -- --test-threads=1
+      - name: Strict AArch64 Clippy
+        working-directory: aarch64-workspace
+        run: cargo clippy -p compiler-backend-aarch64 --all-targets -- -D warnings
