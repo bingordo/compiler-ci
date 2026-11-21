@@ -1,0 +1,95 @@
+name: X7 TypeId generated DAG wide native differential and compile timing
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/x7-typeid-dag-wide-diff-20261120.yml'
+      - 'tools/x7_typeid_dag_wide_differential.py'
+      - 'tools/test_x7_typeid_dag_wide_differential.py'
+permissions:
+  contents: read
+jobs:
+  wide-oracle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 85ee797ff0cfc6457bdc6bd4f4e67b6d01ac67f4
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact source pin and set public dependency access
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 85ee797ff0cfc6457bdc6bd4f4e67b6d01ac67f4
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+          python3 --version
+          gcc --version | head -1
+          rustc --version
+      - name: Deterministic wide C corpus shape and compiled DAG regressions
+        run: |
+          set -euo pipefail
+          PYTHONPATH=tools python3 -m unittest -v test_x7_typeid_dag_wide_differential
+          (cd compiler && cargo test -p compiler-backend-x86 --lib --features x7-typeid-source-dag-optin --quiet)
+      - name: Two production TypeId executables from identical source SHA
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          (cd compiler && cargo build --release -p compiler --bin compiler)
+          cp compiler/target/release/compiler results/compiler-default
+          (cd compiler && cargo build --release -p compiler --bin compiler --features compiler-backend-x86/x7-typeid-source-dag-optin)
+          cp compiler/target/release/compiler results/compiler-optin
+          test "$(sha256sum results/compiler-default | cut -d' ' -f1)" != "$(sha256sum results/compiler-optin | cut -d' ' -f1)"
+      - name: GCC C11 wrapping-reference on deterministic 70-case corpus
+        run: |
+          set -euo pipefail
+          python3 tools/x7_typeid_dag_wide_differential.py \
+            --compiler-root compiler \
+            --default results/compiler-default \
+            --optin results/compiler-optin \
+            --out results
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          d=json.loads(Path("results/wide-diff.json").read_text())
+          assert d["source_count"]==70, "incomplete source corpus"
+          assert d["native_gcc_agreement"] and d["reference_compiled_and_linked_natively"]
+          assert d["text_reductions"]>=2, "expected generated ADD32 real-source benefit absent"
+          assert not d["default_feature_enabled"], "cannot change compiler default"
+          print("X7_WIDE_NATIVE_GCC_PASS", d["source_count"],
+                "text_reduced_cases", d["text_reductions"],
+                "text_regressed_cases", d["text_increases"],
+                "net_text_saved_bytes", d["text_saved_bytes"])
+          PY
+      - name: Add machine-readable summary to CI report
+        if: always()
+        run: |
+          if [ -f results/wide-diff.json ]; then
+            python3 - <<'PY'
+          import json
+          d=json.load(open('results/wide-diff.json'))
+          with open('results/report.md','w') as f:
+              f.write('# X7 real TypeId DAG A/B source-wide differential\n\n')
+              f.write('Feature OFF by default; no source admission changed.\n\n')
+              f.write(f"Cases: {d['source_count']}; reduced .text: {d['text_reductions']}; "
+                      f"larger .text: {d['text_increases']}; net saved: "
+                      f"{d['text_saved_bytes']} bytes.\n\n")
+              f.write('ABBA compilation timing is indicative only on shared runners.\n')
+          PY
+            cat results/report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-typeid-dag-wide-native-corpus
+          path: |
+            results/wide-diff.json
+            results/report.md
+          retention-days: 30
