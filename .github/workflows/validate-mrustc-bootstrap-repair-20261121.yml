@@ -1,0 +1,96 @@
+name: Validate mrustc bootstrap source pins and native TypeId x86 smoke
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/probe-mrustc-bootstrap.yml'
+      - '.github/workflows/validate-mrustc-bootstrap-repair-20261121.yml'
+      - 'bootstrap/mrustc-x86-object-smoke/**'
+      - 'bootstrap/prepare-mrustc-driver.py'
+      - 'bootstrap/run-mrustc-edg-gap.sh'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bootstrap-fast-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout compiler-ci candidate
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Checkout exact compiler source used for this bootstrap repair
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9c3115db84fd934870e664680477a22d4089445e
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Resolve source-pinned frontend revisions
+        id: pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import tomllib
+          from pathlib import Path
+          with Path("compiler/crates/driver/Cargo.toml").open("rb") as f:
+              deps = tomllib.load(f)["dependencies"]
+          oberon = deps["oberon-front-ir"]["rev"]
+          mini = deps["mini-c-syntax"]["rev"]
+          assert deps["mini-c-sema"]["rev"] == mini
+          assert deps["mini-c-preprocess"]["rev"] == mini
+          print(f"oberon={oberon}")
+          print(f"mini={mini}")
+          PY
+      - name: Checkout driver-pinned Oberon source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/oberon
+          ref: ${{ steps.pins.outputs.oberon }}
+          path: oberon
+          persist-credentials: false
+      - name: Checkout driver-pinned Mini-C source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: ${{ steps.pins.outputs.mini }}
+          path: mini-c
+          persist-credentials: false
+      - name: Verify bootstrap scripts and temporary frontend manifest mapping
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile bootstrap/prepare-mrustc-driver.py bootstrap/probe-mrustc-c-dialect.py
+          bash -n bootstrap/run-mrustc-edg-gap.sh
+          python3 bootstrap/prepare-mrustc-driver.py "$PWD"
+          python3 - <<'PY'
+          import tomllib
+          with open("compiler/crates/driver/Cargo.toml","rb") as f:
+              deps=tomllib.load(f)["dependencies"]
+          for name in ("oberon-front-ir","mini-c-syntax","mini-c-sema","mini-c-preprocess"):
+              assert "path" in deps[name] and "git" not in deps[name], name
+          assert deps["mini-c-preprocess"]["features"] == ["internal-rcc"]
+          PY
+      - name: Compile and run production TypeId x86 object smoke via rustc
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --quiet --manifest-path bootstrap/mrustc-x86-object-smoke/Cargo.toml \
+              --target-dir "$RUNNER_TEMP/mrustc-x86-fast-target" \
+              -- "$RUNNER_TEMP/mrustc-x86-smoke.o"
+          test "$(od -An -tx1 -N4 "$RUNNER_TEMP/mrustc-x86-smoke.o" | tr -d '[:space:]')" = 7f454c46
+          readelf -W -h "$RUNNER_TEMP/mrustc-x86-smoke.o" | grep -q 'Advanced Micro Devices X86-64'
+          nm -g "$RUNNER_TEMP/mrustc-x86-smoke.o" | grep -Eq '[[:space:]]T bootstrap_x86_value$'
+          cat >"$RUNNER_TEMP/harness.c" <<'C'
+          extern int bootstrap_x86_value(void);
+          int main(void) { return bootstrap_x86_value() == 42 ? 0 : 1; }
+          C
+          gcc -no-pie "$RUNNER_TEMP/harness.c" "$RUNNER_TEMP/mrustc-x86-smoke.o" -o "$RUNNER_TEMP/harness"
+          timeout 10s "$RUNNER_TEMP/harness"
+          echo 'Pinned frontend path proof, bootstrap audit scripts, production TypeId ELF object and GCC-linked runtime passed' >>"$GITHUB_STEP_SUMMARY"
