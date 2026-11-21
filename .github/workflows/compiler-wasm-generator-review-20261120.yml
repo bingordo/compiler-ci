@@ -1,0 +1,48 @@
+name: Compiler Wasm and generator review
+on:
+  push:
+    branches: [ci/compiler-wasm-generator-review-20261120]
+    paths: ['.github/workflows/compiler-wasm-generator-review-20261120.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      SOURCE_SHA: '9960a3f09627b5c09b4938dd78bf4c990a604ccf'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and isolate Wasm workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "Compiler source SHA: $SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86","crates/backend-wasm"]
+          EOF
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check generator output and rejection cases
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/tools"
+          python3 -m unittest tools/test_regen_x86_sse_packed_forms.py tools/test_regen_x86_sse_vex_forms.py tools/test_regen_x86_sse_evex_shift_imm_forms.py tools/test_x86_selector_rules.py tools/test_regen_aarch64_native_selector_rules.py tools/test_riscv_native_selector_rules.py -v
+          for tool in regen_x86_sse_packed_forms regen_x86_sse_vex_forms regen_x86_sse_evex_shift_imm_forms regen_x86_selector_rules regen_aarch64_native_selector_rules regen_riscv_native_selector_rules; do
+            python3 "tools/$tool.py" --check
+          done
+      - name: Run complete Wasm backend test suite
+        working-directory: compiler
+        run: cargo test -p compiler-backend-wasm
