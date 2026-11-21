@@ -1,0 +1,119 @@
+name: X7 IP3 real Intel/XED cross-iform source DAG evidence
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/x7-ip3-real-intel-xed-cross-form-20261120.yml'
+permissions:
+  actions: read
+  contents: read
+jobs:
+  original-intel-xed:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5805f3398121667a03c1e17ff16475c82d35d269
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Get independently archived pinned original Intel XED variants
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s2-pinned-intel-xed-variant-join
+          run-id: 43635408689
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-ip3-real/s2
+      - name: Get independently verified original Intel helper and flags SMT
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-s3l-l2b-l3a-9-ops-generic-helper-smt-source-evidence
+          run-id: 43687620382
+          repository: bingordo/compiler-ci
+          github-token: ${{ github.token }}
+          path: /tmp/x7-ip3-real/smt
+      - name: Download exact pinned Intel instructions and independent SMT tools
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 5805f3398121667a03c1e17ff16475c82d35d269
+          test -s /tmp/x7-ip3-real/s2/join-1.json
+          test -s /tmp/x7-ip3-real/smt/operations.json
+          test -s /tmp/x7-ip3-real/smt/helpers.json
+          test -s /tmp/x7-ip3-real/smt/semantics-z3.json
+          mkdir -p /tmp/x7-ip3-real/intel /tmp/x7-ip3-real/out
+          REV=35eface1b7ee003a1cda95005ec5fd83de658a64
+          for op in ADD AND OR SUB XOR; do
+            curl --fail --silent --show-error --location --retry 2 --max-time 45 \
+              "https://raw.githubusercontent.com/intel/SDM/${REV}/data/instruction/${op}.xml" \
+              --output "/tmp/x7-ip3-real/intel/${op}.xml"
+          done
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends z3
+          python3 -m venv "$RUNNER_TEMP/x7-ip3-z3"
+          "$RUNNER_TEMP/x7-ip3-z3/bin/python" -m pip install --disable-pip-version-check --quiet 'z3-solver==4.13.4.0'
+          z3 -version
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          ops=json.loads(Path('/tmp/x7-ip3-real/smt/operations.json').read_text())
+          for name in ("ADD", "AND", "OR", "SUB", "XOR"):
+              record=[o for o in ops['normalized'] if o['name']==name]
+              assert len(record)==1, name
+              source=Path('/tmp/x7-ip3-real/intel',name+'.xml').read_bytes()
+              assert record[0]['source_file_sha256']==hashlib.sha256(source).hexdigest(),name
+          print("X7_REAL_SOURCE_SHA_IDENTITY_PASS")
+          PY
+      - name: Reconstruct actual GP physical row and discover multi-node DAGs for two widths
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/compiler/tools"
+          PY="$RUNNER_TEMP/x7-ip3-z3/bin/python"
+          "$PY" -m unittest -v \
+            test_x7_ip3_real_source_gp_join \
+            test_x7_ip3_discovered_physical_join \
+            test_x7_ip2_source_rewrite_search
+          for width in 32 64; do
+            "$PY" compiler/tools/x7_ip3_real_source_gp_join.py \
+              --semantic-manifest compiler/data/x86_s3l_batch_family_contracts.json \
+              --intel-dir /tmp/x7-ip3-real/intel \
+              --operation-ast /tmp/x7-ip3-real/smt/operations.json \
+              --helper-ast /tmp/x7-ip3-real/smt/helpers.json \
+              --source-smt /tmp/x7-ip3-real/smt/semantics-z3.json \
+              --source-xed /tmp/x7-ip3-real/s2/join-1.json \
+              --physical-iform AND_GPRv_GPRv_21 --width "$width" \
+              > "/tmp/x7-ip3-real/out/and-${width}.json"
+          done
+          "$PY" - <<'PY'
+          import json
+          from pathlib import Path
+          for width in (32,64):
+              p=Path(f'/tmp/x7-ip3-real/out/and-{width}.json')
+              report=json.loads(p.read_text())
+              assert report['source_proven_candidate_count']>=1,report
+              assert report['physical_source_gp_receipts_regenerated']==10,report
+              assert report['existing_physical_iform']=='AND_GPRv_GPRv_21'
+              assert report['semantic_source_iform']=='AND_GPRv_MEMv'
+              assert report['native_pattern_selected']==0
+              assert report['new_production_rules']==0
+              assert report['production_selection_eligible'] is False
+              for row in report['candidates']:
+                  assert row['original_source_ir_equivalence']=='unsat'
+                  assert row['exact_existing_source_xed_effect_form_verified'] is True
+                  assert row['existing_xed_variant_id']
+                  assert row['typed_ir']['expression']['op']=='xor'
+                  assert row['candidate_selector_admitted'] is False
+                  assert row['candidate_native_execution_validated'] is False
+                  assert row['candidate_ssa_use_legality_proven'] is False
+              print(f"X7_REAL_PINNED_INTEL_XED_CROSS_FORM_PASS width={width} candidates={report['source_proven_candidate_count']}")
+          PY
+      - name: Archive exact real original-source proof identities (not Intel XML)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-ip3-real-intel-xed-auto-candidate-evidence
+          path: /tmp/x7-ip3-real/out/*.json
+          if-no-files-found: ignore
