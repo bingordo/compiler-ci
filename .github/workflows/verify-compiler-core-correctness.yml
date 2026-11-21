@@ -44,7 +44,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ inputs.source_ref || 'main' }}
+          ref: e43272bfb139d5c8702161ccac1ee2c6614e1084
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -58,6 +58,7 @@ jobs:
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "Compiler source SHA: $sha"
+          [[ "$sha" == "e43272bfb139d5c8702161ccac1ee2c6614e1084" ]] || { echo "x86 #2537 compiler SHA mismatch"; exit 1; }
           # Fail rather than silently accepting a moved/absent test suite.
           for test_source in \
             crates/opt/tests/native_cfg_differential.rs \
@@ -109,6 +110,22 @@ jobs:
           workspaces: compiler -> target
           key: native-cfg-correctness-v1
           cache-workspace-crates: 'true'
+      # Temporary regression validation, without weakening the existing
+      # downstream strict Clippy, AL, native and C11 requirements.
+      - name: Verify staged ASM3 adapter unit tests and strict x86 Clippy
+        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 8m \
+            cargo test -p compiler-backend-x86 --lib staged_memory_ -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/x86-staged-memory-tests.log"
+          grep -F "test asm_memory::tests::staged_memory_read_write_preserve_checked_width_address_and_role ... ok" "$RUNNER_TEMP/x86-staged-memory-tests.log"
+          grep -F "test asm_memory::tests::staged_memory_rejects_role_alias_and_unmodeled_read_modify_write ... ok" "$RUNNER_TEMP/x86-staged-memory-tests.log"
+          timeout --signal=TERM --kill-after=10s 8m \
+            cargo clippy -p compiler-backend-x86 --all-targets -- -D warnings
+          echo "X86_2537 staging_unit_tests=2 strict_clippy=PASS source=$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
       - name: FS-1 draft pointer roots, effects and actual TypeId optimizer observation barriers
         if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
         shell: bash
