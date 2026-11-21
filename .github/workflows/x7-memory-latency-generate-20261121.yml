@@ -1,4 +1,4 @@
-name: Regenerate verified memory-source operand path data
+name: X7 verified memory address and upper-bound latency paths
 on:
   pull_request:
     paths:
@@ -7,35 +7,75 @@ on:
 permissions:
   contents: read
 jobs:
-  regenerate:
+  exact-upstream-memory-timings:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: e6edaa80246caab922cf88dfdc6218355e4283bf
+          ref: 79e13113d6b8c8b45daa258858804b0388d9bfd6
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Verify exact compiler source revision
-        run: test "$(git -C compiler rev-parse HEAD)" = "e6edaa80246caab922cf88dfdc6218355e4283bf"
-      - name: Download the exact previously source-reviewed uops.info XML
+      - name: Verify exact compiler source
+        run: test "$(git -C compiler rev-parse HEAD)" = "79e13113d6b8c8b45daa258858804b0388d9bfd6"
+      - name: Verify exact pinned upstream XED XML
         run: |
           set -euo pipefail
           curl -fL --retry 2 --max-time 600 https://uops.info/instructions.xml -o instructions.xml
           test "$(sha256sum instructions.xml | cut -d' ' -f1)" = "e5e702caaf04c4fc1f75192a9bbe4d8554b3e174f7933a14d124cc33ca677ab3"
-      - name: Generate checked source-provenance and memory latency Rust data
+      - name: Regenerate byte-equivalent memory base/index and data-bound source tables
+        working-directory: compiler
+        run: python3 tools/regen_x86_memory_operand_latencies.py --xml ../instructions.xml --check
+      - name: Validate adversarial missing bound, wrong operand source, and pair cases
+        working-directory: compiler
+        run: python3 -m unittest discover -s tools -p test_x86_memory_operand_latencies.py -v
+      - name: Verify previously pinned register timings and CPU μop source forms
         working-directory: compiler
         run: |
           set -euo pipefail
-          python3 tools/regen_x86_memory_operand_latencies.py --xml ../instructions.xml --write
-          python3 - <<'PY'
-          from pathlib import Path
-          for tag,path in [
-            ("GENJSON","data/x86_memory_operand_latencies.json"),
-            ("GENRUST","crates/backend-x86/src/generated_memory_operand_latencies.rs"),
-          ]:
-              for line in Path(path).read_text().splitlines():
-                  print(tag+":"+line,flush=True)
-          PY
+          python3 tools/regen_x86_operand_latencies.py --xml ../instructions.xml --check
+          python3 tools/regen_x86_physical_costs.py --check
+          python3 tools/validate_x86_costs.py data/x86_costs_skl.json data/x86_costs_zen4.json
+  actual-x86-cost-model-and-native-oracles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 79e13113d6b8c8b45daa258858804b0388d9bfd6
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler source and allow HTTPS git deps
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "79e13113d6b8c8b45daa258858804b0388d9bfd6"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-memory-operand-latencies-20261121
+      - name: Full shared selection-cost and PGO validator unit suite
+        working-directory: compiler
+        run: cargo test -p compiler-backend --lib
+      - name: Full x86 backend including physical memory diagnostic paths and native oracles
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --lib --features compiler-opt/legacy-function-cse-oracle
+      - name: X86 no-default-features build and scoped strict Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-backend-x86 --no-default-features
+          cargo clippy -p compiler-backend -p compiler-backend-x86 --lib -- -D warnings -A unused-imports -A dead-code -A unused-variables -A clippy::empty_line_after_doc_comments -A clippy::needless_lifetimes -A clippy::collapsible_match
+      - name: Independent GCC C11 source oracle of CPU-selected TypeId ELF/GAS
+        working-directory: compiler
+        run: cargo test -p compiler --test x86_cost_selection_source -- --nocapture
+      - name: Preserve default/read-only x86 cost telemetry byte parity
+        working-directory: compiler
+        run: cargo test -p compiler --test x86_late_cost_source -- --nocapture
