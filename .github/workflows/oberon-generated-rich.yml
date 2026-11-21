@@ -1,4 +1,4 @@
-name: Oberon rich and typed AST differentials (live pin)
+name: Oberon rich and typed AST differentials (separate pinned revisions)
 on:
   push:
     paths:
@@ -62,21 +62,33 @@ jobs:
           print('Pinned Oberon frontend: '+match.group(1))
           PY
           git -C compiler rev-parse HEAD
-      - name: Checkout pinned Oberon frontend and reference compilers
+      - name: Checkout exact compiler-pinned Oberon frontend
         uses: actions/checkout@v4
         with:
           repository: bingordo/oberon
           ref: ${{ steps.frontend.outputs.sha }}
+          path: oberon-front
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout independently pinned Oberon generator and reference backends
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/oberon
+          # Tested by compiler-ci run 44851018712. Update this exact SHA only
+          # after validating the generator change independently.
+          ref: 51acb0a53e70a3f359335d45bd3de52861dbbab4
           path: oberon
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Verify pinned revision and link local frontend for CI
+      - name: Verify both revisions and link compiler to its own pinned frontend
         shell: bash
         env:
           FRONTEND_SHA: ${{ steps.frontend.outputs.sha }}
         run: |
           set -euo pipefail
-          test "$(git -C oberon rev-parse HEAD)" = "$FRONTEND_SHA"
+          test "$(git -C oberon-front rev-parse HEAD)" = "$FRONTEND_SHA"
+          test "$(git -C oberon rev-parse HEAD)" = "51acb0a53e70a3f359335d45bd3de52861dbbab4"
+          printf 'Generator and reference backend: %s\n' "$(git -C oberon rev-parse HEAD)"
           python3 - <<'PY'
           from pathlib import Path
           p=Path('compiler/crates/driver/Cargo.toml')
@@ -84,7 +96,7 @@ jobs:
           old='oberon-front-ir = { git = "ssh://git@github.com/bingordo/oberon.git", rev = "'+__import__('os').environ['FRONTEND_SHA']+'" }'
           assert content.count(old)==1,'checked compiler frontend pin does not match checkout'
           p.write_text(content.replace(old,
-              'oberon-front-ir = { path = "../../../oberon/oberon/crates/front-ir" }'))
+              'oberon-front-ir = { path = "../../../oberon-front/oberon/crates/front-ir" }'))
           PY
           git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
       - uses: dtolnay/rust-toolchain@stable
@@ -93,7 +105,8 @@ jobs:
           workspaces: |
             compiler -> target
             oberon/oberon -> target
-          key: oberon-rich-live-v1
+            oberon-front/oberon -> target
+          key: oberon-rich-separate-pins-v2
       - name: Verify deterministic rich generator feature witnesses
         run: cargo test --manifest-path oberon/oberon/Cargo.toml --bin obgen compiler_rich
       - name: Verify type-directed recursive generator depth, types and reproducibility
@@ -102,7 +115,7 @@ jobs:
         run: cargo build --manifest-path oberon/oberon/Cargo.toml --bin obgen --bin obc
       - name: Build native compiler
         run: cargo build --manifest-path compiler/Cargo.toml -p compiler --bin compiler
-      - name: Execute native ELF/GAS and C/Cranelift oracle on fresh pinned source
+      - name: Execute native ELF/GAS and C/Cranelift oracle with separate pins
         shell: bash
         run: |
           set -euo pipefail
