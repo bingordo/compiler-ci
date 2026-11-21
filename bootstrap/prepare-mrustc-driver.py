@@ -36,7 +36,7 @@ for crate, repo, checkout_path in frontends:
     # mrustc/minicargo parser accept a dependency.
     features = dep.get("features", [])
     assert features in ([], ["internal-rcc"]), (crate, features)
-    feature_text = f', features = [{", ".join(repr(v).replace(chr(39), chr(34)) for v in features)}]' if features else ""
+    feature_text = ', features = ["internal-rcc"]' if features else ""
     original = f'{crate} = {{ git = "{dep["git"]}", rev = "{pinned}"{feature_text} }}'
     local = f'{crate} = {{ path = "../../../{checkout_path}"{feature_text} }}'
     assert source.count(original) == 1, f"manifest unexpectedly changed: {crate}"
