@@ -48,7 +48,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/edgcpp-rust
-          ref: ${{ inputs.source_ref || 'fc5adba5dc9061cc24517544c23ee92ab0151b5e' }}
+          ref: ${{ inputs.source_ref || '5d93c7e0a0bd2bee8e01c0e71ca8b432193196cf' }}
           path: edgcpp-rust
           persist-credentials: false
       - name: Record exact revision
@@ -59,7 +59,7 @@ jobs:
           test "${#sha}" -eq 40
           echo "EDG Rust commit: $sha" | tee -a "$GITHUB_STEP_SUMMARY"
           if [[ "${{ github.event_name }}" != workflow_dispatch ]]; then
-            test "$sha" = fc5adba5dc9061cc24517544c23ee92ab0151b5e
+            test "$sha" = 5d93c7e0a0bd2bee8e01c0e71ca8b432193196cf
           fi
       - name: Check out source headers matching the pinned EDG library
         uses: actions/checkout@v4
@@ -278,6 +278,61 @@ jobs:
           grep -Eq 'routine attributes name=__sti__[^ ]+ .*generated=true defined=true' "$RUNNER_TEMP/edg-init-probe.log"
           grep -F 'scope dynamic init scope=' "$RUNNER_TEMP/edg-init-probe.log" || true
           grep -F 'file scope init root position=' "$RUNNER_TEMP/edg-init-probe.log" || true
+      - name: Inspect native __cxa_atexit operand trees on two observable C++17 globals
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source build/gcc-release/environment.sh
+          cat >build/gcc-release/cleanup-args-a.cpp <<'CPP'
+          extern "C" int puts(const char*);
+          struct Effectful {
+            int value;
+            explicit Effectful(int x) : value(x) { puts("construct-a"); }
+            ~Effectful() { puts("destroy-a"); }
+          };
+          Effectful global_effect(7);
+          int main() { puts("main"); return global_effect.value!=7; }
+          CPP
+          cat >build/gcc-release/cleanup-args-b.cpp <<'CPP'
+          extern "C" int puts(const char*);
+          struct Other {
+            explicit Other(int) { puts("construct-b"); }
+            ~Other() { puts("destroy-b"); }
+          };
+          Other other_effect(9);
+          CPP
+          cd build/gcc-release
+          version="$(g++ -dumpfullversion -dumpversion)"
+          IFS=. read -r major minor patch <<<"$version"
+          gnu_number=$((10#${major}*10000+10#${minor:-0}*100+10#${patch:-0}))
+          for source_file in cleanup-args-a.cpp cleanup-args-b.cpp; do
+            log="$RUNNER_TEMP/${source_file%.cpp}.log"
+            cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" \
+              --example parse -- --g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number" \
+              "$source_file" >"$log" 2>&1
+            grep -Fq "EDG status: 0" "$log"
+            grep -Fq 'shutdown_registration_proven=false' "$log"
+            grep -F 'EDG_CXX5_CLEANUP_TYPED witnesses=1 complete_lifecycle_proven=false' "$log"
+            grep -E 'EDG_CXX5_CLEANUP_TYPED_WITNESS .*destructor=2 object=1 dso_handle=[0-9]+ lifecycle_abi_proven=false' "$log"
+            grep -Eq 'EDG_CXX5_CLEANUP_REGISTRATION_CANDIDATE .*observed_args=3 .*registered_destructor_proven=false' "$log"
+            for position in 0 1 2; do
+              grep -Fq "EDG_CXX5_CLEANUP_ARGUMENT position=$position " "$log"
+            done
+            # Event-55 and event-48 are independent EDG-owned source
+            # witnesses, distinct from the constant's event-6 node.
+            grep -F "EDG_CXX5_CLEANUP_ADDRESS position=0 " "$log" || true
+            grep -F "EDG_CXX5_CLEANUP_ADDRESS position=1 " "$log" || true
+            echo "=== Exact EDG source argument identities in $source_file (no ABI admission) ==="
+            grep -E '^(scope dynamic init scope=|EDG_CXX5_STARTUP_ROOT_SOURCE|EDG_CXX5_CLEANUP_REGISTRATION_CANDIDATE|EDG_CXX5_CLEANUP_ARGUMENT |EDG_CXX5_CLEANUP_ADDRESS )' "$log" | head -n 100
+          done
+          g++ -std=c++17 -O0 -Wall -Wextra -Werror cleanup-args-a.cpp \
+            cleanup-args-b.cpp -o "$RUNNER_TEMP/cleanup-args-gcc"
+          "$RUNNER_TEMP/cleanup-args-gcc" >"$RUNNER_TEMP/cleanup-args-gcc.log"
+          for name in construct-a construct-b main destroy-a destroy-b; do
+            grep -Fxq "$name" "$RUNNER_TEMP/cleanup-args-gcc.log"
+          done
+          echo "Native EDG 3-argument registration CANDIDATES observed; operands not yet certified for executable ABI." >> "$GITHUB_STEP_SUMMARY"
       - name: Probe EDG direct base offsets for C++17 std::cout and multiple inheritance
         working-directory: edgcpp
         run: |
@@ -358,6 +413,14 @@ jobs:
           "$RUNNER_TEMP/lifetime-c11"
           "$RUNNER_TEMP/lifetime-cpp20"
           echo 'Pinned EDG C11/C++20 owner snapshots and GCC source oracles passed' >> "$GITHUB_STEP_SUMMARY"
+      - name: Reject ambiguous C++5 native cleanup address evidence
+        working-directory: edgcpp-rust
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test --features codegen --lib startup_provenance::tests::exact_cleanup_address_witnesses_scale_across_many_globals -- --nocapture
+          cargo test --features codegen --lib startup_provenance::tests::incomplete_cleanup_operand_witnesses_fail_closed -- --nocapture
+          cargo test --features codegen --lib startup_provenance::tests::ambiguous_or_unsupported_cleanup_edges_do_not_claim_complete_abi -- --nocapture
       - name: Run all Rust library tests with codegen
         working-directory: edgcpp-rust
         run: |
