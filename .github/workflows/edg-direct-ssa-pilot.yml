@@ -68,7 +68,14 @@ jobs:
       - name: Record compiler and EDG source revision
         run: |
           test "$(git -C edgcpp rev-parse HEAD)" = "$EDG_SOURCE_SHA"
-          git -C compiler rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
+          compiler_sha="$(git -C compiler rev-parse HEAD)"
+          echo "$compiler_sha" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [[ "${{ github.event_name }}" != workflow_dispatch ]]; then
+            # Keep scheduled/push validation on moving compiler/main while
+            # requiring the merged, source-pinned lvalue-adjustment change.
+            git -C compiler merge-base --is-ancestor \
+              cb4111c1480b78b5554340d844a8a582e6ba6c94 "$compiler_sha"
+          fi
 
       - name: Configure matching EDG native metadata only
         env:
@@ -182,6 +189,11 @@ jobs:
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           cargo test --manifest-path tools/edg-driver/Cargo.toml
+          cargo test --manifest-path tools/edg-driver/Cargo.toml \
+            lvalue_adjust_ -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/edg-semantic57-regression.log"
+          grep -Eq 'test result: ok[.] [1-9][0-9]* passed; 0 failed' \
+            "$RUNNER_TEMP/edg-semantic57-regression.log"
           cargo build --manifest-path tools/edg-driver/Cargo.toml
 
       - name: EDG TypeId-native source producer contract
@@ -189,12 +201,15 @@ jobs:
         run: |
           set -euo pipefail
           source=tools/edg-driver/src/lowering.rs
-          # The canonical source producer must construct TypeId-owned
-          # blocks, parameters and instructions directly. All subsequent
-          # native GCC/C++ smoke tests exercise this path.
-          grep -Fq 'blocks:Vec<TypedBlock>' "$source"
-          grep -Fq 'instructions.push(TypedInstruction {id,ty,op})' "$source"
-          grep -Fq 'params.push(TypedParameter {id,ty:type_id})' "$source"
+          # The EDG adapter now uses the shared TypedCfgBuilder, not the
+          # retired inline TypedBlock/TypedInstruction construction.
+          # Guard actual source emission and CFG finalization instead.
+          grep -Fq 'cfg:TypedCfgBuilder' "$source"
+          grep -Fq 'let mut cfg=TypedCfgBuilder::new();' "$source"
+          grep -Fq 'self.cfg.emit(BlockId(self.active as u32),op,ty)' "$source"
+          grep -Fq 'self.cfg.append_param(BlockId(block as u32),type_id)' "$source"
+          grep -Fq 'self.cfg.finish_block(BlockId(self.active as u32),term)?' "$source"
+          grep -Fq 'lower.cfg.finish_preserving_blocks(link_name)?' "$source"
           grep -Fq 'pub fn lower_edg_to_typeid' "$source"
           # Both module ABI entrypoints now transitively validate native
           # TypeId value flow, opcode types and memory provenance; do not
@@ -205,9 +220,10 @@ jobs:
           # lowering. Source-declared variadics now take the TypeId ABI gate.
           grep -Fq 'if module.externals.iter().any(|e|e.signature.variadic)' "$source"
           grep -Fq 'let module=lower_edg_to_typeid(il,globals)?' "$source"
-          # Production EDG codegen now targets the TypeId x86 backend directly.
+          # Production EDG object output routes through the common selected
+          # machine TypeId writer after native source checks.
           grep -Fq 'pub fn emit_edg_typeid_object(il:&Il)' "$source"
-          grep -Fq 'X86_64.emit_typeid_object(&module)' "$source"
+          grep -Fq 'emit_legalized_object_with_undefined_globals(' "$source"
           if grep -Fq 'blocks:Vec<Block>,' "$source"; then
             echo "EDG source frontend regressed to legacy SSA block ownership"
             exit 1
@@ -233,15 +249,36 @@ jobs:
             gcc -std=c11 -O2 -Wall -Wextra -Werror native_edg.o edg_native_ir_pilot_driver.c -o compiler_edg_native_ir
             ./gcc_edg_native_ir
             ./compiler_edg_native_ir
-            # Source-checked C integer automatic locals are supported by D1.
+            # These historical "bad" fixtures are no longer necessarily
+            # unsupported. An admitted feature MUST execute identically
+            # to independently compiled GCC; a rejected feature MUST emit
+            # no object. Neither outcome is inferred from its filename.
             for source in edg_native_ir_bad_global.c edg_native_ir_bad_fp.c; do
               rm -f bad_native_edg.o bad_native_edg.log
+              case "$source" in
+                edg_native_ir_bad_global.c)
+                  printf '%s\n' 'extern int edg_native_bad_global(void);' \
+                    'int main(void) { return edg_native_bad_global()!=99; }' \
+                    >native_feature_check.c ;;
+                edg_native_ir_bad_fp.c)
+                  printf '%s\n' 'extern double edg_native_bad_float(double);' \
+                    'int main(void) { return edg_native_bad_float(3.25)!=4.25; }' \
+                    >native_feature_check.c ;;
+              esac
+              gcc -std=c11 -O2 -Wall -Wextra -Werror \
+                "$source" native_feature_check.c -o gcc_feature_oracle
+              ./gcc_feature_oracle
               if "$binary" bad_native_edg.o --c11 "$source" >bad_native_edg.log 2>&1; then
-                echo "Unsupported EDG/compiler-ir source unexpectedly compiled: $source"
-                exit 1
+                test "$(od -An -tx1 -N4 bad_native_edg.o | tr -d ' \n')" = 7f454c46
+                gcc -std=c11 -O2 -Wall -Wextra -Werror \
+                  bad_native_edg.o native_feature_check.c -o native_feature_oracle
+                ./native_feature_oracle
+                echo "EDG feature $source: native/GCC executable parity" >>"$GITHUB_STEP_SUMMARY"
+              else
+                test ! -e bad_native_edg.o
+                grep -E 'compiler-ir|native pilot|unsupported|EDG|C operation|C expression|C return|source' bad_native_edg.log
+                echo "EDG feature $source: explicit source rejection, no partial object" >>"$GITHUB_STEP_SUMMARY"
               fi
-              grep -E 'compiler-ir|native pilot|unsupported|EDG|C operation|C expression|C return|source' bad_native_edg.log
-              test ! -e bad_native_edg.o
             done
           )
 
@@ -1036,7 +1073,7 @@ jobs:
               local source="$1" driver="$2" tag="$3"
               echo "=== TypeId direct native ELF: $tag ==="
               rm -f typeid_matrix.o typeid_matrix_native typeid_matrix_ref
-              if ! "$binary" typeid_matrix.o --typeid-native --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu "$source" >typeid_matrix.log 2>&1; then
+              if ! "$binary" typeid_matrix.o --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu "$source" >typeid_matrix.log 2>&1; then
                 cat typeid_matrix.log
                 return 1
               fi
@@ -1084,7 +1121,7 @@ jobs:
             fi
             test ! -e rollback_legacy.o
             rm -f typeid_bad_fp.o
-            if "$binary" typeid_bad_fp.o --typeid-native --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu edg_stdio_printf_bad_fp.c >typeid_bad_fp.log 2>&1; then
+            if "$binary" typeid_bad_fp.o --c11 "-I$gcc_include" -I/usr/include/x86_64-linux-gnu edg_stdio_printf_bad_fp.c >typeid_bad_fp.log 2>&1; then
               echo "TypeId native illegally accepted unsupported floating point vararg"
               exit 1
             fi
