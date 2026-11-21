@@ -1,0 +1,79 @@
+name: X7 physical RAW dependency cost-graph acceptance
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/x7-physical-raw-cost-20261121.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  x86-raw-cost-and-source-evidence:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 63e6788de8cc3cb9d87f5c7b6630281cd0ca8ab9
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin exact compiler source and use permitted Git transport
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "63e6788de8cc3cb9d87f5c7b6630281cd0ca8ab9"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-physical-raw-cost-20261121
+      - name: Verified CPU physical-cost data source regeneration
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/regen_x86_physical_costs.py --check
+          python3 tools/validate_x86_costs.py data/x86_costs_skl.json data/x86_costs_zen4.json
+      - name: Full shared backend with executable cost model
+        working-directory: compiler
+        run: cargo test -p compiler-backend --lib
+      - name: Full x86 backend including generated long RAW chains
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --lib --features compiler-opt/legacy-function-cse-oracle
+      - name: Disabled-feature x86 and scoped Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-backend-x86 --no-default-features
+          cargo clippy -p compiler-backend -p compiler-backend-x86 --lib -- -D warnings -A unused-imports -A dead-code -A unused-variables -A clippy::empty_line_after_doc_comments -A clippy::needless_lifetimes -A clippy::collapsible_match
+  real-source-native-cost-policy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 63e6788de8cc3cb9d87f5c7b6630281cd0ca8ab9
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin exact compiler source and permitted Git transport
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "63e6788de8cc3cb9d87f5c7b6630281cd0ca8ab9"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-raw-dep-native-cost-20261121
+      - name: CPU-selected SKL/Zen4 GCC oracle for real TypeId ELF/GAS
+        working-directory: compiler
+        run: cargo test -p compiler --test x86_cost_selection_source -- --nocapture
+      - name: Independent read-only X7 source-cost byte invariance
+        working-directory: compiler
+        run: cargo test -p compiler --test x86_late_cost_source -- --nocapture
