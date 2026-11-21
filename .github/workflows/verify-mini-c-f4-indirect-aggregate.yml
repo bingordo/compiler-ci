@@ -72,7 +72,7 @@ jobs:
           # The two stale examples still import retired native_typeid; validate
           # production lib/bin/tests only, leaving example cleanup to compiler review.
           cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib --bins --tests -- -D warnings -A clippy::too_many_arguments
-      - name: GCC differential for checked indirect MEMORY struct return
+      - name: Verify GCC accepts MEMORY return and current backend fails closed
         shell: bash
         working-directory: compiler
         run: |
@@ -90,12 +90,17 @@ jobs:
           EOF
           cc -O0 /tmp/mini-c-f4/source.c -o /tmp/mini-c-f4/gcc
           /tmp/mini-c-f4/gcc
-          for kind in obj asm; do
-            artifact="/tmp/mini-c-f4/mini.$(test "$kind" = obj && echo o || echo s)"
-            tools/mini-c-driver/target/debug/compiler-mini-c /tmp/mini-c-f4/source.c --emit "$kind" -o "$artifact"
-            cc -O0 "$artifact" -o "/tmp/mini-c-f4/mini-$kind"
-            "/tmp/mini-c-f4/mini-$kind"
-          done
+          # The source checker accepts this after #212. The current M9 native
+          # adapter does NOT lower aggregate results: require an explicit error,
+          # never silently emit an invalid native object.
+          if tools/mini-c-driver/target/debug/compiler-mini-c /tmp/mini-c-f4/source.c \
+              --emit obj -o /tmp/mini-c-f4/unsupported.o \
+              2>/tmp/mini-c-f4/unsupported.stderr; then
+            echo 'ERROR: unverified MEMORY result accepted by M9 backend' >&2
+            exit 1
+          fi
+          grep -F 'M9 supports 32/64-bit integer and checked object pointer results' /tmp/mini-c-f4/unsupported.stderr
+          test ! -e /tmp/mini-c-f4/unsupported.o
           cat > /tmp/mini-c-f4/negative.c <<'EOF'
           struct A { long x; }; struct B { long x; };
           struct A make(void) { struct A a={1}; return a; }
@@ -105,9 +110,20 @@ jobs:
             return (int)b.x;
           }
           EOF
-          if tools/mini-c-driver/target/debug/compiler-mini-c /tmp/mini-c-f4/negative.c --emit obj -o /tmp/mini-c-f4/bad.o; then
+          if tools/mini-c-driver/target/debug/compiler-mini-c /tmp/mini-c-f4/negative.c \
+              --emit obj -o /tmp/mini-c-f4/bad.o 2>/tmp/mini-c-f4/bad.stderr; then
             echo 'ERROR: accepted nominally incompatible aggregates' >&2
             exit 1
           fi
+          grep -F 'incompatible assignment' /tmp/mini-c-f4/bad.stderr
           test ! -e /tmp/mini-c-f4/bad.o
-          echo 'PASS: GCC and native ELF/GAS indirect MEMORY result; nominal mismatch rejected' >> "$GITHUB_STEP_SUMMARY"
+          echo 'PASS: checked source compiles under GCC; M9 aggregate return remains explicitly unsupported' >> "$GITHUB_STEP_SUMMARY"
+      - name: Prove supported indirect GP callbacks still match GCC in ELF and GAS
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/mini-c-driver/tests/s13_p5c_native.py \
+            --compiler tools/mini-c-driver/target/debug/compiler-mini-c \
+            --artifacts /tmp/mini-c-f4/native-callbacks
+          echo 'PASS: supported indirect GP callbacks execute against independent GCC in ELF and GAS' >> "$GITHUB_STEP_SUMMARY"
