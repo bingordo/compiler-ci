@@ -1,0 +1,167 @@
+name: S23.51g adjacent prefix selectivity and inline trials
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-51g-prefix-variants.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  orientation-prefix-variants:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c3b04b7b49909fbf69e9742a67c2ffc735c3cdcb
+          path: b
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 426afcb05fe33f5a6676e8271ca7f57165a6d8d5
+          path: c
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e0d184cf23363e23f392754232a25fb57c6b2dfb
+          path: now
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check exact SHA and identical 88-family rule databases
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C b rev-parse HEAD)" = c3b04b7b49909fbf69e9742a67c2ffc735c3cdcb
+          test "$(git -C c rev-parse HEAD)" = 426afcb05fe33f5a6676e8271ca7f57165a6d8d5
+          test "$(git -C now rev-parse HEAD)" = e0d184cf23363e23f392754232a25fb57c6b2dfb
+          cmp b/tools/typeid-rule-gen/examples.rules c/tools/typeid-rule-gen/examples.rules
+          cmp c/tools/typeid-rule-gen/examples.rules now/tools/typeid-rule-gen/examples.rules
+          # Deliberately compare two different cache emitter implementations.
+          ! cmp -s c/tools/typeid-rule-gen/ssa_codegen.py now/tools/typeid-rule-gen/ssa_codegen.py
+          mkdir -p results
+      - name: Materialize source-pinned generated Rust and optimized instantiated object
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > results/instantiate.rs <<'RS'
+          struct TestView { a:u32, b:u32 }
+          impl SsaView for TestView {
+              type Value=u32;
+              fn binary(&self,id:u32,width:u32,op:Opcode)->Option<(u32,u32)> {
+                  if width!=64 { return None; }
+                  match (id,op) {
+                      (100,_) => Some((self.a,self.b)),
+                      (101,Opcode::And) => Some((self.b,self.a)),
+                      (102,Opcode::Or) => Some((self.a,self.b)),
+                      (103,Opcode::Xor) => Some((self.a,self.b)),
+                      _ => None
+                  }
+              }
+              fn unary(&self,id:u32,width:u32,op:Opcode)->Option<u32> {
+                  (width==64 && op==Opcode::Not && id==104).then_some(self.a)
+              }
+              fn constant(&self,id:u32,width:u32)->Option<i128> {
+                  (width==64 && id==105).then_some(0)
+              }
+          }
+          #[no_mangle]
+          pub extern "C" fn s2351g_matcher_footprint(kind:u8,a:u32,b:u32)->u32 {
+              let opcode=match kind {
+                  0=>Opcode::Add,1=>Opcode::Sub,2=>Opcode::Mul,3=>Opcode::And,
+                  4=>Opcode::Or,5=>Opcode::Xor,_=>Opcode::Not,
+              };
+              let view=TestView{a,b};
+              let root=if kind>=6 {104} else {100};
+              let result=shadow_match(&view,root,64,opcode);
+              match result {
+                  None=>0,Some((_,Proposal::Alias(id)))=>id,
+                  Some((_,Proposal::Constant(n)))=>n as u32,
+                  Some((_,Proposal::Binary{lhs,..}))=>lhs,
+                  Some((_,Proposal::TwoOp{outer_lhs,..}))=>outer_lhs
+              }
+          }
+          RS
+          python3 - <<'PY'
+          import json,shutil,subprocess,time
+          from pathlib import Path
+          records=[]
+          original=(Path('now')/'tools/typeid-rule-gen/ssa_codegen.py').read_text()
+          marker='                if len(group) > 1:'
+          assert original.count(marker)==1,original.count(marker)
+          group_signature='                out.append(f"                fn attempt_{index}<V: SsaView>(view: &V, {args}) -> Option<Proposal<V::Value>> {{")'
+          assert original.count(group_signature)==2
+          shutil.copytree('now/tools/typeid-rule-gen','study-gen')
+          variants=('b','c','now','no_var','var_only','add_only','mul_only',
+                    'or_only','add_mul','add_or','mul_or','all_inline','all_noinline')
+          predicate={
+            'no_var':'group[0][1][2][0] == "op"',
+            'var_only':'group[0][1][2][0] == "var"',
+            'add_only':'group[0][1][2][0] == "op" and group[0][1][2][1] == "add"',
+            'mul_only':'group[0][1][2][0] == "op" and group[0][1][2][1] == "mul"',
+            'or_only':'group[0][1][2][0] == "op" and group[0][1][2][1] == "or"',
+            'add_mul':'group[0][1][2][0] == "op" and group[0][1][2][1] in ("add","mul")',
+            'add_or':'group[0][1][2][0] == "op" and group[0][1][2][1] in ("add","or")',
+            'mul_or':'group[0][1][2][0] == "op" and group[0][1][2][1] in ("mul","or")',
+          }
+          for tag in variants:
+              if tag not in ('b','c','now'):
+                  code=original
+                  if tag in predicate:
+                      code=code.replace(marker,
+                         '                if len(group) > 1 and ('+predicate[tag]+'):')
+                  if tag in ('all_inline','all_noinline'):
+                      attr='#[inline(always)]' if tag=='all_inline' else '#[inline(never)]'
+                      code=code.replace(group_signature,
+                           '                out.append("                '+attr+'")\n'+group_signature,1)
+                  Path('study-gen/ssa_codegen.py').write_text(code)
+                  generator=Path('study-gen/rules.py')
+                  rules=Path('study-gen/examples.rules')
+              else:
+                  root=Path(tag)
+                  generator=root/'tools/typeid-rule-gen/rules.py'
+                  rules=root/'tools/typeid-rule-gen/examples.rules'
+              output=subprocess.run(['python3',str(generator),str(rules),'--emit-ssa-rust'],
+                        capture_output=True,check=True).stdout
+              generated=Path('results')/(tag+'.rs')
+              generated.write_bytes(output+Path('results/instantiate.rs').read_bytes())
+              start=time.monotonic_ns()
+              subprocess.run(['rustc','--crate-name','s2351g_footprint','--edition=2021',
+                   '-C','opt-level=2','-C','codegen-units=1',
+                   '--crate-type=lib','--emit=obj',str(generated),
+                   '-o','results/'+tag+'.o'],check=True)
+              elapsed=time.monotonic_ns()-start
+              obj=int(Path('results',tag+'.o').stat().st_size)
+              sections=subprocess.run(['size','-A','results/'+tag+'.o'],
+                   capture_output=True,text=True,check=True).stdout
+              text_bytes=sum(int(row.split()[1]) for row in sections.splitlines()
+                   if len(row.split())>=2 and row.split()[0].startswith('.text'))
+              record={'revision':tag,'generated_rust_bytes':len(output),
+                   'instantiated_object_bytes':obj,
+                   'instantiated_text_section_bytes':text_bytes,
+                   'rustc_codegen_elapsed_ns':elapsed}
+              records.append(record)
+              print('S2351G_VARIANT revision={revision} generated_rust_bytes={generated_rust_bytes} '
+                    'text_bytes={instantiated_text_section_bytes} '
+                    'object_bytes={instantiated_object_bytes}'.format(**record),
+                    flush=True)
+          assert records[1]['instantiated_text_section_bytes']==41788,records
+          payload={'schema':'compiler.s2351g-prefix-variant-trial.v1',
+             'scope':'fixed synthetic seven-opcode Rust matcher instantiation; no runtime speedup claim',
+             'source_sha':'e0d184cf23363e23f392754232a25fb57c6b2dfb',
+             'measurements':records}
+          Path('results/s2351g-prefix-variants.json').write_text(
+               json.dumps(payload,indent=2)+'\n')
+          PY
+      - name: Save source-pinned orientation prefix variants
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2351g-prefix-variants
+          path: results/s2351g-prefix-variants.json
+          if-no-files-found: error
+          retention-days: 28
