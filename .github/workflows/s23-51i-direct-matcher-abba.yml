@@ -1,0 +1,222 @@
+name: S23.51i direct compiled TypeId matcher source ABBA
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-51i-direct-matcher-abba.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  source-pinned-direct-matcher-abba:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 95
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      RUST_TEST_THREADS: '1'
+    steps:
+      - name: Checkout unchanged S23.51e original production matcher
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9c3115db84fd934870e664680477a22d4089445e
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout unmerged S23.51h original grandchild cache experiment
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7336ee49db50597dbf91bbaf4b26200decaa0685
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout S23.51i test-only benchmark source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1a27b8ddef6cbf34b46bb926925598dbf1e7ed2d
+          path: measure
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source pins, frozen rule database and exact test-only overlay
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C before rev-parse HEAD)" = 9c3115db84fd934870e664680477a22d4089445e
+          test "$(git -C after rev-parse HEAD)" = 7336ee49db50597dbf91bbaf4b26200decaa0685
+          test "$(git -C measure rev-parse HEAD)" = 1a27b8ddef6cbf34b46bb926925598dbf1e7ed2d
+          cmp before/tools/typeid-rule-gen/examples.rules after/tools/typeid-rule-gen/examples.rules
+          cmp before/crates/opt/src/generated_typeid_shadow.rs after/crates/opt/src/generated_typeid_shadow.rs
+          cmp before/crates/opt/src/generated_typeid_probe_census_tests.rs after/crates/opt/src/generated_typeid_probe_census_tests.rs
+          cmp before/crates/opt/tests/native_s2351_matcher_cost.rs after/crates/opt/tests/native_s2351_matcher_cost.rs
+          ! cmp -s before/tools/typeid-rule-gen/ssa_codegen.py after/tools/typeid-rule-gen/ssa_codegen.py
+          test "$(git -C before status --porcelain | wc -l)" -eq 0
+          test "$(git -C after status --porcelain | wc -l)" -eq 0
+          test -s measure/crates/opt/src/generated_typeid_probe_census_tests.rs
+          grep -q 's2351i_measure_compiled_matcher_cost_excluding_clone_and_verifier' \
+            measure/crates/opt/src/generated_typeid_probe_census_tests.rs
+          for version in before after; do
+            cp measure/crates/opt/src/generated_typeid_probe_census_tests.rs \
+              "$version/crates/opt/src/generated_typeid_probe_census_tests.rs"
+            test "$(git -C "$version" diff --name-only)" = \
+              "crates/opt/src/generated_typeid_probe_census_tests.rs"
+            test "$(git -C "$version" status --porcelain | wc -l)" -eq 1
+          done
+          mkdir -p results
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          rustc --version
+          cargo --version
+          printf 'S2351I_PINS base=%s trial=%s benchmark=%s\n' \
+            9c3115db84fd934870e664680477a22d4089445e 7336ee49db50597dbf91bbaf4b26200decaa0685 1a27b8ddef6cbf34b46bb926925598dbf1e7ed2d
+      - name: Download immutable S23.47 and S23.48 original source snapshots
+        uses: actions/download-artifact@v4
+        with:
+          name: s23-48-exact-source-typeid-stage-attribution
+          run-id: 43349934825
+          repository: bingordo/compiler-ci
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: captured
+      - name: Verify original source case manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s captured/typeid_snapshots/manifest.tsv
+          test "$(wc -l < captured/typeid_snapshots/manifest.tsv)" -eq 44
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          source=json.loads(Path('captured/s23-47-source-capture.json').read_text())
+          assert (source['attempted'],source['accepted'],source['rejected'])==(46,44,2)
+          print('S2351I_SOURCE_CAPTURE accepted=44 source_stages=88')
+          PY
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before -> target
+            after -> target
+      - name: Compile both source-pinned production matchers and identical test-only benchmark, outside samples
+        shell: bash
+        run: |
+          set -euo pipefail
+          for version in before after; do
+            (cd "$version" && cargo test --release -p compiler-opt \
+              --features experimental-typeid-generated-rewrites --lib \
+              s2351i_measure_compiled_matcher_cost_excluding_clone_and_verifier --no-run)
+          done
+      - name: Validate committed synthetic smoke and fallback provenance label
+        shell: bash
+        run: |
+          set -euo pipefail
+          for version in before after; do
+            (cd "$version" && cargo test --release -p compiler-opt \
+              --features experimental-typeid-generated-rewrites --lib \
+              s2351i_measure_compiled_matcher_cost_excluding_clone_and_verifier \
+              -- --nocapture --test-threads=1) \
+              2>&1 | tee "results/smoke-$version.log"
+            grep -q 'S2351I_COVERAGE source_cases=0 stages=1' "results/smoke-$version.log"
+          done
+      - name: Alternate same-run direct compiled matcher benchmark A B B A
+        shell: bash
+        run: |
+          set -euo pipefail
+          index=0
+          for version in before after after before; do
+            index=$((index+1))
+            echo "S2351I_ABBA_BEGIN sample=$index version=$version"
+            (cd "$version" && S2351_SNAPSHOT_DIR="$GITHUB_WORKSPACE/captured/typeid_snapshots" \
+              cargo test --release -p compiler-opt \
+              --features experimental-typeid-generated-rewrites --lib \
+              s2351i_measure_compiled_matcher_cost_excluding_clone_and_verifier \
+              -- --nocapture --test-threads=1) \
+              2>&1 | tee "results/abba-$index-$version.log"
+          done
+      - name: Validate identical 88 source stage fingerprints and separate controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          from statistics import median
+          names=('abba-1-before','abba-2-after','abba-3-after','abba-4-before')
+          stable=('id','cohort','stage','functions','roots','hits','fingerprint',
+                  'match_repeats','view_repeats','samples','scope')
+          timing=('matcher_ns','traversal_ns','view_build_ns')
+          runs=[]
+          for name in names:
+              log=Path('results',name+'.log').read_text()
+              assert 'S2351I_COVERAGE source_cases=44 stages=88 roots=4613 matches=68 ' in log,name
+              rows={}
+              for line in log.splitlines():
+                  if not line.startswith('S2351I_DIRECT '):
+                      continue
+                  row=dict(p.split('=',1) for p in line.split()[1:])
+                  key=(row['id'],row['stage'])
+                  assert key not in rows,(name,key)
+                  assert int(row['match_repeats'])==128 and int(row['samples'])==9
+                  assert int(row['view_repeats'])==16
+                  assert all(int(row[field])>0 for field in timing),(name,key,row)
+                  rows[key]=row
+              assert len(rows)==88,(name,len(rows))
+              assert sum(int(row['roots']) for row in rows.values())==4613
+              assert sum(int(row['hits']) for row in rows.values())==68
+              runs.append(rows)
+          keys=set(runs[0])
+          for rows in runs[1:]:
+              assert set(rows)==keys
+              for key in keys:
+                  assert tuple(rows[key][f] for f in stable)==tuple(runs[0][key][f] for f in stable),(
+                      key,'original source matcher rule/proposal fingerprint changed')
+          groups={
+              'all':sorted(keys),
+              'matched':sorted(k for k in keys if int(runs[0][k]['hits'])>0),
+              'missed':sorted(k for k in keys if int(runs[0][k]['hits'])==0)
+          }
+          assert (len(groups['matched']),len(groups['missed']))==(3,85),groups
+          report={
+              'schema':'compiler.s2351i.direct-matcher-source-abba.v1',
+              'source_capture_run':43349934825,
+              'base_sha':'9c3115db84fd934870e664680477a22d4089445e',
+              'rejected_candidate_sha':'7336ee49db50597dbf91bbaf4b26200decaa0685',
+              'test_only_sha':'1a27b8ddef6cbf34b46bb926925598dbf1e7ed2d',
+              'source_cases':44,'stage_cases':88,'roots':4613,'rule_hits':68,
+              'measure':'compiled read-only shadow_match on prebuilt original SSA view',
+              'excluded_from_direct_timer':['module clone','SSA parse','view build',
+                  'typed verifier','DCE','rewrite','proposal conversion'],
+              'match_repeats_per_sample':128,'view_repeats_per_sample':16,
+              'sample_median_count':9,'run_order':list(names),'groups':{}
+          }
+          for name, subset in groups.items():
+              result={'cases':len(subset)}
+              for field in timing:
+                  ratios=[]
+                  for key in subset:
+                      base=median(int(runs[i][key][field]) for i in (0,3))
+                      trial=median(int(runs[i][key][field]) for i in (1,2))
+                      ratios.append(trial/max(1,base))
+                  result[field+'_median_trial_over_base']=median(ratios)
+              base_match=sum(median(int(runs[i][key]['matcher_ns']) for i in (0,3))
+                             for key in subset)
+              trial_match=sum(median(int(runs[i][key]['matcher_ns']) for i in (1,2))
+                              for key in subset)
+              result['sum_stage_matcher_ns_ratio']=trial_match/max(1,base_match)
+              report['groups'][name]=result
+              print(
+                  'S2351I_ABBA group='+name+' cases='+str(len(subset))+
+                  ' direct_ratio='+format(result['matcher_ns_median_trial_over_base'],'.4f')+
+                  ' traversal_control_ratio='+format(result['traversal_ns_median_trial_over_base'],'.4f')+
+                  ' view_build_control_ratio='+format(result['view_build_ns_median_trial_over_base'],'.4f')+
+                  ' summed_matcher_ratio='+format(result['sum_stage_matcher_ns_ratio'],'.4f'))
+          Path('results/s2351i-compiled-matcher-abba.json').write_text(
+              json.dumps(report,sort_keys=True,indent=2)+'\n')
+          PY
+      - name: Preserve direct matcher timing and fingerprint evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2351i-original-source-direct-matcher-abba
+          path: results/
+          if-no-files-found: warn
+          retention-days: 28
