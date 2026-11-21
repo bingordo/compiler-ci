@@ -1,0 +1,123 @@
+name: X7 source-DAG opt-in FP atomic PIC RBP variadic native acceptance
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/x7-dag-optin-abi-isolation-20261120.yml'
+      - 'tools/x7_dag_abi_modes.py'
+permissions:
+  contents: read
+jobs:
+  fp-atomic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 48
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b3bef7ac23621a76a591adf59c4a70bf71a402ee
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Exact SHA, public git fetch for pinned frontends
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = b3bef7ac23621a76a591adf59c4a70bf71a402ee
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+      - name: Native TypeId atomic ELF and GAS operations with generated DAG enabled
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib --features x7-typeid-source-dag-optin atomic_ -- --nocapture
+          cargo test -p compiler-backend-x86 --lib --features x7-typeid-source-dag-optin basic_generated_fetch_and_or_xor_executes_in_shared_elf -- --nocapture
+      - name: Real checked Mini-C mixed GP/FP and IEEE edge semantics with generated DAG enabled
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c \
+            --features compiler-backend-x86/x7-typeid-source-dag-optin \
+            --test fp_mixed_module --test fp_scalar --test fp_mixed_ssa \
+            -- --nocapture
+  abi-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      COMPILER_ELF_REQUIRE_LLVM: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b3bef7ac23621a76a591adf59c4a70bf71a402ee
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source, LLVM toolchain and public frontend dependencies
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = b3bef7ac23621a76a591adf59c4a70bf71a402ee
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+          if ! command -v clang >/dev/null || ! command -v ld.lld >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y clang lld
+          fi
+          clang --version | head -1
+          ld.lld --version
+      - name: Native TypeId PIC+RBP+CFI+GOT+dlopen and glibc ABI under source DAG feature
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler \
+            --features compiler-backend-x86/x7-typeid-source-dag-optin \
+            --test typeid_pic_frame_shared \
+            --test typeid_pic_frame_glibc \
+            --test typeid_frame_pointer \
+            --test typeid_pic_shared \
+            -- --nocapture
+      - name: Source-DAG feature does not break existing GP variadic-call ELF/GAS tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 \
+            --features x7-typeid-source-dag-optin \
+            --test m4_7_gp_variadic_native -- --nocapture
+      - name: Build same-SHA baseline and opt-in TypeId compilers
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          mkdir -p ../results
+          cargo build -p compiler --bin compiler
+          cp target/debug/compiler ../results/compiler-default
+          cargo build -p compiler --bin compiler --features compiler-backend-x86/x7-typeid-source-dag-optin
+          cp target/debug/compiler ../results/compiler-optin
+          test "$(sha256sum ../results/compiler-default | cut -d' ' -f1)" != "$(sha256sum ../results/compiler-optin | cut -d' ' -f1)"
+      - name: Independent GCC oracle across PIC/frame and ELF/GAS with same source
+        run: |
+          set -euo pipefail
+          python3 tools/x7_dag_abi_modes.py \
+            --default results/compiler-default \
+            --optin results/compiler-optin \
+            --out results/x7-dag-abi-modes.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open("results/x7-dag-abi-modes.json"))
+          assert d["cases"]==8
+          assert d["native_reference_parity"]
+          assert d["regressions"]==0
+          assert d["total_saved_text_bytes"]>0
+          print("X7_ABI_MATRIX_COMPLETE",
+                d["cases"],d["total_saved_text_bytes"],d["regressions"])
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-dag-optin-abi-modes
+          path: results/x7-dag-abi-modes.json
+          retention-days: 30
