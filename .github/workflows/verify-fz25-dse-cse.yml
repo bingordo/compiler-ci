@@ -1,0 +1,58 @@
+name: FZ-2.5 DSE CSE pinned PR verification
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-fz25-dse-cse.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  focused:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout exact compiler PR commit with read-only deploy key
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d1e181aab621148ce0e5305c5a4858af0e87c505
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm pinned revision and test presence
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = d1e181aab621148ce0e5305c5a4858af0e87c505
+          test -s crates/opt/tests/typeid_fuzz_dse_cse_targeted.rs
+          git rev-parse HEAD
+      - name: Restrict to credential-independent compiler core
+        working-directory: compiler
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text('''[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          ''')
+          PY
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: fz25-dse-cse
+          cache-workspace-crates: 'true'
+      - name: Execute direct TypeId DSE CSE structural and native C11 GAS ELF oracles
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 10m cargo test -p compiler-opt --test typeid_fuzz_dse_cse_targeted -- --nocapture 2>&1 | tee "$RUNNER_TEMP/fz25-dse-cse.log"
+          grep -F 'test result: ok. 7 passed;' "$RUNNER_TEMP/fz25-dse-cse.log"
+      - name: Preserve failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fz25-dse-cse-failure
+          path: ${{ runner.temp }}/fz25-dse-cse.log
+          if-no-files-found: ignore
+          retention-days: 14
