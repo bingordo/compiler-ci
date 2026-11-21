@@ -305,11 +305,23 @@ jobs:
           version="$(g++ -dumpfullversion -dumpversion)"
           IFS=. read -r major minor patch <<<"$version"
           gnu_number=$((10#${major}*10000+10#${minor:-0}*100+10#${patch:-0}))
+          # C++ libstdc++ headers require GCC's actual include search order;
+          # use the same -I roots as the independently green cout-base
+          # source oracle below, rather than treating a missing include as
+          # an EDG initializer-provenance failure.
+          g++ -std=c++17 -v -E -x c++ /dev/null >"$RUNNER_TEMP/cleanup-include-search.log" 2>&1
+          mapfile -t include_dirs < <(awk '/#include <\.\.\.> search starts here:/{active=1;next} /^End of search list/{active=0} active && /^ /{sub(/^[[:space:]]+/,"");print}' "$RUNNER_TEMP/cleanup-include-search.log")
+          test "${#include_dirs[@]}" -ge 3
+          include_flags=()
+          for dir in "${include_dirs[@]}"; do test -d "$dir" && include_flags+=("-I$dir"); done
           for source_file in global-pair.cpp iostream-lifetime.cpp; do
             log="$RUNNER_TEMP/${source_file%.cpp}.log"
-            cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" \
-              --example parse -- --g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number" \
-              "$source_file" >"$log" 2>&1
+            if ! cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" \
+                --example parse -- --g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number" \
+                "${include_flags[@]}" "$source_file" >"$log" 2>&1; then
+              tail -n 60 "$log"
+              exit 1
+            fi
             grep -Fq 'EDG status: 0' "$log"
             if [[ "$source_file" == "global-pair.cpp" ]]; then
               # EDG's post-lowering scope->dynamic_inits currently exposes
