@@ -46,6 +46,50 @@ jobs:
           PYTHONPATH=tools python3 -m unittest tools.test_ir_consumer_inventory
           python3 tools/check_mixed_function_export_boundary.py
 
+  ifconv-oracle-cutover:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 3d4d7a841e5afa8b365b1f3a482e2af52956afbb
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Source verification and workspace isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "3d4d7a841e5afa8b365b1f3a482e2af52956afbb"
+          python3 compiler/tools/ir_consumer_inventory.py --check-production
+          python3 compiler/tools/check_mixed_function_export_boundary.py
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: legacy-ifconv-cutover
+      - name: Check native and historical feature matrix
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --lib --bin ir-opt
+          cargo check -p compiler-backend-x86 -p compiler-backend-aarch64
+          cargo check -p compiler-opt --lib --no-default-features --features legacy-function-ifconv-oracle
+      - name: Native and independent historical if-conversion suites
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test typed_if_conversion_native --test typed_if_conversion_pure
+          cargo test -p compiler-opt --test if_conversion_typeid_multimerge --test if_conversion_typeid_remaining
+
   discover:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-24.04
