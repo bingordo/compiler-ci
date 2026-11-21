@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 7ad092e6481103a305596cc3c5e2248e637f3117
+          ref: 2a25340816434184fe33c5691eb70d3106943573
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -37,7 +37,7 @@ jobs:
       - name: Install independent Z3 and verify original Intel XML source
         run: |
           set -euo pipefail
-          test "$(git -C compiler rev-parse HEAD)" = 7ad092e6481103a305596cc3c5e2248e637f3117
+          test "$(git -C compiler rev-parse HEAD)" = 2a25340816434184fe33c5691eb70d3106943573
           mkdir -p /tmp/x7-ip4/intel
           rev=35eface1b7ee003a1cda95005ec5fd83de658a64
           for name in ADD AND OR SUB XOR; do
@@ -77,6 +77,42 @@ jobs:
             --features x7-typeid-source-dag-optin --lib \
             dag_match::tests::native_selector::optin_generated_rules_only --offline -- --nocapture
           echo X7_IP4_OPTIN_NATIVE_SSA_MATCHER_MATRIX_PASS
+      - name: Real TypeId GAS/direct ELF native C11 differential and baseline/probe .text
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --features x7-typeid-source-dag-optin \
+            --test x7_ip4_source_and_native --offline -- --nocapture \
+            2>&1 | tee /tmp/x7-ip4-baseline.log
+          cargo test -p compiler-backend-x86 --no-default-features \
+            --features x7-ip4-auto-dag-probe \
+            --test x7_ip4_source_and_native --offline -- --nocapture \
+            2>&1 | tee /tmp/x7-ip4-probe.log
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          metric=re.compile(r'X7_IP4_NATIVE_METRICS mode=(\w+) frame=(\w+) sink=(\w+) text_bytes=(\d+) emit_ns=(\d+)')
+          rows={}
+          for mode in ("baseline","probe"):
+              log=Path(f'/tmp/x7-ip4-{mode}.log').read_text()
+              assert 'test result: ok.' in log,mode
+              matches=metric.findall(log)
+              assert len(matches)==4,(mode,matches)
+              for seen,frame,sink,size,elapsed in matches:
+                  assert seen==mode
+                  assert int(size)>0 and int(elapsed)>0
+                  key=frame,sink
+                  assert (mode,key) not in rows
+                  rows[mode,key]=int(size)
+          for frame in ("frameless","framed"):
+              for sink in ("gas","elf"):
+                  before=rows["baseline",(frame,sink)]
+                  after=rows["probe",(frame,sink)]
+                  assert after < before,(frame,sink,before,after)
+                  print(f'X7_IP4_REAL_NATIVE_TEXT_WIN frame={frame} sink={sink} old={before} new={after} saved={before-after}')
+          PY
+          echo X7_IP4_NATIVE_GCC_AND_CODE_SIZE_AB_PASS
       - name: Retain real source/feature non-admission boundaries
         run: |
           set -euo pipefail
