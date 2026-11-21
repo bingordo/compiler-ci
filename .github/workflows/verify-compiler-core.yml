@@ -95,23 +95,35 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - name: Checkout exact compiler IR migration candidate
+      - name: Checkout exact compiler IR replay candidate
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: bd401482ef451115d0123eeaaec2853cce939b3f
+          ref: d675368dd3343e6b8d2fcc2a42c0a74c9f537bd0
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Verify pinned source and run production source checks
+      - name: Verify pinned source and isolate core workspace
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C compiler rev-parse HEAD)" = "bd401482ef451115d0123eeaaec2853cce939b3f"
-          python3 compiler/tools/test_ir_consumer_inventory.py
-          python3 compiler/tools/ir_consumer_inventory.py --check-production
-          # BT4 backend check is separately owned; its pinned source references
-          # a deleted x86 fixture and is not part of IR audit acceptance.
+          test "$(git -C compiler rev-parse HEAD)" = "d675368dd3343e6b8d2fcc2a42c0a74c9f537bd0"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-replay-determinism
+      - name: Test native replay CLI determinism and immutable inputs
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test ir_replay_cli
+          cargo clippy -p compiler-opt --test ir_replay_cli -- -D warnings
 
   pr-core:
     needs: discover
