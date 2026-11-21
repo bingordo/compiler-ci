@@ -48,7 +48,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/edgcpp-rust
-          ref: ${{ inputs.source_ref || 'fc5adba5dc9061cc24517544c23ee92ab0151b5e' }}
+          ref: ${{ inputs.source_ref || '5448d0fac4008b0cee2e3082418e7379377c67b7' }}
           path: edgcpp-rust
           persist-credentials: false
       - name: Record exact revision
@@ -59,7 +59,7 @@ jobs:
           test "${#sha}" -eq 40
           echo "EDG Rust commit: $sha" | tee -a "$GITHUB_STEP_SUMMARY"
           if [[ "${{ github.event_name }}" != workflow_dispatch ]]; then
-            test "$sha" = fc5adba5dc9061cc24517544c23ee92ab0151b5e
+            test "$sha" = 5448d0fac4008b0cee2e3082418e7379377c67b7
           fi
       - name: Check out source headers matching the pinned EDG library
         uses: actions/checkout@v4
@@ -278,6 +278,56 @@ jobs:
           grep -Eq 'routine attributes name=__sti__[^ ]+ .*generated=true defined=true' "$RUNNER_TEMP/edg-init-probe.log"
           grep -F 'scope dynamic init scope=' "$RUNNER_TEMP/edg-init-probe.log" || true
           grep -F 'file scope init root position=' "$RUNNER_TEMP/edg-init-probe.log" || true
+      - name: Diagnose two source-owned C++ globals and original iostream cleanup census
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source build/gcc-release/environment.sh
+          cat >build/gcc-release/global-pair.cpp <<'CPP'
+          extern "C" int puts(const char*);
+          struct Effectful {
+            int id;
+            explicit Effectful(int i) : id(i) {
+              puts(i == 1 ? "first-ctor" : "second-ctor");
+            }
+            ~Effectful() { puts(id == 1 ? "first-dtor" : "second-dtor"); }
+          };
+          Effectful first(1);
+          Effectful second(2);
+          int main() { puts("main"); return first.id != 1 || second.id != 2; }
+          CPP
+          cat >build/gcc-release/iostream-lifetime.cpp <<'CPP'
+          #include <iostream>
+          int main() { std::cout << "Hello, world!"; }
+          CPP
+          cd build/gcc-release
+          version="$(g++ -dumpfullversion -dumpversion)"
+          IFS=. read -r major minor patch <<<"$version"
+          gnu_number=$((10#${major}*10000+10#${minor:-0}*100+10#${patch:-0}))
+          for source_file in global-pair.cpp iostream-lifetime.cpp; do
+            log="$RUNNER_TEMP/${source_file%.cpp}.log"
+            cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" \
+              --example parse -- --g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number" \
+              "$source_file" >"$log" 2>&1
+            grep -Fq 'EDG status: 0' "$log"
+            if [[ "$source_file" == "global-pair.cpp" ]]; then
+              grep -Fq 'scope dynamic init entries=2' "$log"
+              grep -Fq 'EDG_CXX5_CLEANUP_TYPED witnesses=2 complete_lifecycle_proven=false' "$log"
+              test "$(grep -Fc 'EDG_CXX5_CLEANUP_TYPED_WITNESS ' "$log")" -eq 2
+              grep -Eq 'EDG_CXX5_CLEANUP_TYPED_WITNESS .*scope="1:" ordinal=0 .*lifecycle_abi_proven=false' "$log"
+              grep -Eq 'EDG_CXX5_CLEANUP_TYPED_WITNESS .*scope="1:" ordinal=1 .*lifecycle_abi_proven=false' "$log"
+            fi
+            echo "=== $source_file: scoped EDG ownership, startup, typed cleanup ==="
+            grep -E '^(file scope init scheduler|file scope lowered startup|EDG_CXX5_STARTUP_EVIDENCE|EDG_CXX5_STARTUP_TRANSITIVE|scope dynamic init entries=|scope dynamic init scope=|EDG_CXX5_CLEANUP_TYPED|EDG_CXX5_INIT_OWNER_CENSUS|EDG_CXX5_IOINIT_SYMBOL)' "$log" | head -n 120 || true
+            echo "=== $source_file: first exact native cleanup calls ==="
+            grep -E '^EDG_CXX5_CLEANUP_REGISTRATION_CANDIDATE|^EDG_CXX5_CLEANUP_ADDRESS' "$log" | head -n 35 || true
+          done
+          g++ -std=c++17 -O0 -Wall -Wextra -Werror global-pair.cpp -o "$RUNNER_TEMP/global-pair-gcc"
+          "$RUNNER_TEMP/global-pair-gcc" >"$RUNNER_TEMP/global-pair.out"
+          printf 'first-ctor\nsecond-ctor\nmain\nsecond-dtor\nfirst-dtor\n' >"$RUNNER_TEMP/expected-global-pair.out"
+          cmp "$RUNNER_TEMP/global-pair.out" "$RUNNER_TEMP/expected-global-pair.out"
+          echo "Two-global EDG provenance and iostream cleanup census captured; no executable C++ ABI admission." >>"$GITHUB_STEP_SUMMARY"
       - name: Probe EDG direct base offsets for C++17 std::cout and multiple inheritance
         working-directory: edgcpp
         run: |
@@ -358,6 +408,13 @@ jobs:
           "$RUNNER_TEMP/lifetime-c11"
           "$RUNNER_TEMP/lifetime-cpp20"
           echo 'Pinned EDG C11/C++20 owner snapshots and GCC source oracles passed' >> "$GITHUB_STEP_SUMMARY"
+      - name: Validate uniquely registered scoped cleanup owner with shared class destructor
+        working-directory: edgcpp-rust
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test --features codegen --lib startup_provenance::tests::multiple_globals_may_share_one_native_destructor_routine -- --nocapture
+          cargo test --features codegen --lib startup_provenance::tests::duplicate_native_registration_for_one_scope_initializer_is_ambiguous -- --nocapture
       - name: Run all Rust library tests with codegen
         working-directory: edgcpp-rust
         run: |
