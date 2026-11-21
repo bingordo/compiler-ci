@@ -19,6 +19,7 @@ frontends = (
     ("oberon-front-ir", "oberon", "oberon/oberon/crates/front-ir"),
     ("mini-c-syntax", "mini-c", "mini-c/crates/syntax"),
     ("mini-c-sema", "mini-c", "mini-c/crates/sema"),
+    ("mini-c-preprocess", "mini-c", "mini-c/crates/preprocess"),
 )
 
 source = driver.read_text()
@@ -30,8 +31,14 @@ for crate, repo, checkout_path in frontends:
         ["git", "-C", str(root / repo), "rev-parse", "HEAD"], text=True
     ).strip()
     assert actual == pinned, f"{repo}: checked out {actual}, expected {pinned}"
-    original = f'{crate} = {{ git = "{dep["git"]}", rev = "{pinned}" }}'
-    local = f'{crate} = {{ path = "../../../{checkout_path}" }}'
+    # Preserve the exact manifest feature flags, including the current
+    # Mini-C preprocessing bridge. Do not drop a feature just to make the
+    # mrustc/minicargo parser accept a dependency.
+    features = dep.get("features", [])
+    assert features in ([], ["internal-rcc"]), (crate, features)
+    feature_text = ', features = ["internal-rcc"]' if features else ""
+    original = f'{crate} = {{ git = "{dep["git"]}", rev = "{pinned}"{feature_text} }}'
+    local = f'{crate} = {{ path = "../../../{checkout_path}"{feature_text} }}'
     assert source.count(original) == 1, f"manifest unexpectedly changed: {crate}"
     source = source.replace(original, local)
 driver.write_text(source)
@@ -58,4 +65,6 @@ for manifest_path, workspace_path in (
 with driver.open("rb") as file:
     revised = tomllib.load(file)
 assert all("path" in revised["dependencies"][crate] for crate, _, _ in frontends)
+assert revised["dependencies"]["mini-c-preprocess"]["features"] == ["internal-rcc"]
+assert all("git" not in revised["dependencies"][crate] for crate, _, _ in frontends)
 print("Driver probe manifests prepared with pinned local frontends and LALRPOP runtime.")

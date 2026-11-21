@@ -155,6 +155,9 @@ probe_generated_c() {
 # just because the smaller source parses. No private source excerpts logged.
 echo "EDG_C_SAMPLE_BYTES=$(stat -c %s "$AUDIT_SOURCE")"
 probe_generated_c EDG_C_PARSE "$AUDIT_SOURCE" 90s /audit-tmp/edg-generated-c-parse.log
+# The subsequent large-file probe updates the helper's last exit code.
+# Preserve the SMALL source's result for its own native TypeId gate.
+parse_rc=$last_generated_c_probe_rc
 
 if [[ -n "${AUDIT_LARGE_SOURCE:-}" && -s "$AUDIT_LARGE_SOURCE" &&
       "$AUDIT_LARGE_SOURCE" != "$AUDIT_SOURCE" ]]; then

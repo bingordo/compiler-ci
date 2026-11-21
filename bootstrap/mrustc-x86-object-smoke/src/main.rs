@@ -1,25 +1,51 @@
-//! Real x86-64 object emission from a compiler built via rustc or mrustc/GCC.
-//! The generated ELF object is later linked and executed with a C harness.
+//! Executable x86-64 object emission from rustc or mrustc/GCC, through
+//! the *production* TypeId SSA backend (no retired Function emitter).
+//! The same bytes are compared across toolchains, GCC-linked and executed.
 
-use compiler_backend::Backend;
+use compiler_backend::NativeTypeIdBackend;
 use compiler_backend_x86::X86_64;
-use compiler_ir::{Block, BlockId, Function, Instruction, Op, Terminator, Type, ValueId};
+use compiler_ir::linkage::ModuleLinkage;
+use compiler_ir::typed_cfg_builder::TypedCfgBuilder;
+use compiler_ir::typed_module::DefinedSignature;
+use compiler_ir::typed_ssa::{ResultType, TypedSsaModule};
+use compiler_ir::types::{
+    CallingConvention, DataLayout, Endianness, FunctionSignature, PointerLayout, TypeKind, TypeTable,
+};
+use compiler_ir::{Op, Terminator};
 
 fn main() {
     let output_path = std::env::args().nth(1).expect("output ELF object path");
-    let function = Function {
-        name: "bootstrap_x86_value".into(),
-        blocks: vec![Block {
-            id: BlockId(0),
-            params: vec![],
-            instructions: vec![Instruction {
-                id: ValueId(0), ty: Type::I32, op: Op::ConstI32(42),
-            }],
-            end: Terminator::Return(ValueId(0)),
+    let mut types = TypeTable::new();
+    let i32_ty = types.intern(TypeKind::Integer(32)).expect("I32 TypeId");
+    let mut cfg = TypedCfgBuilder::new();
+    let (entry, _) = cfg.block(&[]);
+    let value = cfg.emit(entry, Op::ConstI32(42), ResultType::Value(i32_ty));
+    cfg.finish_block(entry, Terminator::Return(value))
+        .expect("terminated entry block");
+    let name = "bootstrap_x86_value";
+    let function = cfg.finish(name.to_owned()).expect("native typed SSA");
+    let module = TypedSsaModule {
+        functions: vec![function],
+        linkage: ModuleLinkage::all_external_names([name]).expect("ELF symbol linkage"),
+        globals: vec![],
+        types,
+        layout: DataLayout::new(Endianness::Little)
+            .with_pointer(0, PointerLayout { bits: 64, abi_alignment: 8 })
+            .expect("SysV Ptr64 layout"),
+        definitions: vec![DefinedSignature {
+            symbol: name.into(),
+            signature: FunctionSignature {
+                params: vec![],
+                result: Some(i32_ty),
+                variadic: false,
+                calling_convention: CallingConvention::C,
+            },
         }],
+        externals: vec![],
     };
-    compiler_ir::verify(&function).expect("valid source SSA");
-    let bytes = X86_64.emit_object(&[function]).expect("direct x86-64 ELF object emission");
+    module.validate().expect("complete TypeId module/source ABI");
+    let bytes = X86_64.emit_typeid_object(&module)
+        .expect("production TypeId x86 ELF object emission");
     assert!(bytes.len() > 64, "ELF object has sufficient size");
     assert_eq!(&bytes[..4], b"\x7fELF", "ELF magic");
     assert_eq!(bytes[4], 2, "ELF64");
