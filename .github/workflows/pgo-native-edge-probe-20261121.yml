@@ -1,0 +1,77 @@
+name: PGO late native CFG edge probes
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/pgo-native-edge-probe-20261121.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-edge-execution:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 52f4eb176a7d09102dd23faa4be745a168e02880
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact revision and Git transport
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "52f4eb176a7d09102dd23faa4be745a168e02880"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: pgo-edge-native-real-20261121
+      - name: Profile runtime parser, flow conservation and edge identity negatives
+        working-directory: compiler
+        run: python3 -m unittest discover -s tools -p test_x86_pgo_edge_runtime.py -v
+      - name: Compile and execute real TypeId native ELF/GAS edge counters
+        working-directory: compiler
+        run: bash tools/run_x86_pgo_edge_native.sh
+  backend-compatibility:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 52f4eb176a7d09102dd23faa4be745a168e02880
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source and transport
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "52f4eb176a7d09102dd23faa4be745a168e02880"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: pgo-edge-backend-compat-20261121
+      - name: Full backend, shared profile and x86 unit tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib
+          cargo test -p compiler-backend-x86 --lib
+      - name: Disabled-feature x86 and scoped Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-backend-x86 --no-default-features
+          # Existing unrelated compiler-opt/assembler/ELF legacy warnings.
+          cargo clippy -p compiler-backend-x86 --lib -- -D warnings -A unused-imports -A dead-code -A unused-variables -A clippy::empty_line_after_doc_comments -A clippy::needless_lifetimes -A clippy::collapsible_match
+      - name: Existing opt-in real x86 cost model source ELF/GAS oracle
+        working-directory: compiler
+        run: cargo test -p compiler --test x86_cost_selection_source -- --nocapture
