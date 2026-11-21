@@ -1,0 +1,56 @@
+name: Inspect pinned operand latency measurement structure
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/x7-inspect-latency-20261121.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect-pinned-xml:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 84e19f9a4685b0d877947a9390c4a56ded2364d4
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Fetch exact historically reviewed March 2026 XML (fail closed)
+        run: |
+          set -euo pipefail
+          curl -fL --retry 2 --max-time 600 https://uops.info/instructions.xml -o instructions.xml
+          sha256sum instructions.xml
+          test "$(sha256sum instructions.xml | cut -d' ' -f1)" = "e5e702caaf04c4fc1f75192a9bbe4d8554b3e174f7933a14d124cc33ca677ab3"
+      - name: Review actual exact XED operand-specific latency fields, only verified forms
+        run: |
+          cat > /tmp/inspect_latency.py <<'PY'
+          #!/usr/bin/env python3
+          import hashlib,json,xml.etree.ElementTree as ET
+          from pathlib import Path
+          root=Path("compiler")
+          catalog=json.loads((root/"data/x86_uops_variant_mapping.json").read_text())["forms"]
+          names=["MOV_R_M_8B_32","MOV_R_M_8B_64","MOV_R_R_89_32","MOV_R_R_89_64","ADD_R_R_03_32","ADD_R_M_03_32","ADD_R_M_03_64","ADD_R_R_03_64","CMP_R_R_32","CMOVNE_R_R32","CMOVNE_R_M32","BSF_R_R_32"]
+          h=hashlib.sha256(Path("instructions.xml").read_bytes()).hexdigest()
+          assert h=="e5e702caaf04c4fc1f75192a9bbe4d8554b3e174f7933a14d124cc33ca677ab3",h
+          print("PINNED_XML_OK",h,flush=True)
+          lookup={n:catalog[n] for n in names if n in catalog}
+          for _,inst in ET.iterparse("instructions.xml",events=("end",)):
+              if inst.tag!="instruction":continue
+              matches=[name for name,identity in lookup.items() if all(inst.get(k)==v for k,v in identity.items())]
+              for name in matches:
+                  print("FORM",name,flush=True)
+                  print("OPERANDS",[(x.tag,x.attrib,(x.text or "").strip()[:50]) for x in inst.findall("operand")],flush=True)
+                  for arch in inst.findall("architecture"):
+                      if arch.get("name") not in ("SKL","ZEN4"):continue
+                      ms=arch.findall("measurement")
+                      for m in ms:
+                          print("CPU",arch.get("name"),"TOP_ATTRS",m.attrib,"LATENCIES",[x.attrib for x in m.findall("latency")],flush=True)
+                  del lookup[name]
+              inst.clear()
+          print("MISSING",list(lookup),flush=True)
+          
+          PY
+          python3 /tmp/inspect_latency.py
