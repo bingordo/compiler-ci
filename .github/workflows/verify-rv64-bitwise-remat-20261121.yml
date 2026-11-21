@@ -1,0 +1,181 @@
+name: RV64 source-reviewed bitwise immediate shared rematerialization
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-rv64-bitwise-remat-20261121.yml']
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact compiler source branch or SHA
+        required: true
+        type: string
+        default: '915992ffdb16ad4723e5cdb24a8a19bbc4131432'
+permissions:
+  contents: read
+jobs:
+  rv64-bitwise-remat:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || '915992ffdb16ad4723e5cdb24a8a19bbc4131432' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert source provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git -C compiler rev-parse HEAD)"
+          echo "RV64 bitwise-remat compiler source: $actual" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            test "$actual" = '915992ffdb16ad4723e5cdb24a8a19bbc4131432'
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Isolate TypeId native crates
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-riscv64"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: rv64-bitwise-remat-20261121
+      - name: Verify generated opcode provenance and rule indices
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/regen_riscv_native_selector_rules.py --check
+          python3 -m unittest discover -s tools -p test_riscv_native_selector_rules.py -v
+          python3 tools/riscv_udb_rust_leaf_forms.py \
+            --catalog data/riscv_udb_r0_catalog.json \
+            --output crates/backend-riscv64/src/generated_encoding.rs --check
+      - name: Shared planner, full RV64 test suite and target-only strict Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib remat::tests
+          cargo test -p compiler-backend-riscv64 --lib bitwise_i12
+          cargo test -p compiler-backend-riscv64 --all-targets
+          cargo clippy -p compiler-backend-riscv64 --all-targets -- --no-deps -D warnings
+      - name: Install independent GNU binutils and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y binutils-riscv64-linux-gnu qemu-user
+      - name: Compare bitwise immediate ELF bytes to GAS and verify selection
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for kind in andi_neg ori_pos xori_hi andi_over bitwise_shared; do
+            cargo run -p compiler-backend-riscv64 --example rv64_leaf -- \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}.s" "$kind" --isa=rv64i
+            riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+              "/tmp/rv64_${kind}.s" -o "/tmp/rv64_${kind}_gas.o"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}_direct.bin"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}_gas.o" "/tmp/rv64_${kind}_gas.bin"
+            cmp "/tmp/rv64_${kind}_direct.bin" "/tmp/rv64_${kind}_gas.bin"
+          done
+          grep -qE '^[[:space:]]+andi x' /tmp/rv64_andi_neg.s
+          grep -qE '^[[:space:]]+ori x' /tmp/rv64_ori_pos.s
+          grep -qE '^[[:space:]]+xori x' /tmp/rv64_xori_hi.s
+          for op in andi ori xori; do
+            grep -qE "^[[:space:]]+${op} x" /tmp/rv64_bitwise_shared.s
+          done
+          grep -qE '^[[:space:]]+and x' /tmp/rv64_andi_over.s
+          if grep -qE '^[[:space:]]+andi x' /tmp/rv64_andi_over.s; then
+            echo 'invalid signed-i12 fold'; exit 1
+          fi
+      - name: Execute independently checked input and signed boundary cases
+        run: |
+          set -euo pipefail
+          cat > /tmp/rv64_bitwise_start.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            li a0, 7
+            call rv64_andi_neg
+            li t0, 7
+            bne a0, t0, fail1
+            li a0, -1
+            call rv64_andi_neg
+            li t0, -17
+            bne a0, t0, fail2
+            li a0, 7
+            call rv64_ori_pos
+            li t0, 39
+            bne a0, t0, fail3
+            li a0, -1
+            call rv64_ori_pos
+            li t0, -1
+            bne a0, t0, fail4
+            li a0, 7
+            call rv64_xori_hi
+            li t0, 2040
+            bne a0, t0, fail5
+            li a0, -1
+            call rv64_xori_hi
+            li t0, -2048
+            bne a0, t0, fail6
+            li a0, 7
+            call rv64_andi_over
+            bnez a0, fail7
+            li a0, -1
+            call rv64_andi_over
+            li t0, 2048
+            bne a0, t0, fail8
+            li a0, 7
+            call rv64_bitwise_shared
+            li t0, 78
+            bne a0, t0, fail9
+            li a0, -1
+            call rv64_bitwise_shared
+            li t0, -2
+            bne a0, t0, fail10
+            li a0, 0
+            j exit
+          fail1: li a0, 1
+            j exit
+          fail2: li a0, 2
+            j exit
+          fail3: li a0, 3
+            j exit
+          fail4: li a0, 4
+            j exit
+          fail5: li a0, 5
+            j exit
+          fail6: li a0, 6
+            j exit
+          fail7: li a0, 7
+            j exit
+          fail8: li a0, 8
+            j exit
+          fail9: li a0, 9
+            j exit
+          fail10: li a0, 10
+          exit:
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+            /tmp/rv64_bitwise_start.s -o /tmp/rv64_bitwise_start.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax -e _start \
+            /tmp/rv64_bitwise_start.o /tmp/rv64_andi_neg.o \
+            /tmp/rv64_ori_pos.o /tmp/rv64_xori_hi.o \
+            /tmp/rv64_andi_over.o /tmp/rv64_bitwise_shared.o \
+            -o /tmp/rv64_bitwise.elf
+          timeout 15s qemu-riscv64 /tmp/rv64_bitwise.elf
+          echo 'RV64 bitwise immediate QEMU: ten independent cases passed'
