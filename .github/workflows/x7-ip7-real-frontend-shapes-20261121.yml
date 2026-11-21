@@ -1,0 +1,89 @@
+name: X7 IP7 actual Mini-C/Oberon frontend SSA shape inventory
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/x7-ip7-real-frontend-shapes-20261121.yml'
+permissions:
+  contents: read
+jobs:
+  frontend-source-inventory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 3b3be688a6a592e063a20ea7d7b5d569dab392e4
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source and checkout pinned checked frontends
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 3b3be688a6a592e063a20ea7d7b5d569dab392e4
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          rustc --version
+          cargo --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-ip7-frontend-shape-v1
+      - name: Check bounded/effect/CFG and alpha identity in target-neutral legalized native SSA
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --features x7-ip7-workload-profile \
+            --lib x7_ip7_workload::tests -- --nocapture
+      - name: Run genuine checked Mini-C + Oberon TypeId before and after optimizer
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --bin compiler --features x7-ip7-workload-profile \
+            x7_ip7_real_source_shapes -- --nocapture 2>&1 | tee /tmp/x7-ip7-frontend-shapes.log
+      - name: Verify deterministic bounded read-only reports and candidate source coverage
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          lines=Path('/tmp/x7-ip7-frontend-shapes.log').read_text().splitlines()
+          headers=[s.split('X7_IP7_INVENTORY ',1)[1] for s in lines
+                   if 'X7_IP7_INVENTORY source=' in s]
+          forms={}
+          for s in headers:
+              fields=dict(token.split('=',1) for token in s.split()
+                          if '=' in token)
+              name,phase=fields['source'],fields['phase']
+              assert name in ('c_arithmetic','c_bitwise',
+                              'oberon_arithmetic','oberon_branch'),fields
+              assert phase in ('raw','optimized'),fields
+              assert (name,phase) not in forms
+              assert int(fields['funcs'])>=1
+              assert 0<=int(fields['candidate_roots'])<=int(fields['pure'])
+              assert 0<=int(fields['distinct'])<=int(fields['candidate_roots'])
+              forms[name,phase]=fields
+          assert len(forms)==8,forms
+          for source in ('c_arithmetic','oberon_arithmetic'):
+              assert int(forms[source,'raw']['candidate_roots'])>0,forms
+          records=[line for line in lines if 'X7_IP7_SHAPE source=' in line]
+          assert records,"real checked frontend produced no candidate shape inventory"
+          for line in records:
+              tail=line.split('X7_IP7_SHAPE source=',1)[1]
+              assert 'potential_deleted_each=' in tail
+              assert ' shape=' in tail
+              assert 'ValueId(' not in tail,"reported internal SSA identity"
+          print('X7_IP7_REAL_FRONTEND_INVENTORY_PASS')
+          for name in ('c_arithmetic','c_bitwise','oberon_arithmetic','oberon_branch'):
+              print('X7_IP7_COUNT',name,
+                    'raw='+forms[name,'raw']['candidate_roots'],
+                    'optimized='+forms[name,'optimized']['candidate_roots'])
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-ip7-real-frontends-readonly-shape-inventory
+          path: /tmp/x7-ip7-frontend-shapes.log
+          if-no-files-found: ignore
