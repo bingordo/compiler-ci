@@ -199,7 +199,7 @@ fi
 # dependency as the public producer. No source from the private mrustc TU is
 # supplied to this check.
 if [[ "${EDG_LITERAL_REGRESSION:-0}" == "1" ]]; then
-  candidate_sha=092bf7069921eeb5aca3d26b9b66d6c4047e17fa
+  candidate_sha=9f02c1ee19d34da5d0568f4683e9c0f77c612307
   test "$(git -c safe.directory=/workspace/compiler-literal-source -C /workspace/compiler-literal-source rev-parse HEAD)" = "$candidate_sha"
   # Actions checkout is mounted read-only. Make a disposable compilation
   # copy in the private runner temp so Cargo can update its local lockfile.
@@ -292,7 +292,7 @@ from pathlib import Path
 import sys
 expected=Path(sys.argv[1]).read_bytes()
 observed=Path(sys.argv[2]).read_bytes()
-if expected!=b"STATIC_LITERAL_ELF_PARITY_OK\\n" or observed!=expected:
+if expected!=b"STATIC_LITERAL_ELF_PARITY_OK\n" or observed!=expected:
     raise SystemExit(1)
 PY
           native_parity_rc=$?
