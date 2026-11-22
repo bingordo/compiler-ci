@@ -220,6 +220,37 @@ probe_generated_c EDG_C_PARSE "$AUDIT_SOURCE" 90s /audit-tmp/edg-generated-c-par
 # Preserve the SMALL source's result for its own native TypeId gate.
 parse_rc=$last_generated_c_probe_rc
 
+# Bound and validate all fields of the opt-in native C union constant-tree
+# diagnostic. Never print source/identifier, diagnostic addresses or logs.
+python3 - /audit-tmp/edg-generated-c-parse.log <<'PY'
+from pathlib import Path
+import re,sys
+fields=("type_size","type_align","root_kind","first_kind",
+        "second_kind","third_kind","first_child_kind",
+        "child_count_bounded","root_dynamic","first_address_kind",
+        "first_designator")
+n=0
+for line in Path(sys.argv[1]).read_text(errors="replace").splitlines():
+    prefix="EDG_C_UNION_IMAGE_DIAG "
+    if not line.startswith(prefix):
+        continue
+    entries=line[len(prefix):].split()
+    if len(entries)!=len(fields):
+        continue
+    out=[]
+    for entry,key in zip(entries,fields):
+        match=re.fullmatch(re.escape(key)+r"=([0-9]{1,10})",entry)
+        if match is None:
+            break
+        out.append(match.group(1))
+    else:
+        print(prefix+" ".join(f"{key}={value}"
+                           for key,value in zip(fields,out)))
+        n+=1
+        if n==4:
+            break
+PY
+
 # Independent upstream frontend control: build EDG's normal `cpfe`
 # executable from the same pinned upstream sources as the callable library.
 # Unlike the Rust/C++ callback bridge, this runs EDG's own source frontend
