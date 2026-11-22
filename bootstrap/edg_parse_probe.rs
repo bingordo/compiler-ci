@@ -29,7 +29,7 @@ fn main() {
             // Count those source facts *before* the adapter rejects a TU.
             let il=&unit.il;
             let globals=&il.global_variables;
-            println!(
+            eprintln!(
                 "EDG_PROBE_GLOBALS total={} externs={} internal={} file_scope={} explicit={} tls={} local_static={} materializations={} weak={} sections={} initializers={} integer_images={} fp_images={} aggregate_images={} relocations={} dynamic={} initializer_exprs={} lifetime_inits={} defined_routines={}",
                 globals.len(),
                 globals.iter().filter(|g|g.linkage==1).count(),
