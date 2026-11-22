@@ -199,7 +199,7 @@ fi
 # dependency as the public producer. No source from the private mrustc TU is
 # supplied to this check.
 if [[ "${EDG_LITERAL_REGRESSION:-0}" == "1" ]]; then
-  candidate_sha=388a9e8a02a5322fc1de690d6840c1a7ce9efadd
+  candidate_sha=4047a32de1a76837d91609bbe90cc0b9f5cf80df
   git -C /workspace/compiler fetch --quiet --no-tags --depth=1 origin "$candidate_sha"
   git -C /workspace/compiler worktree add --quiet --detach \
     /workspace/compiler-literal-candidate "$candidate_sha"
