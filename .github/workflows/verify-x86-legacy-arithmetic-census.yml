@@ -1,0 +1,49 @@
+name: x86 legacy arithmetic real ELF selector witness audit
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-x86-legacy-arithmetic-census.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  legacy-arithmetic-census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b6ce4f1a259f5441188640f1a5ca0624af99fac3
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require exact compiler SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "b6ce4f1a259f5441188640f1a5ca0624af99fac3"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Isolate TypeId backend and optimizer crates
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/opt", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f Cargo.lock
+      - name: Validate source and mutation tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/tools"
+          python3 tools/regen_x86_selector_rules.py --check
+          python3 -m unittest discover -s tools -p test_x86_real_selector_census.py -v
+      - name: Require arithmetic rules, ELF emission and independent C11 oracle
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test x86_real_selector_census --features x86-selector-census -- --nocapture | tee /tmp/x86-arithmetic-census.log
+          grep -Fq 'test source_owned_legacy_arithmetic_real_elf_matches_c11 ... ok' /tmp/x86-arithmetic-census.log
+          python3 tools/x86_real_selector_census.py --rust-test-log /tmp/x86-arithmetic-census.log
+      - name: Preserve existing selector unit tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --lib selector::tests
