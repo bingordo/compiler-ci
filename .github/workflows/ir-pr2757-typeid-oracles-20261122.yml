@@ -1,0 +1,63 @@
+# Isolated validation for compiler IR migration PR #2757.
+# Never advances an older migration workflow's pinned source SHA.
+name: IR PR2757 native TypeId oracle validation
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ir-pr2757-typeid-oracles-20261122.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  typeid-oracles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: 366b9095f2100aa985d2c3e9cfa8f0ecdbd2b607
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Check out exact private compiler PR candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm immutable revision and isolate core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+          cargo --version
+          cc --version | head -n 1
+      - name: Cache isolated Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-pr2757-typeid-oracles
+      - name: Run native TypeId and interpreter migration suites
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typeid_reference_native_width -- --nocapture
+          cargo test -p compiler-opt --test m4_integer_effects -- --nocapture
+          cargo test -p compiler-opt --test licm_preheaders -- --nocapture
+          cargo test -p compiler-opt --test pre_licm_semantic_matrix -- --nocapture
+          cargo test -p compiler-opt --test al05_p9_mixed_native_bridge al05_p14_p15_p16_generated_typeid_interpreter_matches_host_recurrence -- --nocapture
+      - name: Strict lint for migration tests
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-opt --test typeid_reference_native_width --test m4_integer_effects --test licm_preheaders --test pre_licm_semantic_matrix -- -D warnings
