@@ -224,3 +224,100 @@ jobs:
             ${{ runner.temp }}/three-way-mini-c-summary.log
           if-no-files-found: ignore
           retention-days: 14
+
+  # Temporary PR-only parity validation. Reuses this existing compiler-ci
+  # workflow, leaving the scheduled production differential gate unchanged.
+  staged-typeid-parity:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Check out exact compiler PR #2707 candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 58f3da929fd1d02268d33a59da7ee290e2382a9c
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check out verified three-way parity harness
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 762cd4cd652086a9aa8b6f20d890243c43d617f3
+          path: parity-harness
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Install exact parity script into staged source checkout
+        run: |
+          cp parity-harness/tools/mini-c-driver/tests/three_way_parity.py \
+            compiler/tools/mini-c-driver/tests/three_way_parity.py
+      - name: Verify exact compiler SHA and pinned shared Mini-C frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 58f3da929fd1d02268d33a59da7ee290e2382a9c
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          text=Path("compiler/tools/mini-c-driver/Cargo.toml").read_text()
+          pins=re.findall(r'mini-c-(?:syntax|sema)\s*=\s*\{[^\n]*?rev\s*=\s*"([0-9a-f]{40})"', text)
+          assert pins == ["0c4ef5e200d5e121cd7c70203183866d17e00fa8"]*2, pins
+          manifest=Path("compiler/tools/mini-c-driver/Cargo.toml")
+          manifest.write_text(text.replace("ssh://git@github.com/bingordo/mini-c.git",
+                                          "https://github.com/bingordo/mini-c.git"))
+          PY
+      - name: Check out Mini-C at the same TypeId source pin
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: 0c4ef5e200d5e121cd7c70203183866d17e00fa8
+          path: mini-c
+          persist-credentials: false
+      - name: Prove pinned Mini-C checkout identity
+        run: test "$(git -C mini-c rev-parse HEAD)" = 0c4ef5e200d5e121cd7c70203183866d17e00fa8
+      - name: Cache independent compiler build dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: three-way-staged-typeid-1273
+          cache-workspace-crates: 'true'
+      - name: Build production TypeId compiler-mini-c
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 14m cargo build --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+          test -x compiler/tools/mini-c-driver/target/debug/compiler-mini-c
+      - name: Cache independent Cranelift build dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mini-c -> target
+          key: three-way-staged-cranelift-1273
+          cache-workspace-crates: 'true'
+      - name: Build standalone Mini-C Cranelift binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 14m cargo build --manifest-path mini-c/Cargo.toml -p mini-c-cranelift --features internal-cpp
+          test -x mini-c/target/debug/mini-c-cranelift
+      - name: Compare 16 ABI probes against staged TypeId integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 9m python3 compiler/tools/mini-c-driver/tests/three_way_parity.py \
+            --typeid compiler/tools/mini-c-driver/target/debug/compiler-mini-c \
+            --cranelift mini-c/target/debug/mini-c-cranelift \
+            --cranelift-source-root mini-c --suite abi \
+            --artifacts "$RUNNER_TEMP/three-way-mini-c-parity" \
+            --timeout 20 | tee "$RUNNER_TEMP/three-way-mini-c-summary.log"
+          grep -q '^PARITY_SUMMARY ' "$RUNNER_TEMP/three-way-mini-c-summary.log"
+      - name: Preserve mismatches and source diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: three-way-staged-typeid-reproducers
+          path: |
+            ${{ runner.temp }}/three-way-mini-c-parity/
+            ${{ runner.temp }}/three-way-mini-c-summary.log
+          if-no-files-found: ignore
+          retention-days: 14
