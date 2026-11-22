@@ -1,0 +1,143 @@
+name: Probe unforced CMake compiler identification
+on:
+  pull_request:
+    paths: ['.github/workflows/probe-gcc-adapter-cmake-identification.yml']
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c761d906761bc6ebbf25bd5414e40c58db7fa30f
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source-pinned GCC adapter Python unit tests
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s compiler/tests -p 'test_compiler_gcc.py' -v
+      - name: Build source-pinned native Mini-C TypeId
+        run: |
+          set -euo pipefail
+          git -C compiler rev-parse HEAD
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("compiler/tools/mini-c-driver/Cargo.toml")
+          s=p.read_text()
+          old="ssh://git@github.com/bingordo/mini-c.git"
+          assert s.count(old)==2
+          p.write_text(s.replace(old,"https://github.com/bingordo/mini-c.git"))
+          PY
+          timeout 12m cargo build --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+      - name: Native TypeId versus GCC for discarded void expressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          d="$(mktemp -d)"
+          trap 'rm -rf "$d"' EXIT
+          cat > "$d/discard.c" <<'EOF'
+          int bump(int *x) { *x = *x + 7; return *x; }
+          int main(void) {
+            int x = 5;
+            (void)bump(&x);
+            (void)x;
+            return x == 12 ? 0 : 1;
+          }
+          EOF
+          cat > "$d/argv.c" <<'EOF'
+          int main(int argc, char **argv) {
+            (void)argv;
+            return argc == 1 ? 0 : 1;
+          }
+          EOF
+          native="$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c"
+          for case in discard argv; do
+            gcc -std=gnu11 -O0 "$d/$case.c" -o "$d/$case.gcc"
+            "$d/$case.gcc"
+            "$native" "$d/$case.c" --emit obj -o "$d/$case.o"
+            gcc "$d/$case.o" -o "$d/$case.native"
+            "$d/$case.native"
+          done
+          echo "VOID_CAST_NATIVE_GCC_DIFFERENTIAL=PASS" >> "$GITHUB_STEP_SUMMARY"
+      - name: Record actual unforced CMake probes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/id-probe/p"
+          cd "$RUNNER_TEMP/id-probe"
+          cp "$GITHUB_WORKSPACE/compiler/tools/compiler-gcc.py" adapter
+          chmod +x adapter
+          cat > bridge <<'PY'
+          #!/usr/bin/env python3
+          import os, subprocess, sys
+          a=sys.argv[1:]
+          with open(os.environ["ADAPTER_ARG_LOG"],"a") as f: f.write(repr(a)+"\n")
+          if len(a)!=9 or a[1:3]!=["--language","mini-c"] or a[3:5]!=["--target","x86_64"] or a[5:7]!=["--emit","obj"] or a[7]!="-o":
+              sys.exit("unsupported native bridge arguments")
+          sys.exit(subprocess.call([os.environ["NATIVE_MINI_C"],a[0],"--emit","obj","-o",a[8]]))
+          PY
+          chmod +x bridge
+          printf 'cmake_minimum_required(VERSION 3.20)\nproject(unforced C)\nadd_executable(probe main.c)\n' > p/CMakeLists.txt
+          printf '#include "answer.h"\nint main(void){return ANSWER == 7 ? 0 : 1;}\n' > p/main.c
+          printf '#define ANSWER 7\n' > p/answer.h
+          export ADAPTER_ARG_LOG="$PWD/args.log"
+          export NATIVE_MINI_C="$GITHUB_WORKSPACE/compiler/tools/mini-c-driver/target/debug/compiler-mini-c"
+          export COMPILER_NATIVE_DRIVER="$PWD/bridge"
+          # Neither generator may use forced compiler identity, WORKS, or ABI.
+          for generator in Ninja "Unix Makefiles"; do
+              case "$generator" in
+                Ninja) suffix=ninja ;;
+                *) suffix=make ;;
+              esac
+              printf '#define ANSWER 7\n' > p/answer.h
+              if ! cmake -S p -B "build-$suffix" -G "$generator" \
+                   -DCMAKE_C_COMPILER="$PWD/adapter" -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/compiler/tools/cmake/typeid-gcc-adapter-toolchain.cmake" >"configure-$suffix.log" 2>&1; then
+                  cat "configure-$suffix.log"
+                  echo "UNFORCED_${suffix}_CONFIGURE=FAIL" | tee -a result.txt
+                  exit 1
+              fi
+              echo "UNFORCED_${suffix}_CONFIGURE=PASS" | tee -a result.txt
+              cmake --build "build-$suffix" >"build-$suffix.log" 2>&1 || {
+                  cat "build-$suffix.log"
+                  exit 1
+              }
+              "./build-$suffix/probe"
+              echo "UNFORCED_${suffix}_NATIVE_RUNTIME=PASS" | tee -a result.txt
+              object="build-$suffix/CMakeFiles/probe.dir/main.c.o"
+              test -s "$object"
+              before="$(stat -c '%Y' "$object")"
+              sleep 1
+              cmake --build "build-$suffix" >>"build-$suffix.log" 2>&1
+              test "$(stat -c '%Y' "$object")" = "$before"
+              sleep 1
+              printf '#define ANSWER 8\n' > p/answer.h
+              cmake --build "build-$suffix" >>"build-$suffix.log" 2>&1
+              after="$(stat -c '%Y' "$object")"
+              test "$after" -gt "$before" || {
+                  echo "UNFORCED_${suffix}_HEADER_REBUILD=FAIL" | tee -a result.txt
+                  exit 1
+              }
+              if "./build-$suffix/probe"; then
+                  echo "UNFORCED_${suffix}_RUNTIME_AFTER_HEADER=WRONG" | tee -a result.txt
+                  exit 1
+              else
+                  test "$?" -eq 1
+              fi
+              echo "UNFORCED_${suffix}_HEADER_REBUILD=PASS" | tee -a result.txt
+          done
+          cat configure-ninja.log
+          cat configure-make.log
+          cat result.txt >> "$GITHUB_STEP_SUMMARY"
+          test -f args.log && cat args.log || :
+      - name: Save exact CMake probe and compiler diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unforced-cmake-identification
+          path: ${{ runner.temp }}/id-probe/
+          if-no-files-found: error
+          retention-days: 14
