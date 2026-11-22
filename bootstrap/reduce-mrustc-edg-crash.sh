@@ -18,16 +18,9 @@ if ! command -v gdb >/dev/null 2>&1; then
   echo "EDG_CREDUCE_STATUS=skipped_gdb_unavailable"
   exit 0
 fi
-if ! command -v creduce >/dev/null 2>&1; then
-  if command -v apt-get >/dev/null 2>&1; then
-    set +e
-    DEBIAN_FRONTEND=noninteractive apt-get update -qq \
-      > /audit-tmp/edg-creduce-apt.log 2>&1 &&
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends creduce \
-      >> /audit-tmp/edg-creduce-apt.log 2>&1
-    set -e
-  fi
-fi
+# The outer EDG audit installs distribution gdb/creduce packages once per job,
+# with the downloaded .deb binaries restored by actions/cache. Never run apt
+# inside the thousands of C-Reduce interestingness test invocations.
 if ! command -v creduce >/dev/null 2>&1; then
   echo "EDG_CREDUCE_STATUS=skipped_creduce_unavailable"
   exit 0
@@ -42,6 +35,8 @@ printf '%s\n' "$@" "-I$(dirname "$source")" > "$work/include-flags.txt"
 export EDG_CREDUCE_PARSER="$parser"
 export EDG_CREDUCE_GNU="$gnu_version"
 export EDG_CREDUCE_INCLUDES="$work/include-flags.txt"
+# Also supply include directories to C-Reduce's clang_delta passes.
+export CREDUCE_INCLUDE_PATH="$(dirname "$source"):${CREDUCE_INCLUDE_PATH:-}"
 
 # C-Reduce runs this test in a fresh directory with its current reduced.c.
 # Require BOTH SIGSEGV and the same GDB top frame; a different parser crash,
@@ -55,8 +50,21 @@ set --
 while IFS= read -r flag; do
   test -n "$flag" && set -- "$@" "$flag"
 done < "$EDG_CREDUCE_INCLUDES"
+# Most reductions produce normal parse errors. Reject those with a direct,
+# cheap parser invocation; only start GDB when the process actually SIGSEGVs.
+# Preserve working directory, dialect flags and input path for both runs.
 (
   cd /workspace/edgcpp/build/gcc-release || exit 1
+  ulimit -c 0
+  timeout --signal=TERM --kill-after=3s 15s \
+    "$EDG_CREDUCE_PARSER" --gcc --c11 --no_strict_gnu \
+      --gnu_version "$EDG_CREDUCE_GNU" "$@" "$candidate"
+) > "$PWD/interesting-direct.log" 2>&1
+direct_rc=$?
+test "$direct_rc" -eq 139 || exit 1
+(
+  cd /workspace/edgcpp/build/gcc-release || exit 1
+  ulimit -c 0
   timeout --signal=TERM --kill-after=3s 20s \
     gdb -nx --batch --quiet \
       -ex 'set pagination off' \
