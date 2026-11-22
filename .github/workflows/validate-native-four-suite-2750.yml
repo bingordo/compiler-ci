@@ -1,0 +1,60 @@
+name: Validate four-suite native TypeId test bridge retirement PR2750
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/validate-native-four-suite-2750.yml'
+permissions:
+  contents: read
+jobs:
+  native-four-suite:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: 6e702e4f04e0c5fe760fb91b3ca3521fd9921939
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      MEM2REG_REPETITIONS: '1'
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin exact SHA and isolate native workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: native-four-suite-2750
+      - name: Check native ownership and production IR
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          ! grep -qE 'typeid_executable_fixture|typed_fixture|from_legacy' crates/opt/tests/inline_native.rs crates/opt/tests/sccp_sparse_native.rs crates/opt/tests/linkage_native.rs crates/opt/tests/mem2reg_profile.rs
+          python3 tools/ir_consumer_inventory.py --check-production
+      - name: Compile all four suites and x86 backend
+        working-directory: compiler
+        run: |
+          cargo check -p compiler-opt --lib --test inline_native --test sccp_sparse_native --test linkage_native --test mem2reg_profile
+          cargo check -p compiler-backend-x86 --lib
+      - name: Run source-owned inlining SCCP linkage GAS and ELF oracles
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test inline_native -- --nocapture
+          cargo test -p compiler-opt --test sccp_sparse_native -- --nocapture
+          cargo test -p compiler-opt --test linkage_native -- --nocapture
+      - name: Exercise all scalable native mem2reg benchmark cases
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test mem2reg_profile -- --ignored --nocapture
