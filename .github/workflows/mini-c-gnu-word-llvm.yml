@@ -1,0 +1,102 @@
+# Source-pinned, correctness-first LLVM Shootout discovery; no timing thresholds.
+name: Mini-C GNU word mode LLVM source regression
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/mini-c-gnu-word-llvm.yml']
+permissions:
+  contents: read
+concurrency:
+  group: mini-c-gnu-word-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  shootout:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      COMPILER_SHA: 48cba4acd33284d49cee1296b3c487cbaac5c13c
+      MINIC_SHA: e90c3b5bd6d40075fd5869eb74af976db5e9a99a
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.COMPILER_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source pin and run offline tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          git -C compiler rev-parse HEAD | tee results/compiler-sha.txt
+          python3 -m py_compile compiler/tools/opt_quality_public_m6_execution.py compiler/tools/test_opt_quality_public_m6_execution.py
+          python3 -m unittest discover -s compiler/tools -p 'test_opt_quality_public_m6_execution.py' -v |& tee results/oracle-tests.log
+      - name: Configure public Mini-C dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('compiler/tools/mini-c-driver/Cargo.toml')
+          original=p.read_text()
+          old='ssh://git@github.com/bingordo/mini-c.git'
+          assert original.count(old)==2
+          old_rev='b7ac6ddfb5304df3dfeb72ac1462d458fba53a9a'
+          assert original.count(old_rev)==2
+          p.write_text(original.replace(old,'https://github.com/bingordo/mini-c.git')
+                       .replace(old_rev, 'e90c3b5bd6d40075fd5869eb74af976db5e9a99a'))
+          PY
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: mini-c-gnu-word-mode
+      - name: Build native TypeId Mini-C compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 12m cargo build \
+            --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --bin compiler-mini-c
+      - name: Fetch original LLVM sources and perform three-way executable census
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 6m python3 \
+            compiler/tools/opt_quality_public_m6_execution.py \
+            --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" \
+            --output results/m6-execution.json \
+            --require-passes 2 \
+            2>&1 | tee results/m6-execution.log
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          r=json.loads(Path('results/m6-execution.json').read_text())
+          assert r['total']==2 and len(r['cases'])==2
+          assert r['llvm_commit']=='ec05cfd8cd10a94e6d4208537588093890c737b9'
+          assert all(x['sha256'] for x in r['cases'])
+          assert len({x['id'] for x in r['cases']})==2
+          fib=next(x for x in r['cases'] if x['id']=='llvm-shootout-fib2')
+          assert fib['status']=='PASS', fib
+          assert len(fib['inputs'])==3
+          assert all(x['status']=='PASS' for x in fib['inputs'])
+          assert r['passed']==2
+          nested=next(x for x in r['cases'] if x['id']=='llvm-shootout-nestedloop')
+          assert nested['status']=='PASS', nested
+          assert len(nested['inputs'])==3
+          print('M6_EXECUTABLE_CENSUS passed:',r['passed'],'/',r['total'])
+          for row in r['cases']:
+              print(row['id'],row['status'],len(row['inputs']))
+          PY
+          echo "GNU word mode gate: both unchanged LLVM Shootout executables pass" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload source and execution diagnostics
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: opt-quality-m6-${{ env.COMPILER_SHA }}
+          path: results/
+          retention-days: 30
