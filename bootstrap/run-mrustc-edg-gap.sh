@@ -166,6 +166,20 @@ if [[ "${EDG_LITERAL_REGRESSION:-0}" == "1" ]]; then
   echo "EDG_C_LITERAL_BRIDGE_EXIT=$bridge_rc"
   echo "EDG_C_LITERAL_WIRE_EXIT=$wire_rc"
   if (( wire_rc != 0 )); then
+    # Public bridge test only. Sanitized, bounded diagnostic lines are
+    # explicitly whitelisted by the parent job's numeric/source-free log
+    # selection; no private mrustc file is involved.
+    python3 - /audit-tmp/edg-static-literal-wire.log <<'PY'
+from pathlib import Path
+import re,sys
+lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
+selected=[line for line in lines if any(token in line for token in
+    ("error[E","error:","panicked at","FAILED","test result:","expected","found"))]
+for n,line in enumerate(selected[-12:],1):
+    msg=re.sub(r"/workspace/[^ :]+","<public-path>",line.strip())
+    msg=re.sub(r"[^A-Za-z0-9 _./:><()\[\],=-]","?",msg)
+    print(f"EDG_C_LITERAL_TEST_DIAG_{n}={msg[:250]}")
+PY
     echo 'EDG_LITERAL_PUBLIC_WIRE_TEST_FAILURE_DETAIL_BEGIN'
     # Only source-backed public in-repo unit tests appear in this file; do
     # not print any private generated-C compiler/error output.
