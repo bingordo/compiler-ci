@@ -1,0 +1,49 @@
+name: x86 source-linked actual TypeId ELF selector rule census
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-x86-real-selector-census.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  selector-census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact compiler source candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 49015a0c36ee0045c73a17a6cb30e5bb8dfc1c05
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require exact source SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "49015a0c36ee0045c73a17a6cb30e5bb8dfc1c05"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Isolate TypeId backend and optimizer crates
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/opt", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f Cargo.lock
+      - name: Validate exact reviewed source and reject forged selector evidence
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/tools"
+          python3 tools/regen_x86_selector_rules.py --check
+          python3 -m unittest discover -s tools -p test_x86_selector_rules.py -v
+          python3 -m unittest discover -s tools -p test_x86_real_selector_census.py -v
+      - name: Measure accepted production x86 ELF and compatibility TypeId rule IDs
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test x86_real_selector_census --features x86-selector-census -- --nocapture | tee /tmp/x86-real-selector-coverage.log
+          python3 tools/x86_real_selector_census.py --rust-test-log /tmp/x86-real-selector-coverage.log
+      - name: Preserve original generic ranked selector Rust tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --lib selector::tests
