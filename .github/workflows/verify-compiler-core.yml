@@ -46,6 +46,50 @@ jobs:
           PYTHONPATH=tools python3 -m unittest tools.test_ir_consumer_inventory
           python3 tools/check_mixed_function_export_boundary.py
 
+  retire-slp-legacy-test-bridges:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 16953814fd2f361b869290e3f4d85477d0468eb7
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Exact SHA and core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "16953814fd2f361b869290e3f4d85477d0468eb7"
+          python3 compiler/tools/ir_consumer_inventory.py --check-production
+          python3 compiler/tools/check_mixed_function_export_boundary.py
+          ! grep -E 'from_legacy[[:space:]]*\\(|legacy_function_signature|ModuleSnapshot|use compiler_ir::.*Function' compiler/crates/backend-x86/src/vector_match.rs
+          ! grep -E 'from_legacy[[:space:]]*\\(|legacy_function_signature|ModuleSnapshot' compiler/crates/opt/tests/typed_slp.rs
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: retire-slptest-native-bridge
+      - name: Native TypeId and backend production builds
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --lib --bin ir-opt
+          cargo check -p compiler-backend-x86 -p compiler-backend-aarch64
+      - name: Native SLP fixture, old oracle and x86 pattern differential
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_slp --test slp_span
+          cargo test -p compiler-backend-x86 --lib vector_match::tests
+
   discover:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-24.04
