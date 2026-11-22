@@ -1,0 +1,55 @@
+name: Validate native inline-memory TypeId migration PR2703
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/validate-native-inline-memory-2703.yml'
+permissions:
+  contents: read
+jobs:
+  native-inlining:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SOURCE_SHA: ca2434779e5e229767dcd5b5f5a857a7c051bf22
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and isolate native crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: native-inline-memory-2703
+      - name: Native TypeId admission and production IR boundary
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          ! grep -qE 'typeid_executable_fixture|typed_fixture|from_legacy' crates/opt/tests/inline_memory_native.rs
+          python3 tools/ir_consumer_inventory.py --check-production
+      - name: Compile opt and x86 test targets
+        working-directory: compiler
+        run: |
+          cargo check -p compiler-opt --lib --test inline_memory_native
+          cargo check -p compiler-backend-x86 --lib
+      - name: Validate native inlining, caller frames, GAS and direct ELF against C
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test inline_memory_native -- --nocapture
+          cargo test -p compiler-opt --test mem2reg_native -- --nocapture
