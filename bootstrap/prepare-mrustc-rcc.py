@@ -51,21 +51,19 @@ for path in mini_paths:
         relative = os.path.relpath(dest.parent, path.parent)
         # Do not remove optional flags; they encode actual C preprocessor ABI.
         optional = ", optional = true" if dep.get("optional") else ""
-        regexp = rf'^(\\s*{re.escape(name)}\\s*=\\s*)\\{{\\s*git\\s*=\\s*"{re.escape(URL)}"\\s*,\\s*rev\\s*=\\s*"{REV}"\\s*{",\\s*optional\\s*=\\s*true" if optional else ""}\\s*\\}}\\s*$'
         # Use source manifest table data rather than reinterpreting git references:
         # the only accepted source spellings are these fully checked lines.
         lines = content.splitlines(keepends=True)
         hits = [i for i, line in enumerate(lines)
-                if line.lstrip().startswith(name + " =") or
-                   line.lstrip().startswith(name + "  =")]
+                if re.match(rf"^\s*{re.escape(name)}\s*=", line)]
         assert len(hits) == 1, (name, len(hits))
         i = hits[0]
         assert 'git = "' + URL + '"' in lines[i] and 'rev = "' + REV + '"' in lines[i]
-        lines[i] = f'{name} = {{ path = "{relative}"{optional} }}\\n'
+        lines[i] = f'{name} = {{ path = "{relative}"{optional} }}\n'
         content = "".join(lines)
         changed += 1
     path.write_text(content)
-assert changed >= 9, f"expected 9 or more source rcc Git declarations; saw {changed}"
+assert changed == 8, f"expected exactly 8 source rcc Git declarations; saw {changed}"
 
 def toml_value(value):
     if isinstance(value, str):
@@ -93,13 +91,13 @@ for name in mapped:
         stripped = line.strip()
         if stripped.startswith("[") and stripped.endswith("]"):
             section = stripped
-        pkg = re.fullmatch(r"([A-Za-z_-]+)\\.workspace\\s*=\\s*true", stripped)
+        pkg = re.fullmatch(r"([A-Za-z_-]+)\.workspace\s*=\s*true", stripped)
         if pkg and section == "[package]":
             field = pkg.group(1)
             assert field in packages, (name, field)
-            out.append(f"{field} = {toml_value(packages[field])}\\n")
+            out.append(f"{field} = {toml_value(packages[field])}\n")
             continue
-        dep = re.fullmatch(r"([A-Za-z_-]+)\\s*=\\s*\\{.*workspace\\s*=\\s*true.*\\}", stripped)
+        dep = re.fullmatch(r"([A-Za-z_-]+)\s*=\s*\\{.*workspace\s*=\s*true.*\\}", stripped)
         if dep and section in ("[dependencies]", "[dev-dependencies]", "[build-dependencies]"):
             dep_name = dep.group(1)
             from_manifest = original[section.strip("[]")][dep_name]
@@ -109,7 +107,7 @@ for name in mapped:
             if "path" in entry:
                 entry["path"] = os.path.relpath(rcc / entry["path"], path.parent)
             entry.update({k:v for k,v in from_manifest.items() if k!="workspace"})
-            out.append(f"{dep_name} = {toml_value(entry)}\\n")
+            out.append(f"{dep_name} = {toml_value(entry)}\n")
             continue
         out.append(line)
     rewritten = "".join(out)
