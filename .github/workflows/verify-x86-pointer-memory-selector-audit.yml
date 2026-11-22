@@ -1,0 +1,50 @@
+name: x86 pointer memory real ELF selector audit
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-x86-pointer-memory-selector-audit.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  selector-census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact compiler source candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e69eade99cb24e9e3b4f79dbc3718f40706aa45a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require exact source SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "e69eade99cb24e9e3b4f79dbc3718f40706aa45a"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Isolate TypeId backend and optimizer crates
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/opt", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f Cargo.lock
+      - name: Check deterministic reviewed selector generation
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/tools"
+          python3 tools/regen_x86_selector_rules.py --check
+          python3 -m unittest discover -s tools -p test_x86_selector_rules.py -v
+          python3 -m unittest discover -s tools -p test_x86_real_selector_census.py -v
+      - name: Source-backed selected rule and independent C11 executable acceptance
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test x86_real_selector_census --features x86-selector-census -- --nocapture | tee /tmp/x86-pointer-memory-selector.log
+          grep -Fq 'test source_owned_pointer_memory_real_elf_matches_c11 ... ok' /tmp/x86-pointer-memory-selector.log
+          python3 tools/x86_real_selector_census.py --rust-test-log /tmp/x86-pointer-memory-selector.log
+      - name: Preserve selector-level tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --lib selector::tests
