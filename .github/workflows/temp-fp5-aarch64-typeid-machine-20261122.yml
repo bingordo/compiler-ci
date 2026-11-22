@@ -1,0 +1,54 @@
+# Source-pinned temporary ARM64 test; close unmerged after compiler source acceptance.
+name: TEMP FP5 AArch64 TypeId F32 F64 machine SSA native differential
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temp-fp5-aarch64-typeid-machine-20261122.yml'
+permissions:
+  contents: read
+jobs:
+  native-typeid-fp:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 47c59470fb641bf54493046f600c3a94e0cfdf2c
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler source
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "47c59470fb641bf54493046f600c3a94e0cfdf2c"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Isolate AArch64 backend dependency closure
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p a64/crates
+          cp -a compiler/crates/ir compiler/crates/backend \
+            compiler/crates/backend-aarch64 a64/crates/
+          cat > a64/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/backend","crates/backend-aarch64"]
+          EOF
+      - name: Strict all-target AArch64 typecheck
+        working-directory: a64
+        run: RUSTFLAGS="-D warnings" cargo check -p compiler-backend-aarch64 --all-targets
+      - name: Native canonical TypeId F32 F64 C11/GCC ABI and IEEE differential
+        working-directory: a64
+        run: cargo test -p compiler-backend-aarch64 --test typeid_fp_native -- --nocapture
+      - name: Full existing AArch64 backend regressions
+        working-directory: a64
+        run: cargo test -p compiler-backend-aarch64 --all-targets -- --test-threads=1
+      - name: Strict Clippy of production FP library and new tests
+        working-directory: a64
+        run: |
+          cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
+          cargo clippy -p compiler-backend-aarch64 --test typeid_fp_native -- -D warnings
+      # Unrelated rustc1.100 all-target generated forms/encoder test lints
+      # are tracked separately and are not silently suppressed here.
