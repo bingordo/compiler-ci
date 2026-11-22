@@ -937,7 +937,7 @@ jobs:
             -v "$RUNNER_TEMP:/audit-tmp" \
             -e "AUDIT_SOURCE=/workspace/$relative" \
             -e "AUDIT_LARGE_SOURCE=/workspace/$large_relative" \
-            -e "EDG_RUN_CREDUCE=${{ (github.event_name == 'pull_request' || inputs.edg_creduce) && '1' || '0' }}" \
+            -e "EDG_RUN_CREDUCE=0" \
             ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8 \
             -euo pipefail /workspace/bootstrap/run-mrustc-edg-gap.sh \
             > "$RUNNER_TEMP/mrustc-edg-audit.log" 2>&1
@@ -958,6 +958,66 @@ jobs:
         with:
           path: ${{ runner.temp }}/edg-debug-apt-cache
           key: edg-debug-apt-v1-linux-amd64-ci14b3948c
+      # The EDG container is Fedora 43; C-Reduce is packaged on Ubuntu host.
+      # Reuse distribution packages, not generated C, in the Actions cache.
+      - name: Restore host C-Reduce binary package cache
+        if: always() && steps.translate.outcome == 'success' && (github.event_name == 'pull_request' || inputs.edg_creduce)
+        id: host-creduce-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }/host-creduce-apt
+          key: host-creduce-ubuntu2404-amd64-v211
+
+      - name: Install packaged C-Reduce once on Ubuntu host
+        if: always() && steps.translate.outcome == 'success' && (github.event_name == 'pull_request' || inputs.edg_creduce)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache="$RUNNER_TEMP/host-creduce-apt"
+          sudo mkdir -p "$cache/partial"
+          sudo chmod 1777 "$cache" "$cache/partial"
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            -o "Dir::Cache::archives=$cache" \
+            -o 'APT::Keep-Downloaded-Packages=true' creduce
+          command -v creduce
+          echo "Host C-Reduce package: $(dpkg-query -W -f='${Version}' creduce)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Minimize real mrustc C with pinned EDG/GDB signature
+        if: always() && steps.translate.outcome == 'success' && (github.event_name == 'pull_request' || inputs.edg_creduce)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          source=$(python3 - "$PWD/mrustc/output-compiler-bootstrap" <<'PY'
+          from pathlib import Path
+          import sys
+          files=[p for p in Path(sys.argv[1]).rglob("*.c") if p.is_file() and p.stat().st_size>0]
+          if not files: raise SystemExit("no generated C")
+          print(min(files,key=lambda p:(p.stat().st_size,str(p))))
+          PY
+          )
+          set +e
+          timeout --signal=TERM --kill-after=20s 16m \
+            bash bootstrap/reduce-mrustc-edg-host.sh "$source" \
+            > "$RUNNER_TEMP/host-creduce-result.log" 2>&1
+          rc=$?
+          set -e
+          echo "Host C-Reduce driver exit=$rc (diagnostic)" >> "$GITHUB_STEP_SUMMARY"
+          grep -E '^EDG_CREDUCE_[A-Z0-9_]+=' "$RUNNER_TEMP/host-creduce-result.log" | \
+            tee -a "$GITHUB_STEP_SUMMARY" || true
+          # Publish only an independently GDB-verified tiny C file to
+          # CI for manual review; the original large source never appears.
+          sed -n '/^EDG_CREDUCE_TESTCASE_BEGIN$/,/^EDG_CREDUCE_TESTCASE_END$/p' \
+            "$RUNNER_TEMP/host-creduce-result.log" || true
+
+      - name: Save host C-Reduce binary package cache
+        if: always() && steps.host-creduce-cache.outcome == 'success' && steps.host-creduce-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }/host-creduce-apt
+          key: host-creduce-ubuntu2404-amd64-v211
+
       - name: Mark experiment outcome
         if: always()
         shell: bash
