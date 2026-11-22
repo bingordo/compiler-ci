@@ -179,13 +179,40 @@ parse_rc=$last_generated_c_probe_rc
 # frames with arguments and paths removed.
 if (( parse_rc == 139 )); then
   echo "EDG_C_GDB_TRIGGER=small_real_source_sigsegv"
-  if ! command -v gdb >/dev/null 2>&1; then
-    if command -v apt-get >/dev/null 2>&1; then
-      set +e
-      DEBIAN_FRONTEND=noninteractive apt-get update -qq > /audit-tmp/edg-gdb-install.log 2>&1 &&
-      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends gdb >> /audit-tmp/edg-gdb-install.log 2>&1
-      set -e
+  # Install binary distro packages only ONCE in this container, not per
+  # C-Reduce candidate. The mounted /audit-tmp cache contains .deb archives
+  # restored across ephemeral GitHub runners by actions/cache; APT still
+  # verifies package metadata and dependencies before installation.
+  debug_packages=(gdb)
+  if [[ "${EDG_RUN_CREDUCE:-0}" == "1" ]]; then
+    debug_packages+=(creduce)
+  fi
+  need_packages=false
+  for package in "${debug_packages[@]}"; do
+    if ! command -v "$package" >/dev/null 2>&1; then
+      need_packages=true
     fi
+  done
+  if [[ "$need_packages" == "true" ]] && command -v apt-get >/dev/null 2>&1; then
+    apt_cache=/audit-tmp/edg-debug-apt-cache
+    mkdir -p "$apt_cache/partial"
+    chmod 1777 "$apt_cache" "$apt_cache/partial"
+    set +e
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq \
+      > /audit-tmp/edg-debug-apt.log 2>&1 &&
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+      -o "Dir::Cache::archives=$apt_cache" \
+      -o 'APT::Keep-Downloaded-Packages=true' \
+      --no-install-recommends "${debug_packages[@]}" \
+      >> /audit-tmp/edg-debug-apt.log 2>&1
+    apt_rc=$?
+    set -e
+    echo "EDG_CREDUCE_APT_INSTALL_EXIT=$apt_rc"
+  fi
+  if [[ "${EDG_RUN_CREDUCE:-0}" == "1" ]] &&
+     command -v creduce >/dev/null 2>&1; then
+    # Log only the binary package version. All install logs stay runner-local.
+    echo "EDG_CREDUCE_PACKAGE_VERSION=$(dpkg-query -W -f='${Version}' creduce 2>/dev/null || echo unknown)"
   fi
   if command -v gdb >/dev/null 2>&1; then
     set +e
@@ -235,7 +262,7 @@ fi
 # C-Reduce uses GDB as its interestingness test to preserve the exact
 # plain_cpp_record top frame, not merely any crash or frontend failure.
 # The original and the minimized source stay inside the mounted runner temp.
-if (( parse_rc == 139 )); then
+if (( parse_rc == 139 )) && [[ "${EDG_RUN_CREDUCE:-0}" == "1" ]]; then
   set +e
   bash /workspace/bootstrap/reduce-mrustc-edg-crash.sh \
     "$parser" "$gnu_number" "$AUDIT_SOURCE" "${include_args[@]}" \
@@ -245,7 +272,7 @@ if (( parse_rc == 139 )); then
   echo "EDG_CREDUCE_WRAPPER_EXIT=$reduce_wrapper_rc"
   grep -E '^EDG_CREDUCE_[A-Z0-9_]+=' /audit-tmp/edg-creduce-summary.log || true
 else
-  echo "EDG_CREDUCE_STATUS=not_applicable_no_small_source_sigsegv"
+  echo "EDG_CREDUCE_STATUS=not_requested_or_no_small_source_sigsegv"
 fi
 if [[ -n "${AUDIT_LARGE_SOURCE:-}" && -s "$AUDIT_LARGE_SOURCE" &&
       "$AUDIT_LARGE_SOURCE" != "$AUDIT_SOURCE" ]]; then
