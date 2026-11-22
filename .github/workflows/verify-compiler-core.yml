@@ -46,6 +46,49 @@ jobs:
           PYTHONPATH=tools python3 -m unittest tools.test_ir_consumer_inventory
           python3 tools/check_mixed_function_export_boundary.py
 
+  native-ctfe-retry-fixture:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 3e40adfd2113cb4a7cb0eaa26e7dd65135b44204
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm source and remove whole-workspace unrelated blockers
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "3e40adfd2113cb4a7cb0eaa26e7dd65135b44204"
+          python3 compiler/tools/ir_consumer_inventory.py --check-production
+          python3 compiler/tools/check_mixed_function_export_boundary.py
+          ! grep -E 'from_legacy[[:space:]]*\\(|legacy_function_signature|ModuleSnapshot|TypedModule[[:space:]]*\\{' compiler/crates/opt/tests/typed_core_pipeline.rs
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: native-ctfe-retry-no-legacy
+      - name: Production optimizer and native backends
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --lib --bin ir-opt
+          cargo check -p compiler-backend-x86 -p compiler-backend-aarch64
+      - name: CTFE retry core pipeline and native replay tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_core_pipeline
+          cargo test -p compiler-opt --test ir_opt_native_v3_only
+
   discover:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-24.04
