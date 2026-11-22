@@ -1,0 +1,54 @@
+# Full source-admitted AArch64 generated rule census from real TypeId ELF.
+name: AArch64 source-bound real selector decision census
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-aarch64-full-selector-census.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  real-elf-decisions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact AArch64 compiler source candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e0d3fe7134857aa2ea2ee8a0475cad7cbff10aa8
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "e0d3fe7134857aa2ea2ee8a0475cad7cbff10aa8"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Isolate the reviewed AArch64 native TypeId crates
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
+          EOF
+          rm -f Cargo.lock
+      - name: Require full reviewed source and negative oracle tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/tools"
+          python3 -m py_compile tools/aarch64_selector_live_census.py tools/test_aarch64_selector_live_census.py
+          python3 -m unittest tools/test_aarch64_selector_live_census.py -v
+          python3 -m unittest discover -s tools -p 'test_regen_aarch64_native_selector_rules.py' -v
+          python3 tools/regen_aarch64_native_selector_rules.py --check
+      - name: Run the full reviewed AArch64 TypeId fixture corpus with actual ELF decision counts
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-aarch64 --test aarch64_selector_live_census -- --nocapture | tee /tmp/aarch64-real-selector-coverage.log
+          python3 tools/aarch64_selector_live_census.py --rust-test-log /tmp/aarch64-real-selector-coverage.log
+      - name: Preserve existing AArch64 production decision coverage tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-aarch64 --test generated_selector_coverage
