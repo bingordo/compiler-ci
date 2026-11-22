@@ -199,7 +199,7 @@ fi
 # dependency as the public producer. No source from the private mrustc TU is
 # supplied to this check.
 if [[ "${EDG_LITERAL_REGRESSION:-0}" == "1" ]]; then
-  candidate_sha=9f02c1ee19d34da5d0568f4683e9c0f77c612307
+  candidate_sha=e314a84748977fc0f2295309e2760430c38c4b25
   test "$(git -c safe.directory=/workspace/compiler-literal-source -C /workspace/compiler-literal-source rev-parse HEAD)" = "$candidate_sha"
   # Actions checkout is mounted read-only. Make a disposable compilation
   # copy in the private runner temp so Cargo can update its local lockfile.
@@ -234,6 +234,36 @@ for i,line in enumerate(selected[-12:],1):
     print(f"EDG_C_LITERAL_TYPEID_DIAG_{i}={msg[:230]}")
 PY
   fi
+  # Test direct TypeId admission against the *original* EDG C11 fixture.
+  # The test mutates actual source event records to prove fail-closed
+  # behavior for displaced/dangling pointers, orphan data and weak/TLS.
+  typeid_unit_rc=11
+  if (( typeid_check_rc == 0 )); then
+    set +e
+    (
+      cd /workspace/edgcpp/build/gcc-release
+      CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+        timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" test --quiet \
+        --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
+        --bin compiler-edg-driver public_c_literal_ -- --test-threads=1
+    ) > /audit-tmp/edg-typeid-literal-unit.log 2>&1
+    typeid_unit_rc=$?
+    set -e
+    if (( typeid_unit_rc != 0 )); then
+      python3 - /audit-tmp/edg-typeid-literal-unit.log <<'PY'
+from pathlib import Path
+import re,sys
+lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
+selected=[line for line in lines if any(
+    needle in line for needle in ("error[E","error:","panicked","FAILED","test result:"))]
+for i,line in enumerate(selected[-12:],1):
+    msg=re.sub(r"/workspace/[^ :]+","<public-path>",line.strip())
+    msg=re.sub(r"[^A-Za-z0-9 _./:><()\[\],=-]","?",msg)
+    print(f"EDG_C_LITERAL_TYPEID_UNIT_DIAG_{i}={msg[:230]}")
+PY
+    fi
+  fi
+  echo "EDG_C_LITERAL_TYPEID_UNIT_EXIT=$typeid_unit_rc"
   # An actual ELF+GCC executable oracle, not just a bridge snapshot.
   # These two original C11 source files are public, checked-in compiler
   # fixtures and do not depend on/print the private generated mrustc TU.
@@ -320,6 +350,88 @@ for i,line in enumerate(selected[-8:],1):
     msg=re.sub(r"/workspace/[^ :]+","<public-path>",line.strip())
     msg=re.sub(r"[^A-Za-z0-9 _./:><()\[\],=-]","?",msg)
     print(f"EDG_C_LITERAL_NATIVE_DIAG_{i}={msg[:230]}")
+PY
+    fi
+
+    # A second public C11 original-source acceptance test: one I32 global
+    # plus one literal-bearing union, with a real global load in a function.
+    # The consumer must prove the *entire* disjoint ownership partition.
+    mixed_source=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_literal_mixed_elf.c
+    mixed_harness=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_literal_mixed_elf_harness.c
+    test -s "$mixed_source" && test -s "$mixed_harness"
+    set +e
+    (
+      cd /workspace/edgcpp/build/gcc-release
+      CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+        timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" run --quiet \
+        --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
+        -- /audit-tmp/edg-static-literal-mixed-native.o --gcc --c11 \
+        --no_strict_gnu --gnu_version "$gnu_number" "$mixed_source"
+    ) > /audit-tmp/edg-static-literal-mixed-native.log 2>&1
+    mixed_native_rc=$?
+    set -e
+    if (( mixed_native_rc == 0 )); then
+      readelf -h /audit-tmp/edg-static-literal-mixed-native.o >/dev/null
+      readelf -rW /audit-tmp/edg-static-literal-mixed-native.o \
+        > /audit-tmp/edg-static-literal-mixed-native-relocs.txt
+      mixed_reloc_count=$(grep -c 'R_X86_64_64' \
+        /audit-tmp/edg-static-literal-mixed-native-relocs.txt || true)
+      echo "EDG_C_LITERAL_MIXED_RELOCATIONS=$mixed_reloc_count"
+      if [[ "$mixed_reloc_count" != "2" ]]; then mixed_native_rc=11; fi
+    fi
+    echo "EDG_C_LITERAL_MIXED_TYPEID_ELF_EXIT=$mixed_native_rc"
+    set +e
+    gcc -std=c11 -O0 -c "$mixed_source" -o /audit-tmp/edg-static-literal-mixed-gcc.o &&
+      gcc -std=c11 -O0 -fno-pie -no-pie \
+        /audit-tmp/edg-static-literal-mixed-gcc.o "$mixed_harness" \
+        -o /audit-tmp/edg-static-literal-mixed-gcc-exe &&
+      /audit-tmp/edg-static-literal-mixed-gcc-exe \
+        > /audit-tmp/edg-static-literal-mixed-gcc.out
+    mixed_gcc_rc=$?
+    mixed_link_rc=11
+    mixed_run_rc=11
+    mixed_parity_rc=11
+    if (( mixed_native_rc == 0 )); then
+      gcc -std=c11 -O0 -fno-pie -no-pie \
+        /audit-tmp/edg-static-literal-mixed-native.o "$mixed_harness" \
+        -o /audit-tmp/edg-static-literal-mixed-native-exe
+      mixed_link_rc=$?
+      if (( mixed_link_rc == 0 )); then
+        /audit-tmp/edg-static-literal-mixed-native-exe \
+          > /audit-tmp/edg-static-literal-mixed-native.out \
+          2> /audit-tmp/edg-static-literal-mixed-native.stderr
+        mixed_run_rc=$?
+        if (( mixed_run_rc == 0 && mixed_gcc_rc == 0 )); then
+          python3 - /audit-tmp/edg-static-literal-mixed-gcc.out \
+              /audit-tmp/edg-static-literal-mixed-native.out <<'PY'
+from pathlib import Path
+import sys
+expected=Path(sys.argv[1]).read_bytes()
+observed=Path(sys.argv[2]).read_bytes()
+if expected!=b"MIXED_STATIC_LITERAL_ELF_PARITY_OK\n" or observed!=expected:
+    raise SystemExit(1)
+PY
+          mixed_parity_rc=$?
+        fi
+      fi
+    fi
+    set -e
+    echo "EDG_C_LITERAL_MIXED_GCC_EXIT=$mixed_gcc_rc"
+    echo "EDG_C_LITERAL_MIXED_LINK_EXIT=$mixed_link_rc"
+    echo "EDG_C_LITERAL_MIXED_RUN_EXIT=$mixed_run_rc"
+    echo "EDG_C_LITERAL_MIXED_PARITY_EXIT=$mixed_parity_rc"
+    if (( mixed_native_rc != 0 || mixed_gcc_rc != 0 ||
+          mixed_link_rc != 0 || mixed_run_rc != 0 || mixed_parity_rc != 0 )); then
+      python3 - /audit-tmp/edg-static-literal-mixed-native.log <<'PY'
+from pathlib import Path
+import re,sys
+lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
+selected=[line for line in lines if any(
+    needle in line for needle in ("error[E","error:","rejected source","panicked"))]
+for i,line in enumerate(selected[-8:],1):
+    msg=re.sub(r"/workspace/[^ :]+","<public-path>",line.strip())
+    msg=re.sub(r"[^A-Za-z0-9 _./:><()\[\],=-]","?",msg)
+    print(f"EDG_C_LITERAL_MIXED_DIAG_{i}={msg[:230]}")
 PY
     fi
   else
