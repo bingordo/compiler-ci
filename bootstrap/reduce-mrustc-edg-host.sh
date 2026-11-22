@@ -52,6 +52,20 @@ docker exec "$EDG_CREDUCE_DOCKER_CONTAINER" bash -c \
 sed -e '/^$/d' -e 's/^/-I/' "$work/fedora-includes.txt" > "$EDG_CREDUCE_INCLUDE_LIST"
 echo "-I$EDG_SOURCE_INCLUDE" >> "$EDG_CREDUCE_INCLUDE_LIST"
 echo "EDG_CREDUCE_INPUT_BYTES=$original_bytes"
+# Check whether moving the TU to C-Reduce's temporary directory changes
+# the failure. Keep raw source diagnostics runner-local.
+set +e
+docker exec -w /workspace/edgcpp/build/gcc-release "$EDG_CREDUCE_DOCKER_CONTAINER" \
+  bash -c '
+    ulimit -c 0
+    source ./environment.sh
+    timeout --signal=TERM --kill-after=3s 15s "$1" \
+      --gcc --c11 --no_strict_gnu --gnu_version "$2" "$3"
+  ' bash "$EDG_CREDUCE_PARSER" "$EDG_CREDUCE_GNU" "$source_container" \
+  > "$work/original-direct.log" 2>&1
+original_rc=$?
+set -e
+echo "EDG_CREDUCE_ORIGINAL_DIRECT_RC=$original_rc"
 echo "EDG_CREDUCE_TOOL_VERSION=$(creduce --version | head -n 1 | tr -dc 'A-Za-z0-9. -' | cut -c1-64)"
 
 cat > "$work/interesting.sh" <<'TEST'
@@ -77,6 +91,7 @@ docker exec -w /workspace/edgcpp/build/gcc-release "$EDG_CREDUCE_DOCKER_CONTAINE
   ' bash "$EDG_CREDUCE_PARSER" "$EDG_CREDUCE_GNU" "$container_candidate" "${args[@]}" \
   > "$PWD/interesting-direct.log" 2>&1
 direct_rc=$?
+printf '%s\n' "$direct_rc" > "$PWD/interesting-direct.rc"
 set -e
 test "$direct_rc" -eq 139 || exit 1
 # Same exact SIGSEGV top-frame proof, not a different crash.
@@ -100,6 +115,22 @@ chmod 700 "$work/interesting.sh"
 
 if ! (cd "$work" && ./interesting.sh); then
   echo "EDG_CREDUCE_STATUS=baseline_not_same_crash"
+  if [[ -s "$work/interesting-direct.rc" ]]; then
+    echo "EDG_CREDUCE_RELOCATED_DIRECT_RC=$(cat "$work/interesting-direct.rc")"
+  else
+    echo "EDG_CREDUCE_RELOCATED_DIRECT_RC=missing"
+  fi
+  if [[ -s "$work/interesting-gdb.log" ]]; then
+    grep -Fq 'Program received signal SIGSEGV' "$work/interesting-gdb.log" &&
+      echo "EDG_CREDUCE_RELOCATED_GDB_SIGSEGV=yes" ||
+      echo "EDG_CREDUCE_RELOCATED_GDB_SIGSEGV=no"
+    # No path, arguments, or source excerpts in published summary.
+    if grep -Eq '^#0[[:space:]]+.*edg::plain_cpp_record' "$work/interesting-gdb.log"; then
+      echo "EDG_CREDUCE_RELOCATED_GDB_TOP=plain_cpp_record"
+    else
+      echo "EDG_CREDUCE_RELOCATED_GDB_TOP=other"
+    fi
+  fi
   exit 0
 fi
 echo "EDG_CREDUCE_BASELINE=same_plain_cpp_record_sigsegv"
