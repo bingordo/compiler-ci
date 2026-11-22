@@ -18,6 +18,9 @@ on:
         required: false
         default: false
         type: boolean
+  pull_request:
+    paths:
+      - '.github/workflows/verify-mini-c-differential.yml'
   schedule:
     - cron: '4,19,34,49 * * * *'
   push:
@@ -34,6 +37,7 @@ concurrency:
 
 jobs:
   differential:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -134,3 +138,43 @@ jobs:
             ${{ runner.temp }}/mini-c-failures/
           if-no-files-found: ignore
           retention-days: 14
+
+  # Temporary source-pinned IR-only verification for compiler #2760.
+  logical-call-contract:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 437a3ab335b2f8e926cd4beef12953b0d586457d
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source SHA and module contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 437a3ab335b2f8e926cd4beef12953b0d586457d
+          grep -qx 'pub mod call_operands;' compiler/crates/ir/src/lib.rs
+          test -s compiler/crates/ir/src/call_operands.rs
+      - name: Run all compiler-ir unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 10m cargo test --manifest-path compiler/crates/ir/Cargo.toml --lib 2>&1 | tee "$RUNNER_TEMP/ir-contract-tests.log"
+      - name: Verify strict compiler-ir clippy
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 3m cargo clippy --manifest-path compiler/crates/ir/Cargo.toml --lib -- -D warnings
+      - name: Save diagnostic log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logical-call-contract-2760-failure
+          path: ${{ runner.temp }}/ir-contract-tests.log
+          if-no-files-found: ignore
+          retention-days: 7
