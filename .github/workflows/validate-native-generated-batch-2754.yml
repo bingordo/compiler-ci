@@ -1,0 +1,58 @@
+name: Validate native generated differential batch PR2754
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/validate-native-generated-batch-2754.yml'
+permissions:
+  contents: read
+jobs:
+  native-generated:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: d5cc599399cbd4ddfbc3c844c8fba03498ac6790
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler source revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source SHA and isolate native compiler workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: native-generated-batch-2754
+      - name: Enforce direct native TypeId input ownership and production boundaries
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          ! grep -qE 'typeid_executable_fixture|typed_fixture|from_legacy' crates/opt/tests/generated_native_oracle.rs crates/opt/tests/support/native_generated_ssa.rs crates/opt/tests/division_effects.rs crates/opt/tests/ct03_closeout.rs
+          python3 tools/ir_consumer_inventory.py --check-production
+      - name: Compile optimizer, generator and x86 backend
+        working-directory: compiler
+        run: |
+          cargo check -p compiler-opt --lib --test generated_native_oracle --test division_effects --test ct03_closeout
+          cargo check -p compiler-backend-x86 --lib
+      - name: Execute CT03 rollback and DIV REM trapping regressions
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test ct03_closeout -- --nocapture
+          cargo test -p compiler-opt --test division_effects -- --nocapture
+      - name: Execute all 84 generated SSA differential and 3 SIGFPE oracle cases in GAS and ELF
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test generated_native_oracle -- --nocapture
