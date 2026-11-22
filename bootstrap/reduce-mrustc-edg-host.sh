@@ -16,12 +16,17 @@ test -n "${RUNNER_TEMP:-}"
 work="$RUNNER_TEMP/edg-creduce-host"
 mkdir -p "$work" "$RUNNER_TEMP/edg-creduce-temporary"
 cp "$source_file" "$work/reduced.c"
+# EDG is path-sensitive on this emitted TU. Keep a pristine private backup:
+# each C-Reduce candidate must be tested at exactly the original source path.
+cp "$source_file" "$work/original.c"
+export EDG_CREDUCE_ORIGINAL_HOST="$source_file"
 original_bytes=$(stat -c %s "$work/reduced.c")
 case "$source_file" in
   "$PWD"/*) source_container="/workspace/${source_file#"$PWD"/}" ;;
   *) echo "generated source outside workspace" >&2; exit 2 ;;
 esac
 export EDG_SOURCE_INCLUDE="$(dirname "$source_container")"
+export EDG_CREDUCE_ORIGINAL_CONTAINER="$source_container"
 export EDG_CREDUCE_DOCKER_CONTAINER="edg-creduce-$GITHUB_RUN_ID"
 export EDG_CREDUCE_INCLUDE_LIST="$work/include-flags.txt"
 export EDG_CREDUCE_PARSER="/workspace/edgcpp-rust/target/debug/examples/ci_edg_parse_probe"
@@ -37,7 +42,8 @@ docker run --rm -d --name "$EDG_CREDUCE_DOCKER_CONTAINER" \
   -e EDGCPP_EDG_REVISION=b195677be8b9b56c8337afad6be8064d21a54082 \
   ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8 \
   -c 'sleep 2400' >/dev/null
-trap 'docker rm -f "$EDG_CREDUCE_DOCKER_CONTAINER" >/dev/null 2>&1 || true' EXIT
+# Restore the unchanged generated C even on an early exit or signal.
+trap 'cp "$work/original.c" "$source_file" 2>/dev/null || true; docker rm -f "$EDG_CREDUCE_DOCKER_CONTAINER" >/dev/null 2>&1 || true' EXIT
 version=$(docker exec "$EDG_CREDUCE_DOCKER_CONTAINER" gcc -dumpfullversion -dumpversion)
 export EDG_CREDUCE_GNU="$(python3 - "$version" <<'PY'
 import sys
@@ -75,7 +81,11 @@ set -uo pipefail
 candidate="$PWD/reduced.c"
 test -s "$candidate" || exit 1
 case "$candidate" in "$RUNNER_TEMP"/*) : ;; *) exit 1 ;; esac
-container_candidate="/audit-tmp/${candidate#"$RUNNER_TEMP"/}"
+# Reproduce the source path from the original crashing EDG audit. In this
+# source-generated TU, moving the file to /audit-tmp changes the result.
+# C-Reduce is deliberately single-worker to prevent candidate copy races.
+cp "$candidate" "$EDG_CREDUCE_ORIGINAL_HOST" || exit 1
+container_candidate="$EDG_CREDUCE_ORIGINAL_CONTAINER"
 args=()
 while IFS= read -r line; do
   [[ -n "$line" ]] && args+=("$line")
@@ -138,10 +148,10 @@ set +e
 (
   cd "$work"
   export TMPDIR="$RUNNER_TEMP/edg-creduce-temporary"
-  # Two workers and no output/cache of generated input. C-Reduce cannot
-  # exceed the requested total wall-clock budget.
+  # Single-worker preserves the exact generated pathname without races.
+  # C-Reduce cannot exceed the requested wall-clock budget.
   timeout --signal=TERM --kill-after=10s 12m \
-    creduce --n 2 --timeout 30 ./interesting.sh reduced.c
+    creduce --n 1 --timeout 30 ./interesting.sh reduced.c
 ) > "$work/creduce.log" 2>&1
 reduce_rc=$?
 set -e
