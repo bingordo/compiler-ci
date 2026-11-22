@@ -1,0 +1,71 @@
+name: x86 DAG full Intel and Z3 source proofs
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-x86-dag-source-proofs.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  x86-dag-source-proofs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - name: Checkout immutable compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 292c940707a57f561d95a4271c1110cd66dc6477
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout reviewed Intel executable specification
+        uses: actions/checkout@v4
+        with:
+          repository: intel/SDM
+          ref: 35eface1b7ee003a1cda95005ec5fd83de658a64
+          path: intel
+          sparse-checkout: |
+            data/instruction/ADD.xml
+            data/instruction/BSF.xml
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Assert source commits and exact Intel Git blob fingerprints
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "292c940707a57f561d95a4271c1110cd66dc6477"
+          test "$(git -C intel rev-parse HEAD)" = "35eface1b7ee003a1cda95005ec5fd83de658a64"
+          test "$(git -C intel hash-object data/instruction/ADD.xml)" = "61a05fe48725ff61e56eb73c6aa87a14a59d32ec"
+          test "$(git -C intel hash-object data/instruction/BSF.xml)" = "29c39aaa3757d45a8ad4b0255d2260649ffd5111"
+      - name: Install external SMT solver
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends z3
+          z3 --version
+      - name: Rerun all reviewed Intel/Z3 source proofs and exact DAG output parity
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/tools"
+          python3 tools/regen_x86_dag_rule_groups.py \
+            --check-source --intel-dir ../intel/data/instruction \
+            --receipt-json ../dag-source-proof-receipt.json | tee ../dag-source-proof.log
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          doc=json.loads(Path('../dag-source-proof-receipt.json').read_text())
+          assert doc['schema_version']==1
+          assert doc['verification']=='source_rechecked'
+          assert len(doc['tables'])==3
+          assert all(len(row['source_sha256'])==64 and len(row['generator_sha256'])==64 for row in doc['tables'])
+          print("PASS 3 source-rechecked DAG generator table receipts")
+          PY
+      - name: Preserve source proof logs and deterministic receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x86-dag-intel-z3-source-proofs
+          path: |
+            dag-source-proof-receipt.json
+            dag-source-proof.log
+          if-no-files-found: warn
