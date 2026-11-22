@@ -1,0 +1,57 @@
+# Exact-commit TypeId migration acceptance; isolated from other compiler-ci jobs.
+name: IR PR2782 native optimizer unit migration
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ir-pr2782-unit-native-20261122.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: da60ccc059c1c59c2cf19714a6e37072dfe01bd9
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Check out pinned compiler PR
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check pinned source and core Rust workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+          cc --version | head -n 1
+      - name: Cache isolated Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-pr2782-native-unit
+      - name: Test optimizer unit and native M4/LICM dependencies
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib tests:: -- --nocapture
+          cargo test -p compiler-opt --test m4_integer_effects -- --nocapture
+          cargo test -p compiler-opt --test pre_licm_semantic_matrix -- --nocapture
+      - name: Check Clippy without unrelated pre-existing x86 doc lint
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-opt --lib -- -D clippy::all -A clippy::empty_line_after_doc_comments
