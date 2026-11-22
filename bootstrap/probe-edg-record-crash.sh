@@ -8,6 +8,9 @@ export EDGCPP_SOURCE_DIR=/workspace/edgcpp
 export EDGCPP_COMPILE_COMMANDS=/workspace/edgcpp/build/gcc-release/compile_commands.json
 export EDGCPP_LIB_DIR=/workspace/edgcpp/build/gcc-release/lib
 export EDGCPP_EDG_REVISION=b195677be8b9b56c8337afad6be8064d21a54082
+for checkout in /workspace/edgcpp /workspace/edgcpp-rust; do
+  git config --global --add safe.directory "$checkout"
+done
 test "$(git -C edgcpp rev-parse HEAD)" = "$EDGCPP_EDG_REVISION"
 test "$(git -C edgcpp-rust rev-parse HEAD)" = fc5adba5dc9061cc24517544c23ee92ab0151b5e
 if ! command -v cargo >/dev/null 2>&1; then
