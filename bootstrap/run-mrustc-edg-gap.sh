@@ -552,7 +552,8 @@ python3 - /audit-tmp/edg-generated-c-native.log <<'PY'
 from pathlib import Path
 import re,sys
 fields=("linkage","explicit","tls","local","type_class","init_kind",
-        "init_explicit","init_uninitialized","image_kind","dynamic",
+        "init_explicit","init_uninitialized","image_kind",
+        "layout_bytes","layout_align","field_count","base_count","dynamic",
         "materialized","weak","alias","section","nonreal",
         "compiler_generated","globals","definitions")
 for line in Path(sys.argv[1]).read_text(errors="replace").splitlines():
