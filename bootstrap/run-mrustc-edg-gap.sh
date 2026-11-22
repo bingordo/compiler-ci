@@ -199,8 +199,8 @@ fi
 # dependency as the public producer. No source from the private mrustc TU is
 # supplied to this check.
 if [[ "${EDG_LITERAL_REGRESSION:-0}" == "1" ]]; then
-  candidate_sha=54cfe82a80c4b45f4deebd3b29f6ea9cde55edca
-  test "$(git -C /workspace/compiler-literal-source rev-parse HEAD)" = "$candidate_sha"
+  candidate_sha=092bf7069921eeb5aca3d26b9b66d6c4047e17fa
+  test "$(git -c safe.directory=/workspace/compiler-literal-source -C /workspace/compiler-literal-source rev-parse HEAD)" = "$candidate_sha"
   # Actions checkout is mounted read-only. Make a disposable compilation
   # copy in the private runner temp so Cargo can update its local lockfile.
   mkdir -p /audit-tmp/compiler-literal-candidate
