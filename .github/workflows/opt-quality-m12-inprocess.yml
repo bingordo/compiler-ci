@@ -1,0 +1,209 @@
+# Source-pinned, correctness-first LLVM Shootout acceptance; no timing thresholds.
+name: Optimization quality M12 adapted Stanford in-process
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/opt-quality-m12-inprocess.yml']
+permissions:
+  contents: read
+concurrency:
+  group: opt-quality-m12-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  shootout:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      COMPILER_SHA: 51336a28af2f84ec48d7eeb7b6d51ae7f93458ba
+      MINIC_SHA: 74ed0653e64cf31e579d68c86b6725861ff5a7ae
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.COMPILER_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source pin and run offline tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          git -C compiler rev-parse HEAD | tee results/compiler-sha.txt
+          python3 -m py_compile compiler/tools/opt_quality_public_m6_execution.py compiler/tools/test_opt_quality_public_m6_execution.py
+          python3 -m unittest discover -s compiler/tools -p 'test_opt_quality_public_m6_execution.py' -v |& tee results/oracle-tests.log
+          python3 -m unittest discover -s compiler/tools -p 'test_opt_quality_public_m2.py' -v |& tee results/importer-tests.log
+          python3 -m py_compile compiler/tools/opt_quality_public_m9_stanford.py compiler/tools/test_opt_quality_public_m9_stanford.py
+          python3 -m unittest discover -s compiler/tools -p 'test_opt_quality_public_m9_stanford.py' -v |& tee results/stanford-tests.log
+          python3 -m py_compile compiler/tools/opt_quality_public_m11_stanford.py compiler/tools/test_opt_quality_public_m11_stanford.py
+          python3 -m unittest discover -s compiler/tools -p 'test_opt_quality_public_m11_stanford.py' -v |& tee results/m11-tests.log
+          python3 -m py_compile compiler/tools/opt_quality_public_m12_inprocess.py compiler/tools/test_opt_quality_public_m12_inprocess.py
+          python3 -m unittest discover -s compiler/tools -p 'test_opt_quality_public_m12_inprocess.py' -v |& tee results/m12-tests.log
+      - name: Configure public Mini-C dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('compiler/tools/mini-c-driver/Cargo.toml')
+          original=p.read_text()
+          old='ssh://git@github.com/bingordo/mini-c.git'
+          assert original.count(old)==2
+          pin='74ed0653e64cf31e579d68c86b6725861ff5a7ae'
+          assert original.count(pin)==2, 'native mini-c dependency must be pinned to merged ABI-safe parser'
+          p.write_text(original.replace(old,'https://github.com/bingordo/mini-c.git'))
+          PY
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: opt-quality-m12-inprocess
+      - name: Build native TypeId Mini-C compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 12m cargo build \
+            --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --bin compiler-mini-c
+      - name: Fetch original LLVM sources and perform three-way executable census
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 6m python3 \
+            compiler/tools/opt_quality_public_m6_execution.py \
+            --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" \
+            --output results/m6-execution.json \
+            --require-passes 2 \
+            2>&1 | tee results/m6-execution.log
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          r=json.loads(Path('results/m6-execution.json').read_text())
+          assert r['total']==2 and len(r['cases'])==2
+          assert r['llvm_commit']=='ec05cfd8cd10a94e6d4208537588093890c737b9'
+          assert all(x['sha256'] for x in r['cases'])
+          assert len({x['id'] for x in r['cases']})==2
+          fib=next(x for x in r['cases'] if x['id']=='llvm-shootout-fib2')
+          assert fib['status']=='PASS', fib
+          assert len(fib['inputs'])==3
+          assert all(x['status']=='PASS' for x in fib['inputs'])
+          assert r['passed']==2
+          nested=next(x for x in r['cases'] if x['id']=='llvm-shootout-nestedloop')
+          assert nested['status']=='PASS',nested
+          assert len(nested['inputs'])==3 and all(x['status']=='PASS' for x in nested['inputs'])
+          assert nested['compile']['native']['status']=='COMPILES'
+          print('M6_EXECUTABLE_CENSUS passed:',r['passed'],'/',r['total'])
+          for row in r['cases']:
+              print(row['id'],row['status'],len(row['inputs']))
+          PY
+          echo "M6: two public LLVM Shootout executables pass three-way output parity" >> "$GITHUB_STEP_SUMMARY"
+      - name: Source-pinned LLVM Stanford C memory and sorting capability census
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 6m python3 \
+            compiler/tools/opt_quality_public_m9_stanford.py \
+            --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" \
+            --output results/m9-stanford.json \
+            --require-passes 3 \
+            2>&1 | tee results/m9-stanford.log
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          r=json.loads(Path('results/m9-stanford.json').read_text())
+          assert r['llvm_commit']=='ec05cfd8cd10a94e6d4208537588093890c737b9'
+          assert r['total']==3 and len(r['cases'])==3
+          assert r['passed']==3 and r['input_passes']==3
+          assert {x['id'] for x in r['cases']}=={
+            'llvm-stanford-intmm','llvm-stanford-quicksort','llvm-stanford-bubblesort'}
+          assert all(x['sha256'] for x in r['cases'])
+          for case in r['cases']:
+              assert set(case['compile'])=={'gcc','clang','native'}
+              assert case['compile']['gcc']['status']=='COMPILES'
+              assert case['compile']['clang']['status']=='COMPILES'
+              assert case['status']=='PASS',case
+              assert len(case['inputs'])==1 and case['inputs'][0]['status']=='PASS'
+              assert case['compile']['native']['status']=='COMPILES'
+          print('M9_STANFORD_CENSUS',r['passed'],'/',r['total'])
+          PY
+          echo 'M9: all 3 unchanged Stanford programs pass three-way executable parity; no performance claims' >> "$GITHUB_STEP_SUMMARY"
+      - name: Correctness-gated Stanford original source runtime diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 8m python3 \
+            compiler/tools/opt_quality_public_m11_stanford.py \
+            --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" \
+            --rounds 3 --output results/m11-stanford.json \
+            2>&1 | tee results/m11-stanford.log
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          result=json.loads(Path('results/m11-stanford.json').read_text())
+          assert result['baseline_pass_count']==3
+          assert result['scoreable_count']==0
+          assert not result['dedicated_host_attested']
+          assert len(result['cases'])==3
+          for row in result['cases']:
+              assert row['baseline_status']=='PASS'
+              assert row['status'] in {
+                  'DIAGNOSTIC_ORIGINAL_SOURCE_TOO_SHORT',
+                  'DURATION_CANDIDATE_ON_SHARED_HOST',
+                  'DURATION_EXCEEDS_CAP',
+              }
+              assert row['source_sha256']
+              assert set(row['text_section_bytes'])=={'gcc','clang','native'}
+              for sample in row['diagnostic_samples'].values():
+                  assert sample['classification']=='DIAGNOSTIC_SHARED_OR_UNATTESTED_HOST'
+                  assert not any('ratio' in key for key in sample)
+                  assert all(len(values)==3 for values in sample['samples_ns'].values())
+          print('M11_DIAGNOSTIC_COMPLETE candidates',result['duration_candidate_count'],
+                'of 3; performance scores=0')
+          PY
+          echo 'M11: Stanford fixed workload duration diagnostics; no shared-runner speedup claims' >> "$GITHUB_STEP_SUMMARY"
+      - name: Generate adapted in-process Stanford loops with full three-way oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 8m python3 \
+            compiler/tools/opt_quality_public_m12_inprocess.py \
+            --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" \
+            --rounds 3 --output results/m12-adapted.json \
+            2>&1 | tee results/m12-adapted.log
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          r=json.loads(Path('results/m12-adapted.json').read_text())
+          assert r['scoreable_count']==0
+          assert not r['dedicated_host_attested']
+          assert not r['upstream_modified']
+          assert r['adaptation']=='instrumented_repeated_main_with_suppressed_printf'
+          assert len(r['cases'])==3
+          for case in r['cases']:
+              assert case['source_sha256']
+              assert set(case['compilers']) >= {'gcc'}
+              assert case['build_status']=='BUILT',case
+              assert case['wrapper_sha256']
+              assert case['status'] in {'CANDIDATE_FOUND','NO_SUITABLE_CANDIDATE'},case
+              assert set(case['text_section_bytes'])=={'gcc','clang','native'}
+              for p in case['probes']:
+                  assert p['classification'] not in {
+                      'REFERENCE_DISAGREEMENT','NATIVE_WRONG_RESULT','EXECUTION_FAILURE'}
+              if case['status']=='CANDIDATE_FOUND':
+                  for sample in case['diagnostic_samples'].values():
+                      assert sample['classification']=='DIAGNOSTIC_SHARED_OR_UNATTESTED_HOST'
+                      assert not any('ratio' in k for k in sample)
+                      assert all(len(x)==3 for x in sample['samples_ns'].values())
+          print('M12_ADAPTED_DISCOVERY',r['correct_workload_count'],'of 3; scores=0')
+          PY
+          echo 'M12: adapted kernel duration discovery; original-source gate unaffected' >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload source and execution diagnostics
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: opt-quality-m12-${{ env.COMPILER_SHA }}
+          path: results/
+          retention-days: 30
