@@ -20,18 +20,22 @@ with manifest.open("rb") as file:
     spec = tomllib.load(file)["package"]
 assert spec["name"] == "yansi" and spec["version"] == "1.0.1", spec
 source = path.read_text()
+# Match the original source with or without indentation. Older yansi sources
+# put these macro invocations at file scope, not inside an indented block.
 anchors = {
-    '    conditions! { feature = "detect-tty"':
-        '    #[cfg(feature = "detect-tty")]\n    conditions! { feature = "detect-tty"',
-    '    conditions! { feature = "detect-env"':
-        '    #[cfg(feature = "detect-env")]\n    conditions! { feature = "detect-env"',
-    '    conditions! { all(feature = "detect-env", feature = "detect-tty")':
-        '    #[cfg(all(feature = "detect-env", feature = "detect-tty"))]\n    conditions! { all(feature = "detect-env", feature = "detect-tty")',
+    'conditions! { feature = "detect-tty"': 'feature = "detect-tty"',
+    'conditions! { feature = "detect-env"': 'feature = "detect-env"',
+    'conditions! { all(feature = "detect-env", feature = "detect-tty")':
+        'all(feature = "detect-env", feature = "detect-tty")',
 }
-for before, after in anchors.items():
-    assert source.count(before) == 1, f"unexpected original yansi source: {before}"
-    source = source.replace(before, after)
-assert source.count("    conditions! {") == 3
-assert len(re.findall(r"    #\[cfg\(", source)) >= 3
+for signature, predicate in anchors.items():
+    pattern = r"(?m)^(?P<indent>[ \t]*)" + re.escape(signature)
+    def guard(match):
+        indent = match.group("indent")
+        return f"{indent}#[cfg({predicate})]\n{indent}{signature}"
+    source, count = re.subn(pattern, guard, source)
+    assert count == 1, f"unexpected original yansi source: {signature}"
+assert len(re.findall(r"(?m)^[ \t]*conditions! \{", source)) == 3
+assert len(re.findall(r"(?m)^[ \t]*#\[cfg\(", source)) >= 3
 path.write_text(source)
 print("YANSI_MRUSTC_COMPAT exact_version=1.0.1 cfg_only=3 source_vendor_only=true")
