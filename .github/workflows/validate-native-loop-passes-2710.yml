@@ -1,0 +1,56 @@
+name: Validate native induction LICM and PRE migration PR2710
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/validate-native-loop-passes-2710.yml'
+permissions:
+  contents: read
+jobs:
+  native-loop-passes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      SOURCE_SHA: 9dfbb2902c5d4f5a4719a41828c396ef840d2ad0
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and isolate native workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: native-loop-passes-2710
+      - name: Production IR inventory and no legacy fixture bridges
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          ! grep -qE 'typeid_executable_fixture|typed_fixture|from_legacy' crates/opt/tests/induction_native.rs crates/opt/tests/licm_native.rs crates/opt/tests/pre_native.rs
+          python3 tools/ir_consumer_inventory.py --check-production
+      - name: Compile optimizer and x86 native suite
+        working-directory: compiler
+        run: |
+          cargo check -p compiler-opt --lib --test induction_native --test licm_native --test pre_native
+          cargo check -p compiler-backend-x86 --lib
+      - name: Validate 17-case generated induction, LICM, PRE and independent GAS ELF C oracles
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test induction_native -- --nocapture
+          cargo test -p compiler-opt --test licm_native -- --nocapture
+          cargo test -p compiler-opt --test pre_native -- --nocapture
