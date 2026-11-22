@@ -18,6 +18,9 @@ on:
         required: false
         default: false
         type: boolean
+  pull_request:
+    paths:
+      - '.github/workflows/verify-mini-c-differential.yml'
   schedule:
     - cron: '4,19,34,49 * * * *'
   push:
@@ -34,6 +37,7 @@ concurrency:
 
 jobs:
   differential:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -134,3 +138,53 @@ jobs:
             ${{ runner.temp }}/mini-c-failures/
           if-no-files-found: ignore
           retention-days: 14
+
+  paired-return:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 3ec006822881b19b2265e786caa2fd549c02661f
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source SHA and prepare isolated native workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 3ec006822881b19b2265e786caa2fd549c02661f
+          mkdir -p "$RUNNER_TEMP/abi-test/crates" "$RUNNER_TEMP/abi-test/tools"
+          for crate in ir backend opt backend-x86 backend-aarch64; do
+            cp -a "compiler/crates/$crate" "$RUNNER_TEMP/abi-test/crates/$crate"
+          done
+          cp -a compiler/tools/typeid-rule-gen "$RUNNER_TEMP/abi-test/tools/typeid-rule-gen"
+          cat > "$RUNNER_TEMP/abi-test/Cargo.toml" <<'TOML'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/opt", "crates/backend-x86", "crates/backend-aarch64"]
+          TOML
+      - name: Verify native scalar-call adapter and grouped ABI cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 20m cargo test --manifest-path "$RUNNER_TEMP/abi-test/Cargo.toml" \
+            -p compiler-backend-x86 --lib paired_return::tests \
+            2>&1 | tee "$RUNNER_TEMP/paired-return-tests.log"
+          grep -Eq 'test result: ok. [1-9][0-9]* passed' "$RUNNER_TEMP/paired-return-tests.log"
+      - name: Check scoped x86 lint
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 6m cargo clippy --manifest-path "$RUNNER_TEMP/abi-test/Cargo.toml" \
+            -p compiler-backend-x86 --lib -- -D warnings -A dead_code -A unused_imports -A clippy::empty_line_after_doc_comments
+      - name: Preserve diagnostic log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: paired-return-2773-errors
+          path: ${{ runner.temp }}/paired-return-tests.log
+          if-no-files-found: ignore
+          retention-days: 7
