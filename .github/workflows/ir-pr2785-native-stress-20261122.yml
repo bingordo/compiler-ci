@@ -1,4 +1,4 @@
-# Exact-source validation isolated from active compiler migration workstreams.
+# Exact-commit integration validation: latest main with only PR2785 test files.
 name: IR PR2785 native profiling and LICM stress
 on:
   push:
@@ -13,23 +13,37 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
-      SOURCE_SHA: c2cbc4440a4ff09771b1bd55866136eecd595b35
+      MAIN_SHA: de866b035a2df2f310f756c591949ce8b1b37af9
+      PR_SHA: c2cbc4440a4ff09771b1bd55866136eecd595b35
       CARGO_INCREMENTAL: '0'
       CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
     steps:
-      - name: Check out exact private compiler source
+      - name: Check out exact current compiler main
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ env.SOURCE_SHA }}
+          ref: ${{ env.MAIN_SHA }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Verify source revision and isolate core Rust workspace
+      - name: Check out exact migration source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.PR_SHA }}
+          path: candidate
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Overlay only migration-owned tests and isolate core workspace
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git -C compiler rev-parse HEAD)" = "$MAIN_SHA"
+          test "$(git -C candidate rev-parse HEAD)" = "$PR_SHA"
+          for path in crates/opt/tests/typeid_source_profile_parity.rs crates/opt/tests/typed_licm_native.rs; do
+            cp "candidate/$path" "compiler/$path"
+          done
+          test "$(git -C compiler diff --name-only | wc -l)" -eq 2
           cat > compiler/Cargo.toml <<'EOF'
           [workspace]
           resolver = "2"
@@ -42,8 +56,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: compiler -> target
-          key: ir-pr2785-native-stress
-      - name: Test native source profiling and LICM stress
+          key: ir-pr2785-main-integration
+      - name: Verify profiling and LICM on merged source
         working-directory: compiler
         shell: bash
         run: |
