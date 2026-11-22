@@ -199,7 +199,7 @@ fi
 # dependency as the public producer. No source from the private mrustc TU is
 # supplied to this check.
 if [[ "${EDG_LITERAL_REGRESSION:-0}" == "1" ]]; then
-  candidate_sha=e314a84748977fc0f2295309e2760430c38c4b25
+  candidate_sha=66638df2ef0eb74d6c1aeee206aa8e6f7309f1de
   test "$(git -c safe.directory=/workspace/compiler-literal-source -C /workspace/compiler-literal-source rev-parse HEAD)" = "$candidate_sha"
   # Actions checkout is mounted read-only. Make a disposable compilation
   # copy in the private runner temp so Cargo can update its local lockfile.
@@ -374,8 +374,21 @@ PY
       readelf -h /audit-tmp/edg-static-literal-mixed-native.o >/dev/null
       readelf -rW /audit-tmp/edg-static-literal-mixed-native.o \
         > /audit-tmp/edg-static-literal-mixed-native-relocs.txt
-      mixed_reloc_count=$(grep -c 'R_X86_64_64' \
-        /audit-tmp/edg-static-literal-mixed-native-relocs.txt || true)
+      mixed_reloc_count=$(python3 - /audit-tmp/edg-static-literal-mixed-native-relocs.txt <<'PY'
+from pathlib import Path
+import re,sys
+section=""
+count=0
+for line in Path(sys.argv[1]).read_text().splitlines():
+    match=re.match(r"Relocation section '([^']+)'",line)
+    if match:
+        section=match.group(1)
+    elif "R_X86_64_64" in line and (
+        section.startswith(".rela.data") or section.startswith(".rela.rodata")):
+        count+=1
+print(count)
+PY
+)
       echo "EDG_C_LITERAL_MIXED_RELOCATIONS=$mixed_reloc_count"
       if [[ "$mixed_reloc_count" != "2" ]]; then mixed_native_rc=11; fi
     fi
