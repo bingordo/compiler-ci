@@ -464,15 +464,64 @@ set +e
 native_rc=$?
 set -e
 echo "EDG_C_TYPEID_EXIT=$native_rc"
-# Native compiler diagnostics may contain private generated source lines:
-# expose only exit status and a bounded error-category count.
+# The original generated C can contain private symbols/source paths.
+# Classify the *native adapter's rejection message* with an allowlist of
+# hard-coded categories. Never print, hash or copy the raw error line.
 python3 - /audit-tmp/edg-generated-c-native.log <<'PY'
 from pathlib import Path
-import re, sys
+import re,sys
 data = Path(sys.argv[1]).read_text(errors="replace")
 print("EDG_C_TYPEID_DIAGNOSTIC_COUNTS "
       + " ".join(f"{word}={len(re.findall(re.escape(word), data, re.I))}"
                  for word in ("error", "unsupported", "reject", "invalid", "panic")))
+markers = {
+    "EDG -> compiler-ir rejected source:": "typeid-adapter",
+    "EDG bridge:": "bridge-callback",
+    "EDG compilation failed with status": "frontend-diagnostic",
+}
+line = next((line for line in data.splitlines()
+             if any(marker in line for marker in markers)), "")
+if not line:
+    stage = "no-adapter-rejection"
+    reason = ""
+else:
+    stage = next(value for marker,value in markers.items() if marker in line)
+    reason = line.split(next(marker for marker in markers if marker in line),1)[-1].lower()
+# The rejection class is a constant enum, not the source-dependent message.
+if "global" in reason and ("import" in reason or "declaration" in reason):
+    classification = "global-import-or-storage-admission"
+elif "global" in reason and ("lifetime" in reason or "initializer" in reason):
+    classification = "global-lifetime-or-initializer"
+elif "source definition" in reason or "statement" in reason or "nested control flow" in reason:
+    classification = "function-body-or-control-flow"
+elif "expression" in reason or "operator" in reason or "conversion" in reason:
+    classification = "expression-or-conversion"
+elif "aggregate" in reason or "record" in reason or "class" in reason:
+    classification = "aggregate-or-class-abi"
+elif "parameter" in reason or "variadic" in reason or "signature" in reason or "call" in reason:
+    classification = "routine-or-call-abi"
+elif "optimizer" in reason or "machine" in reason or "ssa" in reason:
+    classification = "typed-optimizer-or-machine"
+elif "symbol" in reason or "link" in reason:
+    classification = "symbol-or-linkage"
+elif stage == "frontend-diagnostic":
+    classification = "frontend-error"
+else:
+    classification = "unclassified"
+print("EDG_C_TYPEID_FAILURE_STAGE=" + stage)
+print("EDG_C_TYPEID_REJECTION_CLASS=" + classification)
+# Further bounded *non-source-derived* feature flags help distinguish a
+# missing adapter capability from a malformed graph, without leaking names.
+for key,needles in {
+    "UNSUPPORTED":("unsupported","not supported"),
+    "UNPROVEN":("not a proven","not proven","cannot prove"),
+    "MISSING":("missing","not found"),
+    "INCOMPLETE":("incomplete","truncated"),
+    "MALFORMED":("malformed","invalid native"),
+    "DYNAMIC":("dynamic","lifetime"),
+}.items():
+    print("EDG_C_TYPEID_REASON_" + key + "="
+          + ("yes" if any(word in reason for word in needles) else "no"))
 PY
 if (( native_rc == 0 )); then
   test -s /audit-tmp/mrustc-edg-native.o
