@@ -175,9 +175,11 @@ parse_rc=$last_generated_c_probe_rc
 
 # Debug native SIGSEGV on the smallest real mrustc C input; a Rust panic
 # backtrace cannot diagnose EDG's C++/FFI segfault.
+# This expensive diagnostic is enabled only by this PR/manual opt-in;
+# regular main bootstrap retains its cheap parse/stack result without APT.
 # Keep the raw GDB log and generated C runner-private. Publish only bounded
 # frames with arguments and paths removed.
-if (( parse_rc == 139 )); then
+if (( parse_rc == 139 )) && [[ "${EDG_RUN_CREDUCE:-0}" == "1" ]]; then
   echo "EDG_C_GDB_TRIGGER=small_real_source_sigsegv"
   # Install binary distro packages only ONCE in this container, not per
   # C-Reduce candidate. The mounted /audit-tmp cache contains .deb archives
@@ -255,7 +257,7 @@ PY
     echo "EDG_C_GDB_STATUS=unavailable_no_gdb"
   fi
 else
-  echo "EDG_C_GDB_TRIGGER=not_applicable"
+  echo "EDG_C_GDB_TRIGGER=not_requested_or_no_sigsegv"
 fi
 
 # Only minimize the real C input if the initial EDG run truly SIGSEGVed.
