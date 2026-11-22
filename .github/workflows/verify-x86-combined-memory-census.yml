@@ -1,0 +1,51 @@
+name: x86 combined pointer and narrow real ELF selector audit
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-x86-combined-memory-census.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  combined-selector-census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ffcabfc519ef373fa3407d37afaa28aac1c67dc6
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact candidate SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "ffcabfc519ef373fa3407d37afaa28aac1c67dc6"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Isolate TypeId backend and optimizer crates
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/opt", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f Cargo.lock
+      - name: Check generator and negative mutation tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/tools"
+          python3 tools/regen_x86_selector_rules.py --check
+          python3 -m unittest discover -s tools -p test_x86_selector_rules.py -v
+          python3 -m unittest discover -s tools -p test_x86_real_selector_census.py -v
+      - name: Require combined source-backed x86 ELF and C11 oracles
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test x86_real_selector_census --features x86-selector-census -- --nocapture | tee /tmp/x86-combined-memory-census.log
+          grep -Fq 'test source_owned_pointer_memory_real_elf_matches_c11 ... ok' /tmp/x86-combined-memory-census.log
+          grep -Fq 'test source_owned_narrow_arrays_real_elf_execute_against_c11 ... ok' /tmp/x86-combined-memory-census.log
+          python3 tools/x86_real_selector_census.py --rust-test-log /tmp/x86-combined-memory-census.log
+      - name: Preserve selector unit tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --lib selector::tests
