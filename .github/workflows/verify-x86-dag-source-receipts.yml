@@ -1,0 +1,44 @@
+name: x86 DAG source receipts and generator exact bounds
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-x86-dag-source-receipts.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  dag-receipts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout exact compiler source candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: fd757950b9a537da4e732c481408d43fb67bf912
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require pinned compiler SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "fd757950b9a537da4e732c481408d43fb67bf912"
+      - name: Verify deterministic structural DAG source receipt
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/tools"
+          python3 tools/regen_x86_dag_rule_groups.py --check --receipt-json /tmp/x86-dag-structural-receipt.json
+          python3 -m json.tool /tmp/x86-dag-structural-receipt.json > /dev/null
+          python3 - <<'PY'
+          import json
+          receipt=json.load(open('/tmp/x86-dag-structural-receipt.json'))
+          assert receipt['verification']=='structural'
+          assert len(receipt['tables'])==3
+          assert all(len(row['source_sha256'])==64 and len(row['generator_sha256'])==64 for row in receipt['tables'])
+          PY
+      - name: Check mutation gates and exact index / DAG node bounds
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/tools"
+          python3 -m unittest discover -s tools -p test_x86_dag_rule_groups.py -v
+          python3 -m unittest discover -s tools -p test_x86_dag_codegen.py -v
+          python3 -m unittest discover -s tools -p test_ranked_generator_index.py -v
