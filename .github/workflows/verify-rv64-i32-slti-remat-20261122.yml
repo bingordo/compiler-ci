@@ -1,0 +1,345 @@
+name: RV64 canonical i32 SLTI/SLTIU shared rematerialization
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-rv64-i32-slti-remat-20261122.yml']
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact compiler SHA or branch
+        type: string
+        required: true
+        default: '14dfb1c8a0babafbb488ecf9ab54ed3b36203169'
+permissions:
+  contents: read
+jobs:
+  rv64-i32-slti-remat:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || '14dfb1c8a0babafbb488ecf9ab54ed3b36203169' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact compiler source revision
+        run: |
+          set -euo pipefail
+          sha="$(git -C compiler rev-parse HEAD)"
+          echo "RV64 SLTI remat compiler SHA: $sha" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            test "$sha" = '14dfb1c8a0babafbb488ecf9ab54ed3b36203169'
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Isolate TypeId native crates
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-riscv64"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: rv64-i32-slti-remat-20261122
+      - name: Validate source-reviewed generated rules and encoder
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          if ! python3 tools/regen_riscv_native_selector_rules.py --check; then
+            python3 tools/regen_riscv_native_selector_rules.py --write
+            git diff -- crates/backend-riscv64/src/generated_native_selector_rules.rs
+            exit 1
+          fi
+          python3 -m unittest discover -s tools -p test_riscv_native_selector_rules.py -v
+          python3 tools/riscv_udb_rust_leaf_forms.py \
+            --catalog data/riscv_udb_r0_catalog.json \
+            --output crates/backend-riscv64/src/generated_encoding.rs --check
+      - name: Run shared planner and RV64 exhaustive backend targets
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib remat::tests
+          cargo test -p compiler-backend-riscv64 --lib slti_i32
+          cargo test -p compiler-backend-riscv64 --all-targets
+          cargo clippy -p compiler-backend-riscv64 --all-targets -- --no-deps -D warnings
+      - name: Install independent GNU RV64 binutils and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y binutils-riscv64-linux-gnu qemu-user
+      - name: Compare direct ELF bytes with GNU assembler and inspect selection
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for kind in slti_neg sltiu_neg slti_hi sltiu_hi sgti_neg sgtiu_neg slti_over sltiu_over slti32_neg sltiu32_neg slti32_hi sltiu32_hi sgti32_neg sgtiu32_neg slti32_over sltiu32_over; do
+            cargo run -p compiler-backend-riscv64 --example rv64_leaf -- \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}.s" "$kind" --isa=rv64i
+            riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+              "/tmp/rv64_${kind}.s" -o "/tmp/rv64_${kind}_gas.o"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}_direct.bin"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}_gas.o" "/tmp/rv64_${kind}_gas.bin"
+            cmp "/tmp/rv64_${kind}_direct.bin" "/tmp/rv64_${kind}_gas.bin"
+          done
+          for kind in slti_neg slti_hi sgti_neg; do
+            grep -qE '^[[:space:]]+slti x' "/tmp/rv64_${kind}.s"
+          done
+          for kind in sltiu_neg sltiu_hi sgtiu_neg; do
+            grep -qE '^[[:space:]]+sltiu x' "/tmp/rv64_${kind}.s"
+          done
+          if grep -Eq '^[[:space:]]+sltiu? x' /tmp/rv64_slti_over.s || \
+             grep -Eq '^[[:space:]]+sltiu? x' /tmp/rv64_sltiu_over.s; then
+            echo 'invalid signed-i12 immediate compare selected'; exit 1
+          fi
+          for kind in slti32_neg slti32_hi sgti32_neg; do
+            grep -qE '^[[:space:]]+slti x' "/tmp/rv64_${kind}.s"
+          done
+          for kind in sltiu32_neg sltiu32_hi sgtiu32_neg; do
+            grep -qE '^[[:space:]]+sltiu x' "/tmp/rv64_${kind}.s"
+          done
+          if grep -Eq '^[[:space:]]+sltiu? x' /tmp/rv64_slti32_over.s || \
+             grep -Eq '^[[:space:]]+sltiu? x' /tmp/rv64_sltiu32_over.s; then
+            echo 'invalid signed-i12 i32 immediate compare selected'; exit 1
+          fi
+      - name: Execute signed/unsigned independent comparison oracles
+        run: |
+          set -euo pipefail
+          cat > /tmp/rv64_slti_start.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            li a0, -20
+            call rv64_slti_neg
+            li t0, 1
+            bne a0, t0, fail1
+            li a0, -17
+            call rv64_slti_neg
+            li t0, 0
+            bne a0, t0, fail2
+            li a0, 0
+            call rv64_sltiu_neg
+            li t0, 1
+            bne a0, t0, fail3
+            li a0, -1
+            call rv64_sltiu_neg
+            li t0, 0
+            bne a0, t0, fail4
+            li a0, 2046
+            call rv64_slti_hi
+            li t0, 1
+            bne a0, t0, fail5
+            li a0, -1
+            call rv64_sltiu_hi
+            li t0, 0
+            bne a0, t0, fail6
+            li a0, -20
+            call rv64_sgti_neg
+            li t0, 1
+            bne a0, t0, fail7
+            li a0, -2
+            call rv64_sgtiu_neg
+            li t0, 1
+            bne a0, t0, fail8
+            li a0, 2048
+            call rv64_slti_over
+            li t0, 0
+            bne a0, t0, fail9
+            li a0, 2047
+            call rv64_sltiu_over
+            li t0, 1
+            bne a0, t0, fail10
+            li a0, 0
+            j exit
+          fail1: li a0, 1
+            j exit
+          fail2: li a0, 2
+            j exit
+          fail3: li a0, 3
+            j exit
+          fail4: li a0, 4
+            j exit
+          fail5: li a0, 5
+            j exit
+          fail6: li a0, 6
+            j exit
+          fail7: li a0, 7
+            j exit
+          fail8: li a0, 8
+            j exit
+          fail9: li a0, 9
+            j exit
+          fail10: li a0, 10
+            j exit
+          exit:
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+            /tmp/rv64_slti_start.s -o /tmp/rv64_slti_start.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax -e _start \
+            /tmp/rv64_slti_start.o \
+            /tmp/rv64_slti_neg.o /tmp/rv64_sltiu_neg.o \
+            /tmp/rv64_slti_hi.o /tmp/rv64_sltiu_hi.o \
+            /tmp/rv64_sgti_neg.o /tmp/rv64_sgtiu_neg.o \
+            /tmp/rv64_slti_over.o /tmp/rv64_sltiu_over.o \
+            -o /tmp/rv64_slti.elf
+          timeout 15s qemu-riscv64 /tmp/rv64_slti.elf
+          echo 'RV64 SLTI/SLTIU signed and unsigned oracles: ten cases passed'
+          cat > /tmp/rv64_slti_i32_start.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            li a0, -20
+            call rv64_slti32_neg
+            li t0, 1
+            bne a0, t0, fail1
+            li a0, -17
+            call rv64_slti32_neg
+            li t0, 0
+            bne a0, t0, fail2
+            li a0, 0
+            call rv64_sltiu32_neg
+            li t0, 1
+            bne a0, t0, fail3
+            li a0, -1
+            call rv64_sltiu32_neg
+            li t0, 0
+            bne a0, t0, fail4
+            li a0, 2046
+            call rv64_slti32_hi
+            li t0, 1
+            bne a0, t0, fail5
+            li a0, 2147483647
+            call rv64_slti32_hi
+            li t0, 0
+            bne a0, t0, fail6
+            li a0, -2147483648
+            call rv64_sltiu32_hi
+            li t0, 0
+            bne a0, t0, fail7
+            li a0, 2046
+            call rv64_sltiu32_hi
+            li t0, 1
+            bne a0, t0, fail8
+            li a0, -20
+            call rv64_sgti32_neg
+            li t0, 1
+            bne a0, t0, fail9
+            li a0, -17
+            call rv64_sgti32_neg
+            li t0, 0
+            bne a0, t0, fail10
+            li a0, -2
+            call rv64_sgtiu32_neg
+            li t0, 1
+            bne a0, t0, fail11
+            li a0, -1
+            call rv64_sgtiu32_neg
+            li t0, 0
+            bne a0, t0, fail12
+            li a0, 2047
+            call rv64_slti32_over
+            li t0, 1
+            bne a0, t0, fail13
+            li a0, 2048
+            call rv64_slti32_over
+            li t0, 0
+            bne a0, t0, fail14
+            li a0, -1
+            call rv64_sltiu32_over
+            li t0, 0
+            bne a0, t0, fail15
+            li a0, 2047
+            call rv64_sltiu32_over
+            li t0, 1
+            bne a0, t0, fail16
+            li a0, -2147483648
+            call rv64_sltiu32_neg
+            li t0, 1
+            bne a0, t0, fail17
+            li a0, -2147483648
+            call rv64_slti32_neg
+            li t0, 1
+            bne a0, t0, fail18
+            li a0, 2147483647
+            call rv64_sgtiu32_neg
+            li t0, 1
+            bne a0, t0, fail19
+            li a0, 2147483647
+            call rv64_sgti32_neg
+            li t0, 0
+            bne a0, t0, fail20
+            li a0, 0
+            j exit
+          fail1: li a0, 1
+            j exit
+          fail2: li a0, 2
+            j exit
+          fail3: li a0, 3
+            j exit
+          fail4: li a0, 4
+            j exit
+          fail5: li a0, 5
+            j exit
+          fail6: li a0, 6
+            j exit
+          fail7: li a0, 7
+            j exit
+          fail8: li a0, 8
+            j exit
+          fail9: li a0, 9
+            j exit
+          fail10: li a0, 10
+            j exit
+          fail11: li a0, 11
+            j exit
+          fail12: li a0, 12
+            j exit
+          fail13: li a0, 13
+            j exit
+          fail14: li a0, 14
+            j exit
+          fail15: li a0, 15
+            j exit
+          fail16: li a0, 16
+            j exit
+          fail17: li a0, 17
+            j exit
+          fail18: li a0, 18
+            j exit
+          fail19: li a0, 19
+            j exit
+          fail20: li a0, 20
+            j exit
+          exit:
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+            /tmp/rv64_slti_i32_start.s -o /tmp/rv64_slti_i32_start.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax -e _start \
+            /tmp/rv64_slti_i32_start.o \
+            /tmp/rv64_slti32_neg.o \
+            /tmp/rv64_sltiu32_neg.o \
+            /tmp/rv64_slti32_hi.o \
+            /tmp/rv64_sltiu32_hi.o \
+            /tmp/rv64_sgti32_neg.o \
+            /tmp/rv64_sgtiu32_neg.o \
+            /tmp/rv64_slti32_over.o \
+            /tmp/rv64_sltiu32_over.o \
+            -o /tmp/rv64_slti_i32.elf
+          timeout 15s qemu-riscv64 /tmp/rv64_slti_i32.elf
+          echo 'RV64 i32 canonical SLTI/SLTIU: 20 signed/unsigned native cases passed'
