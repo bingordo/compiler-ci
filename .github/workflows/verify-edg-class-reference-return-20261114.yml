@@ -24,9 +24,9 @@ jobs:
       run:
         shell: edg-container-exec "bash -eo pipefail {0}"
     env:
-      COMPILER_SHA: 47979d5de2fa8c09eabb6a24eaa9637e399740d5
+      COMPILER_SHA: 8c53eb8f1e9adebc4877782737a908f82bac5a9c
       EDG_SOURCE_SHA: b195677be8b9b56c8337afad6be8064d21a54082
-      EDG_BRIDGE_SHA: fc5adba5dc9061cc24517544c23ee92ab0151b5e
+      EDG_BRIDGE_SHA: e94de0b03efdf6fb74ca4e01dcbc12cb02a2176b
       EDG_RELEASE_TAG: edgcpfe-v2026.11.14-upstream-177765bb7731
       EDG_RELEASE_SHA256: 1ce495b629924f31382ecccc891a7a72caae1014ddfa2ba7dd39b44d8b0a9526
       RUST_TOOLCHAIN_VERSION: 1.99.1
@@ -41,7 +41,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 47979d5de2fa8c09eabb6a24eaa9637e399740d5
+          ref: 8c53eb8f1e9adebc4877782737a908f82bac5a9c
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -59,7 +59,7 @@ jobs:
           set -euo pipefail
           test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
           test "$(git -C edgcpp rev-parse HEAD)" = "$EDG_SOURCE_SHA"
-          grep -Fq 'rev = "fc5adba5dc9061cc24517544c23ee92ab0151b5e"' compiler/tools/edg-driver/Cargo.toml
+          grep -Fq 'rev = "e94de0b03efdf6fb74ca4e01dcbc12cb02a2176b"' compiler/tools/edg-driver/Cargo.toml
           ! grep -q 'edgcpp_capture_' edgcpp/src/lower_il.c
           fixture=compiler/tools/edg-driver/tests/fixtures/edg_native_cxx5_iostream.cpp
           test -f "$fixture"
@@ -385,6 +385,102 @@ jobs:
           echo 'EDG_CXX5_SIGNED_BYTE_FORMAL GXX_parity=yes poisoned_upper_EDI=yes volatile_rejected=yes' \
             >>"$GITHUB_STEP_SUMMARY"
 
+      - name: Prove source pointer automatic Ptr64 SSA against G++ and reject uninitialized pointer
+        working-directory: edgcpp/build/gcc-release
+        run: |
+          set -euo pipefail
+          source ./environment.sh
+          driver="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          work="$RUNNER_TEMP/cxx5-pointer-ssa"
+          mkdir -p "$work"
+          cd "$work"
+          cat >defs.cpp <<'CPP'
+          int first(const int* p) {
+            const int* q=p;
+            return *q;
+          }
+          int second(const int* p) {
+            const int* q=p;
+            ++q;
+            return *q;
+          }
+          int assigned(const int* p) {
+            const int* cursor=p;
+            return *(cursor=p);
+          }
+          int choose_pointer(const int* a,const int* b,int choose_b) {
+            const int* cursor=a;
+            if (choose_b) { cursor=b; }
+            return *cursor;
+          }
+          int scan_to_zero(const int* input) {
+            const int* cursor=input;
+            int count=0;
+            while (*cursor!=0) {
+              ++cursor;
+              ++count;
+            }
+            return count;
+          }
+          CPP
+          cat >caller.cpp <<'CPP'
+          #include <cstdio>
+          extern int first(const int*);
+          extern int second(const int*);
+          extern int assigned(const int*);
+          extern int choose_pointer(const int*,const int*,int);
+          extern int scan_to_zero(const int*);
+          int main() {
+            const int data[][3]={{13,29,51},{-5,0,122},{0,-79,1},{2147483647,-2147483647,0}};
+            long sum=0;
+            for (const auto& row:data) {
+              if (first(row)!=row[0] || second(row)!=row[1] ||
+                  assigned(row)!=row[0]) return 5;
+              if (choose_pointer(row,row+1,0)!=row[0] ||
+                  choose_pointer(row,row+1,1)!=row[1]) return 6;
+              sum+=first(row)+second(row);
+            }
+            const int strings[][8]={{0},{8,0},{-1,22,0},{3,4,5,6,7,8,9,0}};
+            const int lengths[]={0,1,2,7};
+            for (unsigned i=0;i<4;++i) {
+              if (scan_to_zero(strings[i])!=lengths[i]) return 7;
+              sum+=scan_to_zero(strings[i]);
+            }
+            std::printf("%ld\n",sum);
+            return 0;
+          }
+          CPP
+          g++ -std=c++17 -fno-exceptions -Wall -Wextra -Werror defs.cpp caller.cpp -o oracle
+          timeout 15s ./oracle >oracle.out 2>oracle.err
+          version="$(g++ -dumpfullversion -dumpversion)"
+          IFS=. read -r major minor patch <<<"$version"
+          gnu_number=$((10#$major*10000+10#${minor:-0}*100+10#${patch:-0}))
+          "$driver" native.o --g++ --c++17 --no_strict_gnu \
+            --no_exceptions --gnu_version "$gnu_number" defs.cpp >native.log 2>&1 || {
+              tail -n 80 native.log >&2
+              test ! -e native.o
+              exit 1
+            }
+          test "$(od -An -tx1 -N4 native.o | tr -d '[:space:]')" = 7f454c46
+          g++ -std=c++17 -fno-exceptions native.o caller.cpp -o native
+          timeout 15s ./native >native.out 2>native.err
+          test "$(sha256sum oracle.out | cut -d' ' -f1)" = \
+               "$(sha256sum native.out | cut -d' ' -f1)"
+          test "$(sha256sum oracle.err | cut -d' ' -f1)" = \
+               "$(sha256sum native.err | cut -d' ' -f1)"
+          cat >invalid.cpp <<'CPP'
+          int read_bad(const int* p) { const int* q; (void)p; return *q; }
+          CPP
+          rm -f invalid.o
+          if "$driver" invalid.o --g++ --c++17 --no_strict_gnu \
+            --no_exceptions --gnu_version "$gnu_number" invalid.cpp >invalid.log 2>&1; then
+            echo "::error::uninitialized pointer automatic incorrectly accepted" >&2
+            exit 1
+          fi
+          test ! -e invalid.o
+          echo 'EDG_CXX5_POINTER_SSA native_ELF_GXX_parity=yes uninitialized_rejected=yes' \
+            >>"$GITHUB_STEP_SUMMARY"
+
       - name: Compare unchanged GCC15 iostream and original intermediates
         working-directory: edgcpp/build/gcc-release
         run: |
@@ -533,5 +629,6 @@ jobs:
             ${{ runner.temp }}/cxx5-scalar-ref/
             ${{ runner.temp }}/cxx5-signed-byte/
             ${{ runner.temp }}/cxx5-signed-byte-formal/
+            ${{ runner.temp }}/cxx5-pointer-ssa/
           if-no-files-found: warn
           retention-days: 7
