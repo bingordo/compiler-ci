@@ -231,6 +231,22 @@ else
   echo "EDG_C_GDB_TRIGGER=not_applicable"
 fi
 
+# Only minimize the real C input if the initial EDG run truly SIGSEGVed.
+# C-Reduce uses GDB as its interestingness test to preserve the exact
+# plain_cpp_record top frame, not merely any crash or frontend failure.
+# The original and the minimized source stay inside the mounted runner temp.
+if (( parse_rc == 139 )); then
+  set +e
+  bash /workspace/bootstrap/reduce-mrustc-edg-crash.sh \
+    "$parser" "$gnu_number" "$AUDIT_SOURCE" "${include_args[@]}" \
+    > /audit-tmp/edg-creduce-summary.log 2>&1
+  reduce_wrapper_rc=$?
+  set -e
+  echo "EDG_CREDUCE_WRAPPER_EXIT=$reduce_wrapper_rc"
+  grep -E '^EDG_CREDUCE_[A-Z0-9_]+=' /audit-tmp/edg-creduce-summary.log || true
+else
+  echo "EDG_CREDUCE_STATUS=not_applicable_no_small_source_sigsegv"
+fi
 if [[ -n "${AUDIT_LARGE_SOURCE:-}" && -s "$AUDIT_LARGE_SOURCE" &&
       "$AUDIT_LARGE_SOURCE" != "$AUDIT_SOURCE" ]]; then
   echo "EDG_C_LARGE_BYTES=$(stat -c %s "$AUDIT_LARGE_SOURCE")"
