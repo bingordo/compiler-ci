@@ -59,25 +59,26 @@ jobs:
           import tomllib
 
           with Path("compiler/crates/driver/Cargo.toml").open("rb") as f:
-              deps = tomllib.load(f)["dependencies"]
-          names = {
-              "oberon-front-ir": "oberon",
-              "mini-c-syntax": "mini-c",
-              "mini-c-sema": "mini-c",
-              "mini-c-preprocess": "mini-c",
-          }
-          by_repo = {}
-          for crate, repo in names.items():
+              driver = tomllib.load(f)["dependencies"]
+          with Path("compiler/tools/mini-c-driver/Cargo.toml").open("rb") as f:
+              mini = tomllib.load(f)["dependencies"]
+          # The Mini-C syntax/sema crates moved into a separate workspace.
+          # The main driver preprocessor may use a DIFFERENT pinned revision.
+          def pin(deps, crate, repo):
               dep = deps[crate]
               assert dep["git"] == f"ssh://git@github.com/bingordo/{repo}.git"
               sha = dep["rev"]
               assert re.fullmatch(r"[0-9a-f]{40}", sha), (crate, sha)
-              if repo in by_repo:
-                  assert by_repo[repo] == sha, f"conflicting {repo} frontend pins"
-              by_repo[repo] = sha
-          assert deps["mini-c-preprocess"]["features"] == ["internal-rcc"]
-          print(f"oberon_sha={by_repo['oberon']}")
-          print(f"mini_c_sha={by_repo['mini-c']}")
+              return sha
+          oberon = pin(driver, "oberon-front-ir", "oberon")
+          preprocessor = pin(driver, "mini-c-preprocess", "mini-c")
+          syntax = pin(mini, "mini-c-syntax", "mini-c")
+          sema = pin(mini, "mini-c-sema", "mini-c")
+          assert syntax == sema, "Mini-C syntax/sema must use one source revision"
+          assert driver["mini-c-preprocess"]["features"] == ["internal-rcc"]
+          print(f"oberon_sha={oberon}")
+          print(f"mini_c_frontend_sha={syntax}")
+          print(f"mini_c_preprocess_sha={preprocessor}")
           PY
 
       - name: Checkout pinned Oberon frontend source
@@ -92,7 +93,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/mini-c
-          ref: ${{ steps.frontend-pins.outputs.mini_c_sha }}
+          ref: ${{ steps.frontend-pins.outputs.mini_c_preprocess_sha }}
           path: mini-c
           persist-credentials: false
       - name: Checkout compiler-pinned Mini-C for generated-C compatibility audit
@@ -101,7 +102,7 @@ jobs:
           repository: bingordo/mini-c
           # Use precisely the grammar and checker revision required by the
           # bootstrapped driver rather than a historical parser snapshot.
-          ref: ${{ steps.frontend-pins.outputs.mini_c_sha }}
+          ref: ${{ steps.frontend-pins.outputs.mini_c_frontend_sha }}
           path: mini-c-compat
           persist-credentials: false
       - name: Checkout pinned mrustc
