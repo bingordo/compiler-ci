@@ -1,0 +1,54 @@
+name: x86 CTZ and casts native ELF selected-rule and C11 oracle
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-x86-ctz-cast-real-elf-oracle.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  selector-census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact compiler source candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7cb8a75494a20f81c2b85343fb4e081952709c39
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require exact source SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "7cb8a75494a20f81c2b85343fb4e081952709c39"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Isolate TypeId backend and optimizer crates
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/opt", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f Cargo.lock
+      - name: Validate exact reviewed source and reject forged selector evidence
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/tools"
+          python3 tools/regen_x86_selector_rules.py --check
+          python3 -m unittest discover -s tools -p test_x86_selector_rules.py -v
+          python3 -m unittest discover -s tools -p test_x86_real_selector_census.py -v
+      - name: Measure accepted production x86 ELF and compatibility TypeId rule IDs
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test x86_real_selector_census --features x86-selector-census -- --nocapture | tee /tmp/x86-real-selector-coverage.log
+          python3 tools/x86_real_selector_census.py --rust-test-log /tmp/x86-real-selector-coverage.log
+      - name: Require the independently executable x86 CTZ/casts oracle was run
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test x86_real_selector_census --features x86-selector-census source_owned_ctz_and_cast_real_elf_execute_against_c11
+      - name: Preserve original generic ranked selector Rust tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --lib selector::tests
