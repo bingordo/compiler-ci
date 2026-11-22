@@ -1,0 +1,53 @@
+name: Validate native CFG differential IR migration PR2720
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/validate-native-cfg-2720.yml'
+permissions:
+  contents: read
+jobs:
+  native-cfg:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SOURCE_SHA: 8374fe44c14c7571ecbe6d7945142241ae90ddca
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and isolate native workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: native-cfg-2720
+      - name: Ensure native-only inputs and production IR boundary
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          ! grep -qE 'typeid_executable_fixture|typed_fixture|from_legacy|fn trap_loop|fn pointer_edge_memory' crates/opt/tests/native_cfg_differential.rs
+          python3 tools/ir_consumer_inventory.py --check-production
+      - name: Compile optimizer and x86 backend
+        working-directory: compiler
+        run: |
+          cargo check -p compiler-opt --lib --test native_cfg_differential
+          cargo check -p compiler-backend-x86 --lib
+      - name: Execute CFG trap SIGFPE and pointer-PHI differential with GAS direct ELF and C
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test native_cfg_differential -- --nocapture
