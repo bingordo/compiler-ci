@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: d8e3cb64065dd03968ae9d54d839cf7c0c4c7346
+          ref: d020ad58a823ca297bb9c6bcf030a50fe9184b0d
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -33,6 +33,36 @@ jobs:
           p.write_text(s.replace(old,"https://github.com/bingordo/mini-c.git"))
           PY
           timeout 12m cargo build --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+      - name: Native TypeId versus GCC for discarded void expressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          d="$(mktemp -d)"
+          trap 'rm -rf "$d"' EXIT
+          cat > "$d/discard.c" <<'EOF'
+          int bump(int *x) { *x = *x + 7; return *x; }
+          int main(void) {
+            int x = 5;
+            (void)bump(&x);
+            (void)x;
+            return x == 12 ? 0 : 1;
+          }
+          EOF
+          cat > "$d/argv.c" <<'EOF'
+          int main(int argc, char **argv) {
+            (void)argv;
+            return argc == 1 ? 0 : 1;
+          }
+          EOF
+          native="$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c"
+          for case in discard argv; do
+            gcc -std=gnu11 -O0 "$d/$case.c" -o "$d/$case.gcc"
+            "$d/$case.gcc"
+            "$native" "$d/$case.c" --emit obj -o "$d/$case.o"
+            gcc "$d/$case.o" -o "$d/$case.native"
+            "$d/$case.native"
+          done
+          echo "VOID_CAST_NATIVE_GCC_DIFFERENTIAL=PASS" >> "$GITHUB_STEP_SUMMARY"
       - name: Record actual unforced CMake probes
         shell: bash
         run: |
