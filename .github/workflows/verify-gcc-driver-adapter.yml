@@ -1,7 +1,7 @@
 name: Verify GCC driver adapter (source-only)
 
 # Python parser tests and independent host C preprocessing/dependency smoke.
-# This does NOT build the private native compiler or prove CMake integration.
+# CMake uses a GCC stand-in, not the private compiler.
 on:
   pull_request:
     paths:
@@ -56,6 +56,55 @@ jobs:
           grep -F 'return 42;' "$d/demo.i"
           echo "Host GCC CPP/dependency contract verified; native frontend and linking untested" \
             >> "$GITHUB_STEP_SUMMARY"
+      - name: CMake Makefiles header rebuild smoke with reference codegen
+        shell: bash
+        run: |
+          set -euo pipefail
+          d="$(mktemp -d)"
+          trap 'rm -rf "$d"' EXIT
+          mkdir -p "$d/project"
+          cp compiler/tools/compiler-gcc.py "$d/cc-adapter"
+          chmod +x "$d/cc-adapter"
+          cat > "$d/reference-native" <<'PY'
+          #!/usr/bin/env python3
+          """GCC codegen stand-in; not native TypeId correctness evidence."""
+          import os
+          import subprocess
+          import sys
+          argv = sys.argv[1:]
+          assert argv[1:3] == ["--language", "mini-c"]
+          assert argv[3:5] == ["--target", "x86_64"]
+          assert argv[5:7] == ["--emit", "obj"]
+          assert argv[7] == "-o"
+          with open(os.environ["DRIVER_SMOKE_LOG"], "a", encoding="utf-8") as log:
+              log.write("compile\\n")
+          raise SystemExit(subprocess.call(["gcc", "-c", argv[0], "-o", argv[8]]))
+          PY
+          chmod +x "$d/reference-native"
+          cat > "$d/project/CMakeLists.txt" <<'EOF'
+          cmake_minimum_required(VERSION 3.20)
+          project(driver_probe C)
+          add_library(check_object OBJECT demo.c)
+          target_compile_definitions(check_object PRIVATE VALUE=42)
+          EOF
+          printf '#include "demo.h"\\nint demo(void) { return VALUE + EXTRA; }\\n' > "$d/project/demo.c"
+          printf '#define EXTRA 7\\n' > "$d/project/demo.h"
+          export DRIVER_SMOKE_LOG="$d/native-invocations.log"
+          export COMPILER_NATIVE_DRIVER="$d/reference-native"
+          export COMPILER_HOST_CC=gcc
+          cmake -S "$d/project" -B "$d/build" -G "Unix Makefiles" \\
+            -DCMAKE_C_COMPILER="$d/cc-adapter" \\
+            -DCMAKE_C_COMPILER_ID=GNU -DCMAKE_C_COMPILER_FORCED=TRUE \\
+            -DCMAKE_C_COMPILER_WORKS=TRUE
+          cmake --build "$d/build" --verbose
+          test "$(wc -l < "$DRIVER_SMOKE_LOG")" -eq 1
+          cmake --build "$d/build" --verbose
+          test "$(wc -l < "$DRIVER_SMOKE_LOG")" -eq 1
+          sleep 1
+          printf '#define EXTRA 8\\n' > "$d/project/demo.h"
+          cmake --build "$d/build" --verbose
+          test "$(wc -l < "$DRIVER_SMOKE_LOG")" -eq 2
+          echo "CMake Makefiles rebuild passed with reference codegen only" >> "$GITHUB_STEP_SUMMARY"
       - name: Upload exact source revision and test log
         if: always()
         uses: actions/upload-artifact@v4
