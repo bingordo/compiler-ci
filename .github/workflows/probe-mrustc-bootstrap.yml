@@ -19,6 +19,11 @@ on:
         required: false
         default: main
         type: string
+      edg_creduce:
+        description: 'Minimize the real generated-C EDG crash (bounded, opt-in)'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -879,6 +884,16 @@ jobs:
           path: edgcpp-rust
           persist-credentials: false
 
+      - name: Restore distro C-Reduce/GDB binary package downloads
+        # Cache ONLY public APT binary packages, never generated compiler C.
+        if: always() && steps.translate.outcome == 'success'
+        id: edg-apt-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/edg-debug-apt-cache
+          # Pinned EDG container digest determines the compatible distro/ABI.
+          key: edg-debug-apt-v1-linux-amd64-ci14b3948c
+
       - name: Probe real mrustc C through EDG parse and native TypeId gates
         if: always() && steps.translate.outcome == 'success'
         continue-on-error: true
@@ -920,6 +935,8 @@ jobs:
             -v "$RUNNER_TEMP:/audit-tmp" \
             -e "AUDIT_SOURCE=/workspace/$relative" \
             -e "AUDIT_LARGE_SOURCE=/workspace/$large_relative" \
+            # Only on this diagnostic PR, or by explicit manual dispatch.
+            -e "EDG_RUN_CREDUCE=${{ (github.event_name == 'pull_request' || inputs.edg_creduce) && '1' || '0' }}" \
             ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8 \
             -euo pipefail /workspace/bootstrap/run-mrustc-edg-gap.sh \
             > "$RUNNER_TEMP/mrustc-edg-audit.log" 2>&1
@@ -934,6 +951,12 @@ jobs:
           tail -n 55 "$RUNNER_TEMP/mrustc-edg-audit.log"
           # A missing toolchain or a tested unsupported C feature does not
           # invalidate the established independent GCC bootstrap.
+      - name: Save distro C-Reduce/GDB binary package downloads
+        if: always() && steps.edg-apt-cache.outcome == 'success' && steps.edg-apt-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/edg-debug-apt-cache
+          key: edg-debug-apt-v1-linux-amd64-ci14b3948c
       - name: Mark experiment outcome
         if: always()
         shell: bash
