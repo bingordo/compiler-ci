@@ -199,7 +199,7 @@ fi
 # dependency as the public producer. No source from the private mrustc TU is
 # supplied to this check.
 if [[ "${EDG_LITERAL_REGRESSION:-0}" == "1" ]]; then
-  candidate_sha=4047a32de1a76837d91609bbe90cc0b9f5cf80df
+  candidate_sha=54cfe82a80c4b45f4deebd3b29f6ea9cde55edca
   git -C /workspace/compiler fetch --quiet --no-tags --depth=1 origin "$candidate_sha"
   git -C /workspace/compiler worktree add --quiet --detach \
     /workspace/compiler-literal-candidate "$candidate_sha"
@@ -227,6 +227,74 @@ for i,line in enumerate(selected[-12:],1):
     msg=re.sub(r"[^A-Za-z0-9 _./:><()\[\],=-]","?",msg)
     print(f"EDG_C_LITERAL_TYPEID_DIAG_{i}={msg[:230]}")
 PY
+  fi
+  # An actual ELF+GCC executable oracle, not just a bridge snapshot.
+  # These two original C11 source files are public, checked-in compiler
+  # fixtures and do not depend on/print the private generated mrustc TU.
+  if (( typeid_check_rc == 0 )); then
+    literal_source=/workspace/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_literal_union_elf.c
+    literal_harness=/workspace/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_literal_union_elf_harness.c
+    test -s "$literal_source" && test -s "$literal_harness"
+    set +e
+    (
+      cd /workspace/edgcpp/build/gcc-release
+      CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+        timeout --signal=TERM --kill-after=10s 8m cargo run --quiet \
+        --manifest-path /workspace/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
+        -- /audit-tmp/edg-static-literal-native.o --gcc --c11 \
+        --no_strict_gnu --gnu_version "$gnu_number" "$literal_source"
+    ) > /audit-tmp/edg-static-literal-native.log 2>&1
+    native_rc=$?
+    set -e
+    if (( native_rc == 0 )); then
+      readelf -h /audit-tmp/edg-static-literal-native.o >/dev/null
+      readelf -rW /audit-tmp/edg-static-literal-native.o \
+        > /audit-tmp/edg-static-literal-native-relocs.txt
+      reloc_count=$(grep -c 'R_X86_64_64' \
+        /audit-tmp/edg-static-literal-native-relocs.txt || true)
+      echo "EDG_C_LITERAL_NATIVE_ELF_RELOCATIONS=$reloc_count"
+      if [[ "$reloc_count" != "5" ]]; then native_rc=11; fi
+    fi
+    echo "EDG_C_LITERAL_TYPEID_ELF_EXIT=$native_rc"
+    set +e
+    gcc -std=c11 -O0 -c "$literal_source" -o /audit-tmp/edg-static-literal-gcc.o &&
+      gcc -std=c11 -O0 -fno-pie -no-pie \
+        /audit-tmp/edg-static-literal-gcc.o "$literal_harness" \
+        -o /audit-tmp/edg-static-literal-gcc-exe &&
+      /audit-tmp/edg-static-literal-gcc-exe \
+        > /audit-tmp/edg-static-literal-gcc.out
+    gcc_oracle_rc=$?
+    if (( native_rc == 0 )); then
+      gcc -std=c11 -O0 -fno-pie -no-pie \
+        /audit-tmp/edg-static-literal-native.o "$literal_harness" \
+        -o /audit-tmp/edg-static-literal-native-exe &&
+        /audit-tmp/edg-static-literal-native-exe \
+          > /audit-tmp/edg-static-literal-native.out &&
+        cmp /audit-tmp/edg-static-literal-gcc.out \
+            /audit-tmp/edg-static-literal-native.out
+      native_oracle_rc=$?
+    else
+      native_oracle_rc=11
+    fi
+    set -e
+    echo "EDG_C_LITERAL_GCC_ELF_ORACLE_EXIT=$gcc_oracle_rc"
+    echo "EDG_C_LITERAL_NATIVE_ELF_ORACLE_EXIT=$native_oracle_rc"
+    if (( native_rc != 0 || gcc_oracle_rc != 0 || native_oracle_rc != 0 )); then
+      python3 - /audit-tmp/edg-static-literal-native.log <<'PY'
+from pathlib import Path
+import re,sys
+lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
+selected=[line for line in lines if "error[E" in line or "error:" in line or "rejected source" in line]
+for i,line in enumerate(selected[-8:],1):
+    msg=re.sub(r"/workspace/[^ :]+","<public-path>",line.strip())
+    msg=re.sub(r"[^A-Za-z0-9 _./:><()\[\],=-]","?",msg)
+    print(f"EDG_C_LITERAL_NATIVE_DIAG_{i}={msg[:230]}")
+PY
+    fi
+  else
+    echo "EDG_C_LITERAL_TYPEID_ELF_EXIT=skipped_no_compiler"
+    echo "EDG_C_LITERAL_GCC_ELF_ORACLE_EXIT=skipped_no_compiler"
+    echo "EDG_C_LITERAL_NATIVE_ELF_ORACLE_EXIT=skipped_no_compiler"
   fi
 fi
 
