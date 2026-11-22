@@ -18,6 +18,9 @@ on:
         required: false
         default: false
         type: boolean
+  pull_request:
+    paths:
+      - '.github/workflows/verify-mini-c-differential.yml'
   schedule:
     - cron: '4,19,34,49 * * * *'
   push:
@@ -34,6 +37,7 @@ concurrency:
 
 jobs:
   differential:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -134,3 +138,55 @@ jobs:
             ${{ runner.temp }}/mini-c-failures/
           if-no-files-found: ignore
           retention-days: 14
+
+  # Temporary source-pinned modern x86 TypeId aggregate transport gate.
+  typeid-integer-abi:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out exact compiler aggregate bridge
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 0d7e4f9db6d75c024628b6393745024630af4344
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and isolate backend crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 0d7e4f9db6d75c024628b6393745024630af4344
+          test -s compiler/crates/backend-x86/src/typeid_integer_abi.rs
+          mkdir -p "$RUNNER_TEMP/abi-test/crates"
+          for crate in ir backend opt backend-x86 backend-aarch64; do
+            cp -a "compiler/crates/$crate" "$RUNNER_TEMP/abi-test/crates/$crate"
+          done
+          cat > "$RUNNER_TEMP/abi-test/Cargo.toml" <<'TOML'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/opt", "crates/backend-x86", "crates/backend-aarch64"]
+          TOML
+      - name: Build and test grouped integer ABI bridge
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 20m cargo test --manifest-path "$RUNNER_TEMP/abi-test/Cargo.toml" \
+            -p compiler-backend-x86 --lib typeid_integer_abi::tests \
+            2>&1 | tee "$RUNNER_TEMP/typeid-abi-tests.log"
+          grep -Eq 'test result: ok. [1-9][0-9]* passed' "$RUNNER_TEMP/typeid-abi-tests.log"
+      - name: Strict x86 backend clippy
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 6m cargo clippy --manifest-path "$RUNNER_TEMP/abi-test/Cargo.toml" \
+            -p compiler-backend-x86 --lib -- -D warnings
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: typeid-integer-abi-2764-failure
+          path: ${{ runner.temp }}/typeid-abi-tests.log
+          if-no-files-found: ignore
+          retention-days: 7
