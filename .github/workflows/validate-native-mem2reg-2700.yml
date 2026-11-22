@@ -1,0 +1,55 @@
+name: Validate native mem2reg execution migration PR2700
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/validate-native-mem2reg-2700.yml'
+permissions:
+  contents: read
+jobs:
+  native-mem2reg:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SOURCE_SHA: fca481c70b3d1ea2f995fea7132a4f274ff59ed7
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact SHA and isolate core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: mem2reg-native-2700
+      - name: Production IR inventory and no legacy bridge
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          ! grep -qE 'typeid_executable_fixture|typed_fixture|from_legacy|fn sum_loop|fn mixed_array|fn chained_locals_native' crates/opt/tests/mem2reg_native.rs
+          python3 tools/ir_consumer_inventory.py --check-production
+      - name: Compile optimizer and backend
+        working-directory: compiler
+        run: |
+          cargo check -p compiler-opt --lib --test mem2reg_native
+          cargo check -p compiler-backend-x86 --lib
+      - name: Test native TypeId mem2reg GAS, ELF, and historical regression
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test mem2reg_native -- --nocapture
+          cargo test -p compiler-opt --test typed_mem2reg -- --nocapture
