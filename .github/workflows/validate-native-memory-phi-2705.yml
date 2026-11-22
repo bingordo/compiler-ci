@@ -1,0 +1,53 @@
+name: Validate native memory PHI execution PR2705
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/validate-native-memory-phi-2705.yml'
+permissions:
+  contents: read
+jobs:
+  memory-phi:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      SOURCE_SHA: 5099f44212ac672146c3c82d931446e94e8e5ef7
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and isolate native core
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: native-memory-phi-2705
+      - name: Verify production IR boundary and native-only fixture
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          ! grep -qE 'typeid_executable_fixture|typed_fixture|from_legacy|typed_memory_diamond' crates/opt/tests/memory_native.rs
+          python3 tools/ir_consumer_inventory.py --check-production
+      - name: Compile optimizer, x86 and native memory test
+        working-directory: compiler
+        run: |
+          cargo check -p compiler-opt --lib --test memory_native
+          cargo check -p compiler-backend-x86 --lib
+      - name: Compare pointer PHI memory execution in GAS and direct ELF with C
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test memory_native -- --nocapture
