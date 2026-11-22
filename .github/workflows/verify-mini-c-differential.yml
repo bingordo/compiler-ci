@@ -18,6 +18,9 @@ on:
         required: false
         default: false
         type: boolean
+  pull_request:
+    paths:
+      - '.github/workflows/verify-mini-c-differential.yml'
   schedule:
     - cron: '4,19,34,49 * * * *'
   push:
@@ -34,6 +37,7 @@ concurrency:
 
 jobs:
   differential:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -132,5 +136,91 @@ jobs:
             ${{ runner.temp }}/mini-c-build.log
             ${{ runner.temp }}/mini-c-differential.log
             ${{ runner.temp }}/mini-c-failures/
+          if-no-files-found: ignore
+          retention-days: 14
+
+
+  # Temporary PR-only parity validation. Reuses this existing compiler-ci
+  # workflow, leaving the scheduled production differential gate unchanged.
+  three-way-parity:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Check out exact compiler PR #2707 candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 762cd4cd652086a9aa8b6f20d890243c43d617f3
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler SHA and pinned shared Mini-C frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 762cd4cd652086a9aa8b6f20d890243c43d617f3
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          text=Path("compiler/tools/mini-c-driver/Cargo.toml").read_text()
+          pins=re.findall(r'mini-c-(?:syntax|sema)\s*=\s*\{[^\n]*?rev\s*=\s*"([0-9a-f]{40})"', text)
+          assert pins == ["fc00071cf3a386ffbcf52ba9409602d365f5bc59"]*2, pins
+          manifest=Path("compiler/tools/mini-c-driver/Cargo.toml")
+          manifest.write_text(text.replace("ssh://git@github.com/bingordo/mini-c.git",
+                                          "https://github.com/bingordo/mini-c.git"))
+          PY
+      - name: Check out Mini-C at the same TypeId source pin
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: fc00071cf3a386ffbcf52ba9409602d365f5bc59
+          path: mini-c
+          persist-credentials: false
+      - name: Prove pinned Mini-C checkout identity
+        run: test "$(git -C mini-c rev-parse HEAD)" = fc00071cf3a386ffbcf52ba9409602d365f5bc59
+      - name: Cache independent compiler build dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: three-way-typeid-2707
+          cache-workspace-crates: 'true'
+      - name: Build production TypeId compiler-mini-c
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 14m cargo build --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+          test -x compiler/tools/mini-c-driver/target/debug/compiler-mini-c
+      - name: Cache independent Cranelift build dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mini-c -> target
+          key: three-way-cranelift-2707
+          cache-workspace-crates: 'true'
+      - name: Build standalone Mini-C Cranelift binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 14m cargo build --manifest-path mini-c/Cargo.toml -p mini-c-cranelift --features internal-cpp
+          test -x mini-c/target/debug/mini-c-cranelift
+      - name: Compare 29 identical C programs across GCC Cranelift and TypeId
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 9m python3 compiler/tools/mini-c-driver/tests/three_way_parity.py \
+            --typeid compiler/tools/mini-c-driver/target/debug/compiler-mini-c \
+            --cranelift mini-c/target/debug/mini-c-cranelift \
+            --cranelift-source-root mini-c --suite all \
+            --artifacts "$RUNNER_TEMP/three-way-mini-c-parity" \
+            --timeout 20 | tee "$RUNNER_TEMP/three-way-mini-c-summary.log"
+          grep -q '^PARITY_SUMMARY ' "$RUNNER_TEMP/three-way-mini-c-summary.log"
+      - name: Preserve mismatches and source diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: three-way-mini-c-parity-reproducers
+          path: |
+            ${{ runner.temp }}/three-way-mini-c-parity/
+            ${{ runner.temp }}/three-way-mini-c-summary.log
           if-no-files-found: ignore
           retention-days: 14
