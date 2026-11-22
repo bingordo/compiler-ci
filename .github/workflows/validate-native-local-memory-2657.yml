@@ -1,0 +1,55 @@
+# One-shot, exact-source native IR migration acceptance for compiler PR #2657.
+name: Validate native local-memory TypeId fixture migration PR2657
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/validate-native-local-memory-2657.yml'
+permissions:
+  contents: read
+jobs:
+  local-memory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      SOURCE_SHA: 12cc7d5544bd1927bb2417f3cf70523062428890
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify revision and isolate native workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: native-local-memory-2657
+      - name: Assert native fixture consumer no longer converts legacy Function
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          ! grep -q 'typeid_executable_fixture\|typed_fixture\|from_legacy' crates/opt/tests/local_memory_native.rs
+          python3 tools/ir_consumer_inventory.py --check-production
+      - name: Compile optimized TypeId and x86 backend
+        working-directory: compiler
+        run: |
+          cargo check -p compiler-opt --lib --bin ir-opt --test local_memory_native
+          cargo check -p compiler-backend-x86 --lib
+      - name: Validate native fixture execution with independent GAS and ELF oracle
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test local_memory_native -- --nocapture
