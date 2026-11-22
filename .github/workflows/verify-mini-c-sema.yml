@@ -1,0 +1,70 @@
+name: Mini-C semantic regression at exact source SHA
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/verify-mini-c-sema.yml'
+  pull_request:
+    paths:
+      - '.github/workflows/verify-mini-c-sema.yml'
+  workflow_dispatch:
+    inputs:
+      mini_c_sha:
+        description: 'Full 40-character Mini-C commit SHA to validate'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mini-c-sema-${{ inputs.mini_c_sha || '2d16b6de72d0045ea1da6841dd32abd318f87387' }}
+  cancel-in-progress: false
+
+jobs:
+  sema:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Validate requested immutable revision
+        shell: bash
+        env:
+          MINI_C_SHA: ${{ inputs.mini_c_sha || '2d16b6de72d0045ea1da6841dd32abd318f87387' }}
+        run: |
+          set -euo pipefail
+          [[ "$MINI_C_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "Expected a full lowercase Mini-C commit SHA" >&2
+            exit 1
+          }
+      - name: Checkout exact Mini-C source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: ${{ inputs.mini_c_sha || '2d16b6de72d0045ea1da6841dd32abd318f87387' }}
+          path: mini-c
+          persist-credentials: false
+      - name: Confirm exact checkout
+        shell: bash
+        env:
+          MINI_C_SHA: ${{ inputs.mini_c_sha || '2d16b6de72d0045ea1da6841dd32abd318f87387' }}
+        run: |
+          set -euo pipefail
+          test "$(git -C mini-c rev-parse HEAD)" = "$MINI_C_SHA"
+          echo "Mini-C SHA: $MINI_C_SHA" >> "$GITHUB_STEP_SUMMARY"
+      - name: Rust toolchain
+        run: rustc --version && cargo --version
+      - name: Run checked C semantic tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path mini-c/Cargo.toml -p mini-c-sema --lib 2>&1 | tee "$RUNNER_TEMP/mini-c-sema-tests.log"
+          echo "Mini-C semantic tests passed" >> "$GITHUB_STEP_SUMMARY"
+      - name: Save diagnostic log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mini-c-sema-failure
+          path: ${{ runner.temp }}/mini-c-sema-tests.log
+          if-no-files-found: ignore
+          retention-days: 14
