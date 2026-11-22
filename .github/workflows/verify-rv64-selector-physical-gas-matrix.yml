@@ -1,0 +1,62 @@
+# Source-pinned full reviewed RV64 selector rule -> real physical ELF/GNU-as check.
+# Heavy Rust/QEMU infrastructure runs in compiler-ci, never compiler main.
+name: RV64 source selector physical ELF GNU-as matrix
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-rv64-selector-physical-gas-matrix.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source-physical:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out exact compiler source candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: dd6edef8a648e251a0cc53c1065155229b57432f
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact source revision
+        run: test "$(git -C compiler rev-parse HEAD)" = "dd6edef8a648e251a0cc53c1065155229b57432f"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install independent RISC-V assembler and objcopy
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y binutils-riscv64-linux-gnu
+      - name: Restrict build to frontend-independent TypeId native backend
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-riscv64"]
+          EOF
+          rm -f Cargo.lock
+      - name: Validate source admission and selector/encoding Rust parity
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/tools"
+          python3 -m py_compile tools/riscv_selector_physical_gas_oracle.py tools/test_riscv_selector_physical_gas_oracle.py
+          python3 -m unittest tools/test_riscv_selector_physical_gas_oracle.py -v
+          python3 -m unittest discover -s tools -p 'test_riscv_native_selector_rules.py' -v
+          python3 tools/regen_riscv_native_selector_rules.py --check
+          python3 tools/riscv_udb_rust_leaf_forms.py --catalog data/riscv_udb_r0_catalog.json --output crates/backend-riscv64/src/generated_encoding.rs --check
+      - name: Build real TypeId selector and run existing Rust backend tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo build -p compiler-backend-riscv64 --example rv64_leaf
+          cargo test -p compiler-backend-riscv64 --all-targets
+      - name: Compare every reviewed selector rule and cast fixture's actual ELF against GNU as
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/tools"
+          python3 tools/riscv_selector_physical_gas_oracle.py \
+            --example-binary target/debug/examples/rv64_leaf
