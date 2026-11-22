@@ -1,0 +1,53 @@
+name: Validate native CT03 two-edit PRE migration PR2725
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/validate-native-ct03-2725.yml'
+permissions:
+  contents: read
+jobs:
+  native-ct03:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SOURCE_SHA: 36364d4240e3328fd74b0be6a38194e695ab4b29
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and isolate native workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: native-ct03-2725
+      - name: Assert native test fixture and IR boundaries
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          ! grep -qE 'typeid_executable_fixture|typed_fixture|from_legacy|native_i32' crates/opt/tests/ct03_multi_edit_native.rs
+          python3 tools/ir_consumer_inventory.py --check-production
+      - name: Compile optimizer native CT03 and x86
+        working-directory: compiler
+        run: |
+          cargo check -p compiler-opt --lib --test ct03_multi_edit_native
+          cargo check -p compiler-backend-x86 --lib
+      - name: Validate two critical-edge splits and GAS ELF execution versus C
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test ct03_multi_edit_native -- --nocapture
