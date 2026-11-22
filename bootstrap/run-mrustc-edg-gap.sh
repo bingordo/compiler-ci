@@ -200,17 +200,23 @@ fi
 # supplied to this check.
 if [[ "${EDG_LITERAL_REGRESSION:-0}" == "1" ]]; then
   candidate_sha=54cfe82a80c4b45f4deebd3b29f6ea9cde55edca
-  git -C /workspace/compiler fetch --quiet --no-tags --depth=1 origin "$candidate_sha"
-  git -C /workspace/compiler worktree add --quiet --detach \
-    /workspace/compiler-literal-candidate "$candidate_sha"
-  test "$(git -C /workspace/compiler-literal-candidate rev-parse HEAD)" = "$candidate_sha"
+  test "$(git -C /workspace/compiler-literal-source rev-parse HEAD)" = "$candidate_sha"
+  # Actions checkout is mounted read-only. Make a disposable compilation
+  # copy in the private runner temp so Cargo can update its local lockfile.
+  mkdir -p /audit-tmp/compiler-literal-candidate
+  tar -C /workspace/compiler-literal-source --exclude=.git -cf - . |
+    tar -C /audit-tmp/compiler-literal-candidate -xf -
+  # The exact immutable bridge is already checked out and built locally.
+  # Resolve it through Cargo's source patch rather than trying to git-fetch
+  # from the isolated CI Docker container.
+  edg_patch='patch."https://github.com/bingordo/edgcpp-rust.git".edgcpp.path="/workspace/edgcpp-rust"'
   echo "EDG_C_LITERAL_TYPEID_CANDIDATE_SHA=$candidate_sha"
   set +e
   (
     cd /workspace/edgcpp/build/gcc-release
     CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
-      timeout --signal=TERM --kill-after=10s 12m cargo check --quiet \
-      --manifest-path /workspace/compiler-literal-candidate/tools/edg-driver/Cargo.toml
+      timeout --signal=TERM --kill-after=10s 12m cargo --config "$edg_patch" check --quiet \
+      --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml
   ) > /audit-tmp/edg-typeid-literal-candidate-check.log 2>&1
   typeid_check_rc=$?
   set -e
@@ -232,15 +238,15 @@ PY
   # These two original C11 source files are public, checked-in compiler
   # fixtures and do not depend on/print the private generated mrustc TU.
   if (( typeid_check_rc == 0 )); then
-    literal_source=/workspace/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_literal_union_elf.c
-    literal_harness=/workspace/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_literal_union_elf_harness.c
+    literal_source=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_literal_union_elf.c
+    literal_harness=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_literal_union_elf_harness.c
     test -s "$literal_source" && test -s "$literal_harness"
     set +e
     (
       cd /workspace/edgcpp/build/gcc-release
       CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
-        timeout --signal=TERM --kill-after=10s 8m cargo run --quiet \
-        --manifest-path /workspace/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
+        timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" run --quiet \
+        --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
         -- /audit-tmp/edg-static-literal-native.o --gcc --c11 \
         --no_strict_gnu --gnu_version "$gnu_number" "$literal_source"
     ) > /audit-tmp/edg-static-literal-native.log 2>&1
