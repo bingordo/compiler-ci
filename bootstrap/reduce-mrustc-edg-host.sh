@@ -51,13 +51,37 @@ parts=[int(s) for s in sys.argv[1].split(".")]
 print(parts[0]*10000 + (parts[1] if len(parts)>1 else 0)*100 + (parts[2] if len(parts)>2 else 0))
 PY
 )"
-docker exec "$EDG_CREDUCE_DOCKER_CONTAINER" bash -c \
-  'gcc -E -x c /dev/null -v 2>&1 |
-   awk "/#include <...> search starts here:/{active=1;next} /^End of search list/{active=0} active && /^ /{sub(/^[[:space:]]+/, \"\");print}"' \
-  > "$work/fedora-includes.txt"
-sed -e '/^$/d' -e 's/^/-I/' "$work/fedora-includes.txt" > "$EDG_CREDUCE_INCLUDE_LIST"
-echo "-I$EDG_SOURCE_INCLUDE" >> "$EDG_CREDUCE_INCLUDE_LIST"
+# Mirror the actual working EDG audit: run Fedora GCC's verbose header
+# discovery and parse its merged output on the Ubuntu host. The old nested
+# awk command incorrectly escaped quotes and silently omitted include paths.
+docker exec "$EDG_CREDUCE_DOCKER_CONTAINER" \
+  gcc -E -x c /dev/null -v > "$work/gcc-include-search.log" 2>&1
+python3 - "$work/gcc-include-search.log" "$EDG_CREDUCE_INCLUDE_LIST" <<'PY'
+from pathlib import Path
+import sys
+lines = Path(sys.argv[1]).read_text(errors="replace").splitlines()
+active = False
+paths = []
+for line in lines:
+    if "#include <...> search starts here:" in line:
+        active = True
+        continue
+    if "End of search list" in line:
+        active = False
+    if active and line.startswith(" "):
+        entry = line.strip()
+        if entry and not entry.endswith("(framework directory)"):
+            paths.append(entry)
+assert paths, "Could not discover system GCC include directories"
+Path(sys.argv[2]).write_text("".join("-I" + path + "\n" for path in paths))
+print("EDG_CREDUCE_INCLUDE_COUNT=" + str(len(paths)))
+PY
 echo "EDG_CREDUCE_INPUT_BYTES=$original_bytes"
+# Apply the same GCC include flags for the baseline and each reducer run.
+baseline_args=()
+while IFS= read -r arg; do
+  [[ -n "$arg" ]] && baseline_args+=("$arg")
+done < "$EDG_CREDUCE_INCLUDE_LIST"
 # Check whether moving the TU to C-Reduce's temporary directory changes
 # the failure. Keep raw source diagnostics runner-local.
 set +e
@@ -66,8 +90,8 @@ docker exec -w /workspace/edgcpp/build/gcc-release "$EDG_CREDUCE_DOCKER_CONTAINE
     ulimit -c 0
     source ./environment.sh
     timeout --signal=TERM --kill-after=3s 15s "$1" \
-      --gcc --c11 --no_strict_gnu --gnu_version "$2" "$3"
-  ' bash "$EDG_CREDUCE_PARSER" "$EDG_CREDUCE_GNU" "$source_container" \
+      --gcc --c11 --no_strict_gnu --gnu_version "$2" "${@:4}" "$3"
+  ' bash "$EDG_CREDUCE_PARSER" "$EDG_CREDUCE_GNU" "$source_container" "${baseline_args[@]}" \
   > "$work/original-direct.log" 2>&1
 original_rc=$?
 set -e
