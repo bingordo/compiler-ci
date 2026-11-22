@@ -105,16 +105,26 @@ set -uo pipefail
 candidate="$PWD/reduced.c"
 test -s "$candidate" || exit 1
 case "$candidate" in "$RUNNER_TEMP"/*) : ;; *) exit 1 ;; esac
-# Reproduce the source path from the original crashing EDG audit. In this
-# source-generated TU, moving the file to /audit-tmp changes the result.
-# C-Reduce is deliberately single-worker to prevent candidate copy races.
-cp "$candidate" "$EDG_CREDUCE_ORIGINAL_HOST" || exit 1
-container_candidate="$EDG_CREDUCE_ORIGINAL_CONTAINER"
+# Prefer standalone candidates outside /workspace. Use the generated path
+# only if the exact original cannot reproduce when relocated. For generated
+# path mode use one worker, preventing competing candidates overwriting C.
+if [[ "$EDG_CREDUCE_MODE" == "relocated" ]]; then
+  container_candidate="/audit-tmp/${candidate#"$RUNNER_TEMP"/}"
+else
+  cp "$candidate" "$EDG_CREDUCE_ORIGINAL_HOST" || exit 1
+  container_candidate="$EDG_CREDUCE_ORIGINAL_CONTAINER"
+fi
 args=()
 while IFS= read -r line; do
   [[ -n "$line" ]] && args+=("$line")
 done < "$EDG_CREDUCE_INCLUDE_LIST"
-# Direct parser gate: reject source errors cheaply before spawning GDB.
+# A genuine upstream GCC reproducer must remain a valid GNU C TU.
+# Reject invalid reductions BEFORE running the expensive EDG/GDB predicate.
+docker exec "$EDG_CREDUCE_DOCKER_CONTAINER" \
+  timeout --signal=TERM --kill-after=3s 15s \
+  gcc -std=gnu11 -fsyntax-only "$container_candidate" \
+  > "$PWD/interesting-gcc.log" 2>&1 || exit 1
+# Direct parser gate: reject non-crashes cheaply before spawning GDB.
 set +e
 docker exec -w /workspace/edgcpp/build/gcc-release "$EDG_CREDUCE_DOCKER_CONTAINER" \
   bash -c '
@@ -147,6 +157,18 @@ grep -Eq '^#0[[:space:]]+.*edg::plain_cpp_record' "$PWD/interesting-gdb.log"
 TEST
 chmod 700 "$work/interesting.sh"
 
+# Probe the byte-identical input from an independent directory FIRST:
+# this proves the failure does not require mrustc-generated paths or includes.
+export EDG_CREDUCE_MODE=relocated
+if (cd "$work" && ./interesting.sh); then
+  echo "EDG_CREDUCE_INITIAL_RELOCATED=yes"
+  creduce_workers=2
+else
+  echo "EDG_CREDUCE_INITIAL_RELOCATED=no"
+  export EDG_CREDUCE_MODE=original_path
+  creduce_workers=1
+fi
+echo "EDG_CREDUCE_WORKERS=$creduce_workers"
 if ! (cd "$work" && ./interesting.sh); then
   echo "EDG_CREDUCE_STATUS=baseline_not_same_crash"
   if [[ -s "$work/interesting-direct.rc" ]]; then
@@ -172,10 +194,10 @@ set +e
 (
   cd "$work"
   export TMPDIR="$RUNNER_TEMP/edg-creduce-temporary"
-  # Single-worker preserves the exact generated pathname without races.
-  # C-Reduce cannot exceed the requested wall-clock budget.
-  timeout --signal=TERM --kill-after=10s 12m \
-    creduce --n 1 --timeout 30 ./interesting.sh reduced.c
+  # Relocated mode may use two independent workers; generated-path mode
+  # stays single-worker to avoid candidate races.
+  timeout --signal=TERM --kill-after=10s 27m \
+    creduce --n "$creduce_workers" --timeout 30 ./interesting.sh reduced.c
 ) > "$work/creduce.log" 2>&1
 reduce_rc=$?
 set -e
@@ -185,14 +207,26 @@ if (cd "$work" && ./interesting.sh); then
   echo "EDG_CREDUCE_EXIT=$reduce_rc"
   echo "EDG_CREDUCE_OUTPUT_BYTES=$bytes"
   echo "EDG_CREDUCE_SHA256=$(sha256sum "$work/reduced.c" | cut -d' ' -f1)"
-  if (( bytes <= 8192 )); then
-    # User explicitly requested a small issue reproducer. A bounded source
-    # preview permits human review before posting to public GitHub issue.
-    echo "EDG_CREDUCE_TESTCASE_BEGIN"
-    cat "$work/reduced.c"
-    echo "EDG_CREDUCE_TESTCASE_END"
+  # Final acceptance is deliberately STRICTER than the reduction itself:
+  # re-test the candidate from an unrelated directory, using only the
+  # distribution GCC include paths and the pinned EDG bridge. Never publish
+  # a path-dependent source as an upstream reproducer.
+  export EDG_CREDUCE_MODE=relocated
+  if (cd "$work" && ./interesting.sh); then
+    echo "EDG_CREDUCE_INDEPENDENT_REPRODUCER=yes"
+    if (( bytes <= 32768 )); then
+      mkdir -p "$RUNNER_TEMP/edg-creduce-verified"
+      cp "$work/reduced.c" "$RUNNER_TEMP/edg-creduce-verified/reproducer.c"
+      echo "EDG_CREDUCE_VERIFIED_ARTIFACT=yes"
+      if (( bytes <= 8192 )); then
+        echo "EDG_CREDUCE_TESTCASE_BEGIN"
+        cat "$work/reduced.c"
+        echo "EDG_CREDUCE_TESTCASE_END"
+      fi
+    fi
   else
-    echo "EDG_CREDUCE_TESTCASE_STATUS=too_large_for_issue"
+    echo "EDG_CREDUCE_INDEPENDENT_REPRODUCER=no"
+    echo "EDG_CREDUCE_TESTCASE_STATUS=not_standalone_yet"
   fi
 else
   echo "EDG_CREDUCE_STATUS=final_candidate_not_interesting"
