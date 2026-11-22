@@ -194,6 +194,42 @@ PY
   fi
 fi
 
+# Source-pinned TypeId consumer compile check, deliberately separate from
+# production compiler checkout. The candidate shares the same checked EDG
+# dependency as the public producer. No source from the private mrustc TU is
+# supplied to this check.
+if [[ "${EDG_LITERAL_REGRESSION:-0}" == "1" ]]; then
+  candidate_sha=388a9e8a02a5322fc1de690d6840c1a7ce9efadd
+  git -C /workspace/compiler fetch --quiet --no-tags --depth=1 origin "$candidate_sha"
+  git -C /workspace/compiler worktree add --quiet --detach \
+    /workspace/compiler-literal-candidate "$candidate_sha"
+  test "$(git -C /workspace/compiler-literal-candidate rev-parse HEAD)" = "$candidate_sha"
+  echo "EDG_C_LITERAL_TYPEID_CANDIDATE_SHA=$candidate_sha"
+  set +e
+  (
+    cd /workspace/edgcpp/build/gcc-release
+    CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+      timeout --signal=TERM --kill-after=10s 12m cargo check --quiet \
+      --manifest-path /workspace/compiler-literal-candidate/tools/edg-driver/Cargo.toml
+  ) > /audit-tmp/edg-typeid-literal-candidate-check.log 2>&1
+  typeid_check_rc=$?
+  set -e
+  echo "EDG_C_LITERAL_TYPEID_CHECK_EXIT=$typeid_check_rc"
+  if (( typeid_check_rc != 0 )); then
+    python3 - /audit-tmp/edg-typeid-literal-candidate-check.log <<'PY'
+from pathlib import Path
+import re,sys
+lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
+selected=[line for line in lines if
+          "error[E" in line or "error:" in line or "warning:" in line]
+for i,line in enumerate(selected[-12:],1):
+    msg=re.sub(r"/workspace/[^ :]+","<public-path>",line.strip())
+    msg=re.sub(r"[^A-Za-z0-9 _./:><()\[\],=-]","?",msg)
+    print(f"EDG_C_LITERAL_TYPEID_DIAG_{i}={msg[:230]}")
+PY
+  fi
+fi
+
 # Baseline: these public C fixtures independently isolate GNU layout,
 # linkage, calling-convention, and naked attributes. GCC is the dialect
 # oracle; EDG acceptance is a different, parser-only result.
