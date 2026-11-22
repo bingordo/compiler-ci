@@ -86,8 +86,26 @@ if [[ "${EDG_C_RECORD_REGRESSION:-0}" == "1" ]]; then
   set -e
   echo "EDG_BRIDGE_C_RECORD_TEST_EXIT=$test_rc"
   if (( test_rc != 0 )); then
-    # Fixtures are public; bounded test failure details are safe to print.
-    tail -n 36 /audit-tmp/edg-bridge-c-record-regression.log
+    # Emit ONLY bounded public-test error messages in a stable structured
+    # summary that survives the surrounding workflow's tail/log filtering.
+    python3 - /audit-tmp/edg-bridge-c-record-regression.log <<'PY'
+from pathlib import Path
+import re
+import sys
+lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
+interesting=[]
+for line in lines:
+    if any(p in line for p in (
+        "panicked at", "FAILED", "test result:", "assertion",
+        "C external", "C++ external", "C++ record", "C records",
+        "C aggregate", "EDG must", "bridge must", "symbol",
+        "error[E", "error:")):
+        msg=re.sub(r"/workspace/[^ :]+", "<fixture>", line.strip())
+        if len(msg)>280: msg=msg[:280]
+        interesting.append(msg)
+for i,msg in enumerate(interesting[-14:],1):
+    print(f"EDG_BRIDGE_C_RECORD_TEST_DIAG_{i}={msg}")
+PY
   fi
 fi
 
