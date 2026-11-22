@@ -1,0 +1,65 @@
+name: ASM1-D7 pinned section fill class GNU as differential
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-asm1-d7-data-fill-class.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: asm1-d7-fill-class
+  cancel-in-progress: true
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7a2aaba1137d61d63e6fd548802db248f0f5b820
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - name: Pin exact source and GAS tools
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = '7a2aaba1137d61d63e6fd548802db248f0f5b820'
+          as --version
+          objcopy --version
+          readelf --version
+      - name: Isolate shared Rust core from unrelated frontend dependencies
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: asm1-d7-main-fill-class
+      - name: Run generated directive and independent GNU as byte differential
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test att_fill_bytes -- --nocapture
+      - name: Run existing section and relocation regression families
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for test in att_module att_module_strings att_section_cursor att_data_differences att_mid_labels att_aliases att_unowned_symbols att_text_alignment att_asm; do
+            cargo test -p compiler-backend-x86 --test "$test" -- --nocapture
+          done
+      - name: Check shared x86 library and strict Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib
+          cargo clippy -p compiler-backend-x86 --lib -- -D warnings
+          cargo clippy -p compiler-backend-x86 --test att_fill_bytes -- -D warnings
+          echo 'ASM1-D7=PASS; shared fill directives, generated section matrix, GNU as parity' >> "$GITHUB_STEP_SUMMARY"
