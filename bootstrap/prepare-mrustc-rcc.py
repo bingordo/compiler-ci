@@ -97,7 +97,7 @@ for name in mapped:
             assert field in packages, (name, field)
             out.append(f"{field} = {toml_value(packages[field])}\n")
             continue
-        dep = re.fullmatch(r"([A-Za-z_-]+)\s*=\s*\\{.*workspace\s*=\s*true.*\\}", stripped)
+        dep = re.fullmatch(r"([A-Za-z_-]+)\s*=\s*\{.*workspace\s*=\s*true.*\}", stripped)
         if dep and section in ("[dependencies]", "[dev-dependencies]", "[build-dependencies]"):
             dep_name = dep.group(1)
             from_manifest = original[section.strip("[]")][dep_name]
