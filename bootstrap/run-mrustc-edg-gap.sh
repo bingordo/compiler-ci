@@ -394,6 +394,25 @@ fi
 # driver even if the real C parser rejected its larger workload.
 timeout --signal=TERM --kill-after=10s 20m cargo build --quiet \
   --manifest-path compiler/tools/edg-driver/Cargo.toml
+if [[ "${EDG_TYPEID_UNIT_REGRESSION:-0}" == "1" ]]; then
+  # Run only the new public, deterministic proof regression. Cargo can reuse
+  # the just-built EDG/native and compiler workspace artifacts.
+  set +e
+  timeout --signal=TERM --kill-after=10s 3m cargo test --quiet \
+    --manifest-path compiler/tools/edg-driver/Cargo.toml \
+    --bin compiler-edg-driver \
+    mixed_c_static_data_and_source_proven_external_imports_are_separate \
+    > /audit-tmp/edg-typeid-mixed-global-regression.log 2>&1
+  unit_rc=$?
+  set -e
+  echo "EDG_TYPEID_MIXED_GLOBAL_UNIT_EXIT=$unit_rc"
+  if (( unit_rc != 0 )); then
+    # This test contains public inline fixtures only, never generated input.
+    grep -E '^error|^test result:|^test .*FAILED|panicked at' \
+      /audit-tmp/edg-typeid-mixed-global-regression.log | tail -n 8 | \
+      sed 's/^/EDG_TYPEID_MIXED_GLOBAL_UNIT_DIAG=/' || true
+  fi
+fi
 native=/workspace/compiler/tools/edg-driver/target/debug/compiler-edg-driver
 test -x "$native"
 for kind in alignment linkage abi naked control_globals weak_function section_function control_asm aligned_global scalar_global weak_scalar_global; do
