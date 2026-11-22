@@ -173,6 +173,56 @@ probe_generated_c EDG_C_PARSE "$AUDIT_SOURCE" 90s /audit-tmp/edg-generated-c-par
 # Preserve the SMALL source's result for its own native TypeId gate.
 parse_rc=$last_generated_c_probe_rc
 
+# Independent upstream frontend control: build EDG's normal `cpfe`
+# executable from the same pinned upstream sources as the callable library.
+# Unlike the Rust/C++ callback bridge, this runs EDG's own source frontend
+# with --no_code_gen, so a successful parse distinguishes a bridge crash
+# from a native EDG parsing failure.
+# Opt-in here: routine bootstrap audits must not build a second frontend.
+if [[ "${EDG_UPSTREAM_CHECK:-0}" == "1" ]]; then
+  echo "EDG_UPSTREAM_REVISION=$EDGCPP_EDG_REVISION"
+  echo "EDG_UPSTREAM_INPUT_BYTES=$(stat -c %s "$AUDIT_SOURCE")"
+  echo "EDG_UPSTREAM_INPUT_SHA256=$(sha256sum "$AUDIT_SOURCE" | cut -d' ' -f1)"
+  upstream=/workspace/edgcpp/build/gcc-release/bin/cpfe
+  set +e
+  timeout --signal=TERM --kill-after=10s 14m \
+    cmake --build /workspace/edgcpp/build/gcc-release --target cpfe --parallel 2 \
+    > /audit-tmp/edg-upstream-build.log 2>&1
+  build_rc=$?
+  set -e
+  echo "EDG_UPSTREAM_BUILD_EXIT=$build_rc"
+  if (( build_rc == 0 )) && [[ -x "$upstream" ]]; then
+    # A public fixture proves this separate executable was configured
+    # correctly before attributing any real input failure to upstream EDG.
+    for kind in control real; do
+      if [[ "$kind" == "control" ]]; then
+        input=/workspace/bootstrap/fixtures/edg-gnu-attributes/alignment.c
+      else
+        input="$AUDIT_SOURCE"
+      fi
+      set +e
+      (
+        cd /workspace/edgcpp/build/gcc-release
+        ulimit -c 0
+        timeout --signal=TERM --kill-after=10s 120s \
+          "$upstream" --gcc --c11 --no_strict_gnu \
+          --gnu_version "$gnu_number" --no_code_gen \
+          "${include_args[@]}" "$input"
+      ) > "/audit-tmp/edg-upstream-$kind.log" 2>&1
+      upstream_rc=$?
+      set -e
+      if [[ "$kind" == "real" ]]; then
+        echo "EDG_UPSTREAM_REAL_C_EXIT=$upstream_rc"
+      else
+        echo "EDG_UPSTREAM_CONTROL_EXIT=$upstream_rc"
+      fi
+    done
+    echo "EDG_UPSTREAM_COMPARISON_BRIDGE_EXIT=$parse_rc"
+  else
+    echo "EDG_UPSTREAM_RESULT=not_tested_frontend_build_failed"
+  fi
+fi
+
 # Debug native SIGSEGV on the smallest real mrustc C input; a Rust panic
 # backtrace cannot diagnose EDG's C++/FFI segfault.
 # This expensive diagnostic is enabled only by this PR/manual opt-in;
