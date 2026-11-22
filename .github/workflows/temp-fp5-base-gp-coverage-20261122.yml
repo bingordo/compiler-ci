@@ -1,0 +1,84 @@
+# Temporary baseline evidence and independent lint, DO NOT MERGE TO CI MAIN.
+name: TEMP FP5 baseline GP historical coverage and strict FP Clippy
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temp-fp5-base-gp-coverage-20261122.yml'
+permissions:
+  contents: read
+jobs:
+  gp-base-reproduction:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 8379f3df74e30dac65abc2cfb77632b2b34ae3a1
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify original unmodified main SHA
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "8379f3df74e30dac65abc2cfb77632b2b34ae3a1"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Minimal original backend workspace
+        run: |
+          set -euo pipefail
+          mkdir -p base/crates
+          cp -a compiler/crates/ir compiler/crates/backend compiler/crates/backend-aarch64 base/crates/
+          cat > base/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/backend","crates/backend-aarch64"]
+          EOF
+      - name: Reproduce exact GP coverage assertion on unchanged main
+        working-directory: base
+        shell: bash
+        run: |
+          set -uo pipefail
+          cargo test -p compiler-backend-aarch64 --test generated_selector_coverage \
+            production_memory_and_control_cohorts_count_real_rules_and_non_scalar_work \
+            -- --exact --nocapture 2>&1 | tee baseline-gp.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -eq 0 ]; then
+            echo 'GP baseline PASSED; feature failure must be investigated separately' >&2
+            exit 1
+          fi
+          if ! grep -Fq 'historical_control_flow: unexpected post-fold machine SSA inflation' baseline-gp.log; then
+            echo 'GP baseline failed for a different reason, NOT reproduced' >&2
+            exit 1
+          fi
+          echo 'CONFIRMED: identical GP coverage failure exists on unmodified original main'
+  fp-clippy:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 651ef6e588b5805943d46fb1b0cdd186e46ef694
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact FP compiler source
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "651ef6e588b5805943d46fb1b0cdd186e46ef694"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Isolate backend workspace
+        run: |
+          mkdir -p fp/crates
+          cp -a compiler/crates/ir compiler/crates/backend compiler/crates/backend-aarch64 fp/crates/
+          cat > fp/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/backend","crates/backend-aarch64"]
+          EOF
+      - name: Strict production AArch64 library Clippy
+        working-directory: fp
+        run: cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
+      - name: Strict canonical TypeId FP tests Clippy
+        working-directory: fp
+        run: cargo clippy -p compiler-backend-aarch64 --test typeid_fp_native -- -D warnings
