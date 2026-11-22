@@ -270,17 +270,42 @@ PY
       /audit-tmp/edg-static-literal-gcc-exe \
         > /audit-tmp/edg-static-literal-gcc.out
     gcc_oracle_rc=$?
+    # The minimal EDG runner image may not have coreutils cmp. Keep
+    # link, execution and byte comparison as independent numeric oracles.
+    native_link_rc=11
+    native_run_rc=11
+    native_parity_rc=11
     if (( native_rc == 0 )); then
       gcc -std=c11 -O0 -fno-pie -no-pie \
         /audit-tmp/edg-static-literal-native.o "$literal_harness" \
-        -o /audit-tmp/edg-static-literal-native-exe &&
+        -o /audit-tmp/edg-static-literal-native-exe
+      native_link_rc=$?
+      if (( native_link_rc == 0 )); then
         /audit-tmp/edg-static-literal-native-exe \
-          > /audit-tmp/edg-static-literal-native.out &&
-        cmp /audit-tmp/edg-static-literal-gcc.out \
-            /audit-tmp/edg-static-literal-native.out
-      native_oracle_rc=$?
+          > /audit-tmp/edg-static-literal-native.out \
+          2> /audit-tmp/edg-static-literal-native.stderr
+        native_run_rc=$?
+        if (( native_run_rc == 0 && gcc_oracle_rc == 0 )); then
+          python3 - /audit-tmp/edg-static-literal-gcc.out \
+              /audit-tmp/edg-static-literal-native.out <<'PY'
+from pathlib import Path
+import sys
+expected=Path(sys.argv[1]).read_bytes()
+observed=Path(sys.argv[2]).read_bytes()
+if expected!=b"STATIC_LITERAL_ELF_PARITY_OK\\n" or observed!=expected:
+    raise SystemExit(1)
+PY
+          native_parity_rc=$?
+        fi
+      fi
+    fi
+    echo "EDG_C_LITERAL_NATIVE_LINK_EXIT=$native_link_rc"
+    echo "EDG_C_LITERAL_NATIVE_RUN_EXIT=$native_run_rc"
+    echo "EDG_C_LITERAL_NATIVE_PARITY_EXIT=$native_parity_rc"
+    if (( native_link_rc == 0 && native_run_rc == 0 && native_parity_rc == 0 )); then
+      native_oracle_rc=0
     else
-      native_oracle_rc=11
+      native_oracle_rc=1
     fi
     set -e
     echo "EDG_C_LITERAL_GCC_ELF_ORACLE_EXIT=$gcc_oracle_rc"
