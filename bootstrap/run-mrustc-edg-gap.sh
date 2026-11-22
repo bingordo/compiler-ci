@@ -34,6 +34,15 @@ assert re.fullmatch(r'[0-9a-f]{40}', sha)
 print(sha)
 PY
 )"
+# Opt-in diagnostic pin override for testing a bridge fix against the exact
+# same generated-C compiler revision. Normal production audit remains pinned
+# to the compiler driver dependency above.
+if [[ -n "${EDG_BRIDGE_OVERRIDE_SHA:-}" ]]; then
+  [[ "$EDG_BRIDGE_OVERRIDE_SHA" =~ ^[0-9a-f]{40}$ ]]
+  echo "EDG_C_SOURCE_BRIDGE_COMPILER_PIN=$EDG_BRIDGE_SHA"
+  EDG_BRIDGE_SHA="$EDG_BRIDGE_OVERRIDE_SHA"
+  echo "EDG_C_SOURCE_BRIDGE_TEST_OVERRIDE=yes"
+fi
 test "$(git -C edgcpp-rust rev-parse HEAD)" = "$EDG_BRIDGE_SHA"
 echo "EDG_C_SOURCE_BRIDGE_SHA=$EDG_BRIDGE_SHA"
 test -f "$AUDIT_SOURCE"
@@ -62,6 +71,25 @@ test -s build/prebuilt-edg/lib/libedgcpfe.a
 cp build/prebuilt-edg/lib/libedgcpfe.a build/gcc-release/lib/libedgcpfe.a
 source build/gcc-release/environment.sh
 cd /workspace
+
+# The candidate bridge must preserve both language modes. Run the new
+# integration tests against the already-prepared pinned upstream EDG archive.
+if [[ "${EDG_C_RECORD_REGRESSION:-0}" == "1" ]]; then
+  set +e
+  (
+    cd /workspace/edgcpp/build/gcc-release
+    timeout --signal=TERM --kill-after=10s 12m cargo test \
+      --manifest-path /workspace/edgcpp-rust/Cargo.toml \
+      --test c_record_proof_mode -- --nocapture
+  ) > /audit-tmp/edg-bridge-c-record-regression.log 2>&1
+  test_rc=$?
+  set -e
+  echo "EDG_BRIDGE_C_RECORD_TEST_EXIT=$test_rc"
+  if (( test_rc != 0 )); then
+    # Fixtures are public; bounded test failure details are safe to print.
+    tail -n 36 /audit-tmp/edg-bridge-c-record-regression.log
+  fi
+fi
 
 # Match the pinned EDG CI's GNU dialect configuration.
 version="$(gcc -dumpfullversion -dumpversion)"
