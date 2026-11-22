@@ -1,0 +1,56 @@
+# Exact-source validation isolated from active compiler migration workstreams.
+name: IR PR2785 native profiling and LICM stress
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ir-pr2785-native-stress-20261122.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-stress:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: c2cbc4440a4ff09771b1bd55866136eecd595b35
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Check out exact private compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source revision and isolate core Rust workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+          cc --version | head -n 1
+      - name: Cache isolated Rust compilation
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-pr2785-native-stress
+      - name: Test native source profiling and LICM stress
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typeid_source_profile_parity -- --nocapture
+          cargo test -p compiler-opt --test typed_licm_native -- --nocapture
+      - name: Targeted Clippy, except unrelated preexisting x86 doc spacing
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-opt --test typeid_source_profile_parity --test typed_licm_native -- -D clippy::all -A clippy::empty_line_after_doc_comments
