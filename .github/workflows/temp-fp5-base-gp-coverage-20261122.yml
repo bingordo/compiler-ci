@@ -37,6 +37,7 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
+          set +e # shell starts with -e; explicitly capture the expected assertion failure
           cargo test -p compiler-backend-aarch64 --test generated_selector_coverage \
             production_memory_and_control_cohorts_count_real_rules_and_non_scalar_work \
             -- --exact --nocapture 2>&1 | tee baseline-gp.log
@@ -82,3 +83,41 @@ jobs:
       - name: Strict canonical TypeId FP tests Clippy
         working-directory: fp
         run: cargo clippy -p compiler-backend-aarch64 --test typeid_fp_native -- -D warnings
+
+  gp-coverage-fixed:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7615fc6864c672f5cccd6a5de1788260b02f9cc1
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact separate GP fix source
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = "7615fc6864c672f5cccd6a5de1788260b02f9cc1"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Isolate GP review workspace
+        run: |
+          mkdir -p gp/crates
+          cp -a compiler/crates/ir compiler/crates/backend compiler/crates/backend-aarch64 gp/crates/
+          cat > gp/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/backend","crates/backend-aarch64"]
+          EOF
+      - name: Corrected historical-control-flow GP bound
+        working-directory: gp
+        run: cargo test -p compiler-backend-aarch64 --test generated_selector_coverage -- --nocapture
+      - name: Complete AArch64 backend regression after bound correction
+        working-directory: gp
+        run: cargo test -p compiler-backend-aarch64 --all-targets -- --test-threads=1
+      - name: Strict typecheck and changed test Clippy
+        working-directory: gp
+        run: |
+          RUSTFLAGS="-D warnings" cargo check -p compiler-backend-aarch64 --all-targets
+          cargo clippy -p compiler-backend-aarch64 --test generated_selector_coverage -- -D warnings
