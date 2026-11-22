@@ -540,10 +540,34 @@ for key,needles in {
     "MISSING":("missing","not found"),
     "INCOMPLETE":("incomplete","truncated"),
     "MALFORMED":("malformed","invalid native"),
-    "DYNAMIC":("dynamic","lifetime"),
+    "DYNAMIC":("dynamic","startup","init_array"),
 }.items():
     print("EDG_C_TYPEID_REASON_" + key + "="
           + ("yes" if any(word in reason for word in needles) else "no"))
+PY
+# The compiler's opt-in diagnostic records ONLY numeric EDG source facts.
+# Validate every key/value in an explicit allowlist before echoing to CI;
+# never grep raw source/diagnostic text directly into public Action logs.
+python3 - /audit-tmp/edg-generated-c-native.log <<'PY'
+from pathlib import Path
+import re,sys
+fields=("linkage","explicit","tls","local","type_class","init_kind",
+        "init_explicit","init_uninitialized","image_kind","dynamic",
+        "materialized","weak","alias","section","nonreal",
+        "compiler_generated","globals","definitions")
+for line in Path(sys.argv[1]).read_text(errors="replace").splitlines():
+    prefix="EDG_TYPEID_SAFE_FAIL_GLOBAL "
+    if not line.startswith(prefix): continue
+    entries=line[len(prefix):].split()
+    if len(entries)!=len(fields): continue
+    values=[]
+    for entry,key in zip(entries,fields):
+        m=re.fullmatch(re.escape(key)+r"=([0-9]{1,10})",entry)
+        if m is None: break
+        values.append(m.group(1))
+    else:
+        print(prefix+" ".join(f"{k}={v}" for k,v in zip(fields,values)))
+        break
 PY
 if (( native_rc == 0 )); then
   test -s /audit-tmp/mrustc-edg-native.o
