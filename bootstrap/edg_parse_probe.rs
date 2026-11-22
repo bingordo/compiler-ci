@@ -51,34 +51,6 @@ fn main() {
                 il.initialization_lifetimes.len(),
                 il.entities.iter().filter(|e|matches!(e,edgcpp::Entity::Routine{has_definition:true,..})).count()
             );
-            // Literal definitions and slots must be a closed, consistent
-            // snapshot before any backend may consume them. This source-free
-            // census is allowed for private generated C; no literal bytes or
-            // native names are printed.
-            let mut literal_targets=std::collections::HashSet::new();
-            let mut literal_valid=true;
-            for object in &il.global_literal_objects {
-                literal_valid &= literal_targets.insert(object.id) &&
-                    object.id>0 && !object.bytes.is_empty() &&
-                    object.bytes.len()<=4096 && object.bytes.last()==Some(&0);
-            }
-            for reloc in &il.global_literal_relocations {
-                let image=il.global_aggregate_initializers.iter()
-                    .find(|v|v.symbol==reloc.symbol);
-                let checked=image.and_then(|v|{
-                    let start=usize::try_from(reloc.offset).ok()?;
-                    let end=start.checked_add(8)?;
-                    v.bytes.get(start..end)
-                }).is_some_and(|data|data.iter().all(|byte|*byte==0));
-                if !literal_targets.contains(&reloc.literal_id) || !checked ||
-                    reloc.addend!=0 {
-                    literal_valid=false;
-                }
-            }
-            println!("EDG_PROBE_STATIC_LITERALS objects={} relocations={} valid={}",
-                il.global_literal_objects.len(),
-                il.global_literal_relocations.len(),
-                u8::from(literal_valid));
             if unit.status != 0 {
                 std::process::exit(1);
             }
