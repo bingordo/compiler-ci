@@ -1,0 +1,92 @@
+# Source-pinned external compiler benchmark capability census; no timing claims.
+name: Optimization quality M3 public source census
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/opt-quality-m3-public-census.yml']
+permissions:
+  contents: read
+concurrency:
+  group: opt-quality-m3-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  capability:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      COMPILER_SHA: cc93bd3ba2d6793452c87761aca15190731724cf
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.COMPILER_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pin and fast contract tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          git -C compiler rev-parse HEAD | tee results/compiler-sha.txt
+          python3 -m py_compile compiler/tools/opt_quality_public_m2.py compiler/tools/test_opt_quality_public_m2.py
+          python3 -m unittest discover -s compiler/tools -p 'test_opt_quality_public_m2.py' -v 2>&1 | tee results/contract-tests.log
+          gcc --version | head -n 1 | tee results/gcc-version.txt
+          clang --version | head -n 1 | tee results/clang-version.txt
+      - name: Configure public Mini-C dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('compiler/tools/mini-c-driver/Cargo.toml')
+          data=p.read_text()
+          before='ssh://git@github.com/bingordo/mini-c.git'
+          assert data.count(before)==2
+          p.write_text(data.replace(before,'https://github.com/bingordo/mini-c.git'))
+          PY
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: opt-quality-public-m3
+      - name: Build production TypeId Mini-C frontend/backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 12m cargo build \
+            --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --bin compiler-mini-c
+          test -x compiler/tools/mini-c-driver/target/debug/compiler-mini-c
+      - name: Fetch exact public revisions and compile unmodified source
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 10m python3 \
+            compiler/tools/opt_quality_public_m2.py \
+            --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" \
+            --output results/opt-quality-public-m2.json \
+            2>&1 | tee results/census.log
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          report=json.loads(Path('results/opt-quality-public-m2.json').read_text())
+          assert report['case_count']==4
+          assert len({row['id'] for row in report['cases']})==4
+          assert all(row['sha256'] for row in report['cases'])
+          assert all(set(row['compilers'])=={'gcc','clang','native'} for row in report['cases'])
+          assert report['scope'].endswith('no runtime score')
+          print('M3 native compilation census:',report['all_compile_count'],'/',report['case_count'])
+          PY
+          echo 'M3 public source census completed (not a runtime benchmark)' >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve capability classifications and provenance
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opt-quality-m3-${{ env.COMPILER_SHA }}
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
