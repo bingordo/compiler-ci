@@ -1,0 +1,58 @@
+# One-shot exact-source acceptance for compiler PR #2630.
+name: Validate native mem2reg IR migration PR 2630
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/validate-ir-mem2reg-2630.yml'
+permissions:
+  contents: read
+jobs:
+  native-mem2reg:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      SOURCE_SHA: ad8775328cc913dbfa11736d5247ad1dff322837
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source revision and isolate native workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-mem2reg-2630
+      - name: Verify production IR boundary and guard tests
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/ir_consumer_inventory.py --check-production
+          PYTHONPATH=tools python3 -m unittest tools.test_ir_consumer_inventory
+          python3 tools/check_mixed_function_export_boundary.py
+      - name: Compile optimizer and native backends
+        working-directory: compiler
+        run: |
+          cargo check -p compiler-opt --lib --bin ir-opt
+          cargo check -p compiler-backend-x86 -p compiler-backend-aarch64
+      - name: Exercise native fixtures and historical differential oracle
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typed_mem2reg -- --nocapture
