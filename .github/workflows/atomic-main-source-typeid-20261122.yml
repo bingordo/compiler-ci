@@ -1,0 +1,62 @@
+name: Native Mini-C GNU atomic TypeId source bridge
+on:
+  push:
+    branches: [ci/atomic-main-source-typeid-20261122]
+  pull_request:
+    paths: [.github/workflows/atomic-main-source-typeid-20261122.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-mini-c-atomic-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Checkout exact compiler source candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 652dde8211a760c28840f470729f0f8e2dc6af7f
+          path: compiler
+          persist-credentials: false
+      - name: Checkout exact checked Mini-C frontend
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: ea9614c970584bcc138001cc49ddf68c6a8d6f1a
+          path: mini-c
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Pin local checked frontend dependencies without SSH
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          manifest = Path('compiler/tools/mini-c-driver/Cargo.toml')
+          data = manifest.read_text()
+          for crate in ('mini-c-syntax', 'mini-c-sema'):
+              folder = crate.split('-')[-1]
+              before = (f'{crate} = {{ git = "ssh://git@github.com/bingordo/mini-c.git", '
+                        'rev = "ea9614c970584bcc138001cc49ddf68c6a8d6f1a" }')
+              after = f'{crate} = {{ path = "../../../mini-c/crates/{folder}" }}'
+              if data.count(before) != 1:
+                  raise SystemExit(f'expected one exact pinned {crate} dependency')
+              data = data.replace(before, after)
+          manifest.write_text(data)
+          PY
+      - name: Check current native TypeId source adapter
+        run: cargo check --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib
+      - name: Test source adapter
+        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib
+      - name: Source Mini-C typed atomic checking
+        working-directory: mini-c
+        run: cargo test -p mini-c-syntax -p mini-c-sema
+      - name: Strict native driver lint
+        run: cargo clippy --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib -- -D warnings
