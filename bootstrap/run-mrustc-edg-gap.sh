@@ -222,7 +222,7 @@ parse_rc=$last_generated_c_probe_rc
 
 # Bound and validate all fields of the opt-in native C union constant-tree
 # diagnostic. Never print source/identifier, diagnostic addresses or logs.
-python3 - /audit-tmp/edg-generated-c-parse.log <<'PY'
+python3 - /audit-tmp/edg-union-image-failures.txt <<'PY'
 from pathlib import Path
 import re,sys
 fields=("type_size","type_align","root_kind","first_kind",
@@ -230,7 +230,9 @@ fields=("type_size","type_align","root_kind","first_kind",
         "child_count_bounded","root_dynamic","first_address_kind",
         "first_designator")
 n=0
-for line in Path(sys.argv[1]).read_text(errors="replace").splitlines():
+diagnostics=Path(sys.argv[1])
+for line in (diagnostics.read_text(errors="replace").splitlines()
+             if diagnostics.is_file() else []):
     prefix="EDG_C_UNION_IMAGE_DIAG "
     if not line.startswith(prefix):
         continue
