@@ -1,0 +1,91 @@
+name: X86 profiled cost current-main PR 2682 (source pinned)
+
+on:
+  push:
+    branches: [main, ci/x86-profile-cost-2581-20261121]
+    paths:
+      - '.github/workflows/verify-x86-profile-cost-2581.yml'
+  pull_request:
+    paths:
+      - '.github/workflows/verify-x86-profile-cost-2581.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  focused:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - name: Checkout compiler-ci workflow
+        uses: actions/checkout@v4
+      - name: Checkout exact private compiler PR head
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 61bebd059feddf2edcf0b2806fbf3fa2b00f1a74
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source SHA and expected tests
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=61bebd059feddf2edcf0b2806fbf3fa2b00f1a74
+          actual="$(git rev-parse HEAD)"
+          test "$actual" = "$expected"
+          grep -Fq 'fn compare_weighted_regions(' crates/backend/src/selection_cost.rs
+          grep -Fq 'fn compare_profiled_block_costs(' crates/backend/src/profile_counters.rs
+          grep -Fq 'fn compare_profiled_attributed_physical_windows(' crates/backend-x86/src/physical_costs.rs
+          grep -Fq 'fn attributed_loop_backedge_uses_full_header_visits()' crates/backend-x86/src/physical_costs.rs
+          echo "Exact compiler source: $actual" >> "$GITHUB_STEP_SUMMARY"
+      - name: Restrict temporary source workspace to compiler core
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat >compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+      - name: Reuse compiler-core Rust build objects
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x86-profile-cost-2581
+          cache-workspace-crates: 'true'
+      - name: Run source-pinned backend cost and edge profile tests
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 5m cargo test -p compiler-backend --lib selection_cost -- --nocapture 2>&1 | tee "$RUNNER_TEMP/x86-selection-cost.log"
+          timeout --signal=TERM --kill-after=10s 5m cargo test -p compiler-backend --lib profile_counters -- --nocapture 2>&1 | tee "$RUNNER_TEMP/x86-profile-counters.log"
+          grep -F 'test result: ok.' "$RUNNER_TEMP/x86-selection-cost.log"
+          grep -F 'test result: ok.' "$RUNNER_TEMP/x86-profile-counters.log"
+      - name: Run physical x86 profile and attribution integration tests
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 7m cargo test -p compiler-backend-x86 --lib measured_physical_windows_compare_with_validated_edge_profile -- --nocapture 2>&1 | tee "$RUNNER_TEMP/x86-measured-profile.log"
+          timeout --signal=TERM --kill-after=10s 7m cargo test -p compiler-backend-x86 --lib physical_attribution_checks_actual_items_labels_and_source_identity -- --nocapture 2>&1 | tee "$RUNNER_TEMP/x86-physical-attribution.log"
+          timeout --signal=TERM --kill-after=10s 7m cargo test -p compiler-backend-x86 --lib attributed_loop_backedge_uses_full_header_visits -- --nocapture 2>&1 | tee "$RUNNER_TEMP/x86-backedge.log"
+          # Rust's fully qualified unit names require not using --exact
+          # on a bare test function name. Require positive test counts.
+          for log in "$RUNNER_TEMP/x86-measured-profile.log" "$RUNNER_TEMP/x86-physical-attribution.log" "$RUNNER_TEMP/x86-backedge.log"; do
+            grep -E 'test result: ok\. [1-9][0-9]* passed;' "$log"
+          done
+      # Existing compiler-opt dead_code and unused_imports Rust warnings are\n      # not defects in the x86 profile-cost PR. Keep all default Clippy\n      # lints as errors without promoting unrelated rustc warnings.\n      - name: Strict backend and x86 Clippy
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 6m cargo clippy -p compiler-backend -p compiler-backend-x86 --lib --tests -- -D clippy::all
+      - name: Publish exact pass evidence
+        if: success()
+        run: |
+          echo "PASS: compiler source 61bebd059feddf2edcf0b2806fbf3fa2b00f1a74" >> "$GITHUB_STEP_SUMMARY"
+          echo "Scope: compiler-backend selection_cost and profile_counters, x86 profile/attribution/loop tests, strict Clippy." >> "$GITHUB_STEP_SUMMARY"
