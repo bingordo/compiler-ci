@@ -1,0 +1,95 @@
+# Independent runtime oracle for one exact-source LLVM program; no timing.
+name: Optimization quality M4 LLVM executable oracle
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/opt-quality-m4-llvm-execution.yml']
+permissions:
+  contents: read
+concurrency:
+  group: opt-quality-m4-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  executable-oracle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      COMPILER_SHA: 23d87214fa016b63759b53f05af133028ad8f29a
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.COMPILER_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Source pin and test oracle accounting
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          git -C compiler rev-parse HEAD | tee results/compiler-sha.txt
+          python3 -m py_compile compiler/tools/opt_quality_public_m4_execution.py compiler/tools/test_opt_quality_public_m4_execution.py
+          python3 -m unittest discover -s compiler/tools -p 'test_opt_quality_public_m4_execution.py' -v |& tee results/oracle-tests.log
+      - name: Public Mini-C dependencies and compiler build
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("compiler/tools/mini-c-driver/Cargo.toml")
+          s=p.read_text()
+          old="ssh://git@github.com/bingordo/mini-c.git"
+          assert s.count(old)==2
+          p.write_text(s.replace(old,"https://github.com/bingordo/mini-c.git"))
+          PY
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: opt-quality-m4
+      - name: Build native compiler
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 12m cargo build \
+            --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --bin compiler-mini-c
+      - name: Run independent LLVM executable oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          timeout --signal=TERM --kill-after=10s 6m python3 \
+            compiler/tools/opt_quality_public_m4_execution.py \
+            --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" \
+            --output results/m4-execution.json |& tee results/m4-execution.log
+          result=${PIPESTATUS[0]}
+          set -e
+          test -s results/m4-execution.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path('results/m4-execution.json').read_text())
+          assert data['result']['id']=='llvm-unit-casttest3'
+          assert data['llvm_commit']=='ec05cfd8cd10a94e6d4208537588093890c737b9'
+          print('LLVM native runtime oracle:',data['result']['status'])
+          PY
+          test "$result" -eq 0
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path('results/m4-execution.json').read_text())
+          assert data['result']['status']=='PASS'
+          assert len(data['result']['inputs'])==3
+          PY
+          echo "M4 LLVM CastTest3 native/GCC/Clang runtime parity passed" >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve oracle results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opt-quality-m4-${{ env.COMPILER_SHA }}
+          path: results/
+          retention-days: 30
