@@ -104,6 +104,43 @@ struct Node g[2];
 int main(void) { return g[1].data[3]; }
 C
 
+
+# EDG GCC-mode __builtin_va_list is an intrinsic array/record type.
+# Its class tag/supplement may differ from an ordinary source C struct.
+cat > /audit-tmp/record-slices/13_builtin_va_global.c <<'C'
+typedef __builtin_va_list Va;
+Va g;
+int main(void) { return 0; }
+C
+cat > /audit-tmp/record-slices/14_builtin_va_record.c <<'C'
+struct Node { __builtin_va_list ap; };
+struct Node g;
+int main(void) { return 0; }
+C
+cat > /audit-tmp/record-slices/15_builtin_va_local.c <<'C'
+int f(int last, ...) {
+  __builtin_va_list ap;
+  __builtin_va_start(ap, last);
+  __builtin_va_end(ap);
+  return last;
+}
+C
+cat > /audit-tmp/record-slices/16_va_ptr.c <<'C'
+typedef __builtin_va_list Va;
+Va *g;
+int main(void) { return 0; }
+C
+cat > /audit-tmp/record-slices/17_builtin_va_nested.c <<'C'
+struct Node { __builtin_va_list ap; struct Node *next; };
+struct Node g;
+int main(void) { return 0; }
+C
+cat > /audit-tmp/record-slices/18_builtin_va_qualifier.c <<'C'
+typedef __builtin_va_list Va;
+extern volatile Va g;
+int f(void) { return sizeof(g); }
+C
+
 for input in /audit-tmp/record-slices/*.c; do
   name=$(basename "$input" .c)
   gcc -std=gnu11 -fsyntax-only "$input"
