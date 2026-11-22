@@ -129,7 +129,11 @@ echo "EDG_C_AUDIT builtin_include_dirs=${#include_args[@]}"
 # with 50+ MiB of private generated source. Build a pinned bridge with a
 # separate tiny public compiler-ci entry point that emits bounded counters.
 test ! -e edgcpp-rust/examples/ci_edg_parse_probe.rs
-cp bootstrap/edg_parse_probe.rs edgcpp-rust/examples/ci_edg_parse_probe.rs
+if [[ "${EDG_LITERAL_REGRESSION:-0}" == "1" ]]; then
+  cp bootstrap/edg_literal_parse_probe.rs edgcpp-rust/examples/ci_edg_parse_probe.rs
+else
+  cp bootstrap/edg_parse_probe.rs edgcpp-rust/examples/ci_edg_parse_probe.rs
+fi
 timeout --signal=TERM --kill-after=10s 20m cargo build --quiet \
   --manifest-path edgcpp-rust/Cargo.toml --example ci_edg_parse_probe
 parser=/workspace/edgcpp-rust/target/debug/examples/ci_edg_parse_probe
