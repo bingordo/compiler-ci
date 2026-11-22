@@ -1,0 +1,79 @@
+name: Generic width TypeId source optimizer
+on:
+  push:
+    branches: [ci/typeid-generic-source-optimizer-20261122]
+  pull_request:
+    paths: [.github/workflows/typeid-generic-source-optimizer-20261122.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-mini-c-atomic-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Checkout exact compiler source candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 71003031632fb7c4b5b261d4cbdb0f46af7f66ed
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact checked Mini-C frontend
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: ea9614c970584bcc138001cc49ddf68c6a8d6f1a
+          path: mini-c
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Limit compiler workspace to native driver dependencies
+        shell: bash
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Pin local checked frontend dependencies without SSH
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          manifest = Path('compiler/tools/mini-c-driver/Cargo.toml')
+          data = manifest.read_text()
+          for crate in ('mini-c-syntax', 'mini-c-sema'):
+              folder = crate.split('-')[-1]
+              before = (f'{crate} = {{ git = "ssh://git@github.com/bingordo/mini-c.git", '
+                        'rev = "ea9614c970584bcc138001cc49ddf68c6a8d6f1a" }')
+              after = f'{crate} = {{ path = "../../../mini-c/crates/{folder}" }}'
+              if data.count(before) != 1:
+                  raise SystemExit(f'expected one exact pinned {crate} dependency')
+              data = data.replace(before, after)
+          manifest.write_text(data)
+          PY
+      - name: Strict ABI boundaries with generic exact-width internal SSA
+        run: cargo test --manifest-path compiler/crates/ir/Cargo.toml exact_width_ssa_is_distinct_from_c_call_and_return_abi
+      - name: TypeId exact width builder regression
+        run: cargo test --manifest-path compiler/crates/ir/Cargo.toml typed_cfg_emits_exact_width_values_without_legacy_result_mapping
+      - name: Check current native TypeId source adapter
+        run: cargo check --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib
+      - name: Test source adapter atomic regressions
+        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib gnu_atomic_
+      - name: Source Mini-C typed atomic checking
+        working-directory: mini-c
+        run: cargo test -p mini-c-syntax -p mini-c-sema
+      - name: Native driver lint (known pre-existing warning classes excepted)
+        run: |
+          cargo clippy --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib -- \
+            -D warnings -A unused-imports \
+            -A clippy::match-like-matches-macro -A clippy::too-many-arguments
