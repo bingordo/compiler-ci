@@ -165,6 +165,14 @@ if [[ "${EDG_LITERAL_REGRESSION:-0}" == "1" ]]; then
   echo "EDG_C_LITERAL_GCC_EXIT=$gcc_rc"
   echo "EDG_C_LITERAL_BRIDGE_EXIT=$bridge_rc"
   echo "EDG_C_LITERAL_WIRE_EXIT=$wire_rc"
+  if (( wire_rc != 0 )); then
+    echo 'EDG_LITERAL_PUBLIC_WIRE_TEST_FAILURE_DETAIL_BEGIN'
+    # Only source-backed public in-repo unit tests appear in this file; do
+    # not print any private generated-C compiler/error output.
+    tail -n 32 /audit-tmp/edg-static-literal-wire.log |
+      sed -E 's@/workspace/[^ :]+@<public-path>@g' || true
+    echo 'EDG_LITERAL_PUBLIC_WIRE_TEST_FAILURE_DETAIL_END'
+  fi
   if (( bridge_rc != 0 || wire_rc != 0 )); then
     # This fixture and test are committed public code; limit diagnostics to
     # compiler errors and summary, never leak the private mrustc source.
