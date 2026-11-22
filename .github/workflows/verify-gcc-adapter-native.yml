@@ -1,0 +1,74 @@
+name: Native TypeId GCC-adapter CMake smoke
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-gcc-adapter-native.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 22
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 8594a8560ca4e29c3b8e914ed718b86e477fefa3
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Build native TypeId Mini-C
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C compiler rev-parse HEAD
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('compiler/tools/mini-c-driver/Cargo.toml')
+          s=p.read_text()
+          old='ssh://git@github.com/bingordo/mini-c.git'
+          assert s.count(old)==2
+          p.write_text(s.replace(old,'https://github.com/bingordo/mini-c.git'))
+          PY
+          timeout 12m cargo build --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+      - name: CMake object and header dependency with native TypeId, GCC-linked oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          d="$(mktemp -d)"
+          trap 'rm -rf "$d"' EXIT
+          mkdir -p "$d/p"
+          cp compiler/tools/compiler-gcc.py "$d/cc-adapter"
+          chmod +x "$d/cc-adapter"
+          cat > "$d/bridge" <<'PY'
+          #!/usr/bin/env python3
+          import os, subprocess, sys
+          a=sys.argv[1:]
+          if len(a)!=9 or a[1:3]!=['--language','mini-c'] or a[3:5]!=['--target','x86_64'] or a[5:7]!=['--emit','obj'] or a[7]!='-o':
+              sys.exit('unexpected native command')
+          with open(os.environ['CALL_LOG'],'a') as f: f.write('compile\\n')
+          sys.exit(subprocess.call([os.environ['NATIVE_MINI_C'],a[0],'--emit','obj','-o',a[8]]))
+          PY
+          chmod +x "$d/bridge"
+          printf 'cmake_minimum_required(VERSION 3.20)\nproject(probe C)\nadd_library(check OBJECT demo.c)\ntarget_compile_definitions(check PRIVATE VALUE=42)\n' > "$d/p/CMakeLists.txt"
+          printf '#include "demo.h"\nint demo(void){return VALUE+EXTRA;}\n' > "$d/p/demo.c"
+          printf '#define EXTRA 7\n' > "$d/p/demo.h"
+          printf 'extern int demo(void);\nint main(void){return demo()!=49;}\n' > "$d/main.c"
+          export CALL_LOG="$d/calls"
+          export NATIVE_MINI_C="$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c"
+          export COMPILER_NATIVE_DRIVER="$d/bridge"
+          cmake -S "$d/p" -B "$d/b" -G 'Unix Makefiles' -DCMAKE_C_COMPILER="$d/cc-adapter" -DCMAKE_C_COMPILER_ID=GNU -DCMAKE_C_COMPILER_FORCED=TRUE -DCMAKE_C_COMPILER_WORKS=TRUE
+          cmake --build "$d/b" --verbose
+          test "$(wc -l < "$CALL_LOG")" -eq 1
+          gcc "$d/main.c" "$d/b/CMakeFiles/check.dir/demo.c.o" -o "$d/exe"
+          "$d/exe"
+          cmake --build "$d/b"
+          test "$(wc -l < "$CALL_LOG")" -eq 1
+          sleep 1
+          printf '#define EXTRA 8\n' > "$d/p/demo.h"
+          cmake --build "$d/b"
+          test "$(wc -l < "$CALL_LOG")" -eq 2
+          sed -i 's/49/50/' "$d/main.c"
+          gcc "$d/main.c" "$d/b/CMakeFiles/check.dir/demo.c.o" -o "$d/exe"
+          "$d/exe"
+          echo 'Native TypeId + header rebuild + GCC-linked runtime PASS; forced CMake identity, standalone Mini-C bridge' >> "$GITHUB_STEP_SUMMARY"
