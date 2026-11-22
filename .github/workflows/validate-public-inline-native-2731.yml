@@ -1,0 +1,52 @@
+name: Validate public inline native mask oracle PR2731
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/validate-public-inline-native-2731.yml'
+permissions:
+  contents: read
+jobs:
+  public-inline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      SOURCE_SHA: 51f04732110a43b863ce6c34bb86a4fd1bb5862c
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin source and isolate native crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: public-inline-native-2731
+      - name: Assert native source and IR boundary
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          ! grep -qE 'typeid_executable_fixture|typed_fixture|from_legacy' crates/opt/tests/inline_decision_oracle.rs
+          python3 tools/ir_consumer_inventory.py --check-production
+      - name: Compile optimizer and backend
+        working-directory: compiler
+        run: |
+          cargo check -p compiler-opt --lib --test inline_decision_oracle
+          cargo check -p compiler-backend-x86 --lib
+      - name: Run public two-site and four-site exhaustive inline oracle
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test inline_decision_oracle -- --nocapture
