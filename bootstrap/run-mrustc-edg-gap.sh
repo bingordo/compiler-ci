@@ -197,6 +197,7 @@ probe_generated_c() {
   echo "${prefix}_PEAK_RSS_KB=$rss"
   grep -m 1 '^EDG_PROBE_RESULT ' "$logfile" || true
   grep -m 1 '^EDG_PROBE_GLOBALS ' "$logfile" || true
+  grep -m 1 '^EDG_PROBE_STATIC_LITERALS ' "$logfile" || true
   case "$rc" in
     0) echo "${prefix}_CLASS=accepted" ;;
     124|137) echo "${prefix}_CLASS=timeout_or_forced_kill" ;;
