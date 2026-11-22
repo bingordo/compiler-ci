@@ -313,7 +313,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/edgcpp-rust
-          ref: b73d221740ec2439aa6df1f11d0625912c8f0340
+          ref: 834444ced52d33f325083e0ad0d30f68908465f3
           path: edgcpp-rust
           persist-credentials: false
 
@@ -359,7 +359,7 @@ jobs:
             -v "$PWD:/workspace" \
             -v "$RUNNER_TEMP:/audit-tmp" \
             -e "AUDIT_SOURCE=/workspace/$relative" \
-            -e "EDG_BRIDGE_OVERRIDE_SHA=b73d221740ec2439aa6df1f11d0625912c8f0340" \
+            -e "EDG_BRIDGE_OVERRIDE_SHA=834444ced52d33f325083e0ad0d30f68908465f3" \
             -e "EDGCPP_DIAG_C_AGGREGATE_FAILURE=1" \
             -e "EDGCPP_DIAG_C_AGGREGATE_FAILURE_FILE=/audit-tmp/edg-union-image-failures.txt" \
             -e "EDG_C_RECORD_REGRESSION=1" \
@@ -403,6 +403,48 @@ jobs:
                                           for key,value in zip(fields,values)))
                       count+=1
                       if count==4: break
+          PY
+          # Correlate private native SymbolId with bridge image outcome inside
+          # the runner only; public output contains NO source identities.
+          python3 - "$RUNNER_TEMP/edg-generated-c-native.log" "$RUNNER_TEMP/edg-union-image-failures.txt" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          from pathlib import Path
+          import re, sys
+          native=Path(sys.argv[1])
+          diag=Path(sys.argv[2])
+          if not native.is_file() or not diag.is_file():
+              print("EDG_C_UNION_IMAGE_JOIN status=missing_diagnostic_input")
+          else:
+              error=native.read_text(errors="replace")
+              match=re.search(r"native global SymbolId\\(([0-9]{1,10})\\) is not a proven imported data declaration",error)
+              if match is None:
+                  print("EDG_C_UNION_IMAGE_JOIN status=no_matching_native_global_error")
+              else:
+                  owner=match.group(1)
+                  outcomes=set()
+                  for line in diag.read_text(errors="replace").splitlines():
+                      if not line.startswith("EDG_C_UNION_IMAGE_OUTCOME "):
+                          continue
+                      fields=line.split()[1:]
+                      if len(fields)!=4:
+                          continue
+                      keys=("owner","image_ok","byte_count","relocation_count")
+                      values=[]
+                      for item,key in zip(fields,keys):
+                          valid=re.fullmatch(re.escape(key)+r"=([0-9]{1,10})",item)
+                          if valid is None: break
+                          values.append(valid.group(1))
+                      else:
+                          if values[0]==owner and values[1] in ("0","1"):
+                              outcomes.add(tuple(values[1:]))
+                  if len(outcomes)==0:
+                      print("EDG_C_UNION_IMAGE_JOIN status=no_matching_bridge_record")
+                  elif len(outcomes)>1:
+                      print("EDG_C_UNION_IMAGE_JOIN status=conflicting_bridge_records")
+                  else:
+                      ok,byte_count,relocations=next(iter(outcomes))
+                      print("EDG_C_UNION_IMAGE_JOIN status=matched "
+                            f"image_ok={ok} byte_count={byte_count} "
+                            f"relocation_count={relocations}")
           PY
           if ! grep -q '^EDG_C_PARSE_EXIT=' "$RUNNER_TEMP/mrustc-edg-audit.log"; then
             echo 'EDG generated-C audit did not reach the parser (preflight/toolchain failure); no attribute/ABI compatibility result.' | tee -a "$GITHUB_STEP_SUMMARY"
