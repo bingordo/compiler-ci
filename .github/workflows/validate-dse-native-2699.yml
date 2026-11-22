@@ -1,0 +1,53 @@
+name: Validate native DSE TypeId fixture migration PR2699
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/validate-dse-native-2699.yml'
+permissions:
+  contents: read
+jobs:
+  native-dse:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      SOURCE_SHA: bdbe05f96423ab9d66fabbda6fcfde3617fe5ec1
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and isolate native workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: dse-native-2699
+      - name: Guard native TypeId and production IR boundaries
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          ! grep -q 'typeid_executable_fixture\|typed_fixture\|from_legacy' crates/opt/tests/dse.rs
+          python3 tools/ir_consumer_inventory.py --check-production
+      - name: Compile optimizer, native DSE and x86 backend
+        working-directory: compiler
+        run: |
+          cargo check -p compiler-opt --lib --test dse
+          cargo check -p compiler-backend-x86 --lib
+      - name: Run native DSE and independent historical, C and ELF oracles
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test dse -- --nocapture
