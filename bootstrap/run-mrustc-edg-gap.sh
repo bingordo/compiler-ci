@@ -196,6 +196,7 @@ probe_generated_c() {
   echo "${prefix}_WALL_SECONDS=$((ended-started))"
   echo "${prefix}_PEAK_RSS_KB=$rss"
   grep -m 1 '^EDG_PROBE_RESULT ' "$logfile" || true
+  grep -m 1 '^EDG_PROBE_GLOBALS ' "$logfile" || true
   case "$rc" in
     0) echo "${prefix}_CLASS=accepted" ;;
     124|137) echo "${prefix}_CLASS=timeout_or_forced_kill" ;;
@@ -488,7 +489,9 @@ else:
     stage = next(value for marker,value in markers.items() if marker in line)
     reason = line.split(next(marker for marker in markers if marker in line),1)[-1].lower()
 # The rejection class is a constant enum, not the source-dependent message.
-if "global" in reason and ("import" in reason or "declaration" in reason):
+if "native global" in reason and "not a proven imported data declaration" in reason:
+    classification = "global-definition-not-import"
+elif "global" in reason and ("import" in reason or "declaration" in reason):
     classification = "global-import-or-storage-admission"
 elif "global" in reason and ("lifetime" in reason or "initializer" in reason):
     classification = "global-lifetime-or-initializer"
