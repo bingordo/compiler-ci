@@ -393,9 +393,12 @@ jobs:
             -o "Dir::Cache::archives=$cache" \
             -o 'APT::Keep-Downloaded-Packages=true' creduce
           command -v creduce
+          # GitHub Actions cache archives must be readable without root.
+          sudo chown -R "$(id -u):$(id -g)" "$cache"
           echo "Host C-Reduce package: $(dpkg-query -W -f='${Version}' creduce)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Minimize real mrustc C with pinned EDG/GDB signature
+        id: reducer
         if: always() && steps.translate.outcome == 'success' && (github.event_name == 'pull_request' || inputs.edg_creduce)
         continue-on-error: true
         shell: bash
@@ -410,7 +413,7 @@ jobs:
           PY
           )
           set +e
-          timeout --signal=TERM --kill-after=20s 16m \
+          timeout --signal=TERM --kill-after=20s 32m \
             bash bootstrap/reduce-mrustc-edg-host.sh "$source" \
             > "$RUNNER_TEMP/host-creduce-result.log" 2>&1
           rc=$?
@@ -422,6 +425,22 @@ jobs:
           # CI for manual review; the original large source never appears.
           sed -n '/^EDG_CREDUCE_TESTCASE_BEGIN$/,/^EDG_CREDUCE_TESTCASE_END$/p' \
             "$RUNNER_TEMP/host-creduce-result.log" || true
+          # Artifacts are restricted to independently GDB-confirmed, GCC
+          # syntactically valid, <32 KiB sources; never upload original
+          # generated C, parser logs, or intermediate C-Reduce files.
+          if grep -Fxq 'EDG_CREDUCE_INDEPENDENT_REPRODUCER=yes' "$RUNNER_TEMP/host-creduce-result.log" &&
+             test -s "$RUNNER_TEMP/edg-creduce-verified/reproducer.c"; then
+            echo "artifact=yes" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Preserve independently verified standalone C testcase
+        if: steps.reducer.outputs.artifact == 'yes'
+        uses: actions/upload-artifact@v4
+        with:
+          name: edg-plain-c-reproducer
+          path: ${{ runner.temp }}/edg-creduce-verified/reproducer.c
+          if-no-files-found: error
+          retention-days: 3
 
       - name: Save host C-Reduce binary package cache
         if: always() && steps.host-creduce-cache.outcome == 'success' && steps.host-creduce-cache.outputs.cache-hit != 'true'
