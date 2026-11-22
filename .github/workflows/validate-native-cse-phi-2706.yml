@@ -1,0 +1,55 @@
+name: Validate native CSE and PHI IR migration PR2706
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/validate-native-cse-phi-2706.yml'
+permissions:
+  contents: read
+jobs:
+  native-cse-phi:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SOURCE_SHA: 24b89ff0d45a56a0b81aab932c76ca5300cab6b3
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and isolate native core crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: native-cse-phi-2706
+      - name: Verify no legacy graph imports and IR boundary
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          ! grep -qE 'typeid_executable_fixture|typed_fixture|from_legacy' crates/opt/tests/cse_native.rs crates/opt/tests/phi_native.rs
+          python3 tools/ir_consumer_inventory.py --check-production
+      - name: Compile optimizer and native x86 backend
+        working-directory: compiler
+        run: |
+          cargo check -p compiler-opt --lib --test cse_native --test phi_native
+          cargo check -p compiler-backend-x86 --lib
+      - name: Run both native CSE and loop PHI execution tests against C oracles
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test cse_native -- --nocapture
+          cargo test -p compiler-opt --test phi_native -- --nocapture
