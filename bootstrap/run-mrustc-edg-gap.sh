@@ -136,6 +136,38 @@ parser=/workspace/edgcpp-rust/target/debug/examples/ci_edg_parse_probe
 test -x "$parser"
 ulimit -c 0
 
+# A public C11 source is a separate, independently executable GCC oracle
+# for the immutable string-object relocation witness. This runs inside the
+# pinned EDG environment and does not publish generated compiler C or literal
+# contents from that private translation unit.
+if [[ "${EDG_LITERAL_REGRESSION:-0}" == "1" ]]; then
+  public=/workspace/edgcpp-rust/tests/fixtures/bootstrap_literal_union.c
+  test -s "$public"
+  set +e
+  timeout --signal=TERM --kill-after=3s 30s gcc -std=c11 -O2 -Wall -Wextra -Werror     "$public" -o /audit-tmp/bootstrap-literal-gcc &&
+    timeout --signal=TERM --kill-after=3s 10s /audit-tmp/bootstrap-literal-gcc
+  gcc_rc=$?
+  (
+    cd /workspace/edgcpp/build/gcc-release
+    timeout --signal=TERM --kill-after=10s 8m cargo run --quiet       --manifest-path /workspace/edgcpp-rust/Cargo.toml       --example audit_static_literal_images -- --gcc --c11       --no_strict_gnu --gnu_version "$gnu_number" "${include_args[@]}" "$public"
+  ) > /audit-tmp/edg-static-literal-public.log 2>&1
+  bridge_rc=$?
+  (
+    cd /workspace/edgcpp/build/gcc-release
+    timeout --signal=TERM --kill-after=10s 5m cargo test --quiet       --manifest-path /workspace/edgcpp-rust/Cargo.toml --lib       bootstrap_literal_global_wire_tests
+  ) > /audit-tmp/edg-static-literal-wire.log 2>&1
+  wire_rc=$?
+  set -e
+  echo "EDG_C_LITERAL_GCC_EXIT=$gcc_rc"
+  echo "EDG_C_LITERAL_BRIDGE_EXIT=$bridge_rc"
+  echo "EDG_C_LITERAL_WIRE_EXIT=$wire_rc"
+  if (( bridge_rc != 0 || wire_rc != 0 )); then
+    # This fixture and test are committed public code; limit diagnostics to
+    # compiler errors and summary, never leak the private mrustc source.
+    grep -E '(^error|error\\[E|EDG_STATIC_LITERAL|FAILED|test result:)'       /audit-tmp/edg-static-literal-public.log       /audit-tmp/edg-static-literal-wire.log | tail -n 14 || true
+  fi
+fi
+
 # Baseline: these public C fixtures independently isolate GNU layout,
 # linkage, calling-convention, and naked attributes. GCC is the dialect
 # oracle; EDG acceptance is a different, parser-only result.
