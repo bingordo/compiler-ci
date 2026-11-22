@@ -46,6 +46,48 @@ jobs:
           PYTHONPATH=tools python3 -m unittest tools.test_ir_consumer_inventory
           python3 tools/check_mixed_function_export_boundary.py
 
+  native-memory-stress-batch:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 003eb856db3a505c5cbda3c7114c46b023b035e8
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Exact compiler commit and retirement guards
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "003eb856db3a505c5cbda3c7114c46b023b035e8"
+          python3 compiler/tools/ir_consumer_inventory.py --check-production
+          python3 compiler/tools/check_mixed_function_export_boundary.py
+          ! grep -E 'from_legacy[[:space:]]*\\(|legacy_function_signature|ModuleSnapshot|TypedModule' compiler/crates/opt/tests/typed_dse.rs
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: native-memory-generated-batch
+      - name: Default optimizer CLI and downstream native backends
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --lib --bin ir-opt
+          cargo check -p compiler-backend-x86 -p compiler-backend-aarch64
+      - name: Three memory optimizer full native and old oracle suites
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_dse --test typed_mem2reg --test typed_global_memory
+
   discover:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-24.04
