@@ -82,25 +82,57 @@ jobs:
           PY
           chmod +x bridge
           printf 'cmake_minimum_required(VERSION 3.20)\nproject(unforced C)\nadd_executable(probe main.c)\n' > p/CMakeLists.txt
-          printf 'int main(void){return 0;}\n' > p/main.c
+          printf '#include "answer.h"\nint main(void){return ANSWER == 7 ? 0 : 1;}\n' > p/main.c
+          printf '#define ANSWER 7\n' > p/answer.h
           export ADAPTER_ARG_LOG="$PWD/args.log"
           export NATIVE_MINI_C="$GITHUB_WORKSPACE/compiler/tools/mini-c-driver/target/debug/compiler-mini-c"
           export COMPILER_NATIVE_DRIVER="$PWD/bridge"
-          # No forced ID, WORKS, or compiler features.
-          if cmake -S p -B build -G Ninja -DCMAKE_C_COMPILER="$PWD/adapter" >configure.log 2>&1; then
-              echo 'UNFORCED_CONFIGURE=PASS' | tee result.txt
-              if cmake --build build >build.log 2>&1 && ./build/probe; then
-                  echo 'UNFORCED_NATIVE_RUNTIME=PASS' | tee -a result.txt
-              else
-                  echo 'UNFORCED_NATIVE_RUNTIME=FAIL' | tee -a result.txt
+          # Neither generator may use forced compiler identity, WORKS, or ABI.
+          for generator in Ninja "Unix Makefiles"; do
+              case "$generator" in
+                Ninja) suffix=ninja ;;
+                *) suffix=make ;;
+              esac
+              printf '#define ANSWER 7\n' > p/answer.h
+              if ! cmake -S p -B "build-$suffix" -G "$generator" \
+                   -DCMAKE_C_COMPILER="$PWD/adapter" >"configure-$suffix.log" 2>&1; then
+                  cat "configure-$suffix.log"
+                  echo "UNFORCED_${suffix}_CONFIGURE=FAIL" | tee -a result.txt
+                  exit 1
               fi
-          else
-              echo 'UNFORCED_CONFIGURE=FAIL' | tee result.txt
-          fi
-          cat configure.log
-          test -f args.log && cat args.log || :
+              echo "UNFORCED_${suffix}_CONFIGURE=PASS" | tee -a result.txt
+              cmake --build "build-$suffix" >"build-$suffix.log" 2>&1 || {
+                  cat "build-$suffix.log"
+                  exit 1
+              }
+              "./build-$suffix/probe"
+              echo "UNFORCED_${suffix}_NATIVE_RUNTIME=PASS" | tee -a result.txt
+              object="build-$suffix/CMakeFiles/probe.dir/main.c.o"
+              test -s "$object"
+              before="$(stat -c '%Y' "$object")"
+              sleep 1
+              cmake --build "build-$suffix" >>"build-$suffix.log" 2>&1
+              test "$(stat -c '%Y' "$object")" = "$before"
+              sleep 1
+              printf '#define ANSWER 8\n' > p/answer.h
+              cmake --build "build-$suffix" >>"build-$suffix.log" 2>&1
+              after="$(stat -c '%Y' "$object")"
+              test "$after" -gt "$before" || {
+                  echo "UNFORCED_${suffix}_HEADER_REBUILD=FAIL" | tee -a result.txt
+                  exit 1
+              }
+              if "./build-$suffix/probe"; then
+                  echo "UNFORCED_${suffix}_RUNTIME_AFTER_HEADER=WRONG" | tee -a result.txt
+                  exit 1
+              else
+                  test "$?" -eq 1
+              fi
+              echo "UNFORCED_${suffix}_HEADER_REBUILD=PASS" | tee -a result.txt
+          done
+          cat configure-ninja.log
+          cat configure-make.log
           cat result.txt >> "$GITHUB_STEP_SUMMARY"
-          # This workflow collects diagnostics; failure is NOT a compiler acceptance.
+          test -f args.log && cat args.log || :
       - name: Save exact CMake probe and compiler diagnostics
         if: always()
         uses: actions/upload-artifact@v4
