@@ -1,0 +1,61 @@
+# Isolated validation for compiler AL05 native TypeId migration PR #2763.
+# SHA pinned to prevent CI from silently drifting onto main/another workstream.
+name: IR PR2763 AL05 neutral TypeId migration
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ir-pr2763-al05-neutral-typeid-20261122.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  al05-native-typeid:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: e6d976f189c9055397d81fd6f8fa6b269596da16
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Check out pinned private compiler PR revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source revision and isolate core/backend workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+          cargo --version
+          cc --version | head -n 1
+      - name: Cache core Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-pr2763-al05-neutral-typeid
+      - name: Run all AL05 P9-P16 TypeId and native x86 regression tests
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test al05_p9_mixed_native_bridge -- --nocapture
+      - name: Check TypeId graph generator and tests with Clippy
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --test al05_p9_mixed_native_bridge -- -D clippy::all -A clippy::empty_line_after_doc_comments
