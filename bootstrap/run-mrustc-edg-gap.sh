@@ -173,6 +173,64 @@ probe_generated_c EDG_C_PARSE "$AUDIT_SOURCE" 90s /audit-tmp/edg-generated-c-par
 # Preserve the SMALL source's result for its own native TypeId gate.
 parse_rc=$last_generated_c_probe_rc
 
+# Debug native SIGSEGV on the smallest real mrustc C input; a Rust panic
+# backtrace cannot diagnose EDG's C++/FFI segfault.
+# Keep the raw GDB log and generated C runner-private. Publish only bounded
+# frames with arguments and paths removed.
+if (( parse_rc == 139 )); then
+  echo "EDG_C_GDB_TRIGGER=small_real_source_sigsegv"
+  if ! command -v gdb >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1; then
+      set +e
+      DEBIAN_FRONTEND=noninteractive apt-get update -qq > /audit-tmp/edg-gdb-install.log 2>&1 &&
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends gdb >> /audit-tmp/edg-gdb-install.log 2>&1
+      set -e
+    fi
+  fi
+  if command -v gdb >/dev/null 2>&1; then
+    set +e
+    (
+      cd /workspace/edgcpp/build/gcc-release
+      timeout --signal=TERM --kill-after=10s 120s \
+        gdb -nx --batch --quiet \
+          -ex 'set pagination off' \
+          -ex 'set confirm off' \
+          -ex 'set debuginfod enabled off' \
+          -ex 'set print frame-arguments none' \
+          -ex 'set print static off' \
+          -ex 'run' \
+          -ex 'thread apply all bt 32' \
+          --args "$parser" --gcc --c11 --no_strict_gnu \
+          --gnu_version "$gnu_number" "${include_args[@]}" "$AUDIT_SOURCE"
+    ) > /audit-tmp/edg-small-real-gdb.log 2>&1
+    gdb_rc=$?
+    set -e
+    python3 - /audit-tmp/edg-small-real-gdb.log "$gdb_rc" <<'PY'
+from pathlib import Path
+import re
+import sys
+raw = Path(sys.argv[1]).read_text(errors="replace")
+print("EDG_C_GDB_EXIT=" + sys.argv[2])
+print("EDG_C_GDB_SIGSEGV=" + ("yes" if "Program received signal SIGSEGV" in raw else "no"))
+frames = []
+for line in raw.splitlines():
+    if not re.match(r"^\s*#\d+\s+", line):
+        continue
+    line = re.sub(r"\s+(?:at|from)\s+.*$", "", line.strip())
+    line = re.sub(r"\([^()]*\)", "(...)", line)
+    line = re.sub(r"/(?:[^\s]+)", "<path>", line)
+    frames.append(line[:240])
+print("EDG_C_GDB_FRAMES=" + str(len(frames)))
+for n, frame in enumerate(frames[:32]):
+    print(f"EDG_C_GDB_FRAME_{n}={frame}")
+PY
+  else
+    echo "EDG_C_GDB_STATUS=unavailable_no_gdb"
+  fi
+else
+  echo "EDG_C_GDB_TRIGGER=not_applicable"
+fi
+
 if [[ -n "${AUDIT_LARGE_SOURCE:-}" && -s "$AUDIT_LARGE_SOURCE" &&
       "$AUDIT_LARGE_SOURCE" != "$AUDIT_SOURCE" ]]; then
   echo "EDG_C_LARGE_BYTES=$(stat -c %s "$AUDIT_LARGE_SOURCE")"
