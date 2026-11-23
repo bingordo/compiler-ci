@@ -1,4 +1,4 @@
-# Isolated exact-source TypeId mixed GP and indirect T5 ABI acceptance.
+# Exact-commit three-file PR overlay on latest TypeId/x86 integration base.
 name: IR PR2896 T5 mixed and indirect native
 on:
   push:
@@ -13,23 +13,37 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
-      SOURCE_SHA: a8bde6ba507dc9e81642477a8e71d58ee4e10187
+      MAIN_SHA: c9a3ed91c31e2ee88a784900b2283418acb2a877
+      PR_SHA: a8bde6ba507dc9e81642477a8e71d58ee4e10187
       CARGO_INCREMENTAL: '0'
       CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
     steps:
-      - name: Check out pinned private compiler PR
+      - name: Check out exact current compiler main
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ env.SOURCE_SHA }}
+          ref: ${{ env.MAIN_SHA }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Verify exact source and isolate core workspace
+      - name: Check out exact TypeId migration PR
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.PR_SHA }}
+          path: candidate
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Overlay only migration-owned files and isolate core workspace
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git -C compiler rev-parse HEAD)" = "$MAIN_SHA"
+          test "$(git -C candidate rev-parse HEAD)" = "$PR_SHA"
+          for path in crates/opt/tests/typed_native_parity.rs crates/opt/tests/support/native_t5_pressure.rs crates/opt/tests/support/native_t5_mixed_indirect.rs; do
+            cp "candidate/$path" "compiler/$path"
+          done
+          test "$(git -C compiler status --porcelain --untracked-files=all | wc -l)" -eq 3
           cat > compiler/Cargo.toml <<'EOF'
           [workspace]
           resolver = "2"
@@ -42,17 +56,15 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: compiler -> target
-          key: ir-pr2896-t5-mixed-indirect
-      - name: Full mixed-width pointer-PHI and indirect T5 C11 GAS ELF differential
+          key: ir-pr2896-t5-latest-main-overlay
+      - name: Validate full T5 GAS ELF C11 and memory effect tests
         working-directory: compiler
         shell: bash
         run: |
           set -euo pipefail
           cargo test -p compiler-opt --test typed_native_parity -- --nocapture
           cargo test -p compiler-opt --test m4_integer_effects -- --nocapture
-      # Existing compiler-ir/src/typed_local_byte_ranges.rs:209 triggers collapsible_if.
-      # Keep the pre-existing x86 exceptions; do not weaken other lints.
-      - name: Targeted Clippy with documented unrelated baseline exceptions
+      - name: Targeted Clippy with documented unrelated baseline exclusions
         working-directory: compiler
         run: |
           cargo clippy -p compiler-opt --test typed_native_parity -- -D clippy::all -A clippy::empty_line_after_doc_comments -A clippy::collapsible_match -A clippy::collapsible_if
