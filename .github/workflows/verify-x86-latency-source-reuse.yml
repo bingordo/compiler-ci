@@ -1,0 +1,58 @@
+name: Shared x86 latency source and XED profile validation
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-x86-latency-source-reuse.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  latency-source-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout immutable compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1d66f8a30f9cf6966e6af3d4299ccf15d406569c
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require exact compiler source SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "1d66f8a30f9cf6966e6af3d4299ccf15d406569c"
+      - name: Run shared provenance and exact-vs-memory-bound integration tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/tools"
+          python3 -m unittest discover -s tools -p test_x86_latency_sources.py -v
+      - name: Run existing register and memory reviewed latency mutation suites
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/tools"
+          python3 -m unittest discover -s tools -p test_x86_operand_latencies.py -v
+          python3 -m unittest discover -s tools -p test_x86_memory_operand_latencies.py -v
+      - name: Confirm generated JSON and Rust match reviewed source snapshots
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/tools"
+          python3 -m py_compile tools/x86_latency_sources.py tools/regen_x86_operand_latencies.py tools/regen_x86_memory_operand_latencies.py
+          python3 - <<'PY'
+          import json
+          from regen_x86_operand_latencies import DATA as RD, RUST as RR, render_rust as render_register, payload
+          from regen_x86_memory_operand_latencies import DATA as MD, RUST as MR, render_rust as render_memory, canonical
+          reg = json.loads(RD.read_text())
+          mem = json.loads(MD.read_text())
+          assert RD.read_text() == payload(reg)
+          assert MD.read_text() == canonical(mem)
+          assert RR.read_text() == render_register(reg)
+          assert MR.read_text() == render_memory(mem)
+          for cpu in ("SKL", "ZEN4"):
+              for row in mem["profiles"][cpu].values():
+                  assert row["memory_paths"]
+                  assert all("data_cycles_upper_bound" in v for v in row["memory_paths"])
+                  assert all("data_cycles_upper_bound" not in v for v in row["exact_paths"])
+          print("SOURCE_REVIEWED_X86_LATENCY_OUTPUT_PARITY: both committed JSON/Rust tables exact")
+          PY
