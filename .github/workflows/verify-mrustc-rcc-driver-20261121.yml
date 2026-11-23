@@ -1,0 +1,268 @@
+name: Probe exact source-pinned mrustc driver via Mini-C internal-rcc
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/verify-mrustc-rcc-driver-20261121.yml'
+      - '.github/workflows/probe-mrustc-bootstrap.yml'
+      - 'bootstrap/prepare-mrustc-rcc.py'
+      - 'bootstrap/prepare-mrustc-driver.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bootstrap-mrustc-rcc-driver-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout compiler-ci smoke fixtures
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout compiler using existing read-only deploy key
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f4c7edd4c34eff9db0627749862b3695c9c12d6b
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+
+      - name: Resolve exact frontend source pins from checked-out compiler
+        id: frontend-pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          from pathlib import Path
+          import re
+          import tomllib
+
+          with Path("compiler/crates/driver/Cargo.toml").open("rb") as f:
+              deps = tomllib.load(f)["dependencies"]
+          names = {
+              "oberon-front-ir": "oberon",
+              "mini-c-syntax": "mini-c",
+              "mini-c-sema": "mini-c",
+              "mini-c-preprocess": "mini-c",
+          }
+          by_repo = {}
+          for crate, repo in names.items():
+              dep = deps[crate]
+              assert dep["git"] == f"ssh://git@github.com/bingordo/{repo}.git"
+              sha = dep["rev"]
+              assert re.fullmatch(r"[0-9a-f]{40}", sha), (crate, sha)
+              if repo in by_repo:
+                  assert by_repo[repo] == sha, f"conflicting {repo} frontend pins"
+              by_repo[repo] = sha
+          assert deps["mini-c-preprocess"]["features"] == ["internal-rcc"]
+          print(f"oberon_sha={by_repo['oberon']}")
+          print(f"mini_c_sha={by_repo['mini-c']}")
+          PY
+
+      - name: Checkout pinned Oberon frontend source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/oberon
+          ref: ${{ steps.frontend-pins.outputs.oberon_sha }}
+          path: oberon
+          persist-credentials: false
+
+      - name: Checkout pinned Mini-C frontend source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: ${{ steps.frontend-pins.outputs.mini_c_sha }}
+          path: mini-c
+          persist-credentials: false
+      - name: Checkout compiler-pinned Mini-C for generated-C compatibility audit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          # Use precisely the grammar and checker revision required by the
+          # bootstrapped driver rather than a historical parser snapshot.
+          ref: ${{ steps.frontend-pins.outputs.mini_c_sha }}
+          path: mini-c-compat
+          persist-credentials: false
+      - name: Checkout pinned rcc for Mini-C internal preprocessor bootstrap
+        uses: actions/checkout@v4
+        with:
+          repository: noname0310/rcc
+          ref: aa7ba4115a986cd533965ae297de6490315c35cb
+          path: rcc
+          persist-credentials: false
+
+      - name: Checkout pinned mrustc
+        uses: actions/checkout@v4
+        with:
+          repository: thepowersgang/mrustc
+          ref: master
+          path: mrustc
+          persist-credentials: false
+
+      - name: Identify mrustc cache revision
+        id: mrustc-revision
+        shell: bash
+        run: echo "sha=$(git -C mrustc rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore prebuilt mrustc and Rust 1.90 libraries
+        id: mrustc-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            mrustc/bin
+            mrustc/output-1.90.0
+          key: mrustc-bootstrap-v1-${{ runner.os }}-ubuntu2404-rust190-${{ steps.mrustc-revision.outputs.sha }}
+
+      - name: Install mrustc build dependencies when the toolchain needs building
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.mrustc-cache.outputs.cache-hit }}" == "true" ]] &&
+             [[ -x mrustc/bin/mrustc ]] &&
+             [[ -x mrustc/bin/minicargo ]] &&
+             [[ -f mrustc/output-1.90.0/libcore.rlib ]]; then
+            echo "Cached mrustc is complete; skipping apt install." >> "$GITHUB_STEP_SUMMARY"
+          else
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends build-essential zlib1g-dev pkg-config cmake curl python3 libssl-dev
+          fi
+          # GCC and Cargo are required even when mrustc itself came from cache.
+          command -v gcc
+          command -v cargo
+          command -v python3
+
+      - name: Record reproducibility inputs and target crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Compiler SHA: $(git -C compiler rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          echo "mrustc SHA: $(git -C mrustc rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Host: $(uname -m) / $(lsb_release -rs)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Rust crate editions:" >> "$GITHUB_STEP_SUMMARY"
+          grep -Rh '^edition[[:space:]]*=' compiler/crates/*/Cargo.toml | sort | uniq -c >> "$GITHUB_STEP_SUMMARY"
+          echo "First target: compiler-ir (no frontend dependency); then compiler-opt, backend, driver." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build mrustc and matching Rust 1.90 libraries
+        id: toolchain
+        shell: bash
+        working-directory: mrustc
+        env:
+          RUSTC_VERSION: '1.90.0'
+          MRUSTC_TARGET_VER: '1.90'
+          OUTDIR_SUF: '-1.90.0'
+          PARLEVEL: '2'
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.mrustc-cache.outputs.cache-hit }}" == "true" ]] && \
+             [[ -x bin/mrustc ]] && [[ -x bin/minicargo ]] && \
+             [[ -f output-1.90.0/libcore.rlib ]]; then
+            echo "Using cached mrustc toolchain and Rust libraries" >> "$GITHUB_STEP_SUMMARY"
+          else
+            # Missing/incomplete caches rebuild in this runner.
+            timeout --signal=TERM --kill-after=10s 20m make -j2
+            timeout --signal=TERM --kill-after=10s 10m make RUSTCSRC
+            timeout --signal=TERM --kill-after=10s 55m make -f minicargo.mk LIBS
+          fi
+          test -x bin/mrustc
+          test -x bin/minicargo
+          test -f output-1.90.0/libcore.rlib
+
+      - name: Cache validated mrustc toolchain
+        if: success() && steps.mrustc-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            mrustc/bin
+            mrustc/output-1.90.0
+          key: mrustc-bootstrap-v1-${{ runner.os }}-ubuntu2404-rust190-${{ steps.mrustc-revision.outputs.sha }}
+
+      - name: Prepare temporary pinned frontend paths and vendor LALRPOP runtime
+        id: driver-deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Only checkout manifests are changed; original repositories stay intact.
+          python3 bootstrap/prepare-mrustc-driver.py "$PWD"
+          python3 bootstrap/prepare-mrustc-rcc.py "$PWD"
+          seed="$RUNNER_TEMP/mrustc-vendor-seed"
+          mkdir -p "$seed/src"
+          cat > "$seed/Cargo.toml" <<'TOML'
+          [package]
+          name = "mrustc-vendor-seed"
+          version = "0.1.0"
+          edition = "2021"
+          [dependencies]
+          lalrpop-util = { version = "=0.23.1", default-features = false }
+          sha2 = "0.10"
+          wasm-encoder = "=0.262.0"
+          wasmparser = "=0.262.0"
+          # Source-pinned rcc workspaces require only these registry crates;
+          # no generated or stub rcc implementation is substituted.
+          rustc-hash = "2"
+          indexmap = "2"
+          ariadne = "0.5"
+          clap = { version = "4", features = ["derive"] }
+          insta = "1"
+          proptest = "1"
+          criterion = "0.5"
+          TOML
+          printf 'fn main() {}\n' > "$seed/src/main.rs"
+          timeout --signal=TERM --kill-after=10s 10m cargo vendor --manifest-path "$seed/Cargo.toml" \
+            --versioned-dirs "$RUNNER_TEMP/mrustc-driver-vendor" \
+            > "$RUNNER_TEMP/mrustc-driver-vendor-config.txt"
+          test -f "$RUNNER_TEMP/mrustc-driver-vendor/lalrpop-util-0.23.1/Cargo.toml"
+          test -f "$RUNNER_TEMP/mrustc-driver-vendor/wasm-encoder-0.262.0/Cargo.toml"
+          test -f "$RUNNER_TEMP/mrustc-driver-vendor/wasmparser-0.262.0/Cargo.toml"
+          # The original yansi 1.0.1 macros are feature-disabled by this
+          # driver; mrustc nevertheless expands them unless cfg is explicit.
+          # Only the runner's exact vendored source is adapted.
+          python3 bootstrap/prepare-mrustc-yansi.py "$RUNNER_TEMP/mrustc-driver-vendor"
+          find "$RUNNER_TEMP/mrustc-driver-vendor" -maxdepth 2 -path '*/sha2-0.10.*/Cargo.toml' -print -quit | grep -q .
+          echo "Driver inputs: exact pinned Oberon, Mini-C and rcc local sources, original internal-rcc feature, registry dependencies vendored on runner." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Bootstrap real compiler driver via mrustc and GCC
+        if: always() && steps.driver-deps.outcome == 'success'
+        id: driver-bootstrap
+        shell: bash
+        working-directory: mrustc
+        env:
+          RUSTC_VERSION: '1.90.0'
+          MRUSTC_TARGET_VER: '1.90'
+          OUTDIR_SUF: '-1.90.0'
+          PARLEVEL: '2'
+          CC: gcc
+        run: |
+          set -euo pipefail
+          # Full logs on failure are intentional and authorized for compiler-ci.
+          set +e
+          timeout --signal=TERM --kill-after=10s 40m bin/minicargo \
+            --vendor-dir "$RUNNER_TEMP/mrustc-driver-vendor" \
+            -L output-1.90.0 -o output-compiler-bootstrap \
+            ../compiler/crates/driver > "$RUNNER_TEMP/mrustc-driver.log" 2>&1
+          rc=$?
+          set -e
+          if (( rc != 0 )); then
+            echo "::group::Full real compiler driver minicargo/mrustc/GCC errors"
+            cat "$RUNNER_TEMP/mrustc-driver.log"
+            echo "::endgroup::"
+            echo "Real driver bootstrap failed: minicargo exit $rc" >> "$GITHUB_STEP_SUMMARY"
+            exit "$rc"
+          fi
+          executable="output-compiler-bootstrap/compiler"
+          if [[ ! -x "$executable" ]]; then
+            echo "::error::Driver translation succeeded but expected GCC-linked executable not found: $executable"
+            find output-compiler-bootstrap -maxdepth 2 -type f -executable -printf '%p\n' | sort
+            exit 1
+          fi
+          timeout 30s "$executable" --help > "$RUNNER_TEMP/mrustc-driver-help.txt"
+          grep -q 'Usage: compiler' "$RUNNER_TEMP/mrustc-driver-help.txt"
+          echo "Real compiler driver built by mrustc→C→GCC and --help succeeded." >> "$GITHUB_STEP_SUMMARY"
