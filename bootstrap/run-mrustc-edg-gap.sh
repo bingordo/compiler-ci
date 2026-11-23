@@ -447,6 +447,99 @@ for i,line in enumerate(selected[-8:],1):
     print(f"EDG_C_LITERAL_MIXED_DIAG_{i}={msg[:230]}")
 PY
     fi
+    # The real 32-byte union's rejected leaf is a ck_address carrying an
+    # explicitly cast original pointer in a C integer word slot. Assert
+    # native symbolic R_X86_64_64 + independently GCC-linked runtime parity
+    # on this public reproduction; no pointer bits or mrustc text are logged.
+    word_source=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_integer_literal_address.c
+    word_harness=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_integer_literal_address_harness.c
+    test -s "$word_source" && test -s "$word_harness"
+    set +e
+    (
+      cd /workspace/edgcpp/build/gcc-release
+      CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+        timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" run --quiet \
+        --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
+        -- /audit-tmp/edg-static-literal-word-native.o --gcc --c11 \
+        --no_strict_gnu --gnu_version "$gnu_number" "$word_source"
+    ) > /audit-tmp/edg-static-literal-word-native.log 2>&1
+    word_native_rc=$?
+    word_reloc_count=0
+    if (( word_native_rc == 0 )); then
+      readelf -rW /audit-tmp/edg-static-literal-word-native.o \
+        > /audit-tmp/edg-static-literal-word-relocs.txt
+      word_reloc_count=$(python3 - /audit-tmp/edg-static-literal-word-relocs.txt <<'PY'
+from pathlib import Path
+import re,sys
+section=""
+count=0
+for line in Path(sys.argv[1]).read_text().splitlines():
+    match=re.match(r"Relocation section '([^']+)'",line)
+    if match:section=match.group(1)
+    elif "R_X86_64_64" in line and (
+        section.startswith(".rela.data") or section.startswith(".rela.rodata")):
+        count+=1
+print(count)
+PY
+)
+      if [[ "$word_reloc_count" != "1" ]]; then word_native_rc=11; fi
+    fi
+    gcc -std=c11 -O0 -Wall -Wextra -Werror -c "$word_source" \
+      -o /audit-tmp/edg-static-literal-word-gcc.o &&
+      gcc -std=c11 -O0 -Wall -Wextra -Werror -no-pie \
+        /audit-tmp/edg-static-literal-word-gcc.o "$word_harness" \
+        -o /audit-tmp/edg-static-literal-word-gcc-exe &&
+      /audit-tmp/edg-static-literal-word-gcc-exe \
+        > /audit-tmp/edg-static-literal-word-gcc.out
+    word_gcc_rc=$?
+    word_native_link_rc=11
+    word_native_run_rc=11
+    word_parity_rc=11
+    if (( word_native_rc == 0 )); then
+      gcc -std=c11 -O0 -Wall -Wextra -Werror -no-pie \
+        /audit-tmp/edg-static-literal-word-native.o "$word_harness" \
+        -o /audit-tmp/edg-static-literal-word-native-exe
+      word_native_link_rc=$?
+      if (( word_native_link_rc == 0 )); then
+        /audit-tmp/edg-static-literal-word-native-exe \
+          > /audit-tmp/edg-static-literal-word-native.out
+        word_native_run_rc=$?
+        if (( word_native_run_rc == 0 && word_gcc_rc == 0 )); then
+          python3 - /audit-tmp/edg-static-literal-word-gcc.out \
+              /audit-tmp/edg-static-literal-word-native.out <<'PY'
+from pathlib import Path
+import sys
+expected=Path(sys.argv[1]).read_bytes()
+observed=Path(sys.argv[2]).read_bytes()
+if expected!=b"STATIC_INTEGER_ADDRESS_PARITY_OK\\n" or expected!=observed:
+    raise SystemExit(1)
+PY
+          word_parity_rc=$?
+        fi
+      fi
+    fi
+    set -e
+    echo "EDG_C_LITERAL_WORD_ELF_EXIT=$word_native_rc"
+    echo "EDG_C_LITERAL_WORD_DATA_RELOCATIONS=$word_reloc_count"
+    echo "EDG_C_LITERAL_WORD_GCC_EXIT=$word_gcc_rc"
+    echo "EDG_C_LITERAL_WORD_LINK_EXIT=$word_native_link_rc"
+    echo "EDG_C_LITERAL_WORD_RUN_EXIT=$word_native_run_rc"
+    echo "EDG_C_LITERAL_WORD_PARITY_EXIT=$word_parity_rc"
+    if (( word_native_rc != 0 || word_gcc_rc != 0 ||
+          word_native_link_rc != 0 || word_native_run_rc != 0 ||
+          word_parity_rc != 0 )); then
+      python3 - /audit-tmp/edg-static-literal-word-native.log <<'PY'
+from pathlib import Path
+import re,sys
+lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
+selected=[line for line in lines if any(
+    needle in line for needle in ("error[E","error:","rejected source","panicked"))]
+for i,line in enumerate(selected[-8:],1):
+    msg=re.sub(r"/workspace/[^ :]+","<public-path>",line.strip())
+    msg=re.sub(r"[^A-Za-z0-9 _./:><()\\[\\],=-]","?",msg)
+    print(f"EDG_C_LITERAL_WORD_DIAG_{i}={msg[:230]}")
+PY
+    fi
   else
     echo "EDG_C_LITERAL_TYPEID_ELF_EXIT=skipped_no_compiler"
     echo "EDG_C_LITERAL_GCC_ELF_ORACLE_EXIT=skipped_no_compiler"
