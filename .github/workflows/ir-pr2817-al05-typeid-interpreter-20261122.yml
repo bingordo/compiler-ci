@@ -1,0 +1,62 @@
+# Test-only AL05 P14/P15/P16 TypeId interpreter/host recurrence acceptance.
+# Keep source pinned independently from parallel compiler development.
+name: IR PR2817 AL05 P14-P16 interpreter parity
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ir-pr2817-al05-typeid-interpreter-20261122.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  al05-typeid-parity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      SOURCE_SHA: 7ae6e76bcba50fa04543f3e1bb99828e431b67d1
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Check out exact PR2817 compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source SHA and isolate core workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+          cargo --version
+      - name: Cache TypeId test build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-pr2763-al05-neutral-typeid
+      - name: Clippy TypeId P14-P16 interpreter integration test
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --test al05_p9_mixed_native_bridge -- -D clippy::all -A clippy::empty_line_after_doc_comments
+      - name: Execute bounded independent host vs TypeId recurrence checks
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test al05_p9_mixed_native_bridge al05_p14_p15_p16_typeid_reference_matches_host_recurrence -- --exact --nocapture
+      - name: Recheck 320 structural parity source/native graph cases
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test al05_p9_mixed_native_bridge al05_p9_neutral_plan_legacy_and_native_typeid_structural_parity -- --exact --nocapture
