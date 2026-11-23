@@ -1,0 +1,77 @@
+# One-off source-pinned ABI validation for compiler PR #2596.
+# This workflow runs on a push to main that introduces this file, avoiding
+# workflow_dispatch permissions that are unavailable through the connector.
+name: Validate compiler ABI PR 2596 once
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/verify-abi-pr2596-once.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  abi:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout exact compiler PR revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a78cc95265fde0e5fa54eabe3474091be290e58c
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source revision
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = a78cc95265fde0e5fa54eabe3474091be290e58c
+          test -s compiler/tools/mini-c-driver/tests/differential.py
+      - name: Make Mini-C dependency available over HTTPS
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("compiler/tools/mini-c-driver/Cargo.toml")
+          contents=p.read_text()
+          old="ssh://git@github.com/bingordo/mini-c.git"
+          assert contents.count(old)==2, "unexpected dependency manifest"
+          p.write_text(contents.replace(old, "https://github.com/bingordo/mini-c.git"))
+          PY
+      - name: Cache build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: abi-pr2596
+      - name: Build Mini-C driver
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 12m cargo build \
+            --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --bin compiler-mini-c \
+            2>&1 | tee "$RUNNER_TEMP/abi-build.log"
+      - name: Run mixed-object ABI tests against GCC
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 8m python3 \
+            compiler/tools/mini-c-driver/tests/differential.py \
+            --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" \
+            --mixed-only --timeout 15 \
+            --artifacts "$RUNNER_TEMP/abi-reproducers" \
+            2>&1 | tee "$RUNNER_TEMP/abi-tests.log"
+          grep -Fxq 'PASS: mixed ABI calls' "$RUNNER_TEMP/abi-tests.log"
+          echo "ABI mixed-object tests passed for compiler a78cc95265fde0e5fa54eabe3474091be290e58c" >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve failures
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: abi-pr2596-failures
+          path: |
+            ${{ runner.temp }}/abi-build.log
+            ${{ runner.temp }}/abi-tests.log
+            ${{ runner.temp }}/abi-reproducers/
+          if-no-files-found: ignore
+          retention-days: 14
