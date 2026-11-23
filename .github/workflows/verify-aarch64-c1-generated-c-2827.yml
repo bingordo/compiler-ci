@@ -1,0 +1,109 @@
+name: C1 AArch64 generated real C GCC execution differential
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-aarch64-c1-generated-c-2827.yml'
+permissions:
+  contents: read
+jobs:
+  deterministic-source-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2ea6796327282c6682f765734f19ded748e25f53
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler source and Python generator syntax
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "2ea6796327282c6682f765734f19ded748e25f53"
+          python3 -m py_compile compiler/tools/aarch64_c1_source_oracle.py compiler/tools/tests/test_aarch64_c1_source_oracle.py
+      - name: Deterministic seeded source and negative report mutation suite
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s compiler/tools/tests \
+            -p test_aarch64_c1_source_oracle.py -v
+  actual-native-aarch64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2ea6796327282c6682f765734f19ded748e25f53
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Record exact source and configure public frontend Git dependency
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          test "$(git -C compiler rev-parse HEAD)" = "2ea6796327282c6682f765734f19ded748e25f53"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+          gcc --version | head -n 1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: c1-aarch64-real-source-oracle-v1
+      - name: Compile production checked source driver and verify report CLI
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo build --release -p compiler --bin compiler
+          cargo test -p compiler --test aarch64_selector_report_cli -- --nocapture
+      - name: "Execute independent native GCC C11 oracle over 32 seeded source functions"
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          python3 compiler/tools/aarch64_c1_source_oracle.py \
+            --compiler compiler/target/release/compiler \
+            --output results/seed7 --seed 7 --functions 32 --samples 512 \
+            --execute-native
+      - name: "Execute PIC and independent seed 73 native GCC C11 oracle"
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/aarch64_c1_source_oracle.py \
+            --compiler compiler/target/release/compiler \
+            --output results/seed73-pic --seed 73 --functions 20 --samples 256 \
+            --pic --execute-native
+      - name: Check independent source coverage and native execution receipts
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          rows=[json.loads(p.read_text()) for p in sorted(Path("results").glob("*/summary.json"))]
+          assert len(rows)==2
+          assert sum(r["functions"] for r in rows)==52
+          assert all(r["object_parity"] and r["native_executed"] for r in rows)
+          assert all(r["coverage"]["handwritten"]==0 for r in rows)
+          assert all(r["coverage"]["generated"]>0 for r in rows)
+          assert all(r["coverage"]["text_bytes"]>0 for r in rows)
+          assert rows[0]["source_sha256"]!=rows[1]["source_sha256"]
+          print("A64_C1_NATIVE_SOURCE_GCC",json.dumps({
+              "functions":sum(r["functions"] for r in rows),
+              "samples":sum(r["functions"]*r["samples_per_function"] for r in rows),
+              "scalar_rules":sum(r["coverage"]["generated"] for r in rows),
+              "code_bytes":sum(r["coverage"]["text_bytes"] for r in rows),
+              "seeds":[r["seed"] for r in rows],
+              "elf_identical":all(r["object_parity"] for r in rows),
+              "gcc_native_execution_equal":all(r["native_executed"] for r in rows)
+          },sort_keys=True),flush=True)
+          PY
+          echo 'AArch64 native GCC differential and actual TypeId/ELF source measurements PASS on exact source 2ea6796327282c6682f765734f19ded748e25f53' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: aarch64-c1-seeded-source-oracle-reproducers
+          path: results/
+          if-no-files-found: ignore
+          retention-days: 21
