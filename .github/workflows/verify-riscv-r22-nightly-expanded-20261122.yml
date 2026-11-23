@@ -1,0 +1,126 @@
+name: RV64 R22 nightly expanded seeded LP64 GP routing
+on:
+  workflow_dispatch:
+    inputs:
+      routing_seed:
+        description: "Deterministic routing and operand seed (nightly uses run ID)"
+        required: true
+        default: "20261122"
+        type: string
+  # Exactly one useful seeded RV64 nightly; no redundant per-shard schedules.
+  schedule:
+    - cron: '41 10 * * *'
+  push:
+    branches: [main, 'ci/riscv-r22-nightly-expanded-20261122']
+    paths: ['.github/workflows/verify-riscv-r22-nightly-expanded-20261122.yml']
+permissions:
+  contents: read
+jobs:
+  r22-expanded:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      R22_ROUTING_SEED: ${{ github.event_name == 'schedule' && github.run_id || github.event.inputs.routing_seed || '20261122' }}
+    steps:
+      - name: Permit pinned private compiler dependency access
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Configure trusted GitHub SSH host
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - name: Checkout exact compiler implementation revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f51462fdfe82e173113c39b598ed656b5146eeca
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Enforce exact compiler source and expose reproducer identifier
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = f51462fdfe82e173113c39b598ed656b5146eeca
+          printf 'compiler=%s seed=%s\n' "$(git -C compiler rev-parse HEAD)" "$R22_ROUTING_SEED"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Verify R22 route contracts and compile native fixture once
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools/tests -p test_riscv_route_seeded_oracle.py -v
+          cargo test -p compiler-backend-riscv64 --lib --tests
+          cargo clippy -p compiler-backend-riscv64 --tests -- -D warnings
+          cargo build -q -p compiler-backend-riscv64 --example rv64_leaf
+      - name: Install independent GNU RV64 compiler binutils and QEMU once
+        run: |
+          sudo env DEBIAN_FRONTEND=noninteractive timeout 600s apt-get install -y \
+            --no-install-recommends gcc-riscv64-linux-gnu \
+            binutils-riscv64-linux-gnu qemu-user
+      - name: Run 4 sequential 32-case shards with one Rust build and toolchain
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          root=/tmp/rv64-r22-nightly
+          echo "R22 nightly source: $(git rev-parse HEAD); seed=$R22_ROUTING_SEED"
+          python3 tools/riscv_route_seeded_oracle.py --output "$root" \
+            --routing-seed "$R22_ROUTING_SEED" --seed "$R22_ROUTING_SEED" \
+            --max-cases 128 --vectors 24
+          python3 tools/riscv_route_seeded_oracle.py --output /tmp/rv64-r22-nightly-replay \
+            --routing-seed "$R22_ROUTING_SEED" --seed "$R22_ROUTING_SEED" \
+            --max-cases 128 --vectors 24
+          diff -qr "$root" /tmp/rv64-r22-nightly-replay
+          python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); assert len(m["cases"])==128 and m["coverage"]["novel_pairs"]==128 and m["coverage"]["uncovered_pairs"]==137 and m["coverage"]["incoming_arities"]==list(range(17)) and m["coverage"]["outgoing_arities"]==list(range(17))' "$root/manifest.json"
+          for shard in 0 1 2 3; do
+            start=$((24 + shard * 32))
+            end=$((start + 31))
+            echo "R22 shard=$shard cases=[$start,$end] source=$(git rev-parse HEAD) seed=$R22_ROUTING_SEED"
+            for index in $(seq "$start" "$end"); do
+              kind=route$index
+              target/debug/examples/rv64_leaf \
+                "$root/$kind.o" "$root/$kind"_native.s "$kind" --isa=rv64i \
+                --route-manifest="$root/route_cases.tsv"
+              riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+                "$root/$kind"_native.s -o "$root/$kind"_gas.o
+              riscv64-linux-gnu-objcopy -O binary -j .text \
+                "$root/$kind.o" "$root/$kind"_native.bin
+              riscv64-linux-gnu-objcopy -O binary -j .text \
+                "$root/$kind"_gas.o "$root/$kind"_gas.bin
+              cmp "$root/$kind"_native.bin "$root/$kind"_gas.bin
+              grep -q "^rv64_$kind:" "$root/$kind"_native.s
+              grep -q 'R_RISCV_CALL_PLT' "$root/$kind"_native.s
+              riscv64-linux-gnu-gcc -march=rv64im -mabi=lp64 -O2 \
+                -ffreestanding -fno-builtin -fno-pie -fno-stack-protector \
+                -fwrapv -c "$root/$kind.c" -o "$root/$kind"_gcc.o
+              riscv64-linux-gnu-as -march=rv64im -mabi=lp64 \
+                "$root/$kind.s" -o "$root/$kind"_harness.o
+              riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax -e _start \
+                "$root/$kind"_harness.o "$root/$kind.o" \
+                "$root/$kind"_gcc.o -o "$root/$kind.elf"
+              set +e
+              timeout 20s qemu-riscv64 "$root/$kind.elf"
+              status=$?
+              set -e
+              if [ "$status" -ne 0 ]; then
+                echo "R22 expanded mismatch shard=$shard case=$kind exit=$status seed=$R22_ROUTING_SEED" >&2
+                python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); n=int(sys.argv[3]); c=next(x for x in m["cases"] if x["case"]==sys.argv[2]); print("R22 failing mapping:",c["mapping"]); print("R22 reproducer vector:",c["vectors"][n-1] if 1<=n<=len(c["vectors"]) else "SP/s-registers/native machine code failure")' "$root/manifest.json" "$kind" "$status"
+                exit 1
+              fi
+            done
+            echo "R22 shard $shard passed 32 cases x 24 vectors = 768 GCC/QEMU comparisons"
+          done
+          echo "PASSED R22 expanded 128 unique novel GP pairs x 24 = 3072 GCC/QEMU comparisons"
+      - name: Preserve deterministic manifest and failure source reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r22-expanded-seeded-repro-${{ github.run_id }}
+          path: |
+            /tmp/rv64-r22-nightly/manifest.json
+            /tmp/rv64-r22-nightly/route_cases.tsv
+            /tmp/rv64-r22-nightly/route*.c
+            /tmp/rv64-r22-nightly/route*.s
+            /tmp/rv64-r22-nightly/route*_native.s
+          if-no-files-found: warn
+          retention-days: 14
