@@ -1,0 +1,97 @@
+# Source-pinned compiler issue #545 validation in compiler-ci, never compiler Actions.
+name: AArch64 direct tail-call acceptance (issue 545)
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/issue545-aarch64-tail-native.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  arm-native:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - name: Check out exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 502ceca5440a1d26b10a21045d6392812888d73a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert source pin
+        shell: bash
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = '502ceca5440a1d26b10a21045d6392812888d73a'
+          echo "Compiler source: \`502ceca5440a1d26b10a21045d6392812888d73a\`" >> "$GITHUB_STEP_SUMMARY"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Make isolated native backend workspace
+        run: |
+          mkdir -p work/crates
+          cp -a compiler/crates/ir compiler/crates/opt compiler/crates/backend \
+            compiler/crates/backend-x86 compiler/crates/backend-aarch64 \
+            compiler/crates/backend-wasm compiler/crates/driver work/crates/
+          cp -a compiler/examples compiler/tests work/
+          cat > work/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend",
+                     "crates/backend-x86", "crates/backend-aarch64",
+                     "crates/backend-wasm", "crates/driver"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: work
+          key: issue545-aarch64-tail
+      - name: Strict AArch64 backend check
+        working-directory: work
+        run: RUSTFLAGS="-D warnings" cargo check -p compiler-backend-aarch64 --all-targets
+      - name: Direct/recursive branch and BL fallback runtime tests
+        working-directory: work
+        run: cargo test -p compiler-backend-aarch64 --test tail_call_native -- --nocapture
+      - name: Existing direct ABI/CFI regression
+        working-directory: work
+        run: |
+          cargo test -p compiler-backend-aarch64 --test direct_calls -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test typeid_abi_calls_native -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test unwind_cfi -- --nocapture
+      - name: Strict Clippy for candidate test and backend
+        working-directory: work
+        run: cargo clippy -p compiler-backend-aarch64 --all-targets -- -D warnings
+  x86-known-regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 502ceca5440a1d26b10a21045d6392812888d73a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Isolate TypeId optimizer workspace
+        run: |
+          mkdir -p work/crates
+          cp -a compiler/crates/ir compiler/crates/opt compiler/crates/backend \
+            compiler/crates/backend-x86 compiler/crates/backend-aarch64 \
+            compiler/crates/backend-wasm compiler/crates/driver work/crates/
+          cp -a compiler/examples compiler/tests work/
+          cat > work/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend",
+                     "crates/backend-x86", "crates/backend-aarch64",
+                     "crates/backend-wasm", "crates/driver"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: work
+          key: issue545-x86-regression
+      - name: Existing reported generated direct tail-call regression (evidence; may fail)
+        working-directory: work
+        continue-on-error: true
+        run: |
+          cargo test -p compiler-opt --test typeid_fuzz_targeted \
+            generated_internal_call_profiles_cover_auto_detected_direct_tail_exits -- --exact --nocapture
