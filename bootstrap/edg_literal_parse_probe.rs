@@ -79,6 +79,30 @@ fn main() {
                 il.global_literal_objects.len(),
                 il.global_literal_relocations.len(),
                 u8::from(literal_valid));
+            // A routine relocation must refer to an original EDG function
+            // SymbolId, not an invented address or source-text spelling.
+            // This counter is source-free, safe for private generated C.
+            let mut routine_slots=std::collections::HashSet::new();
+            let routine_valid=il.global_routine_relocations.iter().all(|reloc| {
+                let image=il.global_aggregate_initializers.iter()
+                    .find(|v|v.symbol==reloc.symbol);
+                let zero=image.and_then(|v|{
+                    let start=usize::try_from(reloc.offset).ok()?;
+                    let end=start.checked_add(8)?;
+                    v.bytes.get(start..end)
+                }).is_some_and(|bytes|bytes.iter().all(|b|*b==0));
+                let original=il.symbols.iter().any(|s|
+                    s.id==reloc.routine && s.kind==1);
+                let nonoverlap=routine_slots.insert((reloc.symbol,reloc.offset)) &&
+                    !il.global_literal_relocations.iter().any(|r|
+                        r.symbol==reloc.symbol && r.offset==reloc.offset) &&
+                    !il.global_aggregate_relocations.iter().any(|r|
+                        r.symbol==reloc.symbol && r.offset==reloc.offset);
+                original && zero && nonoverlap && reloc.offset%8==0 &&
+                    reloc.addend==0
+            });
+            println!("EDG_PROBE_STATIC_ROUTINES relocations={} valid={}",
+                il.global_routine_relocations.len(),u8::from(routine_valid));
             if unit.status != 0 {
                 std::process::exit(1);
             }
