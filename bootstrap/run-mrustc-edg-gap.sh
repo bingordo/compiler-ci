@@ -235,6 +235,48 @@ PY
   fi
 fi
 
+# Original GNU C11 strong-data address plus weak union routine-address
+# differential. The source fixture and EDG auditor are committed public
+# code; never expose the private generated mrustc translation unit.
+if [[ "${EDG_WEAK_DATA_WORD_ORACLE:-0}" == "1" ]]; then
+  weak_source=/workspace/edgcpp-rust/tests/fixtures/bootstrap_weak_word_variable_addresses.c
+  test -s "$weak_source"
+  set +e
+  timeout --signal=TERM --kill-after=3s 30s gcc -std=gnu11 \
+    -O2 -Wall -Wextra -Werror -c "$weak_source" -o /audit-tmp/weak-data-word-gcc.o
+  weak_data_gcc_rc=$?
+  if (( weak_data_gcc_rc == 0 )); then
+    rout_reloc_count=$(readelf -rW /audit-tmp/weak-data-word-gcc.o |
+      grep -cE 'R_X86_64_64.*bootstrap_weak_word_target' || true)
+    data_reloc_count=$(readelf -rW /audit-tmp/weak-data-word-gcc.o |
+      grep -cE 'R_X86_64_64.*bootstrap_weak_data_target' || true)
+    weak_def_count=$(readelf -Ws /audit-tmp/weak-data-word-gcc.o |
+      awk '$4=="OBJECT" && $5=="WEAK" &&
+           $8 ~ /^bootstrap_weak_word[568]$/ {n++} END {print n+0}')
+    if [[ "$rout_reloc_count" != 3 || "$data_reloc_count" != 3 ||
+          "$weak_def_count" != 3 ]]; then
+      weak_data_gcc_rc=1
+    fi
+  fi
+  (
+    cd /workspace/edgcpp/build/gcc-release
+    timeout --signal=TERM --kill-after=10s 8m cargo run --quiet \
+      --manifest-path /workspace/edgcpp-rust/Cargo.toml \
+      --example audit_weak_word_variable_addresses -- --gcc --c11 \
+      --no_strict_gnu --gnu_version "$gnu_number" "${include_args[@]}" "$weak_source"
+  ) > /audit-tmp/edg-public-weak-data-word.log 2>&1
+  weak_data_edg_rc=$?
+  set -e
+  echo "EDG_C_WEAK_DATA_WORD_GCC_EXIT=$weak_data_gcc_rc"
+  echo "EDG_C_WEAK_DATA_WORD_EDG_EXIT=$weak_data_edg_rc"
+  if (( weak_data_edg_rc != 0 )); then
+    # The only source of diagnostics is the committed public C fixture.
+    grep -E '(error\[E|^error|panicked|source-owned|weak union|relocation)' \
+      /audit-tmp/edg-public-weak-data-word.log | tail -n 12 |
+      sed -E 's@/workspace/[^ :]+@<public-fixture>@g' || true
+  fi
+fi
+
 # Source-pinned TypeId consumer compile check, deliberately separate from
 # production compiler checkout. The candidate shares the same checked EDG
 # dependency as the public producer. No source from the private mrustc TU is
