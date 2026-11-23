@@ -18,11 +18,9 @@ on:
         required: false
         default: false
         type: boolean
-      abi_only:
-        description: 'Run only mixed-object ABI tests (manual validation)'
-        required: false
-        default: false
-        type: boolean
+  pull_request:
+    paths:
+      - '.github/workflows/verify-mini-c-differential.yml'
   schedule:
     - cron: '4,19,34,49 * * * *'
   push:
@@ -39,6 +37,7 @@ concurrency:
 
 jobs:
   differential:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -66,7 +65,6 @@ jobs:
           test -s compiler/tools/mini-c-driver/Cargo.toml
           echo "Compiler revision: $sha" >> "$GITHUB_STEP_SUMMARY"
       - name: Check for previously successful source and cohort
-        if: ${{ !inputs.abi_only }}
         id: verified
         uses: actions/cache/restore@v4
         with:
@@ -74,7 +72,7 @@ jobs:
           key: mini-c-source-v1-${{ hashFiles('.github/workflows/verify-mini-c-differential.yml') }}-${{ steps.source.outputs.sha }}-${{ inputs.seed_count || '6' }}
           lookup-only: true
       - name: Make public Mini-C dependency accessible without another deploy key
-        if: inputs.abi_only || steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
         shell: bash
         run: |
           set -euo pipefail
@@ -87,14 +85,14 @@ jobs:
           manifest.write_text(text.replace(old,'https://github.com/bingordo/mini-c.git'))
           PY
       - name: Cache Rust objects and dependencies
-        if: inputs.abi_only || steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: compiler/tools/mini-c-driver -> target
           key: mini-c-source-differential-v1
           cache-workspace-crates: 'true'
       - name: Build compiler-mini-c once
-        if: inputs.abi_only || steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
         shell: bash
         run: |
           set -euo pipefail
@@ -104,43 +102,30 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/mini-c-build.log"
           test -x compiler/tools/mini-c-driver/target/debug/compiler-mini-c
       - name: Compare compiled Mini-C against GCC
-        if: inputs.abi_only || steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
         shell: bash
         env:
           SEED_COUNT: ${{ inputs.seed_count || '6' }}
-          ABI_ONLY: ${{ inputs.abi_only || 'false' }}
         run: |
           set -euo pipefail
-          args=(--seed-count "$SEED_COUNT" --steps 120 --timeout 15
-                --artifacts "$RUNNER_TEMP/mini-c-failures")
-          if [[ "$ABI_ONLY" == true ]]; then
-            args+=(--mixed-only)
-          fi
           timeout --signal=TERM --kill-after=10s 10m python3 \
             compiler/tools/mini-c-driver/tests/differential.py \
             --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" \
-            "${args[@]}" \
+            --seed-count "$SEED_COUNT" --steps 120 --timeout 15 \
+            --artifacts "$RUNNER_TEMP/mini-c-failures" \
             2>&1 | tee "$RUNNER_TEMP/mini-c-differential.log"
-          if [[ "$ABI_ONLY" == true ]]; then
-            grep -Fxq "PASS: mixed ABI calls" "$RUNNER_TEMP/mini-c-differential.log"
-          else
-            grep -Eq "^PASS: [1-9][0-9]* fixtures, $SEED_COUNT seeds, mixed ABI calls and negative cases$" "$RUNNER_TEMP/mini-c-differential.log"
-          fi
+          grep -Eq "^PASS: [1-9][0-9]* fixtures, $SEED_COUNT seeds, mixed ABI calls and negative cases$" "$RUNNER_TEMP/mini-c-differential.log"
           mkdir -p .mini-c-verified
           printf '%s\n' "${{ steps.source.outputs.sha }}" > .mini-c-verified/source-sha.txt
-          if [[ "$ABI_ONLY" == true ]]; then
-            echo "Passed focused mixed-object ABI checks" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "Passed fixed, seeded, ABI and negative GCC oracles" >> "$GITHUB_STEP_SUMMARY"
-          fi
+          echo "Passed fixed, seeded, ABI and negative GCC oracles" >> "$GITHUB_STEP_SUMMARY"
       - name: Save successful exact revision evidence
-        if: success() && !inputs.abi_only && steps.verified.outputs.cache-hit != 'true'
+        if: success() && steps.verified.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: .mini-c-verified
           key: mini-c-source-v1-${{ hashFiles('.github/workflows/verify-mini-c-differential.yml') }}-${{ steps.source.outputs.sha }}-${{ inputs.seed_count || '6' }}
       - name: Report cached result
-        if: !inputs.abi_only && steps.verified.outputs.cache-hit == 'true' && !inputs.force_recheck
+        if: steps.verified.outputs.cache-hit == 'true' && !inputs.force_recheck
         run: echo "Exact compiler revision and seed cohort previously passed" >> "$GITHUB_STEP_SUMMARY"
       - name: Preserve build logs and failing test cases
         if: failure()
@@ -153,3 +138,53 @@ jobs:
             ${{ runner.temp }}/mini-c-failures/
           if-no-files-found: ignore
           retention-days: 14
+
+  machine-paired-return:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 88334a0678f42bd85f6cc34459786f47c137127a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source SHA and prepare isolated native workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 88334a0678f42bd85f6cc34459786f47c137127a
+          mkdir -p "$RUNNER_TEMP/abi-test/crates" "$RUNNER_TEMP/abi-test/tools"
+          for crate in ir backend opt backend-x86 backend-aarch64; do
+            cp -a "compiler/crates/$crate" "$RUNNER_TEMP/abi-test/crates/$crate"
+          done
+          cp -a compiler/tools/typeid-rule-gen "$RUNNER_TEMP/abi-test/tools/typeid-rule-gen"
+          cat > "$RUNNER_TEMP/abi-test/Cargo.toml" <<'TOML'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/opt", "crates/backend-x86", "crates/backend-aarch64"]
+          TOML
+      - name: Verify native scalar-call adapter and grouped ABI cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 20m cargo test --manifest-path "$RUNNER_TEMP/abi-test/Cargo.toml" \
+            -p compiler-backend-x86 --lib paired_return::tests \
+            2>&1 | tee "$RUNNER_TEMP/paired-return-tests.log"
+          grep -Eq 'test result: ok. [1-9][0-9]* passed' "$RUNNER_TEMP/paired-return-tests.log"
+      - name: Check scoped x86 lint
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 6m cargo clippy --manifest-path "$RUNNER_TEMP/abi-test/Cargo.toml" \
+            -p compiler-backend-x86 --lib -- -D warnings -A dead_code -A unused_imports -A clippy::empty_line_after_doc_comments
+      - name: Preserve diagnostic log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: machine-paired-return-2789-errors
+          path: ${{ runner.temp }}/paired-return-tests.log
+          if-no-files-found: ignore
+          retention-days: 7
