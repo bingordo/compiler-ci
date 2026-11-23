@@ -240,8 +240,14 @@ fi
 # dependency as the public producer. No source from the private mrustc TU is
 # supplied to this check.
 if [[ "${EDG_LITERAL_REGRESSION:-0}" == "1" ]]; then
-  candidate_sha=83ab252e7f3d526f1de1a1f012d1dcce90e55ab3
-  test "$(git -c safe.directory=/workspace/compiler-literal-source -C /workspace/compiler-literal-source rev-parse HEAD)" = "$candidate_sha"
+  # The workflow pins the checked-out candidate to an immutable full SHA.
+  # Report that exact checkout instead of duplicating a second, stale SHA
+  # here: otherwise the public native ELF oracle never reaches the compiler.
+  candidate_sha="$(git -c safe.directory=/workspace/compiler-literal-source -C /workspace/compiler-literal-source rev-parse HEAD)"
+  if [[ ! "$candidate_sha" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "EDG_C_LITERAL_TYPEID_CANDIDATE_PIN_INVALID"
+    exit 1
+  fi
   # Actions checkout is mounted read-only. Make a disposable compilation
   # copy in the private runner temp so Cargo can update its local lockfile.
   mkdir -p /audit-tmp/compiler-literal-candidate
