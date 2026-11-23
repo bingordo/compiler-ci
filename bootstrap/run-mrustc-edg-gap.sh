@@ -194,6 +194,47 @@ PY
   fi
 fi
 
+# C11 original function-address reference is an independent source family.
+# It must retain the EDG routine SymbolId and cannot borrow literal IDs.
+if [[ "${EDG_LITERAL_REGRESSION:-0}" == "1" ]]; then
+  routine_public=/workspace/edgcpp-rust/tests/fixtures/bootstrap_static_routine_union.c
+  test -s "$routine_public"
+  set +e
+  (
+    cd /workspace/edgcpp/build/gcc-release
+    timeout --signal=TERM --kill-after=10s 8m cargo run --quiet \
+      --manifest-path /workspace/edgcpp-rust/Cargo.toml \
+      --example audit_static_routine_union -- --gcc --c11 \
+      --no_strict_gnu --gnu_version "$gnu_number" "${include_args[@]}" "$routine_public"
+  ) > /audit-tmp/edg-static-routine-public.log 2>&1
+  routine_bridge_rc=$?
+  (
+    cd /workspace/edgcpp/build/gcc-release
+    timeout --signal=TERM --kill-after=10s 5m cargo test --quiet \
+      --manifest-path /workspace/edgcpp-rust/Cargo.toml --lib \
+      bootstrap_static_routine_relocation_wire_tests
+  ) > /audit-tmp/edg-static-routine-wire.log 2>&1
+  routine_wire_rc=$?
+  set -e
+  echo "EDG_C_ROUTINE_BRIDGE_EXIT=$routine_bridge_rc"
+  echo "EDG_C_ROUTINE_WIRE_EXIT=$routine_wire_rc"
+  if (( routine_bridge_rc != 0 || routine_wire_rc != 0 )); then
+    python3 - /audit-tmp/edg-static-routine-public.log \
+      /audit-tmp/edg-static-routine-wire.log <<'PY'
+from pathlib import Path
+import re,sys
+for p in sys.argv[1:]:
+    lines=Path(p).read_text(errors="replace").splitlines()
+    selected=[line for line in lines if any(k in line for k in
+        ("error[E","error:","panicked","FAILED","test result:"))]
+    for i,line in enumerate(selected[-8:],1):
+        msg=re.sub(r"/workspace/[^ :]+","<public-path>",line.strip())
+        msg=re.sub(r"[^A-Za-z0-9 _./:><()\\[\\],=-]","?",msg)
+        print(f"EDG_C_ROUTINE_PUBLIC_DIAG_{i}={msg[:230]}")
+PY
+  fi
+fi
+
 # Source-pinned TypeId consumer compile check, deliberately separate from
 # production compiler checkout. The candidate shares the same checked EDG
 # dependency as the public producer. No source from the private mrustc TU is
