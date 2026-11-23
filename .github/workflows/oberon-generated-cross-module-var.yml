@@ -72,6 +72,60 @@ jobs:
           echo "Nightly four-seed window begins at $base"
       - name: Run seeded cross-module VAR INTEGER/BOOLEAN C differential
         run: cargo test --manifest-path compiler/Cargo.toml -p compiler --test oberon_generated_module_var_native -- --nocapture
+      - name: Checkout exact Oberon imported-VAR generator candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/oberon
+          ref: b2c72e20e16c5358ca68edc12ad3270ce63ceb9f
+          path: oberon-generator
+          persist-credentials: false
+      - name: Build and unit-test the pinned typed import generator
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path oberon-generator/oberon/Cargo.toml --bin obgen compiler_typed
+          cargo build --manifest-path oberon-generator/oberon/Cargo.toml --bin obgen
+          cargo build --manifest-path compiler/Cargo.toml -p compiler --bin compiler
+      - name: Native multi-module typed AST C differential (GAS and direct ELF)
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$OBERON_MODULE_BASE_SEED" =~ ^[0-9]+$ ]]
+          [[ "$OBERON_MODULE_SEEDS" =~ ^[1-9][0-9]*$ ]]
+          test "$OBERON_MODULE_SEEDS" -le 64
+          obgen="$PWD/oberon-generator/oberon/target/debug/obgen"
+          compiler="$PWD/compiler/target/debug/compiler"
+          for ((offset=0; offset<OBERON_MODULE_SEEDS; offset++)); do
+            seed=$((OBERON_MODULE_BASE_SEED + offset))
+            root="/tmp/oberon-typed-import-$seed"
+            mkdir -p "$root"
+            "$obgen" --base "$seed" --compiler-subset=typed-import-provider > "$root/FuzzOps.mod"
+            "$obgen" --base "$seed" --compiler-subset=typed-import-source > "$root/Fuzz.mod"
+            "$obgen" --base "$seed" --compiler-subset=typed-import-harness > "$root/reference.c"
+            for format in asm obj; do
+              build="$root/$format"
+              mkdir -p "$build"
+              if ! "$compiler" "$root/Fuzz.mod" --language oberon \
+                  --build-modules "$build" --module-path "$root" --emit "$format" \
+                  > "$build/compile.log" 2>&1; then
+                cat "$build/compile.log" >&2
+                exit 1
+              fi
+              if [[ "$format" == asm ]]; then suffix=s; else suffix=o; fi
+              grep -qx "FuzzOps.$suffix" "$build/objects.list"
+              grep -qx "Fuzz.$suffix" "$build/objects.list"
+              grep -q 'PROC Change' "$build/FuzzOps.sym"
+              grep -q 'PROC FlipFlag' "$build/FuzzOps.sym"
+              grep -q 'PROC Twist' "$build/FuzzOps.sym"
+              if ! cc -std=c11 -O2 -fwrapv -Wall -Wextra -Werror -fPIE -pie \
+                    "$root/reference.c" "$build/FuzzOps.$suffix" "$build/Fuzz.$suffix" \
+                    -o "$build/check" > "$build/link.log" 2>&1; then
+                cat "$build/link.log" >&2
+                exit 1
+              fi
+              "$build/check"
+            done
+          done
       - name: Reject generated bad module graphs, VAR actuals and ABI interfaces atomically
         run: cargo test --manifest-path compiler/Cargo.toml -p compiler --test oberon_generated_module_var_native generated_invalid_module_graphs_and_var_signatures_fail_atomically -- --nocapture
       - name: Generate and validate converging 5-10-module VAR ABI DAGs
@@ -100,6 +154,7 @@ jobs:
         with:
           name: oberon-generated-cross-module-failures
           path: |
+            /tmp/oberon-typed-import-*
             /tmp/oberon-module-generated-*
             /tmp/oberon-module-negative-*
             /tmp/oberon-module-dag-*
