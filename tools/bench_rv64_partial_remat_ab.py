@@ -20,7 +20,7 @@ import time
 CASES = (
     "addi_phi", "addi_shared", "slti32_neg", "sltiu32_neg",
     "bitwise_shared", "spillsum", "pressure16", "pressure48",
-    "spillbranch", "branch", "same",
+    "spillbranch", "branch", "same", "partial16", "partial32",
 )
 REG_OPS = {"add", "and", "or", "xor", "slt", "sltu"}
 IMM_OPS = {"addi", "andi", "ori", "xori", "slti", "sltiu"}
@@ -58,11 +58,11 @@ def count(path: Path) -> dict:
         "opcodes": dict(sorted(opcode.items())),
     }
 
-def runtime_samples(root: Path) -> dict:
-    # No arbitrary source-program cap: the count here controls just the
-    # repeat time of this microbenchmark, not compiler capabilities.
+def runtime_samples(root: Path, kind: str, iterations: int) -> dict:
+    # No arbitrary source-program cap: the iteration count controls only the
+    # duration of this benchmark. It is not a compiler capability limit.
     cpu = min(os.sched_getaffinity(0))
-    paths = {mode: root / mode / "addi_phi_bench.elf" for mode in ("old", "new")}
+    paths = {mode: root / mode / (kind + "_bench.elf") for mode in ("old", "new")}
     for mode, elf in paths.items():
         assert elf.is_file(), elf
         for _ in range(2):
@@ -77,13 +77,13 @@ def runtime_samples(root: Path) -> dict:
         samples[mode].append((time.perf_counter_ns() - t0) / 1e6)
     med = {k: statistics.median(v) for k, v in samples.items()}
     return {
-        "benchmark": "two branches of addi_phi, 100000 loop iterations",
+        "benchmark": f"{kind} executed {iterations} times in the QEMU call loop",
         "cpu_affinity": cpu,
         "metric": "QEMU-user process host wall time, milliseconds",
         "samples_ms": samples,
         "median_ms": med,
         "candidate_vs_baseline_pct": 100 * (med["new"] / med["old"] - 1),
-        "caution": "QEMU startup, dynamic translation and host scheduler are included; not target hardware cycles",
+        "caution": "QEMU startup, dynamic translation and host scheduling included; not target hardware cycles",
     }
 
 def main() -> None:
@@ -107,9 +107,18 @@ def main() -> None:
         "addi_phi did not exercise partial rematerialization",
         results["addi_phi"],
     )
-    runtime = runtime_samples(root)
-    print("QEMU-user median host ms:", runtime["median_ms"])
-    print("candidate vs baseline %:", round(runtime["candidate_vs_baseline_pct"], 2))
+    for kind in ("partial16", "partial32"):
+        assert results[kind]["delta"]["gp_read_sites_on_alu_compare"] < 0, (
+            f"{kind} did not exercise the intended high-pressure partial fold",
+            results[kind],
+        )
+    runtime = {
+        "addi_phi": runtime_samples(root, "addi_phi", 200000),
+        "partial32": runtime_samples(root, "partial32", 20000),
+    }
+    for kind, sample in runtime.items():
+        print(f"{kind} QEMU-user median host ms: {sample['median_ms']}")
+        print(f"{kind} candidate vs baseline %: {sample['candidate_vs_baseline_pct']:.2f}")
     out = {"method": "source-pinned same-runner old/new .text and QEMU ABBA",
            "versions": {"old": "213831b84dd5546e3aab7ee578c25de61b3c6434",
                         "new": "c1f89639e5e776d81bb4e4947b4431a6ec9cae5c"},
