@@ -1,0 +1,54 @@
+# Exact-source TypeId codec metadata ordering checks; no compiler-repo Actions.
+name: IR PR2879 metadata ordering
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ir-pr2879-metadata-order-20261122.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  codec:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      SOURCE_SHA: c397c4052690d1c4d2522b3451f2d6fc0b0e276e
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Check out exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned source and isolate core
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Cache isolated Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-pr2879-metadata-order
+      - name: Verify IR binary/text/LTO replay
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test native_binary_v1 -- --nocapture
+          cargo test -p compiler-ir --test native_module_text_v3 -- --nocapture
+          cargo test -p compiler-ir --test lto_merge -- --nocapture
+      - name: Strict focused lint
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-ir --test native_binary_v1 -- -D clippy::all -A clippy::empty_line_after_doc_comments
