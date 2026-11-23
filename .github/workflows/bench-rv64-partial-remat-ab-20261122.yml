@@ -1,0 +1,145 @@
+name: RV64 partial remat exact-commit code and QEMU A/B
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/bench-rv64-partial-remat-ab-20261122.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source-pinned-ab:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler-ci
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 213831b84dd5546e3aab7ee578c25de61b3c6434
+          path: old
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c1f89639e5e776d81bb4e4947b4431a6ec9cae5c
+          path: new
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact source revisions and identical fixture inputs
+        run: |
+          set -euo pipefail
+          test "$(git -C old rev-parse HEAD)" = '213831b84dd5546e3aab7ee578c25de61b3c6434'
+          test "$(git -C new rev-parse HEAD)" = 'c1f89639e5e776d81bb4e4947b4431a6ec9cae5c'
+          for path in \
+            crates/backend-riscv64/examples/rv64_leaf.rs \
+            crates/backend-riscv64/tests/fixtures/mod.rs \
+            crates/backend-riscv64/src/leaf.rs \
+            crates/backend-riscv64/src/machine.rs \
+            crates/backend-riscv64/src/target.rs; do
+            cmp "old/$path" "new/$path"
+          done
+          echo "Baseline: 213831b84dd5546e3aab7ee578c25de61b3c6434" >> "$GITHUB_STEP_SUMMARY"
+          echo "Candidate: c1f89639e5e776d81bb4e4947b4431a6ec9cae5c" >> "$GITHUB_STEP_SUMMARY"
+          echo "Fixture files and backend emitter: byte-identical" >> "$GITHUB_STEP_SUMMARY"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build same source-owned TypeId examples at both commits
+        run: |
+          set -euo pipefail
+          for mode in old new; do
+            cat > "$mode/Cargo.toml" <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-riscv64"]
+          EOF
+            rm -f "$mode/Cargo.lock"
+            (cd "$mode" && cargo build -p compiler-backend-riscv64 --release --example rv64_leaf)
+          done
+      - name: Install independent RISC-V assembler and user-mode QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y binutils-riscv64-linux-gnu qemu-user
+      - name: Generate exact same matrix of TypeId CFG objects
+        run: |
+          set -euo pipefail
+          for mode in old new; do
+            mkdir -p "benchmark-output/$mode"
+            for kind in addi_phi addi_shared slti32_neg sltiu32_neg \
+                        bitwise_shared spillsum pressure16 pressure48 \
+                        spillbranch branch same; do
+              "$mode/target/release/examples/rv64_leaf" \
+                "benchmark-output/$mode/$kind.o" \
+                "benchmark-output/$mode/$kind.s" "$kind" --isa=rv64i
+              riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+                "benchmark-output/$mode/$kind.s" \
+                -o "benchmark-output/$mode/$kind.gas.o"
+              riscv64-linux-gnu-objcopy -O binary -j .text \
+                "benchmark-output/$mode/$kind.o" "benchmark-output/$mode/$kind.direct.bin"
+              riscv64-linux-gnu-objcopy -O binary -j .text \
+                "benchmark-output/$mode/$kind.gas.o" "benchmark-output/$mode/$kind.gas.bin"
+              cmp "benchmark-output/$mode/$kind.direct.bin" "benchmark-output/$mode/$kind.gas.bin"
+            done
+          done
+      - name: Build identical branch-balanced QEMU call-loop benchmark
+        run: |
+          set -euo pipefail
+          cat > benchmark-output/rv64_ab_start.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            li s0, 100000
+            li s1, 0
+          loop:
+            li a0, 7
+            li a1, 18
+            call rv64_addi_phi
+            add s1, s1, a0
+            li a0, 20
+            li a1, 6
+            call rv64_addi_phi
+            add s1, s1, a0
+            addi s0, s0, -1
+            bnez s0, loop
+            li t0, 7100000
+            bne s1, t0, bad
+            li a0, 0
+            j done
+          bad:
+            li a0, 51
+          done:
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+            benchmark-output/rv64_ab_start.s -o benchmark-output/rv64_ab_start.o
+          for mode in old new; do
+            riscv64-linux-gnu-ld -static -m elf64lriscv --no-relax -e _start \
+              benchmark-output/rv64_ab_start.o \
+              "benchmark-output/$mode/addi_phi.o" \
+              -o "benchmark-output/$mode/addi_phi_bench.elf"
+            timeout 20s qemu-riscv64 "benchmark-output/$mode/addi_phi_bench.elf"
+          done
+      - name: Record exact code metrics and ABBA QEMU-host time
+        run: |
+          set -euo pipefail
+          python3 harness/tools/bench_rv64_partial_remat_ab.py benchmark-output \
+            | tee benchmark-output/summary.txt
+          cat benchmark-output/summary.txt >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rv64-partial-remat-source-pinned-ab-evidence
+          path: |
+            benchmark-output/comparison.json
+            benchmark-output/summary.txt
+            benchmark-output/old/*.s
+            benchmark-output/new/*.s
+          if-no-files-found: warn
