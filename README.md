@@ -104,3 +104,15 @@ protect against zero-test false greens, and all failure logs are uploaded.
 This is intentionally **not** a general benchmark or full-workspace build:
 new compiler features need targeted regression additions, while
 solver-heavy Alive-lite proofs and Csmith remain separate workflows.
+
+## Historical workflow archive and schedule hygiene
+
+Older exact-source milestone workflows that only reran when their own YAML
+changed have been moved to [the historical workflow archive](ci/archive/README.md).
+The original workflow bytes and compiler pins are preserved for recovery, but
+the archived jobs are no longer in GitHub Actions' active workflow directory.
+Current-source compiler validation (including Mini-C, compiler-core, backend,
+proof and fuzz checks) stays active. Fixed-commit historical checks can be
+replayed with `workflow_dispatch`, but do not poll unchanged compiler source.
+The lightweight [workflow hygiene check](.github/workflows/workflow-hygiene-inventory.yml)
+rejects newly scheduled source-pinned workflows and checks archive isolation.
