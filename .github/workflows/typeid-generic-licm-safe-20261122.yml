@@ -1,0 +1,95 @@
+name: Generic TypeId LICM preserving atomic effects
+on:
+  push:
+    branches: [ci/typeid-generic-licm-safe-20261122]
+  pull_request:
+    paths: [.github/workflows/typeid-generic-licm-safe-20261122.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-mini-c-atomic-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Checkout exact compiler source candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 73bef10a2e26f2ac67d0dae3a3f69894e878d460
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact checked Mini-C frontend
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: 1e05474aab47db77f4884e39f84c767742bc204c
+          path: mini-c
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Limit compiler workspace to native driver dependencies
+        shell: bash
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Pin local checked frontend dependencies without SSH
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          manifest = Path('compiler/tools/mini-c-driver/Cargo.toml')
+          data = manifest.read_text()
+          for crate in ('mini-c-syntax', 'mini-c-sema'):
+              folder = crate.split('-')[-1]
+              before = (f'{crate} = {{ git = "ssh://git@github.com/bingordo/mini-c.git", '
+                        'rev = "1e05474aab47db77f4884e39f84c767742bc204c" }')
+              after = f'{crate} = {{ path = "../../../mini-c/crates/{folder}" }}'
+              if data.count(before) != 1:
+                  raise SystemExit(f'expected one exact pinned {crate} dependency')
+              data = data.replace(before, after)
+          manifest.write_text(data)
+          PY
+      - name: Strict ABI boundaries with generic exact-width internal SSA
+        run: cargo test --manifest-path compiler/crates/ir/Cargo.toml exact_width_ssa_is_distinct_from_c_call_and_return_abi
+      - name: TypeId exact width builder regression
+        run: cargo test --manifest-path compiler/crates/ir/Cargo.toml typed_cfg_emits_exact_width_values_without_legacy_result_mapping
+      - name: Verify generic integer PRE makes real edge-sensitive edits
+        run: cargo test --manifest-path compiler/crates/opt/Cargo.toml --test typed_pre_native generic_integer_pre_reuses_diamond_critical_and_parallel_edge_edits
+      - name: Verify generic I8 LICM hoists exact-width operations into preheaders
+        run: cargo test --manifest-path compiler/crates/opt/Cargo.toml --test typed_licm_native generic_licm_hoists_exact_width_integer_without_changing_c_abi
+      - name: Check current native TypeId source adapter
+        run: cargo check --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib
+      - name: Test source adapter atomic regressions
+        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib gnu_atomic_
+      - name: Source Mini-C typed atomic checking
+        working-directory: mini-c
+        run: cargo test -p mini-c-syntax -p mini-c-sema
+      - name: Native driver lint (known pre-existing warning classes excepted)
+        run: |
+          # The separate, newly merged aggregate ABI prototype has no
+          # consumers yet. Scope its dead-code allowance to the exact struct
+          # in the ephemeral CI checkout, not to the whole driver crate.
+          python3 - <<'PY'
+          from pathlib import Path
+          src = Path('compiler/tools/mini-c-driver/src/aggregate_abi.rs')
+          code = src.read_text()
+          needle = 'pub(crate) struct CheckedIntegerPrototype {'
+          if code.count(needle) != 1:
+              raise SystemExit('aggregate ABI prototype changed; revisit lint exception')
+          src.write_text(code.replace(needle, '#[allow(dead_code)]\n' + needle))
+          PY
+          cargo clippy --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib -- \
+            -D warnings -A unused-imports \
+            -A clippy::match-like-matches-macro -A clippy::too-many-arguments
