@@ -1,0 +1,98 @@
+# Validate exact source source-to-x86 64-bit interior memcpy without using
+# exhausted compiler-repository Actions minutes. Pinned immutable source.
+name: Validate TypeId LP64 interior memcpy PR2880
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/validate-lp64-interior-memcpy-pr2880.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source-and-machine:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 4574717652f479a6e222ce91c226ddbc7319c979
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: 1e05474aab47db77f4884e39f84c767742bc204c
+          path: mini-c-pinned
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/oberon
+          ref: 88979bfeda0ec08f9453010771df70ee5d28169c
+          path: oberon-pinned
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Pin sources and expose local frontend mirrors
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 4574717652f479a6e222ce91c226ddbc7319c979
+          test "$(git -C mini-c-pinned rev-parse HEAD)" = 1e05474aab47db77f4884e39f84c767742bc204c
+          test "$(git -C oberon-pinned rev-parse HEAD)" = 88979bfeda0ec08f9453010771df70ee5d28169c
+          git -C mini-c-pinned cat-file -e '6ba1cb655d8bb2cf5b795aa774e8234d4f701e0b^{commit}'
+          git config --global url."file://${GITHUB_WORKSPACE}/mini-c-pinned".insteadOf "ssh://git@github.com/bingordo/mini-c.git"
+          git config --global url."file://${GITHUB_WORKSPACE}/oberon-pinned".insteadOf "ssh://git@github.com/bingordo/oberon.git"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86","crates/backend-aarch64","crates/backend-riscv64","crates/backend-wasm","crates/driver"]
+          exclude = ["tools/mini-c-driver"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: pr2880-lp64-interior-memcpy
+      - name: TypeId native interior byte provenance and negative tests
+        working-directory: compiler
+        run: cargo test -p compiler-ir --lib typed_memcopy_provenance -- --nocapture
+      - name: Shared Mini-C source pointer/SSA constant proof tests
+        working-directory: compiler
+        run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib checked_local_memcpy -- --nocapture
+      - name: Native exact C11 local copy GAS / ELF / GCC differential and negatives
+        working-directory: compiler
+        run: cargo test -p compiler --test native_lp64_memcopy_interiors -- --nocapture
+      - name: Earlier native whole-object bulk-copy regression
+        working-directory: compiler
+        run: cargo test -p compiler --test wasm32_minic_source native_lp64_ -- --nocapture
+      - name: W12m SSA arithmetic source memory byte ranges
+        working-directory: compiler
+        run: cargo test -p compiler --test wasm32_minic_source wasm32_w12m_ -- --nocapture
+      - name: W12k and W12l C11 vs native and Wasm source regressions
+        working-directory: compiler
+        run: |
+          cargo test -p compiler --test wasm32_minic_source wasm32_w12k_ -- --nocapture
+          cargo test -p compiler --test wasm32_minic_source wasm32_w12l_ -- --nocapture
+      - name: Native AArch64 retains existing large-libc-copy source policy
+        working-directory: compiler
+        run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib native_lp64_machine_bulkcopy_is_not_forced_on_aarch64 -- --nocapture
+      - name: Full IR / shared backend / x86 / AArch64 unit suites
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-ir --lib
+          cargo test -p compiler-backend --lib
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend-aarch64 --lib
+      - name: Shared TypeId byte proof and new native tests rustfmt
+        working-directory: compiler
+        run: |
+          rustfmt --edition 2021 --check crates/ir/src/typed_local_byte_ranges.rs crates/ir/src/typed_memcopy_provenance.rs crates/ir/tests/unit/typed_memcopy_provenance.rs crates/driver/tests/native_lp64_memcopy_interiors.rs
