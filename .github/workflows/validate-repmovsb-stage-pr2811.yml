@@ -1,0 +1,50 @@
+name: Validate x86 REP MOVSB staging PR2811
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/validate-repmovsb-stage-pr2811.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  x86-physical:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a6842bb11840e2e2bd6cad605a24c77430d05713
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source SHA and isolate backend workspace
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = a6842bb11840e2e2bd6cad605a24c77430d05713
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: repmovsb-stage-2811
+      - name: Test physical copy staging and independent C11 ELF/GAS oracles
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --lib bulk_copy -- --nocapture
+      - name: All x86 library tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --lib
+      - name: New x86 code formatting
+        working-directory: compiler
+        run: rustfmt --edition 2021 --check crates/backend-x86/src/bulk_copy.rs
+      - name: Target backend Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-x86 --lib -- -D clippy::all -A clippy::empty_line_after_doc_comments
