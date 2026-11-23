@@ -1,0 +1,89 @@
+name: Validate LP64 local MemCopy TypeId PR2829
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/validate-lp64-memcopy-pr2829.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 38
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 91bd8e10f33b05baaf5f30687ac0ca5c291978ae
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: 1e05474aab47db77f4884e39f84c767742bc204c
+          path: mini-c-pinned
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/oberon
+          ref: 88979bfeda0ec08f9453010771df70ee5d28169c
+          path: oberon-pinned
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify immutable refs and retain independent frontend workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 91bd8e10f33b05baaf5f30687ac0ca5c291978ae
+          test "$(git -C mini-c-pinned rev-parse HEAD)" = 1e05474aab47db77f4884e39f84c767742bc204c
+          test "$(git -C oberon-pinned rev-parse HEAD)" = 88979bfeda0ec08f9453010771df70ee5d28169c
+          git -C mini-c-pinned cat-file -e '6ba1cb655d8bb2cf5b795aa774e8234d4f701e0b^{commit}'
+          git config --global url."file://${GITHUB_WORKSPACE}/mini-c-pinned".insteadOf "ssh://git@github.com/bingordo/mini-c.git"
+          git config --global url."file://${GITHUB_WORKSPACE}/oberon-pinned".insteadOf "ssh://git@github.com/bingordo/oberon.git"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86","crates/backend-aarch64","crates/backend-riscv64","crates/backend-wasm","crates/driver"]
+          exclude = ["tools/mini-c-driver"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-lp64-proven-memcopy-2829
+      - name: Exact native TypeId memory provenance unit tests
+        working-directory: compiler
+        run: cargo test -p compiler-ir --lib typed_memcopy_provenance -- --nocapture
+      - name: Shared scalar byte-count and inline-only contract tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend --lib scalar_copy_and_zero_share_the_pre_ra_bulk_memory_contract -- --nocapture
+      - name: X86 selected Machine IR and physical GAS/ELF tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --lib bulk_copy -- --nocapture
+      - name: Real Mini-C LP64 200-byte copies against GCC (both sinks) and negatives
+        working-directory: compiler
+        run: cargo test -p compiler --test wasm32_minic_source native_lp64_ -- --nocapture
+      - name: Regress existing W12k overlapping memmove against GCC, wasm32 and native
+        working-directory: compiler
+        run: cargo test -p compiler --test wasm32_minic_source wasm32_w12k_local_memmove_and_interior_copy_matches_gcc_and_native -- --nocapture
+      - name: Shared checked-source C memcpy and memmove proofs
+        working-directory: compiler
+        run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib checked_local_memcpy -- --nocapture
+      - name: Full IR, backend and native x86 unit suites
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-ir --lib
+          cargo test -p compiler-backend --lib
+          cargo test -p compiler-backend-x86 --lib
+      - name: New TypeId provenance source formatting
+        working-directory: compiler
+        run: rustfmt --edition 2021 --check crates/ir/src/typed_memcopy_provenance.rs crates/ir/tests/unit/typed_memcopy_provenance.rs
