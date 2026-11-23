@@ -1,0 +1,55 @@
+# Source-pinned IR TypeId canonical binary-v2 regression; isolated runner.
+name: IR PR2901 TypeId canonical binary v2
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ir-pr2901-typeid-canonical-20261122.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  canonical-types:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SOURCE_SHA: c795352c0dba5337c8c178da5e3ede902360b3d1
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler PR
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned SHA and isolate core
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Cache core Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-pr2901-canonical-types
+      - name: Verify canonical binary and LTO cross-module mapping
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test native_binary_v2 -- --nocapture
+          cargo test -p compiler-ir --test native_binary_v1 -- --nocapture
+          cargo test -p compiler-ir --test lto_merge -- --nocapture
+          cargo test -p compiler-ir --test native_module_text_v3 -- --nocapture
+      - name: Focused Clippy
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-ir --test native_binary_v2 -- -D clippy::all -A clippy::empty_line_after_doc_comments -A clippy::collapsible_if
