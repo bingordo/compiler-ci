@@ -1,0 +1,122 @@
+# Source-pinned optimizer and real driver checks for sampled TypeId semantic debug.
+name: TypeId local-array semantic checker PR2853
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/typeid-semantic-local-arrays-pr2853-20261122.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  semantic-opt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SOURCE_SHA: c0e4988951f3091f30d46783e4bf962e5e15fe64
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm exact source, isolate optimizer workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-semantic-debug-opt-pr2853
+      - name: Semantic and native optimizer regression tests
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test semantic_debug -- --nocapture
+          cargo test -p compiler-opt --test typeid_core_pass_manager -- --nocapture
+          cargo test -p compiler-opt --test pre_licm_semantic_matrix -- --nocapture
+          cargo test -p compiler-opt --test typed_pre_native -- --nocapture
+          cargo test -p compiler-opt --test typed_cse -- --nocapture
+          cargo test -p compiler-opt --test typeid_reference_native_width -- --nocapture
+      - name: Strict optimizer-only Clippy
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-opt --test semantic_debug -- --no-deps -D clippy::all -A clippy::empty_line_after_doc_comments
+
+  semantic-driver:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      SOURCE_SHA: c0e4988951f3091f30d46783e4bf962e5e15fe64
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Configure read-only SSH for pinned source frontends
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust pinned dependency host
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm exact compiler source
+        run: test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-semantic-debug-driver-pr2853
+      - name: Build real native source compiler
+        working-directory: compiler
+        run: cargo build -p compiler --bin compiler
+      - name: Verify CLI scope, coverage and strict rollback
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN=target/debug/compiler
+          "$BIN" --help | grep -F -- '--verify-semantics'
+          cat > /tmp/sem-pass-pr2853.c <<'EOF'
+          int scalar(int x) { return x + 7; }
+          EOF
+          "$BIN" /tmp/sem-pass-pr2853.c --language mini-c --verify-semantics --emit asm -o /tmp/sem-pass-pr2853.s 2>/tmp/sem-pass-report-pr2853.txt
+          cat /tmp/sem-pass-report-pr2853.txt
+          grep -F "TYPEID_SEMANTIC_SUMMARY" /tmp/sem-pass-report-pr2853.txt
+          grep -F 'fully_covered=true' /tmp/sem-pass-report-pr2853.txt
+          test -s /tmp/sem-pass-pr2853.s
+          if "$BIN" /tmp/sem-pass-pr2853.c --language mini-c --verify-semantics --experimental-no-source-opt --emit asm -o /tmp/sem-incompatible-pr2853.s 2>/tmp/sem-incompatible-report-pr2853.txt; then
+            echo "semantic verification was silently bypassed by noopt" >&2
+            exit 1
+          fi
+          grep -F -- '--verify-semantics cannot be combined with --experimental-no-source-opt' /tmp/sem-incompatible-report-pr2853.txt
+          test ! -e /tmp/sem-incompatible-pr2853.s
+          "$BIN" --load-ir crates/opt/tests/fixtures/typed_pre_native_v3.ir --verify-semantics --emit asm -o /tmp/sem-load-pr2853.s 2>/tmp/sem-load-report-pr2853.txt
+          grep -F 'TYPEID_SEMANTIC_SUMMARY' /tmp/sem-load-report-pr2853.txt
+          test -s /tmp/sem-load-pr2853.s
+          "$BIN" --load-ir crates/opt/tests/fixtures/semantic_debug_local_arrays_v3.ir --verify-semantics-strict --emit obj -o /tmp/sem-arrays-pr2853.o 2>/tmp/sem-arrays-report-pr2853.txt
+          grep -F 'fully_covered=true' /tmp/sem-arrays-report-pr2853.txt
+          grep -F 'checked_samples=24 unsupported=0' /tmp/sem-arrays-report-pr2853.txt
+          test -s /tmp/sem-arrays-pr2853.o
+          if "$BIN" --load-ir crates/opt/tests/fixtures/typed_array_fold_v3.ir --verify-semantics-strict --emit obj -o /tmp/sem-uncovered-pr2853.o 2>/tmp/sem-uncovered-report-pr2853.txt; then
+            echo "expected strict uncovered TypeId effect to reject" >&2
+            exit 1
+          fi
+          grep -F 'coverage incomplete' /tmp/sem-uncovered-report-pr2853.txt
+          test ! -e /tmp/sem-uncovered-pr2853.o
