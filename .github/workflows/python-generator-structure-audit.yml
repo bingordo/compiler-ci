@@ -1,0 +1,147 @@
+# Static inventory of generator entrypoints and references on pinned compiler SHA.
+name: Python generator structural audit
+on:
+  push:
+    branches: [dup-audit-20261122]
+    paths: ['.github/workflows/python-generator-structure-audit.yml']
+permissions:
+  contents: read
+jobs:
+  inventory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Sparse checkout source and consumers
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 35d37818b1cab95849ac565eb583e03d43f4c623
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          filter: blob:none
+          sparse-checkout: |
+            tools
+            crates
+            docs
+            .github
+            tests
+            fuzz
+            examples
+            README.md
+            Cargo.toml
+          sparse-checkout-cone-mode: false
+      - name: Audit reference coverage without reading code aloud
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "35d37818b1cab95849ac565eb583e03d43f4c623"
+          python3 - <<'PY'
+          from __future__ import annotations
+          import ast, collections, json, os, re
+          from pathlib import Path
+          
+          root=Path("compiler")
+          tools=root/"tools"
+          py=sorted(tools.rglob("*.py"))
+          files=[p for p in root.rglob("*") if p.is_file() and p.suffix in
+                 (".py",".rs",".md",".yml",".yaml",".toml",".sh",".json",".txt",".c",".h")
+                 and ".git" not in p.parts]
+          generated_rs=sorted(p for p in (root/"crates").rglob("*.rs") if p.name.startswith("generated_"))
+          metadata={}
+          stem_to_paths=collections.defaultdict(list)
+          for p in py:
+              rel=str(p.relative_to(root))
+              lines=p.read_text(encoding="utf-8",errors="replace").splitlines()
+              code="\n".join(lines)
+              try:
+                  tree=ast.parse(code)
+                  funcs=sum(isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) for n in ast.walk(tree))
+                  classes=sum(isinstance(n,ast.ClassDef) for n in ast.walk(tree))
+              except SyntaxError:
+                  funcs=-1;classes=-1
+              stem=p.stem
+              stem_to_paths[stem].append(rel)
+              metadata[rel]={
+                "lines":len(lines),"bytes":p.stat().st_size,"functions":funcs,"classes":classes,
+                "cli":bool(re.search(r'__name__\s*==\s*["\x27]__main__["\x27]',code)),
+                "generating":bool(re.search(r'(?:^regen_|^gen_|generate|_gen(?:erator)?(?:_|\.py)|(?:forms|rules)\.py)',p.name)),
+                "writes_rust":bool(re.search(r'generated_[A-Za-z0-9_]+\.rs|\.rs["\x27]|(?:write_text|write_bytes)\(',code)),
+                "explicit_check":bool(re.search(r'["\x27]--check["\x27]',code)),
+                "explicit_write":bool(re.search(r'["\x27]--write["\x27]',code)),
+                "stage": "test" if p.name.startswith("test_") or "/tests/" in rel else (
+                    "x86" if "x86" in rel else "aarch64" if "aarch64" in rel else "riscv" if "riscv" in rel else "other"),
+                "workflows":[],"docs":[],"imports":[],"other_scripts":[],"rust":[],"other_refs":[]
+              }
+          stems=set(stem_to_paths)
+          rust_to_paths=collections.defaultdict(list)
+          for p in generated_rs:
+              rust_to_paths[p.stem].append(str(p.relative_to(root)))
+          rust_stems=set(rust_to_paths)
+          all_names=stems|rust_stems
+          refs=collections.defaultdict(lambda:collections.defaultdict(list))
+          # Scan every checked-out source document exactly once. Track distinct references
+          # from other files, never print code contents or paths outside repository.
+          for p in files:
+              rel=str(p.relative_to(root))
+              try: raw=p.read_text(encoding="utf-8",errors="replace")
+              except OSError: continue
+              tokens=set(re.findall(r'\b[A-Za-z_][A-Za-z0-9_]*\b',raw)) & all_names
+              if not tokens: continue
+              kind=("docs" if rel.startswith("docs/") or p.suffix==".md" else
+                    "workflows" if rel.startswith(".github/") or p.suffix in (".yml",".yaml") else
+                    "rust" if p.suffix==".rs" else
+                    "imports" if p.suffix==".py" else "other_refs")
+              for tok in tokens:
+                  if tok in stems:
+                      for dst in stem_to_paths[tok]:
+                          if dst==rel: continue
+                          slot="other_scripts" if kind=="imports" else kind
+                          if len(metadata[dst][slot])<30:metadata[dst][slot].append(rel)
+                  if tok in rust_stems:
+                      for dst in rust_to_paths[tok]:
+                          if dst==rel:continue
+                          if len(refs[dst][kind])<30:refs[dst][kind].append(rel)
+          summary={"source_sha":"35d37818b1cab95849ac565eb583e03d43f4c623",
+                   "python_files":len(py),"total_python_lines":sum(v["lines"] for v in metadata.values()),
+                   "generator_name_files":sum(v["generating"] for v in metadata.values()),
+                   "generator_name_lines":sum(v["lines"] for v in metadata.values() if v["generating"]),
+                   "rust_generated_files":len(generated_rs),
+                   "scan_files":len(files)}
+          for v in metadata.values():
+              for k in ("workflows","docs","imports","other_scripts","rust","other_refs"):
+                  v[k]=sorted(set(v[k]))
+              v["external_ref_count"]=sum(len(v[k]) for k in ("workflows","docs","imports","other_scripts","rust","other_refs"))
+          idle=[(path,v) for path,v in metadata.items() if v["stage"]!="test" and
+                v["external_ref_count"]==0 and v["cli"]]
+          idle.sort(key=lambda a:a[1]["lines"],reverse=True)
+          print("METRICS",json.dumps(summary))
+          print("UNREFERENCED_CLI",json.dumps([{"file":p,"lines":v["lines"],"generating":v["generating"]} for p,v in idle[:80]],separators=(",",":")))
+          big=sorted(((p,v) for p,v in metadata.items() if v["stage"]!="test"),key=lambda a:a[1]["lines"],reverse=True)
+          print("LARGEST_NONTEST",json.dumps([{"file":p,"lines":v["lines"],"functions":v["functions"],"refs":v["external_ref_count"],"check":v["explicit_check"],"write":v["explicit_write"]} for p,v in big[:50]],separators=(",",":")))
+          oneoff=sorted(((p,v) for p,v in metadata.items() if v["stage"]!="test" and
+                      v["cli"] and v["external_ref_count"]<=1),
+                      key=lambda a:a[1]["lines"],reverse=True)
+          print("ONE_OR_ZERO_CLI",json.dumps([{"file":p,"lines":v["lines"],"refs":v["external_ref_count"]} for p,v in oneoff[:85]],separators=(",",":")))
+          unref_rs=[]
+          for path in rust_to_paths.values():
+              for r in path:
+                  count=sum(len(y) for y in refs[r].values())
+                  if count==0:
+                      unref_rs.append(r)
+          print("UNREFERENCED_GENERATED_RS",json.dumps(unref_rs[:110]))
+          biggens=sorted(((p,v) for p,v in metadata.items() if v["generating"] and v["stage"]!="test"),
+                        key=lambda a:a[1]["lines"],reverse=True)
+          print("LARGE_GENERATORS",json.dumps([{"file":p,"lines":v["lines"],"functions":v["functions"],
+                "refs":v["external_ref_count"],"check":v["explicit_check"],"write":v["explicit_write"]} for p,v in biggens[:65]],separators=(",",":")))
+          out={"summary":summary,"tools":metadata,"generated_rust_references":{p:{k:sorted(set(y)) for k,y in v.items()} for p,v in refs.items()}}
+          Path("results").mkdir(exist_ok=True)
+          Path("results/generator-inventory.json").write_text(json.dumps(out,indent=2))
+          
+          PY
+      - name: Upload file-level references only
+        uses: actions/upload-artifact@v4
+        with:
+          name: generator-structure-audit-35d378
+          path: results/generator-inventory.json
+          retention-days: 10
