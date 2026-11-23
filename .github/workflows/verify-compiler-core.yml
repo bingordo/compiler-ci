@@ -36,7 +36,26 @@ jobs:
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
+      - name: Identify exact compiler revision
+        id: boundary-source
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git -C compiler rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "IR-boundary compiler SHA: $sha" >> "$GITHUB_STEP_SUMMARY"
+      - name: Check prior successful IR-boundary verification
+        id: boundary-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ir-boundary-verified
+          key: ir-boundary-v1-${{ steps.boundary-source.outputs.sha }}
+          lookup-only: true
+      - name: Report cached successful IR-boundary verification
+        if: steps.boundary-cache.outputs.cache-hit == 'true' && github.event_name != 'workflow_dispatch'
+        run: echo 'Unchanged source SHA already passed independent IR-boundary guards.' >> "$GITHUB_STEP_SUMMARY"
       - name: Run source retirement and independent oracle guards
+        if: steps.boundary-cache.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
         shell: bash
         working-directory: compiler
         run: |
@@ -45,6 +64,18 @@ jobs:
           python3 tools/ir_consumer_inventory.py --check-production
           PYTHONPATH=tools python3 -m unittest tools.test_ir_consumer_inventory
           python3 tools/check_mixed_function_export_boundary.py
+      - name: Write verified source SHA after all three checks pass
+        if: success() && steps.boundary-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir -p .ir-boundary-verified
+          echo '${{ steps.boundary-source.outputs.sha }}' > .ir-boundary-verified/source-sha
+      - name: Cache successful IR-boundary source revision
+        if: success() && steps.boundary-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .ir-boundary-verified
+          key: ir-boundary-v1-${{ steps.boundary-source.outputs.sha }}
 
   discover:
     if: github.event_name == 'schedule'
