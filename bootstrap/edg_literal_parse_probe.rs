@@ -89,6 +89,45 @@ fn main() {
                 il.global_routine_relocations.iter()
                     .map(|r|r.symbol).collect::<std::collections::HashSet<_>>().len(),
             );
+            // Classify only the *missing* weak static-image owner types.
+            // Canonicalize original EDG typedef/qualifier chains (role 4);
+            // every output is a bounded aggregate of numeric type/layout
+            // facts, never source names, paths, symbol IDs or image bytes.
+            let symbol_types:std::collections::HashMap<_,_>=il.symbol_types.iter()
+                .map(|t|(t.symbol,t.ty)).collect();
+            let type_defs:std::collections::HashMap<_,_>=il.types.iter()
+                .map(|t|(t.id,t)).collect();
+            let layouts:std::collections::HashMap<_,_>=il.type_object_sizes.iter()
+                .map(|t|(t.owner,t)).collect();
+            let mut groups=std::collections::BTreeMap::<(u32,u32,u64,u64),usize>::new();
+            for global in missing.iter().filter(|g|weak.contains(&g.symbol)) {
+                let original=symbol_types.get(&global.symbol).copied();
+                let root_kind=original.and_then(|id|type_defs.get(&id))
+                    .map_or(0,|t|t.kind);
+                let mut native_kind=root_kind;
+                let mut canonical=original;
+                let mut visited=std::collections::HashSet::new();
+                while let Some(id)=canonical {
+                    if !visited.insert(id) {break;}
+                    let Some(ty)=type_defs.get(&id) else {break;};
+                    native_kind=ty.kind;
+                    if ty.related_role!=Some(4) {break;}
+                    canonical=ty.related;
+                }
+                let layout=canonical.and_then(|id|layouts.get(&id))
+                    .or_else(||original.and_then(|id|layouts.get(&id)));
+                let (bytes,align)=layout.map_or((0,0),|t|(t.bytes,t.alignment));
+                *groups.entry((root_kind,native_kind,bytes,align)).or_default()+=1;
+            }
+            for ((root_kind,native_kind,bytes,align),count) in groups.iter().take(16) {
+                println!(
+                    "EDG_PROBE_MISSING_WEAK_TYPE root_kind={} native_kind={} bytes={} align={} count={}",
+                    root_kind,native_kind,bytes,align,count
+                );
+            }
+            println!("EDG_PROBE_MISSING_WEAK_TYPE_GROUPS total={} reported={} owners={}",
+                groups.len(),groups.len().min(16),
+                missing.iter().filter(|g|weak.contains(&g.symbol)).count());
             // Literal definitions and slots must be a closed, consistent
             // snapshot before any backend may consume them. This source-free
             // census is allowed for private generated C; no literal bytes or

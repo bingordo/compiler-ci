@@ -747,6 +747,8 @@ probe_generated_c() {
   grep -m 1 '^EDG_PROBE_RESULT ' "$logfile" || true
   grep -m 1 '^EDG_PROBE_GLOBALS ' "$logfile" || true
   grep -m 1 '^EDG_PROBE_STATIC_OWNERS ' "$logfile" || true
+  grep -m 16 '^EDG_PROBE_MISSING_WEAK_TYPE ' "$logfile" || true
+  grep -m 1 '^EDG_PROBE_MISSING_WEAK_TYPE_GROUPS ' "$logfile" || true
   grep -m 1 '^EDG_PROBE_STATIC_LITERALS ' "$logfile" || true
   grep -m 1 '^EDG_PROBE_STATIC_ROUTINES ' "$logfile" || true
   case "$rc" in
@@ -1095,6 +1097,8 @@ else:
 # The rejection class is a constant enum, not the source-dependent message.
 if "native global" in reason and "not a proven imported data declaration" in reason:
     classification = "global-definition-not-import"
+elif "static literal/object relocation events lack a complete c ownership proof" in reason:
+    classification = "global-literal-source-closure"
 elif "global" in reason and ("import" in reason or "declaration" in reason):
     classification = "global-import-or-storage-admission"
 elif "global" in reason and ("lifetime" in reason or "initializer" in reason):
