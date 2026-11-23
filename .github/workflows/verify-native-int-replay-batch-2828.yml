@@ -1,0 +1,78 @@
+name: Verify generated native-int seeded test migration #2828
+on:
+  push:
+    branches: [ci/validate-native-int-replay-batch-2828-20261122]
+    paths: [.github/workflows/verify-native-int-replay-batch-2828.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source-pinned-regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      SOURCE_SHA: de8f946d81c22fd21f3ec255bd7c599e20c3a714
+    steps:
+      - name: Check out exact compiler revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: de8f946d81c22fd21f3ec255bd7c599e20c3a714
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm source pin and isolate compiler crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: opt-native-replay-2828
+      - name: Run all ten affected generated suites and golden tests
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for suite in \
+            generated_native_cmp_cast \
+            generated_native_demorgan_existing_s2337 \
+            generated_native_dual_arithmetic_cancellation_s2333 \
+            generated_native_extension_literal \
+            generated_native_matchpd_boolean_factor_s2314 \
+            generated_native_matchpd_boolean_s2311 \
+            generated_native_matchpd_complement_s2312 \
+            generated_native_shared_masked_sub_s2332 \
+            generated_native_strict_bitwise_partitions_s2344 \
+            generated_native_unsigned_subset_s2343
+          do
+            echo "=== $suite ==="
+            cargo test -p compiler-opt --test "$suite" -- --nocapture
+          done
+      - name: Strict test Clippy excluding known unrelated baseline warnings
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt \
+            --test generated_native_cmp_cast \
+            --test generated_native_demorgan_existing_s2337 \
+            --test generated_native_dual_arithmetic_cancellation_s2333 \
+            --test generated_native_extension_literal \
+            --test generated_native_matchpd_boolean_factor_s2314 \
+            --test generated_native_matchpd_boolean_s2311 \
+            --test generated_native_matchpd_complement_s2312 \
+            --test generated_native_shared_masked_sub_s2332 \
+            --test generated_native_strict_bitwise_partitions_s2344 \
+            --test generated_native_unsigned_subset_s2343 \
+            -- -D warnings -A unused-imports -A dead-code -A clippy::empty-line-after-doc-comments
