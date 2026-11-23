@@ -1,4 +1,4 @@
-# Source-pinned acceptance for the independent LICM TypeId migration PR.
+# Exact two-file overlay test of PR2797 against current compiler main.
 name: IR PR2797 LICM pointer-PHI and runtime native
 on:
   push:
@@ -13,23 +13,37 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
-      SOURCE_SHA: 0866439a117d69bc9157ae87d55384cb8df7c3b8
+      MAIN_SHA: 213831b84dd5546e3aab7ee578c25de61b3c6434
+      PR_SHA: 0866439a117d69bc9157ae87d55384cb8df7c3b8
       CARGO_INCREMENTAL: '0'
       CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
     steps:
-      - name: Check out exact compiler PR source
+      - name: Checkout exact compiler main
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ env.SOURCE_SHA }}
+          ref: ${{ env.MAIN_SHA }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Verify revision and isolate core workspace
+      - name: Checkout exact two-file LICM candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.PR_SHA }}
+          path: candidate
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Overlay only candidate files and isolate Rust core workspace
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git -C compiler rev-parse HEAD)" = "$MAIN_SHA"
+          test "$(git -C candidate rev-parse HEAD)" = "$PR_SHA"
+          for path in crates/opt/tests/typed_licm_native.rs crates/opt/tests/fixtures/typed_licm_pointer_phi_v3.ir; do
+            cp "candidate/$path" "compiler/$path"
+          done
+          test "$(git -C compiler status --porcelain --untracked-files=all | wc -l)" -eq 2
           cat > compiler/Cargo.toml <<'EOF'
           [workspace]
           resolver = "2"
@@ -42,8 +56,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: compiler -> target
-          key: ir-pr2797-licm-pointer
-      - name: Test full native LICM structural and C11 GAS direct-ELF execution
+          key: ir-pr2797-licm-main-integration
+      - name: Verify LICM native, preheaders and M4 on merged source
         working-directory: compiler
         shell: bash
         run: |
@@ -51,7 +65,7 @@ jobs:
           cargo test -p compiler-opt --test typed_licm_native -- --nocapture
           cargo test -p compiler-opt --test licm_preheaders -- --nocapture
           cargo test -p compiler-opt --test m4_integer_effects -- --nocapture
-      - name: Clippy edited tests except unrelated existing x86 doc comment spacing
+      - name: Targeted Clippy except unrelated existing x86 doc spacing
         working-directory: compiler
         run: |
           cargo clippy -p compiler-opt --test typed_licm_native -- -D clippy::all -A clippy::empty_line_after_doc_comments
