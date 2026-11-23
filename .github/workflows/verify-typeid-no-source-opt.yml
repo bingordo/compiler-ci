@@ -52,6 +52,54 @@ jobs:
           gcc "$d/fixture.o" -o "$d/native"
           "$d/native"
           echo 'NATIVE_NO_SOURCE_OPT_RUNTIME=PASS' >> "$GITHUB_STEP_SUMMARY"
+      - name: Differential native unoptimized source matrix and assembly parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          d="$(mktemp -d)"
+          trap 'rm -rf "$d"' EXIT
+          cat > "$d/branch.c" <<'EOF'
+          int calc(int x) {
+              if (x < 0) return -x;
+              return x * 2;
+          }
+          int main(void) { return calc(-3) == 3 && calc(4) == 8 ? 0 : 1; }
+          EOF
+          cat > "$d/pointers.c" <<'EOF'
+          int add_to(int *p) { *p = *p + 7; return *p; }
+          int main(void) { int value = 5; int answer = add_to(&value);
+              return value == 12 && answer == 12 ? 0 : 1; }
+          EOF
+          cat > "$d/globals.c" <<'EOF'
+          static int counter = 4;
+          int bump(void) { counter = counter + 1; return counter; }
+          int main(void) { int a = bump(); int b = bump();
+              return a == 5 && b == 6 ? 0 : 1; }
+          EOF
+          cat > "$d/divide.c" <<'EOF'
+          int quotient(int a, int b) { return a / b; }
+          int main(void) { return quotient(27, 4) == 6 ? 0 : 1; }
+          EOF
+          cat > "$d/loops.c" <<'EOF'
+          int main(void) { int x = 0; int i = 0;
+              while (i < 9) { x = x + i; i = i + 1; }
+              return x == 36 ? 0 : 1; }
+          EOF
+          for case in branch pointers globals divide loops; do
+              gcc -std=c11 -O0 "$d/$case.c" -o "$d/$case.gcc"
+              "$d/$case.gcc"
+              compiler/target/debug/compiler "$d/$case.c" \
+                --language mini-c --target x86_64 --emit obj \
+                --experimental-no-source-opt -o "$d/$case.o"
+              gcc "$d/$case.o" -o "$d/$case.native"
+              "$d/$case.native"
+              compiler/target/debug/compiler "$d/$case.c" \
+                --language mini-c --target x86_64 --emit asm \
+                --experimental-no-source-opt -o "$d/$case.s"
+              gcc "$d/$case.s" -o "$d/$case.asm"
+              "$d/$case.asm"
+          done
+          echo 'NATIVE_NO_SOURCE_OPT_5_CASES_OBJECT_ASSEMBLY=PASS' >> "$GITHUB_STEP_SUMMARY"
       - name: Reject unsupported experimental mode combinations
         shell: bash
         run: |
