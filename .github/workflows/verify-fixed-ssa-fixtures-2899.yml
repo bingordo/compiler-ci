@@ -1,0 +1,67 @@
+name: Verify fixed TypeId v3 optimizer fixtures #2899
+on:
+  push:
+    branches: [ci/verify-fixed-ssa-fixtures-2899-20261122]
+    paths: [.github/workflows/verify-fixed-ssa-fixtures-2899.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source-pinned-fixtures:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      SOURCE_SHA: 08eeb1570b69117b172b1209afb1c4689a3cf8c4
+    steps:
+      - name: Checkout exact tested compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 08eeb1570b69117b172b1209afb1c4689a3cf8c4
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm pin and isolate core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: opt-fixed-v3-fixtures-2899
+      - name: Run four complete affected integration suites
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for suite in \
+            review_typed_cfg_trap_pre \
+            typed_algebra \
+            native_v3_fixture_inventory \
+            native_verifier_fixture_matrix
+          do
+            echo "=== $suite ==="
+            cargo test -p compiler-opt --test "$suite" -- --nocapture
+          done
+      - name: Strict focused Clippy with unrelated baseline allowances
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt \
+            --test review_typed_cfg_trap_pre \
+            --test typed_algebra \
+            --test native_v3_fixture_inventory \
+            --test native_verifier_fixture_matrix \
+            -- -D warnings -A unused-imports -A dead-code \
+               -A clippy::empty-line-after-doc-comments -A clippy::collapsible-match
