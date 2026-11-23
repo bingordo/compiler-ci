@@ -1,0 +1,66 @@
+# Source-pinned correctness only; no timing gates on shared runners.
+name: optimization corpus correctness (TypeId, GCC, Clang)
+on:
+  push:
+    branches: [bench/optimization-corpus-gate-20261122]
+    paths:
+      - .github/workflows/verify-optimization-corpus-20261122.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  correctness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b58499734b2200e79740eb0ebc09cc348acd769c
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source checkout and GCC/Clang
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "b58499734b2200e79740eb0ebc09cc348acd769c"
+          gcc --version | head -1
+          clang --version | head -1
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: opt-corpus-correctness-20261122
+      - name: Python classifier unit tests
+        working-directory: compiler
+        run: python3 -m unittest discover -s tests -p test_optimization_corpus.py -v
+      - name: Build production TypeId compiler
+        working-directory: compiler
+        run: cargo build --release -p compiler --bin compiler
+      - name: Run 5-source independent oracle checks
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/optimization_corpus.py \
+            --compiler target/release/compiler \
+            --manifest corpus/optimization_quality/manifest.json \
+            --json "$RUNNER_TEMP/optimization-corpus.json"
+          python3 - "$RUNNER_TEMP/optimization-corpus.json" <<'PY'
+          import json
+          import sys
+          result = json.load(open(sys.argv[1], encoding="utf-8"))
+          assert len(result["cases"]) == 5, result["counts"]
+          assert result["counts"]["PASS"] == 5, result["counts"]
+          PY
+      - name: Retain full per-case correctness report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: optimization-corpus-correctness
+          path: ${{ runner.temp }}/optimization-corpus.json
+          if-no-files-found: ignore
