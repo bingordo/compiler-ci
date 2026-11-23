@@ -27,6 +27,38 @@ jobs:
           git -C compiler rev-parse HEAD
           timeout --signal=TERM --kill-after=10s 14m cargo build -p compiler --bin compiler --manifest-path compiler/Cargo.toml
           test -x compiler/target/debug/compiler
+      - name: Diagnose CMake ABI probe directly (informational)
+        shell: bash
+        run: |
+          set -euo pipefail
+          abi_source="$(find /usr/local/share /usr/share -path '*/Modules/CMakeCCompilerABI.c' -print -quit 2>/dev/null)"
+          if test -z "$abi_source"; then
+            echo 'CMake ABI probe source not found' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          modules="$(dirname "$abi_source")"
+          export COMPILER_NATIVE_DRIVER="$PWD/compiler/target/debug/compiler"
+          out="$RUNNER_TEMP/typeid-cmake-abi.o"
+          set +e
+          python3 compiler/tools/compiler-gcc.py -I"$modules" -c \
+            "$abi_source" -o "$out" >"$RUNNER_TEMP/typeid-cmake-abi.log" 2>&1
+          result="$?"
+          set -e
+          echo "Native main-driver CMakeCCompilerABI.c compile exit=$result" >> "$GITHUB_STEP_SUMMARY"
+          if test "$result" -eq 0; then
+            strings "$out" | grep 'INFO:' || :
+          else
+            cat "$RUNNER_TEMP/typeid-cmake-abi.log"
+          fi
+          # Report independently: diagnostic failures don't fail the build gate.
+      - name: Upload CMake ABI evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: main-typeid-cmake-abi-diagnostics
+          path: ${{ runner.temp }}/typeid-cmake-abi.log
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Main driver CMake compile-link and header rebuild
         shell: bash
         run: |
