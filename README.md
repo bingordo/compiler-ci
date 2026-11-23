@@ -116,3 +116,21 @@ proof and fuzz checks) stays active. Fixed-commit historical checks can be
 replayed with `workflow_dispatch`, but do not poll unchanged compiler source.
 The lightweight [workflow hygiene check](.github/workflows/workflow-hygiene-inventory.yml)
 rejects newly scheduled source-pinned workflows and checks archive isolation.
+
+### Retired legacy 15-minute polling
+
+The three legacy workflows below remain in `.github/workflows/` for exact
+manual replay (and any self-file change trigger), but no longer consume
+scheduled runners every 15 minutes:
+
+- `verify-x86-isl.yml` validates the historical `feature/x86-cost-inventory`
+  branch; current-main x86 checks are maintained separately.
+- `verify-x86-t5-bridge.yml` compares an experimental generator branch with
+  current compiler main. Run manually when explicitly testing that bridge.
+- `verify-driver-native.yml` verifies a published ABI test archive in
+  `expr-rule-gen-binaries`. Run manually after a new publication. Its
+  SHA/publication validation and cached-pass gates remain unchanged.
+
+Together these changes eliminate **288 polling invocations/day** (2,016/week)
+without removing any test definitions. They do not replace or disable
+current-compiler main source checks, differential fuzzing or proof suites.
