@@ -433,7 +433,11 @@ PY
         /audit-tmp/weak-word-typeid-exe > /audit-tmp/weak-word-typeid.out
         weak_run_rc=$?
         if (( weak_run_rc == 0 )); then
-          cmp -s /audit-tmp/weak-word-gcc.out /audit-tmp/weak-word-typeid.out
+          # The pinned minimal EDG runner need not have GNU cmp.
+          python3 -c 'from pathlib import Path; import sys; sys.exit(
+              0 if Path(sys.argv[1]).read_bytes()==Path(sys.argv[2]).read_bytes()
+              else 1)' \
+            /audit-tmp/weak-word-gcc.out /audit-tmp/weak-word-typeid.out
           weak_parity_rc=$?
         fi
       fi
