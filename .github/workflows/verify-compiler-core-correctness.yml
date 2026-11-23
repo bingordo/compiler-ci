@@ -373,6 +373,63 @@ jobs:
                 "$RUNNER_TEMP/al05-p9-mixed-native.log"
             done
           done
+          # P17 piggybacks on the already-run P9/P14/P15/P16 native suite.
+          # No additional Cargo build or test invocation, preserving CI time.
+          python3 - "$RUNNER_TEMP/al05-p9-mixed-native.log" "$(git rev-parse HEAD)" <<'PY'
+          import collections, json, pathlib, re, sys
+          lines = pathlib.Path(sys.argv[1]).read_text(errors="replace").splitlines()
+          source_sha = sys.argv[2]
+          token = "AL05_P17_MUTATION_LEDGER "
+          rows = [json.loads(line.split(token, 1)[1])
+                  for line in lines if token in line]
+          if len(rows) != 48:
+              raise SystemExit(f"P17 ledger missing/duplicated records: {len(rows)}")
+          pairs = {(r["case_id"], r["mutation_kind"]) for r in rows}
+          cases = {r["case_id"] for r in rows}
+          kinds = {"wrong-loop-phi": ("wrong-return", "block10->block1.args[0,1]"),
+                   "dropped-latch-divs": ("missing-trap", "block10.instruction42")}
+          if len(pairs) != 48 or len(cases) != 24 or collections.Counter(
+              r["mutation_kind"] for r in rows
+          ) != {"wrong-loop-phi": 24, "dropped-latch-divs": 24}:
+              raise SystemExit("P17 selected case or mutation family lost")
+          for r in rows:
+              expected, location = kinds[r["mutation_kind"]]
+              witness = r["witness"]
+              if not (re.fullmatch(r"m[0-7]s[0-7]c[0-4]", r["case_id"])
+                  and r["schema"] == "al05-p17-mutation-ledger-v1"
+                  and r["source_sha"] == source_sha
+                  and r["location"] == location
+                  and r["verifier"] == "PASS"
+                  and r["expected_oracle"] == "independent-host-i32-recurrence"
+                  and r["mutant_oracle"] == "bounded-typeid-reference"
+                  and r["expected_failure_class"] == expected
+                  and r["observed_failure_class"] == expected
+                  and r["semantics"] == "FS1-DRAFT-NON-NORMATIVE"
+                  and r["verdict"] == "BOUNDED"
+                  and isinstance(witness, dict)
+                  and set(witness) == {"x", "y", "bound"}
+                  and all(type(v) is int for v in witness.values())):
+                  raise SystemExit(f"Invalid P17 source-bound mutation record: {r}")
+          summary = next((line for line in lines
+                          if "AL05_P17_LEDGER_SUMMARY" in line), "")
+          required = [f"source_sha={source_sha}", "selected=24", "admitted=48",
+                      "unsupported=0", "phi_wrong_return=24", "phi_step_cap=0",
+                      "phi_unknown=0", "dropped_trap=24",
+                      "weakened_selector=REJECTED", "missing_family=REJECTED",
+                      "missing_case=REJECTED", "unknown=REJECTED",
+                      "host_oracle=INDEPENDENT", "fs1=NON_NORMATIVE",
+                      "verdict=BOUNDED"]
+          if not all(value in summary for value in required):
+              raise SystemExit("P17 summary lost concrete negative controls")
+          if not any("AL05_P17_CONCRETE selected=24" in line
+                     and "phi_wrong_return=24" in line
+                     and "dropped_trap=24" in line for line in lines):
+              raise SystemExit("P17 legacy compatibility summary missing")
+          print(f"AL05_P17_PERMANENT_LEDGER_VALIDATED sha={source_sha} "
+                "records=48 cases=24 wrong_phi=24 dropped_trap=24 verdict=PASS")
+          PY
+          echo "AL-05.P17: source-bound 48/48 mutation witnesses, independent host "
+          echo "oracle, negative controls and native x86/AArch64 C11/GAS/ELF verified" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Record successful exact source SHA
         if: success() && (steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck)
