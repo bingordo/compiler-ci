@@ -1,0 +1,262 @@
+name: Validate Rust GCC probes and unforced CMake integration
+on:
+  push:
+    branches: ['ci/native-gcc-probes-cmake-20261122']
+  pull_request:
+    paths: ['.github/workflows/verify-rust-gcc-cmake.yml']
+permissions:
+  contents: read
+jobs:
+  native-rust-gcc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 22
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 060a10f7bf7bc2dd011607d85581c53adf503f06
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Build native production compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C compiler rev-parse HEAD
+          timeout --signal=TERM --kill-after=10s 14m cargo build -p compiler --bin compiler --manifest-path compiler/Cargo.toml
+      - name: Rust GCC planner regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Existing main-driver unit test target currently fails to compile
+          # for two unrelated NativeX86ReplayModes missing opt_level fields.
+          # Exercise the new isolated parser module without importing that
+          # unrelated test target; the full production binary is built above.
+          d="$(mktemp -d)"
+          trap 'rm -rf "$d"' EXIT
+          root="$PWD/compiler"
+          printf '#[path="%s/crates/driver/src/gcc_driver.rs"]\nmod gcc_driver;\n#[path="%s/crates/driver/tests/unit/gcc_driver_cases.rs"]\nmod gcc_driver_cases;\n' \
+            "$root" "$root" > "$d/harness.rs"
+          rustc --edition=2021 --test "$d/harness.rs" -o "$d/gcc_planner_tests"
+          "$d/gcc_planner_tests" --nocapture
+      - name: Native Rust GCC vs Python adapter and original CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          d="$(mktemp -d)"
+          trap 'rm -rf "$d"' EXIT
+          compiler="$PWD/compiler/target/debug/compiler"
+          adapter="$PWD/compiler/tools/compiler-gcc.py"
+          cd "$d"
+          cat > hello.c <<'EOF'
+          int helper(void);
+          int main(void) { return helper() == 42 ? 0 : 1; }
+          EOF
+          printf 'int helper(void) { return 42; }\n' > helper.c
+          "$compiler" --gcc-driver -c hello.c helper.c -g0
+          test -s hello.o && test -s helper.o
+          gcc hello.o helper.o -o rust-compiled
+          ./rust-compiled
+          "$compiler" --gcc-driver -S hello.c -o hello.s
+          test -s hello.s
+          gcc hello.s helper.o -o rust-assembly
+          ./rust-assembly
+          COMPILER_NATIVE_DRIVER="$compiler" python3 "$adapter" -c hello.c -o python.o
+          test -s python.o
+          "$compiler" hello.c --language mini-c --target x86_64 --emit obj -o native.o
+          test -s native.o
+          gcc native.o helper.o -o original-cli
+          ./original-cli
+          for rejected in '-O2' '-std=c17' '-Werror' '-g2'; do
+            if "$compiler" --gcc-driver -c hello.c "$rejected" -o invalid.o; then
+              echo "Rust GCC mode unexpectedly accepted $rejected" >&2
+              exit 1
+            fi
+          done
+          test ! -e invalid.o
+          if "$compiler" --gcc-driver hello.c -o program; then
+            echo 'Rust GCC mode unexpectedly accepted link request' >&2
+            exit 1
+          fi
+          echo 'RUST_GCC_IN_PROCESS_COMPILE_AND_ASM=PASS' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Host preprocessing, Make depfile parity and failure cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+          d="$(mktemp -d)"
+          trap 'rm -rf "$d"' EXIT
+          compiler="$PWD/compiler/target/debug/compiler"
+          python_adapter="$PWD/compiler/tools/compiler-gcc.py"
+          cd "$d"
+          mkdir -p include
+          printf '#define VALUE 42\n' > include/answer.h
+          cat > main.c <<'EOF'
+          #include "answer.h"
+          #if !defined(BUILD_TAG)
+          #error missing compiler definition
+          #endif
+          int main(void) { return VALUE == BUILD_TAG ? 0 : 1; }
+          EOF
+          "$compiler" --gcc-driver -c -std=c11 -Iinclude -DBUILD_TAG=42 \
+            -MD -MF rust.d -MT rust.o -MP main.c -o rust.o
+          test -s rust.o
+          test -s rust.d
+          grep -F 'include/answer.h' rust.d
+          grep -F 'rust.o:' rust.d
+          gcc rust.o -o native
+          ./native
+          COMPILER_NATIVE_DRIVER="$compiler" python3 "$python_adapter" \
+            -c -std=c11 -Iinclude -DBUILD_TAG=42 \
+            -MD -MF python.d -MT rust.o -MP main.c -o python.o
+          test -s python.d
+          sed -n '1,10p' rust.d
+          sed -n '1,10p' python.d
+          gcc python.o -o python
+          ./python
+          # A failed native compilation must not replace an earlier depfile.
+          printf 'sentinel\n' > failure.d
+          printf 'int bad(void) { return missing_identifier; }\n' > bad.c
+          if "$compiler" --gcc-driver -c -MD -MF failure.d \
+               bad.c -o bad.o; then
+            echo 'unsupported C unexpectedly compiled' >&2
+            exit 1
+          fi
+          grep -Fx 'sentinel' failure.d
+          # Output path preflight must happen before touching source or depfile.
+          if "$compiler" --gcc-driver -c -MD -MF main.c main.c -o safe.o; then
+            echo 'depfile aliased source' >&2
+            exit 1
+          fi
+          test -s main.c
+          test ! -e safe.o
+          # Header change and fresh compile must reflect new native output.
+          printf '#define VALUE 43\n' > include/answer.h
+          "$compiler" --gcc-driver -c -std=c11 -Iinclude -DBUILD_TAG=42 \
+            -MD -MF rust.d -MT rust.o main.c -o rust.o
+          gcc rust.o -o changed
+          if ./changed; then
+            echo 'header change not observed' >&2
+            exit 1
+          else
+            test "$?" -eq 1
+          fi
+          echo 'RUST_GCC_CPP_DEPFILE_PARITY=PASS' >> "$GITHUB_STEP_SUMMARY"
+      - name: GCC Rust source/object linker order and Python differential
+        shell: bash
+        run: |
+          set -euo pipefail
+          d="$(mktemp -d)"
+          trap 'rm -rf "$d"' EXIT
+          compiler="$PWD/compiler/target/debug/compiler"
+          adapter="$PWD/compiler/tools/compiler-gcc.py"
+          cd "$d"
+          mkdir -p include
+          printf '#define BASE 41\n' > include/answer.h
+          cat > helper.c <<'EOF'
+          #include "answer.h"
+          int helper(void) { return BASE + 1; }
+          EOF
+          cat > main.c <<'EOF'
+          int helper(void);
+          int ext(void);
+          int main(void) { return helper() == 42 && ext() == 10 ? 0 : 1; }
+          EOF
+          printf 'int ext(void) { return 10; }\n' > ext.c
+          cc -c ext.c -o ext.o
+          "$compiler" --gcc-driver -std=c11 -Iinclude \
+            -fno-inline main.c ext.o helper.c -lm -o rust-linked
+          ./rust-linked
+          COMPILER_NATIVE_DRIVER="$compiler" python3 "$adapter" \
+            -std=c11 -Iinclude -fno-inline main.c ext.o helper.c -lm -o py-linked
+          ./py-linked
+          # The Rust mode must also link existing objects without new C sources.
+          if "$compiler" --gcc-driver ext.o -o object-only; then
+            echo 'unexpectedly linked ext.o without main' >&2
+            exit 1
+          fi
+          test ! -e object-only
+          for opt in -shared -Werror -pthread -static; do
+            if "$compiler" --gcc-driver main.c "$opt" -o rejected; then
+              echo "unexpectedly accepted unsupported link flag $opt" >&2
+              exit 1
+            fi
+          done
+          test ! -e rejected
+          if "$compiler" --gcc-driver main.c -o main.c; then
+            echo 'unexpectedly overwrote source with executable' >&2
+            exit 1
+          fi
+          test -s main.c
+          echo 'RUST_GCC_NATIVE_HOST_LINK_PARITY=PASS' >> "$GITHUB_STEP_SUMMARY"
+      - name: Rust GCC -E and compiler identity probe parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          c="$PWD/compiler/target/debug/compiler"
+          py="$PWD/compiler/tools/compiler-gcc.py"
+          test "$("$c" --gcc-driver --version)" = "$(python3 "$py" --version)"
+          d="$(mktemp -d)"
+          trap 'rm -rf "$d"' EXIT
+          cd "$d"
+          mkdir inc
+          printf '#define RESULT 42\n' > inc/result.h
+          cat > source.c <<'EOF'
+          #include "result.h"
+          int main(void) { return RESULT == 42 ? 0 : 1; }
+          EOF
+          "$c" --gcc-driver -E -std=c11 -I inc source.c -o rust.i
+          python3 "$py" -E -std=c11 -I inc source.c -o python.i
+          cmp rust.i python.i
+          "$c" --gcc-driver -xc -c source.c -Iinc -o native.o
+          gcc native.o -o program
+          ./program
+          echo 'RUST_GCC_PREPROCESS_AND_PROBES=PASS' >> "$GITHUB_STEP_SUMMARY"
+      - name: Real CMake TypeId vendor and header rebuild with Rust GCC
+        shell: bash
+        run: |
+          set -euo pipefail
+          c="$PWD/compiler/target/debug/compiler"
+          tc="$PWD/compiler/tools/cmake/typeid-gcc-adapter-toolchain.cmake"
+          d="$(mktemp -d)"
+          trap 'rm -rf "$d"' EXIT
+          mkdir "$d/src"
+          cat > "$d/src/CMakeLists.txt" <<'EOF'
+          cmake_minimum_required(VERSION 3.20)
+          project(native_typeid C)
+          if(NOT CMAKE_C_COMPILER_ID STREQUAL "TypeId")
+            message(FATAL_ERROR "Expected truthful TypeId vendor, got: ${CMAKE_C_COMPILER_ID}")
+          endif()
+          add_executable(probe main.c)
+          EOF
+          printf '#include "answer.h"\nint main(void) { return ANSWER == 42 ? 0 : 1; }\n' > "$d/src/main.c"
+          for generator in Ninja "Unix Makefiles"; do
+            printf '#define ANSWER 42\n' > "$d/src/answer.h"
+            suffix=ninja
+            test "$generator" = Ninja || suffix=make
+            cmake -S "$d/src" -B "$d/$suffix" -G "$generator" \
+              -DCMAKE_C_COMPILER="$c" \
+              -DCMAKE_C_COMPILER_ARG1=--gcc-driver \
+              -DCMAKE_TOOLCHAIN_FILE="$tc"
+            cmake --build "$d/$suffix"
+            "$d/$suffix/probe"
+            obj="$d/$suffix/CMakeFiles/probe.dir/main.c.o"
+            before="$(stat -c %Y "$obj")"
+            sleep 1
+            cmake --build "$d/$suffix"
+            test "$(stat -c %Y "$obj")" = "$before"
+            sleep 1
+            printf '#define ANSWER 43\n' > "$d/src/answer.h"
+            cmake --build "$d/$suffix"
+            test "$(stat -c %Y "$obj")" -gt "$before"
+            if "$d/$suffix/probe"; then
+              echo 'CMake did not reflect edited header' >&2
+              exit 1
+            else
+              test "$?" -eq 1
+            fi
+          done
+          echo 'RUST_GCC_CMAKE_NINJA_AND_MAKEFILES=PASS' >> "$GITHUB_STEP_SUMMARY"
