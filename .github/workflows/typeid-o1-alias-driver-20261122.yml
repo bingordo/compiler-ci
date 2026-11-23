@@ -1,0 +1,80 @@
+# Exact-source acceptance for two effective TypeId optimization policies.
+name: Native TypeId O0 and O1-is-O2 driver integration
+on:
+  push:
+    branches: [validation/typeid-o1-alias-driver-20261122]
+    paths: ['.github/workflows/typeid-o1-alias-driver-20261122.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pass-manager:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SOURCE_SHA: 9252615466f9a3018e86aa9c9ce710f92e252e5b
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned source and isolated optimizer workspace
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: native-o0-o1-alias-optimizer
+      - name: Run only O0 and O2 manager tests with O1 equality assertion
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --test typeid_core_pass_manager
+          cargo test -p compiler-opt --lib typed_pass_manager
+      - name: Check compiler-opt production lint
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt --lib -- -D clippy::all
+
+  native-driver:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: 9252615466f9a3018e86aa9c9ce710f92e252e5b
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Configure access to pinned private frontends
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust pinned frontend host
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact checked-out SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: native-o0-o1-alias-driver
+      - name: Build production driver and run focused GCC/ELF CLI tests
+        working-directory: compiler
+        run: |
+          cargo build -p compiler --bin compiler
+          cargo test -p compiler --test typeid_opt_level_cli -- --nocapture
