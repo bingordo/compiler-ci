@@ -746,6 +746,7 @@ probe_generated_c() {
   echo "${prefix}_PEAK_RSS_KB=$rss"
   grep -m 1 '^EDG_PROBE_RESULT ' "$logfile" || true
   grep -m 1 '^EDG_PROBE_GLOBALS ' "$logfile" || true
+  grep -m 1 '^EDG_PROBE_STATIC_OWNERS ' "$logfile" || true
   grep -m 1 '^EDG_PROBE_STATIC_LITERALS ' "$logfile" || true
   grep -m 1 '^EDG_PROBE_STATIC_ROUTINES ' "$logfile" || true
   case "$rc" in
