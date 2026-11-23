@@ -13,14 +13,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 3ddb9323c737f537934a9cd2e5f2b1b4d23142c0
+          ref: 3b9a1575c07889bfd2813650c3b211f5b3ff653c
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - name: Confirm source and public pin
         run: |
           set -euo pipefail
-          test "$(git -C compiler rev-parse HEAD)" = 3ddb9323c737f537934a9cd2e5f2b1b4d23142c0
+          test "$(git -C compiler rev-parse HEAD)" = 3b9a1575c07889bfd2813650c3b211f5b3ff653c
           python3 - <<'PY'
           from pathlib import Path
           p=Path("compiler/tools/mini-c-driver/Cargo.toml")
@@ -33,7 +33,7 @@ jobs:
           set -euo pipefail
           timeout 20m cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib aggregate_abi::entry_tests
           # Diagnostic only while comparing failures to the exact main baseline.
-          timeout 8m cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib || echo "FULL_LIBRARY_SUITE_RED: baseline comparison required"
+          timeout 8m cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib 2>&1 | tee "$RUNNER_TEMP/candidate-library-tests.log" || true
       - name: Build TypeId C driver for executable GCC ABI comparison
         run: |
           set -euo pipefail
@@ -150,4 +150,20 @@ jobs:
           PY
           cargo test --manifest-path compiler-baseline/tools/mini-c-driver/Cargo.toml \
              -p compiler-mini-c --lib 2>&1 | tee "$RUNNER_TEMP/baseline-library-tests.log" || true
-          grep -E 'test tests::.*FAILED|test result:' "$RUNNER_TEMP/baseline-library-tests.log" || true
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          def failures(path):
+              text=Path(path).read_text()
+              names=set(re.findall(r'test (\\S+) \\.\\.\\. FAILED',text))
+              assert 'test result: FAILED.' in text or 'test result: ok.' in text, path
+              return names
+          baseline=failures(Path(__import__('os').environ['RUNNER_TEMP'])/'baseline-library-tests.log')
+          candidate=failures(Path(__import__('os').environ['RUNNER_TEMP'])/'candidate-library-tests.log')
+          print("baseline failures:",sorted(baseline))
+          print("candidate failures:",sorted(candidate))
+          extra=candidate-baseline
+          if extra:
+              raise SystemExit("NEW MINI-C REGRESSIONS: "+repr(sorted(extra)))
+          print("NO NEW MINI-C TEST FAILURES")
+          PY
