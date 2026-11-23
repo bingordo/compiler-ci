@@ -1,0 +1,79 @@
+# Source-pinned checks for the shared test validation policy.
+name: TypeId test validation policy 20261122
+on:
+  push:
+    branches:
+      - validation/typeid-test-validation-policy-20261122
+    paths:
+      - '.github/workflows/typeid-test-validation-policy-20261122.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  opt-test-validation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      SOURCE_SHA: a8cb9f5a459ff6b73e567e138f44d8c1b40975f0
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check pinned source and isolate optimizer workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-test-validation-opt-20261122
+      - name: Optimizer semantic and pass-manager regression
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test semantic_debug -- --nocapture
+          cargo test -p compiler-opt --test typeid_core_pass_manager
+          cargo clippy -p compiler-opt --lib -- -D clippy::all
+  driver-test-validation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: a8cb9f5a459ff6b73e567e138f44d8c1b40975f0
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub for private frontend dependencies
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check pinned source
+        run: test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-test-validation-driver-20261122
+      - name: Real native driver validation environment regression
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test typeid_opt_level_cli -- --nocapture
