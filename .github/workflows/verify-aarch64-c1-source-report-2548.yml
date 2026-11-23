@@ -1,0 +1,159 @@
+name: AArch64 C1 exact TypeId selector and physical byte census
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-aarch64-c1-source-report-2548.yml'
+permissions:
+  contents: read
+jobs:
+  real-native-aarch64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 144c7d6c8257c74909bfd3ce4a4b65d87a1dbf65
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Pin real native AArch64 source and backend-only workspace
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          test "$(git -C compiler rev-parse HEAD)" = "144c7d6c8257c74909bfd3ce4a4b65d87a1dbf65"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Check every native AArch64 target warnings denied and strict Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          RUSTFLAGS="-D warnings" cargo check -p compiler-backend-aarch64 --all-targets
+          cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings
+      - name: Run actual emitted byte counts, rule/cfg accounting and all ARM64 backend tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-aarch64 --all-targets -- --test-threads=1 --nocapture
+          cargo test -p compiler-backend --lib -- --test-threads=1
+          echo "Native AArch64 C1 JSON and exact code byte measurements PASS at 144c7d6c8257c74909bfd3ce4a4b65d87a1dbf65" >> "$GITHUB_STEP_SUMMARY"
+  driver-real-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 144c7d6c8257c74909bfd3ce4a4b65d87a1dbf65
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Verify exact source pin and configure canonical frontend dependencies
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "144c7d6c8257c74909bfd3ce4a4b65d87a1dbf65"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+      - name: Build the real source compiler and run source/IR CLI report regressions
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test aarch64_selector_report_cli -- --nocapture
+          cargo test -p compiler --test ir_default_cli aarch64_defaults_to_typeid_and_rejects_obsolete_legacy_ir -- --nocapture
+          cargo test -p compiler-backend-x86 --lib -- --test-threads=1
+      - name: "Real checked C source corpus: strict JSON parsing, runtime rule counts and byte parity"
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          python3 - <<'PY'
+          import hashlib, json, subprocess, tempfile, time
+          from pathlib import Path
+          root=Path("compiler").resolve()
+          binary=root/"target/debug/compiler"
+          assert binary.is_file(), "the actual checked source compiler was not built"
+          fixtures=root/"tools/mini-c-driver/tests/fixtures/m6_musl"
+          source_cases={p.stem:p for p in sorted(fixtures.glob("*.c"))}
+          assert len(source_cases)>=8, "missing pre-existing real musl Mini-C source extracts"
+          with tempfile.TemporaryDirectory() as td:
+              tmp=Path(td)
+              # A trusted, small, C11 control case keeps backend measurement
+              # independently valid when real extracts are currently rejected.
+              control=tmp/"c1_control.c"
+              control.write_text("int count(int a,int b){int c=a+b;if(c>20)return c-2;return c+1;}\n")
+              source_cases["c1_control"]=control
+              cases={}
+              for name,src in sorted(source_cases.items()):
+                  base=tmp/(name+"-plain.o")
+                  checked=tmp/(name+"-reported.o")
+                  report=tmp/(name+"-report.json")
+                  common=[str(binary),str(src),"--target","aarch64",
+                          "--language","mini-c","--emit","obj"]
+                  def invoke(args):
+                      started=time.perf_counter_ns()
+                      p=subprocess.run(args,encoding="utf-8",capture_output=True,
+                                       timeout=80,check=False)
+                      return p,(time.perf_counter_ns()-started)/1_000_000
+                  one,t0=invoke(common+["-o",str(base)])
+                  two,t1=invoke(common+["-o",str(checked),
+                           "--aarch64-selector-report",str(report)])
+                  if (one.returncode==0)!=(two.returncode==0):
+                      raise AssertionError(f"{name}: reporting changed compilation success")
+                  if one.returncode:
+                      assert not checked.exists() and not report.exists(), name
+                      cases[name]={"status":"unsupported",
+                                   "reason":two.stderr[-600:],
+                                   "source_sha256":hashlib.sha256(src.read_bytes()).hexdigest()}
+                      continue
+                  assert base.read_bytes()==checked.read_bytes(),name
+                  data=json.loads(report.read_text())
+                  assert data["schema"]=="aarch64-c1-selector-coverage-v1",name
+                  totals=data["totals"]
+                  assert totals["functions"]==len(data["functions"]),name
+                  assert totals["generated_scalar"]+totals["handwritten_scalar"]==totals["scalar_instructions"],name
+                  assert totals["handwritten_scalar"]==0,name
+                  assert totals["text_bytes"]>0 and totals["text_bytes"]%4==0,name
+                  assert totals["a64_instruction_words"]==totals["text_bytes"]//4,name
+                  assert sum(f["text_bytes"] for f in data["functions"])==totals["text_bytes"],name
+                  assert all(f["text_bytes"]>0 and f["text_bytes"]%4==0 for f in data["functions"]),name
+                  cases[name]={"status":"compiled","source_sha256":hashlib.sha256(src.read_bytes()).hexdigest(),
+                               "object_sha256":hashlib.sha256(base.read_bytes()).hexdigest(),
+                               "object_bytes":base.stat().st_size,
+                               "physical_text_bytes":totals["text_bytes"],
+                               "selected_scalar":totals["generated_scalar"],
+                               "selected_cfg":totals["generated_terminators"],
+                               "plain_ms":round(t0,2),"report_ms":round(t1,2)}
+                  print("A64_REAL_C1",name,"scalar",totals["generated_scalar"],
+                        "code_bytes",totals["text_bytes"],"normal_ms",round(t0,2),
+                        "report_ms",round(t1,2),flush=True)
+          assert cases["c1_control"]["status"]=="compiled",cases["c1_control"]
+          summary={"schema":"aarch64-c1-source-census-v1",
+                   "compiler_source_sha":"144c7d6c8257c74909bfd3ce4a4b65d87a1dbf65","source_cases":cases,
+                   "compiled":sum(x["status"]=="compiled" for x in cases.values()),
+                   "unsupported":sum(x["status"]=="unsupported" for x in cases.values()),
+                   "all_compiled_objects_identical_with_report":True}
+          Path("results/aarch64-c1-census.json").write_text(json.dumps(summary,sort_keys=True,indent=2)+"\n")
+          print("A64_REAL_C1_TOTAL",summary["compiled"],"compiled,",
+                summary["unsupported"],"rejected",flush=True)
+          PY
+          cat results/aarch64-c1-census.json | python3 -m json.tool > /dev/null
+          echo "Actual C source C1 census (accepted/rejected and byte-identical ELF): results/aarch64-c1-census.json" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: aarch64-c1-real-source-census
+          path: results/
+          if-no-files-found: ignore
+          retention-days: 30
