@@ -1,0 +1,116 @@
+name: Validate GCC adapter with main TypeId driver
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-gcc-adapter-main-driver.yml']
+permissions:
+  contents: read
+jobs:
+  native-main:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 22
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f18500d30e01e165bf0cf9c33331ff9b4517cbb3
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Install credentials for pinned private Oberon dependency
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Build main TypeId driver
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C compiler rev-parse HEAD
+          timeout --signal=TERM --kill-after=10s 14m cargo build -p compiler --bin compiler --manifest-path compiler/Cargo.toml
+          test -x compiler/target/debug/compiler
+      - name: Diagnose CMake ABI probe directly (informational)
+        shell: bash
+        run: |
+          set -euo pipefail
+          abi_source="$(find /usr/local/share /usr/share -path '*/Modules/CMakeCCompilerABI.c' -print -quit 2>/dev/null)"
+          if test -z "$abi_source"; then
+            echo 'CMake ABI probe source not found' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          modules="$(dirname "$abi_source")"
+          export COMPILER_NATIVE_DRIVER="$PWD/compiler/target/debug/compiler"
+          out="$RUNNER_TEMP/typeid-cmake-abi.o"
+          set +e
+          python3 compiler/tools/compiler-gcc.py -I"$modules" -c \
+            "$abi_source" -o "$out" >"$RUNNER_TEMP/typeid-cmake-abi.log" 2>&1
+          result="$?"
+          set -e
+          echo "Native main-driver CMakeCCompilerABI.c compile exit=$result" >> "$GITHUB_STEP_SUMMARY"
+          if test "$result" -eq 0; then
+            strings "$out" | grep 'INFO:' || :
+          else
+            cat "$RUNNER_TEMP/typeid-cmake-abi.log"
+          fi
+          # Report independently: diagnostic failures don't fail the build gate.
+      - name: Upload CMake ABI evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: main-typeid-cmake-abi-diagnostics
+          path: ${{ runner.temp }}/typeid-cmake-abi.log
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Main driver CMake compile-link and header rebuild
+        shell: bash
+        run: |
+          set -euo pipefail
+          d="$(mktemp -d)"
+          trap 'rm -rf "$d"' EXIT
+          mkdir -p "$d/p"
+          printf 'cmake_minimum_required(VERSION 3.20)\nproject(main_probe C)\nadd_executable(probe main.c)\n' > "$d/p/CMakeLists.txt"
+          printf '#include "answer.h"\nint main(void) { return ANSWER == 42 ? 0 : 1; }\n' > "$d/p/main.c"
+          printf '#define ANSWER 42\n' > "$d/p/answer.h"
+          chmod +x compiler/tools/compiler-gcc.py
+          export COMPILER_NATIVE_DRIVER="$PWD/compiler/target/debug/compiler"
+          cmake -S "$d/p" -B "$d/b" -G Ninja \
+            -DCMAKE_C_COMPILER="$PWD/compiler/tools/compiler-gcc.py" \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/compiler/tools/cmake/typeid-gcc-adapter-toolchain.cmake"
+          cmake --build "$d/b"
+          "$d/b/probe"
+          object="$d/b/CMakeFiles/probe.dir/main.c.o"
+          before="$(stat -c %Y "$object")"
+          sleep 1
+          cmake --build "$d/b"
+          test "$(stat -c %Y "$object")" = "$before"
+          sleep 1
+          printf '#define ANSWER 43\n' > "$d/p/answer.h"
+          cmake --build "$d/b"
+          test "$(stat -c %Y "$object")" -gt "$before"
+          if "$d/b/probe"; then
+            echo 'header rebuild result incorrect'
+            exit 1
+          else
+            test "$?" -eq 1
+          fi
+          # Independently verify CMake's Unix Makefiles dependency path.
+          printf '#define ANSWER 42\n' > "$d/p/answer.h"
+          cmake -S "$d/p" -B "$d/make" -G 'Unix Makefiles' \
+            -DCMAKE_C_COMPILER="$PWD/compiler/tools/compiler-gcc.py" \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/compiler/tools/cmake/typeid-gcc-adapter-toolchain.cmake"
+          cmake --build "$d/make"
+          "$d/make/probe"
+          make_object="$d/make/CMakeFiles/probe.dir/main.c.o"
+          make_before="$(stat -c %Y "$make_object")"
+          sleep 1
+          cmake --build "$d/make"
+          test "$(stat -c %Y "$make_object")" = "$make_before"
+          sleep 1
+          printf '#define ANSWER 43\n' > "$d/p/answer.h"
+          cmake --build "$d/make"
+          test "$(stat -c %Y "$make_object")" -gt "$make_before"
+          if "$d/make/probe"; then
+            echo 'Makefiles header rebuild result incorrect'
+            exit 1
+          else
+            test "$?" -eq 1
+          fi
+          echo 'MAIN_DRIVER_NATIVE_CMAKE_NINJA_AND_MAKEFILES=PASS' >> "$GITHUB_STEP_SUMMARY"
