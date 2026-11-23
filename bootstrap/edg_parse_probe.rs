@@ -23,6 +23,34 @@ fn main() {
                 unit.il.statements.len(),
                 unit.il.expressions.len(),
             );
+            // Numeric-only census: no names, paths or generated C excerpts.
+            // The TypeId whole-TU global proof currently distinguishes
+            // imports, file-scope storage and nontrivial initializer trees.
+            // Count those source facts *before* the adapter rejects a TU.
+            let il=&unit.il;
+            let globals=&il.global_variables;
+            eprintln!(
+                "EDG_PROBE_GLOBALS total={} externs={} internal={} file_scope={} explicit={} tls={} local_static={} materializations={} weak={} sections={} initializers={} integer_images={} fp_images={} aggregate_images={} relocations={} dynamic={} initializer_exprs={} lifetime_inits={} defined_routines={}",
+                globals.len(),
+                globals.iter().filter(|g|g.linkage==1).count(),
+                globals.iter().filter(|g|g.linkage==2).count(),
+                globals.iter().filter(|g|g.linkage==3).count(),
+                globals.iter().filter(|g|g.explicit_initializer).count(),
+                globals.iter().filter(|g|g.thread_local).count(),
+                globals.iter().filter(|g|g.local_to_function).count(),
+                il.global_materializations.len(),
+                il.global_materializations.iter().filter(|m|m.is_weak).count(),
+                il.global_materializations.iter().filter(|m|m.has_explicit_section).count(),
+                il.variable_initializers.len(),
+                il.initializer_integers.len(),
+                il.global_float_initializers.len(),
+                il.global_aggregate_initializers.len(),
+                il.global_aggregate_relocations.len(),
+                il.dynamic_initializers.len(),
+                il.initializer_expressions.len(),
+                il.initialization_lifetimes.len(),
+                il.entities.iter().filter(|e|matches!(e,edgcpp::Entity::Routine{has_definition:true,..})).count()
+            );
             if unit.status != 0 {
                 std::process::exit(1);
             }

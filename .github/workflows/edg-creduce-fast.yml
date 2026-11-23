@@ -1,0 +1,787 @@
+name: Fast EDG generated-C GDB/C-Reduce reproducer
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/edg-creduce-fast.yml'
+      - 'bootstrap/reduce-mrustc-edg-host.sh'
+      - 'bootstrap/run-mrustc-edg-gap.sh'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Compiler source branch, tag, or SHA'
+        required: false
+        default: main
+        type: string
+      edg_creduce:
+        description: 'Enable C-Reduce on exact generated C'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: edg-creduce-fast-${{ github.head_ref || inputs.source_ref || 'main' }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    steps:
+      - name: Checkout compiler-ci smoke fixtures
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout compiler using existing read-only deploy key
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          # Test the merged source-verified TypeId adapter (not the old mixed-global
+          # branch) without changing compiler production history.
+          # Manual dispatch can still select any explicit source_ref.
+          ref: ${{ inputs.source_ref || '181e6bab665ec27ffb7c9e2a21a952792cd6f6c9' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+
+      - name: Resolve exact frontend source pins from checked-out compiler
+        id: frontend-pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          from pathlib import Path
+          import re
+          import tomllib
+
+          with Path("compiler/crates/driver/Cargo.toml").open("rb") as f:
+              driver = tomllib.load(f)["dependencies"]
+          with Path("compiler/tools/mini-c-driver/Cargo.toml").open("rb") as f:
+              mini = tomllib.load(f)["dependencies"]
+          # The Mini-C syntax/sema crates moved into a separate workspace.
+          # The main driver preprocessor may use a DIFFERENT pinned revision.
+          def pin(deps, crate, repo):
+              dep = deps[crate]
+              assert dep["git"] == f"ssh://git@github.com/bingordo/{repo}.git"
+              sha = dep["rev"]
+              assert re.fullmatch(r"[0-9a-f]{40}", sha), (crate, sha)
+              return sha
+          oberon = pin(driver, "oberon-front-ir", "oberon")
+          preprocessor = pin(driver, "mini-c-preprocess", "mini-c")
+          syntax = pin(mini, "mini-c-syntax", "mini-c")
+          sema = pin(mini, "mini-c-sema", "mini-c")
+          assert syntax == sema, "Mini-C syntax/sema must use one source revision"
+          assert driver["mini-c-preprocess"]["features"] == ["internal-rcc"]
+          print(f"oberon_sha={oberon}")
+          print(f"mini_c_frontend_sha={syntax}")
+          print(f"mini_c_preprocess_sha={preprocessor}")
+          PY
+
+      - name: Checkout pinned Oberon frontend source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/oberon
+          ref: ${{ steps.frontend-pins.outputs.oberon_sha }}
+          path: oberon
+          persist-credentials: false
+
+      - name: Checkout pinned Mini-C frontend source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: ${{ steps.frontend-pins.outputs.mini_c_preprocess_sha }}
+          path: mini-c
+          persist-credentials: false
+      - name: Checkout compiler-pinned Mini-C for generated-C compatibility audit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          # Use precisely the grammar and checker revision required by the
+          # bootstrapped driver rather than a historical parser snapshot.
+          ref: ${{ steps.frontend-pins.outputs.mini_c_frontend_sha }}
+          path: mini-c-compat
+          persist-credentials: false
+      - name: Checkout pinned mrustc
+        uses: actions/checkout@v4
+        with:
+          repository: thepowersgang/mrustc
+          ref: master
+          path: mrustc
+          persist-credentials: false
+
+      - name: Identify mrustc cache revision
+        id: mrustc-revision
+        shell: bash
+        run: echo "sha=$(git -C mrustc rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore prebuilt mrustc and Rust 1.90 libraries
+        id: mrustc-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            mrustc/bin
+            mrustc/output-1.90.0
+          key: mrustc-bootstrap-v1-${{ runner.os }}-ubuntu2404-rust190-${{ steps.mrustc-revision.outputs.sha }}
+
+      - name: Install mrustc build dependencies when the toolchain needs building
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.mrustc-cache.outputs.cache-hit }}" == "true" ]] &&
+             [[ -x mrustc/bin/mrustc ]] &&
+             [[ -x mrustc/bin/minicargo ]] &&
+             [[ -f mrustc/output-1.90.0/libcore.rlib ]]; then
+            echo "Cached mrustc is complete; skipping apt install." >> "$GITHUB_STEP_SUMMARY"
+          else
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends build-essential zlib1g-dev pkg-config cmake curl python3 libssl-dev
+          fi
+          # GCC and Cargo are required even when mrustc itself came from cache.
+          command -v gcc
+          command -v cargo
+          command -v python3
+
+      - name: Record reproducibility inputs and target crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Compiler SHA: $(git -C compiler rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          echo "mrustc SHA: $(git -C mrustc rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Host: $(uname -m) / $(lsb_release -rs)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Rust crate editions:" >> "$GITHUB_STEP_SUMMARY"
+          grep -Rh '^edition[[:space:]]*=' compiler/crates/*/Cargo.toml | sort | uniq -c >> "$GITHUB_STEP_SUMMARY"
+          echo "First target: compiler-ir (no frontend dependency); then compiler-opt, backend, driver." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build mrustc and matching Rust 1.90 libraries
+        id: toolchain
+        shell: bash
+        working-directory: mrustc
+        env:
+          RUSTC_VERSION: '1.90.0'
+          MRUSTC_TARGET_VER: '1.90'
+          OUTDIR_SUF: '-1.90.0'
+          PARLEVEL: '2'
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.mrustc-cache.outputs.cache-hit }}" == "true" ]] && \
+             [[ -x bin/mrustc ]] && [[ -x bin/minicargo ]] && \
+             [[ -f output-1.90.0/libcore.rlib ]]; then
+            echo "Using cached mrustc toolchain and Rust libraries" >> "$GITHUB_STEP_SUMMARY"
+          else
+            # Missing/incomplete caches rebuild in this runner.
+            timeout --signal=TERM --kill-after=10s 20m make -j2
+            timeout --signal=TERM --kill-after=10s 10m make RUSTCSRC
+            timeout --signal=TERM --kill-after=10s 55m make -f minicargo.mk LIBS
+          fi
+          test -x bin/mrustc
+          test -x bin/minicargo
+          test -f output-1.90.0/libcore.rlib
+
+      - name: Cache validated mrustc toolchain
+        if: success() && steps.mrustc-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            mrustc/bin
+            mrustc/output-1.90.0
+          key: mrustc-bootstrap-v1-${{ runner.os }}-ubuntu2404-rust190-${{ steps.mrustc-revision.outputs.sha }}
+
+      - name: Snapshot C files before translation
+        shell: bash
+        run: |
+          find mrustc -type f -name '*.c' -printf '%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/mrustc-c-before.txt"
+
+      - name: Attempt compiler-ir Rust-to-C emission
+        id: translate
+        shell: bash
+        working-directory: mrustc
+        env:
+          RUSTC_VERSION: '1.90.0'
+          MRUSTC_TARGET_VER: '1.90'
+          OUTDIR_SUF: '-1.90.0'
+          PARLEVEL: '2'
+          CC: gcc
+        run: |
+          set -euo pipefail
+          # This is deliberately a bounded first-crate feasibility probe, not
+          # an assertion that the full Cargo workspace is supported.
+          set +e
+          # minicargo's positional argument is the crate DIRECTORY, not Cargo.toml.
+          # Share one fresh per-run directory across all compiler crate probes.
+          # minicargo can now reuse compiler-ir and other completed dependencies.
+          # Do not persist private generated C/rlibs in public Actions caches.
+          timeout --signal=TERM --kill-after=10s 20m bin/minicargo \
+            -L output-1.90.0 -o output-compiler-bootstrap \
+            ../compiler/crates/ir > "$RUNNER_TEMP/mrustc-probe.log" 2>&1
+          rc=$?
+          set -e
+          echo "mrustc/minicargo exit code: $rc" >> "$GITHUB_STEP_SUMMARY"
+          find . -type f -name '*.c' -printf '%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/mrustc-c-after.txt"
+          # Before-snapshot is relative to mrustc/; after-snapshot is also
+          # relative to mrustc/, avoiding false differences from prefix changes.
+          comm -13 "$RUNNER_TEMP/mrustc-c-before.txt" "$RUNNER_TEMP/mrustc-c-after.txt" > "$RUNNER_TEMP/mrustc-c-new.txt"
+          echo "New C files from attempted translation: $(wc -l < "$RUNNER_TEMP/mrustc-c-new.txt")" >> "$GITHUB_STEP_SUMMARY"
+          echo "All C files (includes prebuilt Rust stdlib): $(wc -l < "$RUNNER_TEMP/mrustc-c-after.txt")" >> "$GITHUB_STEP_SUMMARY"
+          # Do not print private compiler source or raw diagnostics into public CI.
+          python3 - "$RUNNER_TEMP/mrustc-probe.log" "$GITHUB_STEP_SUMMARY" <<'PY'
+          import pathlib, re, sys
+          log = pathlib.Path(sys.argv[1]).read_text(errors="replace")
+          categories = {
+              "manifest or dependency resolution": r"failed to (load|parse|select|resolve)|dependency|manifest",
+              "missing files or paths": r"No such file|not found|cannot open",
+              "unsupported Rust feature": r"unsupported|not implemented|unimplemented|TODO",
+              "type or parsing error": r"parse error|type error|error:|ERROR:",
+              "compiler crash": r"SIGSEGV|segmentation fault|panic|assertion failed",
+              "GCC diagnostic": r"gcc: error|fatal error:|compilation terminated",
+          }
+          print("Diagnostic categories (counts; non-exclusive):", file=open(sys.argv[2], "a"))
+          with open(sys.argv[2], "a") as out:
+              for name, pattern in categories.items():
+                  print(f"- {name}: {len(re.findall(pattern, log, re.I))}", file=out)
+          PY
+          echo "Target translation must succeed before GCC syntax and object tests run." >> "$GITHUB_STEP_SUMMARY"
+          if (( rc != 0 )); then
+            # Only show a bounded, non-source-bearing summary here. Private
+            # diagnostics remain in the runner temp log.
+            echo "minicargo failed; inspect diagnostic categories above." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "probe_exit=$rc" >> "$GITHUB_OUTPUT"
+          # A nonzero exit is a real failed acceptance gate, not a green probe.
+          exit "$rc"
+
+      - name: Generate small real mrustc compiler-ir executable C as reduction seed
+        if: always() && steps.translate.outcome == 'success'
+        shell: bash
+        working-directory: mrustc
+        env:
+          RUSTC_VERSION: '1.90.0'
+          MRUSTC_TARGET_VER: '1.90'
+          OUTDIR_SUF: '-1.90.0'
+          PARLEVEL: '2'
+          CC: gcc
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 15m bin/minicargo \
+            -L output-1.90.0 -o output-compiler-bootstrap \
+            ../bootstrap/mrustc-gcc-smoke > "$RUNNER_TEMP/mrustc-small-smoke.log" 2>&1
+          # The compiler-ir library alone emits a 65+ MB file. This
+          # source-owned public executable smoke emits a much smaller C unit
+          # without compiling the unrelated optimizer, backends, or driver.
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          from pathlib import Path
+          units=[p.stat().st_size for p in Path("output-compiler-bootstrap").rglob("*.c") if p.is_file() and p.stat().st_size]
+          assert len(units) >= 2, "expected library C plus executable C"
+          print("Generated-C unit count:", len(units))
+          print("Smallest generated-C bytes:", min(units))
+          assert min(units) < 1024*1024, "missing <1MiB executable seed"
+          PY
+
+      - name: Checkout pinned EDG callable frontend source for C compatibility audit
+        if: always() && steps.translate.outcome == 'success'
+        uses: actions/checkout@v4
+        with:
+          repository: bingundu/edgcpp
+          ref: b195677be8b9b56c8337afad6be8064d21a54082
+          path: edgcpp
+          persist-credentials: false
+
+      - name: Resolve native EDG Rust bridge revision from checked-out compiler
+        id: native-edg-pin
+        if: always() && steps.translate.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import re
+          import tomllib
+          with open("compiler/tools/edg-driver/Cargo.toml", "rb") as f:
+              dependencies = tomllib.load(f)["dependencies"]
+          dep = dependencies["edgcpp"]
+          assert dep["git"] == "https://github.com/bingordo/edgcpp-rust.git"
+          rev = dep["rev"]
+          assert re.fullmatch(r"[0-9a-f]{40}", rev), "invalid source-pinned EDG bridge"
+          print("sha=" + rev)
+          PY
+
+      - name: Checkout compiler-pinned production EDG bridge for TypeId audit
+        if: always() && steps.native-edg-pin.outcome == 'success'
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/edgcpp-rust
+          ref: 96ff850153924440cc2b566eacdc05f5f05e567d
+          path: edgcpp-rust
+          persist-credentials: false
+
+      - name: Checkout source-pinned TypeId static literal consumer for acceptance
+        if: always() && steps.translate.outcome == 'success'
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 181e6bab665ec27ffb7c9e2a21a952792cd6f6c9
+          path: compiler-literal-source
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+
+      - name: Probe real mrustc C through EDG parse and native TypeId gates
+        if: always() && steps.translate.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Audit the real C already generated from compiler-ir and other
+          # crates even when the optional full driver GCC bootstrap fails.
+          # The original source C is not uploaded or published.
+          selection="$RUNNER_TEMP/mrustc-c-selections.txt"
+          if [[ ! -s "$selection" ]]; then
+            python3 bootstrap/probe-mrustc-c-dialect.py \
+              "$PWD/mrustc/output-compiler-bootstrap" "$selection"
+          fi
+          # Parse a small real mrustc TU first, not the 53+ MiB
+          # compiler-ir library that previously segfaulted in EDG.
+          # Keep the original large representative as a separate scale gate.
+          source=$(python3 - "$PWD/mrustc/output-compiler-bootstrap" <<'PY'
+          from pathlib import Path
+          import sys
+          files = [p for p in Path(sys.argv[1]).rglob("*.c") if p.is_file() and p.stat().st_size > 0]
+          if not files:
+              raise SystemExit("no real generated C files")
+          print(min(files, key=lambda p: (p.stat().st_size, str(p))))
+          PY
+          )
+          large_source=$(sed -n '1p' "$selection")
+          test -f "$source" && test -f "$large_source"
+          case "$source" in "$PWD"/*) ;; *) echo "invalid small C sample path"; exit 1;; esac
+          case "$large_source" in "$PWD"/*) ;; *) echo "invalid large C sample path"; exit 1;; esac
+          relative="${source#"$PWD"/}"
+          large_relative="${large_source#"$PWD"/}"
+          echo "EDG generated-C audit small bytes=$(stat -c %s "$source") large bytes=$(stat -c %s "$large_source")" >> "$GITHUB_STEP_SUMMARY"
+          # C-Reduce is diagnostic-only, active for this draft PR or manual
+          # workflow_dispatch opt-in. Main bootstrap skips the reduction.
+          set +e
+          timeout --signal=TERM --kill-after=20s 30m docker run --rm \
+            --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+            --entrypoint /bin/bash \
+            -v "$PWD:/workspace" \
+            -v "$PWD/compiler-literal-source:/workspace/compiler-literal-source:ro" \
+            -v "$RUNNER_TEMP:/audit-tmp" \
+            -e "AUDIT_SOURCE=/workspace/$relative" \
+            -e "EDG_BRIDGE_OVERRIDE_SHA=96ff850153924440cc2b566eacdc05f5f05e567d" \
+            -e "EDGCPP_DIAG_C_AGGREGATE_FAILURE=1" \
+            -e "EDGCPP_DIAG_C_AGGREGATE_FAILURE_FILE=/audit-tmp/edg-union-image-failures.txt" \
+            -e "EDG_C_RECORD_REGRESSION=1" \
+            -e "EDG_LITERAL_REGRESSION=1" \
+            -e "EDGCPP_STATIC_LITERAL_NUMERIC_DIAG=1" \
+            -e "EDG_TYPEID_UNIT_REGRESSION=1" \
+            -e "EDG_TYPEID_SAFE_GLOBAL_DIAG=1" \
+            -e "EDG_RUN_CREDUCE=0" \
+            -e "EDG_UPSTREAM_CHECK=0" \
+            ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8 \
+            -euo pipefail /workspace/bootstrap/run-mrustc-edg-gap.sh \
+            > "$RUNNER_TEMP/mrustc-edg-audit.log" 2>&1
+          rc=$?
+          set -e
+          echo "EDG audit runner exit=$rc (diagnostic only)" | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -E '^(EDG_C_UNION_IMAGE_DIAG |EDG_TYPEID_SAFE_FAIL_GLOBAL |EDG_PROBE_GLOBALS |EDG_PROBE_STATIC_LITERALS |EDG_C_LITERAL_[A-Z0-9_]+|EDG_GNU_ATTR_PARSE_[A-Z_]+_EXIT|EDG_C_(PARSE|TYPEID|LARGE_PARSE)_EXIT|EDG_C_(PARSE|LARGE_PARSE|LARGE_STACK64M_PARSE)_(CLASS|WALL_SECONDS|PEAK_RSS_KB)|EDG_C_LARGE_STACK64M_PARSE_EXIT|EDG_C_LARGE_STACK64M_RETRY|EDG_C_GDB_[A-Z0-9_]+|EDG_CREDUCE_[A-Z0-9_]+|EDG_TYPEID_MIXED_GLOBAL_UNIT_EXIT|EDG_C_TYPEID_FAILURE_STAGE|EDG_C_TYPEID_REJECTION_CLASS|EDG_C_TYPEID_REASON_[A-Z_]+|EDG_C_SAMPLE_BYTES|EDG_C_LARGE_BYTES|EDG_UPSTREAM_[A-Z0-9_]+|EDG_BRIDGE_[A-Z0-9_]+|EDG_C_SOURCE_BRIDGE_[A-Z0-9_]+)=' "$RUNNER_TEMP/mrustc-edg-audit.log" | tee -a "$GITHUB_STEP_SUMMARY" || true
+          # The real mrustc-generated C never leaves the private runner.
+          # Re-export only source-independent, strictly recognized numeric
+          # evidence; zero literal objects remain an unsatisfied acceptance
+          # condition rather than being silently treated as success.
+          python3 - "$RUNNER_TEMP/mrustc-edg-audit.log" "$RUNNER_TEMP/edg-generated-c-parse.log" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          from pathlib import Path
+          import re,sys
+          lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
+          static=re.compile(r"^EDG_PROBE_STATIC_LITERALS objects=([0-9]{1,7}) relocations=([0-9]{1,7}) valid=([01])$")
+          expected=("total","externs","internal","file_scope","explicit","tls",
+                    "local_static","materializations","weak","sections","initializers",
+                    "integer_images","fp_images","aggregate_images","relocations",
+                    "dynamic","initializer_exprs","lifetime_inits","defined_routines")
+          found=False
+          for line in lines:
+              m=static.fullmatch(line)
+              if m:
+                  print(line)
+                  found=True
+                  break
+          print("EDG_C_LITERAL_REAL_CENSUS_PRESENT="+str(int(found)))
+          for line in lines:
+              if not line.startswith("EDG_PROBE_GLOBALS "):
+                  continue
+              entries=line[len("EDG_PROBE_GLOBALS "):].split()
+              if len(entries)!=len(expected):
+                  continue
+              values=[]
+              for key,entry in zip(expected,entries):
+                  m=re.fullmatch(re.escape(key)+r"=([0-9]{1,10})",entry)
+                  if m is None:break
+                  values.append(m.group(1))
+              else:
+                  print("EDG_PROBE_GLOBALS "+" ".join(
+                      f"{key}={value}" for key,value in zip(expected,values)))
+                  break
+          # Provenance/image census is aggregate numeric data, never names,
+          # symbols or bytes. Re-serialize only the exact supported schema.
+          owner_fields=("definitions","explicit","weak","explicit_weak",
+                        "explicit_strong","missing_image","missing_weak",
+                        "missing_strong","aggregate_weak","aggregate_strong",
+                        "orphan_image_owners","literal_reloc_owners",
+                        "routine_reloc_owners")
+          seen_owner=False
+          for line in lines:
+              if not line.startswith("EDG_PROBE_STATIC_OWNERS "):
+                  continue
+              entries=line[len("EDG_PROBE_STATIC_OWNERS "):].split()
+              if len(entries)!=len(owner_fields):
+                  continue
+              values=[]
+              for key,entry in zip(owner_fields,entries):
+                  m=re.fullmatch(re.escape(key)+r"=([0-9]{1,10})",entry)
+                  if m is None: break
+                  values.append(m.group(1))
+              else:
+                  print("EDG_C_REAL_STATIC_OWNERS "+" ".join(
+                      f"{key}={value}" for key,value in zip(owner_fields,values)))
+                  seen_owner=True
+                  break
+          print("EDG_C_REAL_STATIC_OWNERS_PRESENT="+str(int(seen_owner)))
+          image_fields=("images_ok","images_failed","invalid_address",
+                        "invalid_literal","invalid_pointer_integer","other_leaf",
+                        "union32_ok","union32_failed","union32_failure_mask",
+                        "union32_leaf_kind_mask","union32_leaf_type_mask",
+                        "union32_constant_type_mask","union32_original_type_mask",
+                        "union32_cast_flags_mask","union32_address_reason_mask",
+                        "union32_address_kind_mask","union32_other_address_base_mask")
+          native_diag=re.compile(
+              r"^EDG_STATIC_LITERAL_BRIDGE_DIAG " +
+              " ".join(re.escape(key)+r"=([0-9]{1,10})" for key in image_fields)+r"$")
+          source_path=Path(sys.argv[2])
+          found_native=False
+          if source_path.is_file():
+              for candidate in source_path.read_text(errors="replace").splitlines():
+                  matched=native_diag.fullmatch(candidate)
+                  if matched:
+                      print("EDG_C_REAL_STATIC_IMAGE_DIAG "+" ".join(
+                          f"{key}={value}" for key,value in
+                          zip(image_fields,matched.groups())))
+                      found_native=True
+                      break
+          print("EDG_C_REAL_STATIC_IMAGE_DIAG_PRESENT="+str(int(found_native)))
+          PY
+          # This *only* displays the bounded, public in-repo Rust wire unit
+          # test output previously delimited by the parser runner. It does
+          # not print private generated C or native source identifiers.
+          awk '
+            /^EDG_LITERAL_PUBLIC_WIRE_TEST_FAILURE_DETAIL_BEGIN$/ {show=1;next}
+            /^EDG_LITERAL_PUBLIC_WIRE_TEST_FAILURE_DETAIL_END$/ {show=0;exit}
+            show {print}
+          ' "$RUNNER_TEMP/mrustc-edg-audit.log" | tail -n 34
+          # The bridge's runner-private diagnostic is not a parser log.
+          # Publish only a bounded numeric allowlist; never upload generated C,
+          # native pointers, names, source paths or other raw EDG diagnostics.
+          python3 - "$RUNNER_TEMP/edg-union-image-failures.txt" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          from pathlib import Path
+          import re, sys
+          fields=("raw_type_kind","normalized_type_kind","init_kind","explicit",
+                  "constant_present","constant_kind","raw_size",
+                  "normalized_size","normalized_align")
+          path=Path(sys.argv[1])
+          if path.is_file():
+              count=0
+              for line in path.read_text(errors="replace").splitlines():
+                  prefix="EDG_C_UNION_ROOT_DIAG "
+                  if not line.startswith(prefix):
+                      continue
+                  parts=line[len(prefix):].split()
+                  if len(parts)!=len(fields):
+                      continue
+                  values=[]
+                  for part,key in zip(parts,fields):
+                      match=re.fullmatch(re.escape(key)+r"=([0-9]{1,10})",part)
+                      if match is None: break
+                      values.append(match.group(1))
+                  else:
+                      print(prefix+" ".join(f"{key}={value}"
+                                          for key,value in zip(fields,values)))
+                      count+=1
+                      if count==4: break
+          PY
+          # Correlate private native SymbolId with bridge image outcome inside
+          # the runner only; public output contains NO source identities.
+          python3 - "$RUNNER_TEMP/edg-generated-c-native.log" "$RUNNER_TEMP/edg-union-image-failures.txt" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          from pathlib import Path
+          import re, sys
+          native=Path(sys.argv[1])
+          diag=Path(sys.argv[2])
+          if not native.is_file() or not diag.is_file():
+              print("EDG_C_UNION_IMAGE_JOIN status=missing_diagnostic_input")
+          else:
+              error=native.read_text(errors="replace")
+              match=re.search(r"native global SymbolId\(([0-9]{1,10})\) is not a proven imported data declaration",error)
+              if match is None:
+                  print("EDG_C_UNION_IMAGE_JOIN status=no_matching_native_global_error")
+              else:
+                  owner=match.group(1)
+                  outcomes=set()
+                  for line in diag.read_text(errors="replace").splitlines():
+                      if not line.startswith("EDG_C_UNION_IMAGE_OUTCOME "):
+                          continue
+                      fields=line.split()[1:]
+                      if len(fields)!=4:
+                          continue
+                      keys=("owner","image_ok","byte_count","relocation_count")
+                      values=[]
+                      for item,key in zip(fields,keys):
+                          valid=re.fullmatch(re.escape(key)+r"=([0-9]{1,10})",item)
+                          if valid is None: break
+                          values.append(valid.group(1))
+                      else:
+                          if values[0]==owner and values[1] in ("0","1"):
+                              outcomes.add(tuple(values[1:]))
+                  if len(outcomes)==0:
+                      print("EDG_C_UNION_IMAGE_JOIN status=no_matching_bridge_record")
+                  elif len(outcomes)>1:
+                      print("EDG_C_UNION_IMAGE_JOIN status=conflicting_bridge_records")
+                  else:
+                      ok,byte_count,relocations=next(iter(outcomes))
+                      print("EDG_C_UNION_IMAGE_JOIN status=matched "
+                            f"image_ok={ok} byte_count={byte_count} "
+                            f"relocation_count={relocations}")
+                      # The bridge already checked that this exact source
+                      # image failed. Show its bounded constant-tree shape,
+                      # never the private numeric owner or source symbol.
+                      shape_keys=("owner","type_size","type_align","root_kind",
+                                  "first_kind","second_kind","third_kind",
+                                  "first_child_kind","child_count_bounded",
+                                  "root_dynamic","first_address_kind","first_designator")
+                      shapes=set()
+                      for line in diag.read_text(errors="replace").splitlines():
+                          if not line.startswith("EDG_C_UNION_IMAGE_DIAG "):
+                              continue
+                          parts=line.split()[1:]
+                          if len(parts)!=len(shape_keys):
+                              continue
+                          parsed=[]
+                          for part,key in zip(parts,shape_keys):
+                              found=re.fullmatch(re.escape(key)+r"=([0-9]{1,10})",part)
+                              if found is None: break
+                              parsed.append(found.group(1))
+                          else:
+                              if parsed[0]==owner: shapes.add(tuple(parsed[1:]))
+                      nested_keys=("owner","selected","member_kind","member_bytes",
+                                   "member_align","member_offset","array_count",
+                                   "nested_count","nested_first","nested_second",
+                                   "nested_first_child","nested_address_kind",
+                                   "nested_repeat_count","nested_designator")
+                      nested_shapes=set()
+                      for line in diag.read_text(errors="replace").splitlines():
+                          if not line.startswith("EDG_C_UNION_NESTED_DIAG "):
+                              continue
+                          parts=line.split()[1:]
+                          if len(parts)!=len(nested_keys):
+                              continue
+                          parsed=[]
+                          for part,key in zip(parts,nested_keys):
+                              found=re.fullmatch(re.escape(key)+r"=([0-9]{1,10})",part)
+                              if found is None: break
+                              parsed.append(found.group(1))
+                          else:
+                              if parsed[0]==owner:
+                                  nested_shapes.add(tuple(parsed[1:]))
+                      ref_keys=("owner","is_const_address","referent_present",
+                                "referent_kind","type_kind","type_bytes",
+                                "type_align","string_length","string_bytes_present",
+                                "offset_zero","one_past","object_reflection",
+                                "alias_repeat_count")
+                      referents=set()
+                      for line in diag.read_text(errors="replace").splitlines():
+                          if not line.startswith("EDG_C_UNION_REFERENT_DIAG "):
+                              continue
+                          parts=line.split()[1:]
+                          if len(parts)!=len(ref_keys): continue
+                          values=[]
+                          for part,key in zip(parts,ref_keys):
+                              found=re.fullmatch(re.escape(key)+r"=([0-9]{1,10})",part)
+                              if found is None: break
+                              values.append(found.group(1))
+                          else:
+                              if values[0]==owner:
+                                  referents.add(tuple(values[1:]))
+                      if len(referents)==1:
+                          values=next(iter(referents))
+                          print("EDG_C_UNION_REFERENT_DETAIL "+" ".join(
+                              f"{key}={val}" for key,val in
+                              zip(ref_keys[1:],values)))
+                      elif len(referents)>1:
+                          print("EDG_C_UNION_REFERENT_DETAIL status=conflicting_shapes")
+                      else:
+                          print("EDG_C_UNION_REFERENT_DETAIL status=not_recorded")
+                      if len(nested_shapes)==1:
+                          vals=next(iter(nested_shapes))
+                          print("EDG_C_UNION_NESTED_DETAIL "+" ".join(
+                              f"{key}={value}" for key,value in
+                              zip(nested_keys[1:],vals)))
+                      elif len(nested_shapes)>1:
+                          print("EDG_C_UNION_NESTED_DETAIL status=conflicting_shapes")
+                      else:
+                          print("EDG_C_UNION_NESTED_DETAIL status=not_recorded")
+                      if len(shapes)==1:
+                          values=next(iter(shapes))
+                          print("EDG_C_UNION_IMAGE_DETAIL "+" ".join(
+                              f"{key}={value}" for key,value in
+                              zip(shape_keys[1:],values)))
+                      elif len(shapes)>1:
+                          print("EDG_C_UNION_IMAGE_DETAIL status=conflicting_shapes")
+                      else:
+                          print("EDG_C_UNION_IMAGE_DETAIL status=not_recorded")
+
+          PY
+          if ! grep -q '^EDG_C_PARSE_EXIT=' "$RUNNER_TEMP/mrustc-edg-audit.log"; then
+            echo 'EDG generated-C audit did not reach the parser (preflight/toolchain failure); no attribute/ABI compatibility result.' | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+          echo 'EDG audit diagnostic tail:'
+          tail -n 55 "$RUNNER_TEMP/mrustc-edg-audit.log"
+          # A missing toolchain or a tested unsupported C feature does not
+          # invalidate the established independent GCC bootstrap.
+      - name: Require public C11 literal and mixed-global TypeId ELF GCC parity
+        if: always() && steps.translate.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/mrustc-edg-audit.log"
+          grep -q '^EDG_C_LITERAL_GCC_EXIT=0$' "$log"
+          grep -q '^EDG_C_LITERAL_BRIDGE_EXIT=0$' "$log"
+          grep -q '^EDG_C_LITERAL_WIRE_EXIT=0$' "$log"
+          grep -q '^EDG_C_LITERAL_TYPEID_CHECK_EXIT=0$' "$log"
+          grep -q '^EDG_C_LITERAL_TYPEID_UNIT_EXIT=0$' "$log"
+          grep -q '^EDG_C_LITERAL_TYPEID_ELF_EXIT=0$' "$log"
+          grep -q '^EDG_C_LITERAL_NATIVE_ELF_RELOCATIONS=5$' "$log"
+          grep -q '^EDG_C_LITERAL_GCC_ELF_ORACLE_EXIT=0$' "$log"
+          grep -q '^EDG_C_LITERAL_NATIVE_ELF_ORACLE_EXIT=0$' "$log"
+          grep -q '^EDG_C_LITERAL_MIXED_TYPEID_ELF_EXIT=0$' "$log"
+          grep -q '^EDG_C_LITERAL_MIXED_RELOCATIONS=2$' "$log"
+          grep -q '^EDG_C_LITERAL_MIXED_GCC_EXIT=0$' "$log"
+          grep -q '^EDG_C_LITERAL_MIXED_LINK_EXIT=0$' "$log"
+          grep -q '^EDG_C_LITERAL_MIXED_RUN_EXIT=0$' "$log"
+          grep -q '^EDG_C_LITERAL_MIXED_PARITY_EXIT=0$' "$log"
+          grep -q '^EDG_C_LITERAL_WORD_ELF_EXIT=0$' "$log"
+          grep -q '^EDG_C_LITERAL_WORD_DATA_RELOCATIONS=1$' "$log"
+          grep -q '^EDG_C_LITERAL_WORD_GCC_EXIT=0$' "$log"
+          grep -q '^EDG_C_LITERAL_WORD_LINK_EXIT=0$' "$log"
+          grep -q '^EDG_C_LITERAL_WORD_RUN_EXIT=0$' "$log"
+          grep -q '^EDG_C_LITERAL_WORD_PARITY_EXIT=0$' "$log"
+          grep -q '^EDG_C_ROUTINE_BRIDGE_EXIT=0$' "$log"
+          grep -q '^EDG_C_ROUTINE_WIRE_EXIT=0$' "$log"
+          grep -q '^EDG_C_ROUTINE_ELF_EXIT=0$' "$log"
+          grep -q '^EDG_C_ROUTINE_DATA_RELOCATIONS=1$' "$log"
+          grep -q '^EDG_C_ROUTINE_GCC_EXIT=0$' "$log"
+          grep -q '^EDG_C_ROUTINE_LINK_EXIT=0$' "$log"
+          grep -q '^EDG_C_ROUTINE_RUN_EXIT=0$' "$log"
+          grep -q '^EDG_C_ROUTINE_PARITY_EXIT=0$' "$log"
+          echo 'Public C11 original EDG literal, mixed-global TypeId source proof, native x86-64 ELF and independently GCC-linked runtime parity: PASS' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Require real mrustc C source-owned literal relocation coverage
+        if: always() && steps.translate.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/mrustc-edg-audit.log"
+          grep -q '^EDG_C_PARSE_EXIT=0$' "$log"
+          grep -Eq '^EDG_PROBE_STATIC_LITERALS objects=[1-9][0-9]* relocations=[1-9][0-9]* valid=1$' "$log"
+          grep -Eq '^EDG_PROBE_STATIC_ROUTINES relocations=[1-9][0-9]* valid=1$' "$log"
+          echo 'Real mrustc-generated C original EDG literal relocation closure: PASS' >> "$GITHUB_STEP_SUMMARY"
+      # PR runs prioritize standalone upstream cpfe vs bridge comparison.
+      # Full GDB/C-Reduce remains available through workflow_dispatch with
+      # edg_creduce=true; avoid delaying the direct upstream diagnosis.
+      - name: Restore host C-Reduce binary package cache
+        if: always() && steps.translate.outcome == 'success' && (github.event_name == 'workflow_dispatch' && inputs.edg_creduce)
+        id: host-creduce-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/host-creduce-apt
+          key: host-creduce-ubuntu2404-amd64-v211
+
+      - name: Install packaged C-Reduce once on Ubuntu host
+        if: always() && steps.translate.outcome == 'success' && (github.event_name == 'workflow_dispatch' && inputs.edg_creduce)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache="$RUNNER_TEMP/host-creduce-apt"
+          sudo mkdir -p "$cache/partial"
+          sudo chmod 1777 "$cache" "$cache/partial"
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            -o "Dir::Cache::archives=$cache" \
+            -o 'APT::Keep-Downloaded-Packages=true' creduce
+          command -v creduce
+          # GitHub Actions cache archives must be readable without root.
+          sudo chown -R "$(id -u):$(id -g)" "$cache"
+          echo "Host C-Reduce package: $(dpkg-query -W -f='${Version}' creduce)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Minimize real mrustc C with pinned EDG/GDB signature
+        id: reducer
+        if: always() && steps.translate.outcome == 'success' && (github.event_name == 'workflow_dispatch' && inputs.edg_creduce)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          source=$(python3 - "$PWD/mrustc/output-compiler-bootstrap" <<'PY'
+          from pathlib import Path
+          import sys
+          files=[p for p in Path(sys.argv[1]).rglob("*.c") if p.is_file() and p.stat().st_size>0]
+          if not files: raise SystemExit("no generated C")
+          print(min(files,key=lambda p:(p.stat().st_size,str(p))))
+          PY
+          )
+          set +e
+          timeout --signal=TERM --kill-after=20s 32m \
+            bash bootstrap/reduce-mrustc-edg-host.sh "$source" \
+            > "$RUNNER_TEMP/host-creduce-result.log" 2>&1
+          rc=$?
+          set -e
+          echo "Host C-Reduce driver exit=$rc (diagnostic)" >> "$GITHUB_STEP_SUMMARY"
+          grep -E '^EDG_CREDUCE_[A-Z0-9_]+=' "$RUNNER_TEMP/host-creduce-result.log" | \
+            tee -a "$GITHUB_STEP_SUMMARY" || true
+          # Publish only an independently GDB-verified tiny C file to
+          # CI for manual review; the original large source never appears.
+          sed -n '/^EDG_CREDUCE_TESTCASE_BEGIN$/,/^EDG_CREDUCE_TESTCASE_END$/p' \
+            "$RUNNER_TEMP/host-creduce-result.log" || true
+          # Artifacts are restricted to independently GDB-confirmed, GCC
+          # syntactically valid, <32 KiB sources; never upload original
+          # generated C, parser logs, or intermediate C-Reduce files.
+          if grep -Fxq 'EDG_CREDUCE_INDEPENDENT_REPRODUCER=yes' "$RUNNER_TEMP/host-creduce-result.log" &&
+             test -s "$RUNNER_TEMP/edg-creduce-verified/reproducer.c"; then
+            echo "artifact=yes" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Preserve independently verified standalone C testcase
+        if: steps.reducer.outputs.artifact == 'yes'
+        uses: actions/upload-artifact@v4
+        with:
+          name: edg-plain-c-reproducer
+          path: ${{ runner.temp }}/edg-creduce-verified/reproducer.c
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Save host C-Reduce binary package cache
+        if: always() && steps.host-creduce-cache.outcome == 'success' && steps.host-creduce-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/host-creduce-apt
+          key: host-creduce-ubuntu2404-amd64-v211
+
+      - name: Mark experiment outcome
+        if: always()
+        shell: bash
+        env:
+          TOOLCHAIN_OUTCOME: ${{ steps.toolchain.outcome }}
+          TRANSLATE_OUTCOME: ${{ steps.translate.outcome }}
+          PROBE_EXIT: ${{ steps.translate.outputs.probe_exit }}
+        run: |
+          echo "Compiler crate outputs share a single per-run minicargo directory; no private compiler objects are uploaded to the public cache." >> "$GITHUB_STEP_SUMMARY"
+          echo "mrustc build: $TOOLCHAIN_OUTCOME" >> "$GITHUB_STEP_SUMMARY"
+          echo "Translation step: $TRANSLATE_OUTCOME; minicargo exit: ${PROBE_EXIT:-not reached}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Full driver GCC bootstrap and source-level checks are covered above; alternate C-compiler gap analysis is diagnostic-only." >> "$GITHUB_STEP_SUMMARY"
