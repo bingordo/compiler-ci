@@ -51,6 +51,44 @@ fn main() {
                 il.initialization_lifetimes.len(),
                 il.entities.iter().filter(|e|matches!(e,edgcpp::Entity::Routine{has_definition:true,..})).count()
             );
+            // Whole-TU, source-free ownership partition. This identifies
+            // missing source image families independently of attribute
+            // handling; it never prints SymbolIds, names or initializer bytes.
+            // Use indexed owner sets to keep even large generated units linear.
+            let defs:Vec<_>=globals.iter()
+                .filter(|g|matches!(g.linkage,2|3)).collect();
+            let weak:std::collections::HashSet<_>=il.global_materializations.iter()
+                .filter(|m|m.is_weak).map(|m|m.symbol).collect();
+            let int_images:std::collections::HashSet<_>=il.initializer_integers.iter()
+                .map(|v|v.symbol).collect();
+            let fp_images:std::collections::HashSet<_>=il.global_float_initializers.iter()
+                .map(|v|v.symbol).collect();
+            let agg_images:std::collections::HashSet<_>=il.global_aggregate_initializers.iter()
+                .map(|v|v.symbol).collect();
+            let image_owners:std::collections::HashSet<_>=int_images.iter()
+                .chain(fp_images.iter()).chain(agg_images.iter()).copied().collect();
+            let def_owners:std::collections::HashSet<_>=defs.iter()
+                .map(|g|g.symbol).collect();
+            let explicit:Vec<_>=defs.iter().copied()
+                .filter(|g|g.explicit_initializer).collect();
+            let missing:Vec<_>=explicit.iter().copied()
+                .filter(|g|!image_owners.contains(&g.symbol)).collect();
+            eprintln!(
+                "EDG_PROBE_STATIC_OWNERS definitions={} explicit={} weak={} explicit_weak={} explicit_strong={} missing_image={} missing_weak={} missing_strong={} aggregate_weak={} aggregate_strong={} orphan_image_owners={} literal_reloc_owners={} routine_reloc_owners={}",
+                defs.len(),explicit.len(),
+                defs.iter().filter(|g|weak.contains(&g.symbol)).count(),
+                explicit.iter().filter(|g|weak.contains(&g.symbol)).count(),
+                explicit.iter().filter(|g|!weak.contains(&g.symbol)).count(),
+                missing.len(),missing.iter().filter(|g|weak.contains(&g.symbol)).count(),
+                missing.iter().filter(|g|!weak.contains(&g.symbol)).count(),
+                agg_images.iter().filter(|id|weak.contains(id)).count(),
+                agg_images.iter().filter(|id|!weak.contains(id)).count(),
+                image_owners.iter().filter(|id|!def_owners.contains(id)).count(),
+                il.global_literal_relocations.iter()
+                    .map(|r|r.symbol).collect::<std::collections::HashSet<_>>().len(),
+                il.global_routine_relocations.iter()
+                    .map(|r|r.symbol).collect::<std::collections::HashSet<_>>().len(),
+            );
             // Literal definitions and slots must be a closed, consistent
             // snapshot before any backend may consume them. This source-free
             // census is allowed for private generated C; no literal bytes or
