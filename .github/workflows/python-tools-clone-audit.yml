@@ -1,0 +1,150 @@
+# Single, source-pinned, sparse-checkout clone audit. Reports omit private code bodies.
+name: Python tools clone audit
+on:
+  push:
+    branches: [dup-audit-20261122]
+    paths: ['.github/workflows/python-tools-clone-audit.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout only the Python tooling subtree at the audited SHA
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f58d12a43d5e4c46af76c0f17e52f259e0fb8e72
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          filter: blob:none
+          sparse-checkout: |
+            tools
+          sparse-checkout-cone-mode: true
+
+      - name: Check provenance and input coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "f58d12a43d5e4c46af76c0f17e52f259e0fb8e72"
+          python3 - <<'PY'
+          from pathlib import Path
+          files = list(Path("compiler/tools").rglob("*.py"))
+          print(f"Source SHA: f58d12a43d5e4c46af76c0f17e52f259e0fb8e72")
+          print(f"Python files in tools/: {len(files)}")
+          print(f"Python lines: {sum(len(p.read_bytes().splitlines()) for p in files)}")
+          print(f"Files over 16 MiB (jscpd max size): {sum(p.stat().st_size > 16*1024*1024 for p in files)}")
+          if not files: raise SystemExit("No Python files found")
+          PY
+
+      - name: Install uv with download cache for repeat runs
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: '.github/workflows/python-tools-clone-audit.yml'
+
+      - name: Scan entire tools tree, including tests, without rebuilding compilers
+        shell: bash
+        env:
+          UV_NO_PROGRESS: '1'
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/private-audit" "$GITHUB_WORKSPACE/results"
+          cd compiler/tools
+          cat > biston.toml <<'EOF'
+          [scan]
+          exact_min_lines = 6
+          similar_min_lines = 9
+          threshold = 0.80
+          [normalization]
+          anonymize_locals = true
+          anonymize_literals = true
+          [output]
+          format = "json"
+          max_results = 50000
+          show_source = false
+          group_overlapping = true
+          EOF
+
+          echo "jscpd 5.4.3: token, renamed, gap, and AST-clone scan"
+          uvx --from jscpd==5.4.3 jscpd . --format python \
+            --min-lines 8 --min-tokens 50 --max-size 16mb \
+            --ignore-identifiers --ignore-literals \
+            --max-gap-lines 3 --similarity=0.80 \
+            --workers 2 --reporters json \
+            --output "$RUNNER_TEMP/private-audit" \
+            > "$RUNNER_TEMP/private-audit/jscpd.log" 2>&1 || {
+              echo "jscpd invocation failed (private log withheld)";
+              exit 1;
+            }
+
+          echo "biston 0.7.6: production Python functions + containment"
+          set +e
+          uvx --from biston==0.7.6 biston scan --containment --format json . \
+            > "$RUNNER_TEMP/private-audit/biston-prod.json" 2> "$RUNNER_TEMP/private-audit/biston-prod.err"
+          prod_rc=$?
+          uvx --from biston==0.7.6 biston scan --tests-only --containment --format json . \
+            > "$RUNNER_TEMP/private-audit/biston-tests.json" 2> "$RUNNER_TEMP/private-audit/biston-tests.err"
+          tests_rc=$?
+          set -e
+          echo "biston production exit code: $prod_rc; test exit code: $tests_rc (0=no findings, 1=findings)"
+          test "$prod_rc" -le 1 && test "$tests_rc" -le 1
+
+          # Sanitize all public outputs: paths, locations, counts and scores only.
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          import os
+          root=Path(os.environ["RUNNER_TEMP"])/"private-audit"
+          out=Path(os.environ["GITHUB_WORKSPACE"])/"results"
+          j=json.loads((root/"jscpd-report.json").read_text())
+          duplicates=j.get("duplicates",[])
+          safe={"source","snippet","code","text","template","body","content","rendered","suggestion","source_code","details","message"}
+          string_keys={"name","file","path","filename","function","function_name","qualname","kind","tier","type","category","format","mode","relation","status"}
+          def scrub(obj, key=""):
+              if isinstance(obj,dict):
+                  return {str(k):scrub(v,str(k)) for k,v in obj.items() if str(k).lower() not in safe}
+              if isinstance(obj,list):
+                  return [scrub(v,key) for v in obj]
+              if isinstance(obj,str):
+                  return obj if key.lower() in string_keys else "[redacted]"
+              if obj is None or isinstance(obj,(int,float,bool)):
+                  return obj
+              return None
+          pairs=sorted(duplicates,key=lambda d: (d.get("lines") or 0, d.get("tokens") or 0),reverse=True)
+          j_report={"source_sha":"f58d12a43d5e4c46af76c0f17e52f259e0fb8e72",
+                    "statistics":scrub(j.get("statistics",{})),
+                    "count":len(duplicates),
+                    "duplicates":[{"kind":d.get("kind"),"lines":d.get("lines"),
+                                   "tokens":d.get("tokens"),
+                                   "first":scrub(d.get("firstFile",{})),
+                                   "second":scrub(d.get("secondFile",{}))}
+                                  for d in pairs]}
+          (out/"jscpd-locations.json").write_text(json.dumps(j_report,indent=2))
+          print("jscpd clone pairs:",len(duplicates))
+          for d in pairs[:30]:
+              a=d.get("firstFile",{})
+              b=d.get("secondFile",{})
+              print(f"  {d.get('kind','clone')} {d.get('lines',0)} lines: {a.get('name','?')}:{a.get('start','?')} ~ {b.get('name','?')}:{b.get('start','?')}")
+          for name in ("biston-prod","biston-tests"):
+              raw=json.loads((root/(name+".json")).read_text())
+              sanitized=scrub(raw)
+              (out/(name+"-locations.json")).write_text(json.dumps(sanitized,indent=2))
+              if isinstance(raw,dict):
+                  print(name,"keys:",",".join(raw.keys()))
+                  for k,v in raw.items():
+                      if isinstance(v,list): print(f"  {k}: {len(v)}")
+              elif isinstance(raw,list):
+                  print(name,"results:",len(raw))
+          PY
+      - name: Upload sanitized locations and metrics only (no private source)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-tools-clone-audit-f58d12a
+          path: results/*-locations.json
+          if-no-files-found: warn
+          retention-days: 14
