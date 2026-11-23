@@ -1,0 +1,65 @@
+# Isolated verification of Function-only helper gating in compiler PR #2920.
+# No schedule; source is pinned and never resolved through mutable main.
+name: IR PR2920 TypeId mixed helpers
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ir-pr2920-typeid-mixed-helpers.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      SOURCE_SHA: b4a55fae3d69e2444713a96cef18c4c7bf174098
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Check out exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and isolate core
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo "Compiler source: $SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
+      - name: Cache core Rust compilation
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-pr2920-mixed-helpers
+      - name: Production optimizer library strict Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt --lib -- -D warnings
+      - name: Build native Alive-lite proof test and check strict Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test alive_lite --no-run
+          cargo clippy -p compiler-opt --test alive_lite -- -D warnings
+      - name: Run native optimizer and legacy oracle regressions
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test typed_global_memory
+          cargo test -p compiler-opt --test alive_lite -- --nocapture
+      - name: Compile explicit legacy oracle feature modes
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --lib --no-default-features --features legacy-function-algebra-oracle,legacy-function-mem2reg-oracle,legacy-function-mixed-oracle
+          cargo clippy -p compiler-opt --lib --no-default-features --features legacy-function-algebra-oracle,legacy-function-mem2reg-oracle,legacy-function-mixed-oracle -- -D warnings
