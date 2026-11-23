@@ -1,0 +1,78 @@
+name: ASM3 P09 opaque GNU memory source TypeId RA GAS ELF GCC
+# Dedicated off-repository exact-source verification for compiler and Mini-C.
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-asm3-p09-opaque-memory-native.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 8f98079469da405fecd6a17d56400d21421320ac
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: ecbf1a845f11b6431dc8ec072b29067a0871359c
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: mini-c
+      - name: Verify both exact input commits and authenticated dependencies
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 8f98079469da405fecd6a17d56400d21421320ac
+          test "$(git -C mini-c rev-parse HEAD)" = ecbf1a845f11b6431dc8ec072b29067a0871359c
+          grep -q ecbf1a845f11b6431dc8ec072b29067a0871359c compiler/tools/mini-c-driver/Cargo.toml
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mini-c
+          key: asm3-p09-mini-c-source
+      - name: Mini-C syntax and semantic named-reference checks
+        working-directory: mini-c
+        run: |
+          set -euo pipefail
+          cargo test -p mini-c-syntax --lib
+          cargo test -p mini-c-sema --lib
+          cargo clippy -p mini-c-syntax -p mini-c-sema --lib -- -D warnings
+      - name: Prepare isolated shared compiler workspace
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: asm3-p09-native
+      - name: Compiler and generic typed-machine verification
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check --workspace
+          cargo test -p compiler-ir -p compiler-opt --lib
+          cargo test -p compiler-backend-x86 --test asm3_p04_bound_template -- --nocapture
+      - name: End-to-end GNU named operand native executable differential
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test asm3_p09_opaque_memory_native -- --nocapture
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test asm3_p08_named_source_native -- --nocapture
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test asm3_p07_opaque_two_inputs_native -- --nocapture
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test asm3_p06_opaque_gnu_gp_source_oracle -- --nocapture
+          echo 'ASM3 P09=PASS: true checked memory address, optimized TypeId, RA, GAS/ELF and executable GCC' >> "$GITHUB_STEP_SUMMARY"
