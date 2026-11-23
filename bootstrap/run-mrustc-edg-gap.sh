@@ -353,6 +353,104 @@ PY
     fi
   fi
   echo "EDG_C_LITERAL_TYPEID_UNIT_EXIT=$typeid_unit_rc"
+  # Full public GNU C11 weak data/routine combined proof. The source
+  # fixture and harness are both committed with the candidate compiler.
+  # Private mrustc generated C is not part of this positive oracle.
+  if [[ "${EDG_WEAK_TYPEID_ORACLE:-0}" == "1" ]]; then
+    weak_src=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_weak_union_word_data.c
+    weak_harness=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_weak_union_word_data_harness.c
+    test -s "$weak_src" && test -s "$weak_harness"
+    set +e
+    (
+      cd /workspace/edgcpp/build/gcc-release
+      CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+        timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" test --quiet \
+        --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
+        --bin compiler-edg-driver weak_c_word_array_relocations -- --test-threads=1
+    ) > /audit-tmp/weak-word-typeid-unit.log 2>&1
+    weak_unit_rc=$?
+    set -e
+    echo "EDG_C_WEAK_TYPEID_UNIT_EXIT=$weak_unit_rc"
+    if (( weak_unit_rc != 0 )); then
+      python3 - /audit-tmp/weak-word-typeid-unit.log <<'PY'
+from pathlib import Path
+import re,sys
+lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
+errors=[x for x in lines if any(k in x for k in
+    ("error[E","error:","panicked","FAILED","test result:"))]
+for i,msg in enumerate(errors[-14:],1):
+    msg=re.sub(r"/(?:workspace|audit-tmp)/[^ :]+","<public-fixture>",msg.strip())
+    msg=re.sub(r"[^A-Za-z0-9 _./:><()\[\],=-]","?",msg)
+    print(f"EDG_C_WEAK_TYPEID_UNIT_DIAG_{i}={msg[:240]}")
+PY
+    fi
+    weak_native_rc=11
+    if (( weak_unit_rc == 0 )); then
+      set +e
+      (
+        cd /workspace/edgcpp/build/gcc-release
+        CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+          timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" run --quiet \
+          --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
+          -- /audit-tmp/weak-word-typeid.o --gcc --c11 --no_strict_gnu \
+          --gnu_version "$gnu_number" "$weak_src"
+      ) > /audit-tmp/weak-word-typeid-object.log 2>&1
+      weak_native_rc=$?
+      set -e
+    fi
+    set +e
+    gcc -std=gnu11 -O0 -Wall -Wextra -Werror -c "$weak_src" \
+      -o /audit-tmp/weak-word-gcc.o
+    weak_gcc_rc=$?
+    set -e
+    if (( weak_gcc_rc == 0 && weak_native_rc == 0 )); then
+      for obj in /audit-tmp/weak-word-gcc.o /audit-tmp/weak-word-typeid.o; do
+        ro=$(readelf -rW "$obj" |
+          grep -cE 'R_X86_64_64.*bootstrap_weak_word_target' || true)
+        da=$(readelf -rW "$obj" |
+          grep -cE 'R_X86_64_64.*bootstrap_weak_data_target' || true)
+        wk=$(readelf -Ws "$obj" |
+          awk '$4=="OBJECT" && $5=="WEAK" &&
+               $8 ~ /^bootstrap_weak_word[568]$/ {n++} END {print n+0}')
+        if [[ "$ro" != 3 || "$da" != 3 || "$wk" != 3 ]]; then
+          if [[ "$obj" == *typeid.o ]]; then weak_native_rc=12
+          else weak_gcc_rc=12; fi
+        fi
+      done
+    fi
+    weak_link_rc=11
+    weak_run_rc=11
+    weak_parity_rc=11
+    if (( weak_gcc_rc == 0 && weak_native_rc == 0 )); then
+      set +e
+      gcc -std=gnu11 -O0 -fno-pie -no-pie \
+        /audit-tmp/weak-word-gcc.o "$weak_harness" -o /audit-tmp/weak-word-gcc-exe &&
+      gcc -std=gnu11 -O0 -fno-pie -no-pie \
+        /audit-tmp/weak-word-typeid.o "$weak_harness" -o /audit-tmp/weak-word-typeid-exe
+      weak_link_rc=$?
+      if (( weak_link_rc == 0 )); then
+        /audit-tmp/weak-word-gcc-exe > /audit-tmp/weak-word-gcc.out &&
+        /audit-tmp/weak-word-typeid-exe > /audit-tmp/weak-word-typeid.out
+        weak_run_rc=$?
+        if (( weak_run_rc == 0 )); then
+          cmp -s /audit-tmp/weak-word-gcc.out /audit-tmp/weak-word-typeid.out
+          weak_parity_rc=$?
+        fi
+      fi
+      set -e
+    fi
+    echo "EDG_C_WEAK_TYPEID_ELF_EXIT=$weak_native_rc"
+    echo "EDG_C_WEAK_TYPEID_GCC_EXIT=$weak_gcc_rc"
+    echo "EDG_C_WEAK_TYPEID_LINK_EXIT=$weak_link_rc"
+    echo "EDG_C_WEAK_TYPEID_RUN_EXIT=$weak_run_rc"
+    echo "EDG_C_WEAK_TYPEID_PARITY_EXIT=$weak_parity_rc"
+    if ((weak_native_rc != 0)); then
+      # The only source is committed public C11; never print private mrustc.
+      grep -E '(error\[E|^error:|rejected source|EDG TypeId|invalid)' \
+        /audit-tmp/weak-word-typeid-object.log | tail -n 12 |
+        sed -E 's@/(workspace|audit-tmp)/[^ :]+@<public-fixture>@g' || true
+    fi
+  fi
   # An actual ELF+GCC executable oracle, not just a bridge snapshot.
   # These two original C11 source files are public, checked-in compiler
   # fixtures and do not depend on/print the private generated mrustc TU.
