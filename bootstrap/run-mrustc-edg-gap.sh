@@ -261,6 +261,25 @@ for i,line in enumerate(selected[-12:],1):
     msg=re.sub(r"[^A-Za-z0-9 _./:><()\[\],=-]","?",msg)
     print(f"EDG_C_LITERAL_TYPEID_UNIT_DIAG_{i}={msg[:230]}")
 PY
+      # Extract only public fixture unit-test panic's immediately following
+      # error value; unlike the real generated-C diagnostics this log has
+      # no private source and never prints an entire source file.
+      python3 - /audit-tmp/edg-typeid-literal-unit.log <<'PY'
+from pathlib import Path
+import re,sys
+lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
+for i,line in enumerate(lines):
+    if "panicked at src/lowering/aggregate_globals.rs:" not in line:
+        continue
+    for candidate in lines[i+1:i+4]:
+        value=candidate.strip()
+        if not value or value.startswith("note:"):continue
+        value=re.sub(r"/workspace/[^ :]+","<public-path>",value)
+        value=re.sub(r"[^A-Za-z0-9 _./:><()\\[\\],=-]","?",value)
+        print("EDG_C_LITERAL_TYPEID_UNIT_REASON="+value[:260])
+        break
+    break
+PY
     fi
   fi
   echo "EDG_C_LITERAL_TYPEID_UNIT_EXIT=$typeid_unit_rc"
@@ -440,7 +459,7 @@ from pathlib import Path
 import re,sys
 lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
 selected=[line for line in lines if any(
-    needle in line for needle in ("error[E","error:","rejected source","panicked"))]
+    needle in line for needle in ("error[E","error:","Error:","rejected source","panicked"))]
 for i,line in enumerate(selected[-8:],1):
     msg=re.sub(r"/workspace/[^ :]+","<public-path>",line.strip())
     msg=re.sub(r"[^A-Za-z0-9 _./:><()\[\],=-]","?",msg)
