@@ -34,6 +34,15 @@ assert re.fullmatch(r'[0-9a-f]{40}', sha)
 print(sha)
 PY
 )"
+# Opt-in diagnostic pin override for testing a bridge fix against the exact
+# same generated-C compiler revision. Normal production audit remains pinned
+# to the compiler driver dependency above.
+if [[ -n "${EDG_BRIDGE_OVERRIDE_SHA:-}" ]]; then
+  [[ "$EDG_BRIDGE_OVERRIDE_SHA" =~ ^[0-9a-f]{40}$ ]]
+  echo "EDG_C_SOURCE_BRIDGE_COMPILER_PIN=$EDG_BRIDGE_SHA"
+  EDG_BRIDGE_SHA="$EDG_BRIDGE_OVERRIDE_SHA"
+  echo "EDG_C_SOURCE_BRIDGE_TEST_OVERRIDE=yes"
+fi
 test "$(git -C edgcpp-rust rev-parse HEAD)" = "$EDG_BRIDGE_SHA"
 echo "EDG_C_SOURCE_BRIDGE_SHA=$EDG_BRIDGE_SHA"
 test -f "$AUDIT_SOURCE"
@@ -63,6 +72,43 @@ cp build/prebuilt-edg/lib/libedgcpfe.a build/gcc-release/lib/libedgcpfe.a
 source build/gcc-release/environment.sh
 cd /workspace
 
+# The candidate bridge must preserve both language modes. Run the new
+# integration tests against the already-prepared pinned upstream EDG archive.
+if [[ "${EDG_C_RECORD_REGRESSION:-0}" == "1" ]]; then
+  set +e
+  (
+    cd /workspace/edgcpp/build/gcc-release
+    timeout --signal=TERM --kill-after=10s 12m cargo test \
+      --manifest-path /workspace/edgcpp-rust/Cargo.toml \
+      --test c_record_proof_mode -- --nocapture
+  ) > /audit-tmp/edg-bridge-c-record-regression.log 2>&1
+  test_rc=$?
+  set -e
+  echo "EDG_BRIDGE_C_RECORD_TEST_EXIT=$test_rc"
+  if (( test_rc != 0 )); then
+    # Emit ONLY bounded public-test error messages in a stable structured
+    # summary that survives the surrounding workflow's tail/log filtering.
+    python3 - /audit-tmp/edg-bridge-c-record-regression.log <<'PY'
+from pathlib import Path
+import re
+import sys
+lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
+interesting=[]
+for line in lines:
+    if any(p in line for p in (
+        "panicked at", "FAILED", "test result:", "assertion",
+        "C external", "C++ external", "C++ record", "C records",
+        "C aggregate", "EDG must", "bridge must", "symbol",
+        "error[E", "error:")):
+        msg=re.sub(r"/workspace/[^ :]+", "<fixture>", line.strip())
+        if len(msg)>280: msg=msg[:280]
+        interesting.append(msg)
+for i,msg in enumerate(interesting[-14:],1):
+    print(f"EDG_BRIDGE_C_RECORD_TEST_DIAG_{i}={msg}")
+PY
+  fi
+fi
+
 # Match the pinned EDG CI's GNU dialect configuration.
 version="$(gcc -dumpfullversion -dumpversion)"
 IFS=. read -r major minor patch <<< "$version"
@@ -83,12 +129,578 @@ echo "EDG_C_AUDIT builtin_include_dirs=${#include_args[@]}"
 # with 50+ MiB of private generated source. Build a pinned bridge with a
 # separate tiny public compiler-ci entry point that emits bounded counters.
 test ! -e edgcpp-rust/examples/ci_edg_parse_probe.rs
-cp bootstrap/edg_parse_probe.rs edgcpp-rust/examples/ci_edg_parse_probe.rs
+if [[ "${EDG_LITERAL_REGRESSION:-0}" == "1" ]]; then
+  cp bootstrap/edg_literal_parse_probe.rs edgcpp-rust/examples/ci_edg_parse_probe.rs
+else
+  cp bootstrap/edg_parse_probe.rs edgcpp-rust/examples/ci_edg_parse_probe.rs
+fi
 timeout --signal=TERM --kill-after=10s 20m cargo build --quiet \
   --manifest-path edgcpp-rust/Cargo.toml --example ci_edg_parse_probe
 parser=/workspace/edgcpp-rust/target/debug/examples/ci_edg_parse_probe
 test -x "$parser"
 ulimit -c 0
+
+# A public C11 source is a separate, independently executable GCC oracle
+# for the immutable string-object relocation witness. This runs inside the
+# pinned EDG environment and does not publish generated compiler C or literal
+# contents from that private translation unit.
+if [[ "${EDG_LITERAL_REGRESSION:-0}" == "1" ]]; then
+  public=/workspace/edgcpp-rust/tests/fixtures/bootstrap_literal_union.c
+  test -s "$public"
+  set +e
+  timeout --signal=TERM --kill-after=3s 30s gcc -std=c11 -O2 -Wall -Wextra -Werror     "$public" -o /audit-tmp/bootstrap-literal-gcc &&
+    timeout --signal=TERM --kill-after=3s 10s /audit-tmp/bootstrap-literal-gcc
+  gcc_rc=$?
+  (
+    cd /workspace/edgcpp/build/gcc-release
+    timeout --signal=TERM --kill-after=10s 8m cargo run --quiet       --manifest-path /workspace/edgcpp-rust/Cargo.toml       --example audit_static_literal_images -- --gcc --c11       --no_strict_gnu --gnu_version "$gnu_number" "${include_args[@]}" "$public"
+  ) > /audit-tmp/edg-static-literal-public.log 2>&1
+  bridge_rc=$?
+  (
+    cd /workspace/edgcpp/build/gcc-release
+    timeout --signal=TERM --kill-after=10s 5m cargo test --quiet       --manifest-path /workspace/edgcpp-rust/Cargo.toml --lib       bootstrap_literal_global_wire_tests
+  ) > /audit-tmp/edg-static-literal-wire.log 2>&1
+  wire_rc=$?
+  (
+    cd /workspace/edgcpp/build/gcc-release
+    timeout --signal=TERM --kill-after=10s 5m cargo test --quiet \
+      --manifest-path /workspace/edgcpp-rust/Cargo.toml --lib \
+      bootstrap_static_routine_relocation_wire_tests
+  ) > /audit-tmp/edg-static-routine-wire.log 2>&1
+  routine_wire_rc=$?
+  set -e
+  echo "EDG_C_LITERAL_ROUTINE_WIRE_EXIT=$routine_wire_rc"
+  if (( routine_wire_rc != 0 )); then
+    # Original in-repo public wire records only, not private mrustc.
+    python3 - /audit-tmp/edg-static-routine-wire.log <<'PY'
+from pathlib import Path
+import re,sys
+lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
+selected=[v for v in lines if any(n in v for n in
+          ("error[E","error:","panicked at","FAILED","test result:"))]
+for i,line in enumerate(selected[-10:],1):
+    value=re.sub(r"/workspace/[^ :]+","<public-path>",line.strip())
+    value=re.sub(r"[^A-Za-z0-9 _./:><()\\[\\],=-]","?",value)
+    print(f"EDG_C_LITERAL_ROUTINE_WIRE_DIAG_{i}={value[:200]}")
+PY
+  fi
+  echo "EDG_C_LITERAL_GCC_EXIT=$gcc_rc"
+  echo "EDG_C_LITERAL_BRIDGE_EXIT=$bridge_rc"
+  echo "EDG_C_LITERAL_WIRE_EXIT=$wire_rc"
+  if (( wire_rc != 0 )); then
+    # Public bridge test only. Sanitized, bounded diagnostic lines are
+    # explicitly whitelisted by the parent job's numeric/source-free log
+    # selection; no private mrustc file is involved.
+    python3 - /audit-tmp/edg-static-literal-wire.log <<'PY'
+from pathlib import Path
+import re,sys
+lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
+selected=[line for line in lines if any(token in line for token in
+    ("error[E","error:","panicked at","FAILED","test result:","expected","found"))]
+for n,line in enumerate(selected[-12:],1):
+    msg=re.sub(r"/workspace/[^ :]+","<public-path>",line.strip())
+    msg=re.sub(r"[^A-Za-z0-9 _./:><()\[\],=-]","?",msg)
+    print(f"EDG_C_LITERAL_TEST_DIAG_{n}={msg[:250]}")
+PY
+    echo 'EDG_LITERAL_PUBLIC_WIRE_TEST_FAILURE_DETAIL_BEGIN'
+    # Only source-backed public in-repo unit tests appear in this file; do
+    # not print any private generated-C compiler/error output.
+    tail -n 32 /audit-tmp/edg-static-literal-wire.log |
+      sed -E 's@/workspace/[^ :]+@<public-path>@g' || true
+    echo 'EDG_LITERAL_PUBLIC_WIRE_TEST_FAILURE_DETAIL_END'
+  fi
+  if (( bridge_rc != 0 || wire_rc != 0 )); then
+    # This fixture and test are committed public code; limit diagnostics to
+    # compiler errors and summary, never leak the private mrustc source.
+    grep -E '(^error|error\\[E|EDG_STATIC_LITERAL|FAILED|test result:)'       /audit-tmp/edg-static-literal-public.log       /audit-tmp/edg-static-literal-wire.log | tail -n 14 || true
+  fi
+fi
+
+# Source-pinned TypeId consumer compile check, deliberately separate from
+# production compiler checkout. The candidate shares the same checked EDG
+# dependency as the public producer. No source from the private mrustc TU is
+# supplied to this check.
+if [[ "${EDG_LITERAL_REGRESSION:-0}" == "1" ]]; then
+  candidate_sha=011bcc925accc27743022a8fd4c82a77ced5d7df
+  test "$(git -c safe.directory=/workspace/compiler-literal-source -C /workspace/compiler-literal-source rev-parse HEAD)" = "$candidate_sha"
+  # Actions checkout is mounted read-only. Make a disposable compilation
+  # copy in the private runner temp so Cargo can update its local lockfile.
+  mkdir -p /audit-tmp/compiler-literal-candidate
+  tar -C /workspace/compiler-literal-source --exclude=.git -cf - . |
+    tar -C /audit-tmp/compiler-literal-candidate -xf -
+  # The exact immutable bridge is already checked out and built locally.
+  # Resolve it through Cargo's source patch rather than trying to git-fetch
+  # from the isolated CI Docker container.
+  edg_patch='patch."https://github.com/bingordo/edgcpp-rust.git".edgcpp.path="/workspace/edgcpp-rust"'
+  echo "EDG_C_LITERAL_TYPEID_CANDIDATE_SHA=$candidate_sha"
+  set +e
+  (
+    cd /workspace/edgcpp/build/gcc-release
+    CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+      timeout --signal=TERM --kill-after=10s 12m cargo --config "$edg_patch" check --quiet \
+      --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml
+  ) > /audit-tmp/edg-typeid-literal-candidate-check.log 2>&1
+  typeid_check_rc=$?
+  set -e
+  echo "EDG_C_LITERAL_TYPEID_CHECK_EXIT=$typeid_check_rc"
+  if (( typeid_check_rc != 0 )); then
+    python3 - /audit-tmp/edg-typeid-literal-candidate-check.log <<'PY'
+from pathlib import Path
+import re,sys
+lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
+selected=[line for line in lines if
+          "error[E" in line or "error:" in line or "warning:" in line]
+for i,line in enumerate(selected[-12:],1):
+    msg=re.sub(r"/workspace/[^ :]+","<public-path>",line.strip())
+    msg=re.sub(r"[^A-Za-z0-9 _./:><()\[\],=-]","?",msg)
+    print(f"EDG_C_LITERAL_TYPEID_DIAG_{i}={msg[:230]}")
+PY
+  fi
+  # Test direct TypeId admission against the *original* EDG C11 fixture.
+  # The test mutates actual source event records to prove fail-closed
+  # behavior for displaced/dangling pointers, orphan data and weak/TLS.
+  typeid_unit_rc=11
+  if (( typeid_check_rc == 0 )); then
+    set +e
+    (
+      cd /workspace/edgcpp/build/gcc-release
+      CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+        timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" test --quiet \
+        --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
+        --bin compiler-edg-driver public_c_literal_ -- --test-threads=1
+    ) > /audit-tmp/edg-typeid-literal-unit.log 2>&1
+    typeid_unit_rc=$?
+    set -e
+    if (( typeid_unit_rc != 0 )); then
+      python3 - /audit-tmp/edg-typeid-literal-unit.log <<'PY'
+from pathlib import Path
+import re,sys
+lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
+selected=[line for line in lines if any(
+    needle in line for needle in ("error[E","error:","panicked","FAILED","test result:"))]
+for i,line in enumerate(selected[-12:],1):
+    msg=re.sub(r"/workspace/[^ :]+","<public-path>",line.strip())
+    msg=re.sub(r"[^A-Za-z0-9 _./:><()\[\],=-]","?",msg)
+    print(f"EDG_C_LITERAL_TYPEID_UNIT_DIAG_{i}={msg[:230]}")
+PY
+      # Extract only public fixture unit-test panic's immediately following
+      # error value; unlike the real generated-C diagnostics this log has
+      # no private source and never prints an entire source file.
+      python3 - /audit-tmp/edg-typeid-literal-unit.log <<'PY'
+from pathlib import Path
+import re,sys
+lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
+for i,line in enumerate(lines):
+    if "panicked at src/lowering/aggregate_globals.rs:" not in line:
+        continue
+    for candidate in lines[i+1:i+4]:
+        value=candidate.strip()
+        if not value or value.startswith("note:"):continue
+        value=re.sub(r"/workspace/[^ :]+","<public-path>",value)
+        value=re.sub(r"[^A-Za-z0-9 _./:><()\\[\\],=-]","?",value)
+        print("EDG_C_LITERAL_TYPEID_UNIT_REASON="+value[:260])
+        break
+    break
+PY
+    fi
+  fi
+  echo "EDG_C_LITERAL_TYPEID_UNIT_EXIT=$typeid_unit_rc"
+  # An actual ELF+GCC executable oracle, not just a bridge snapshot.
+  # These two original C11 source files are public, checked-in compiler
+  # fixtures and do not depend on/print the private generated mrustc TU.
+  if (( typeid_check_rc == 0 )); then
+    literal_source=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_literal_union_elf.c
+    literal_harness=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_literal_union_elf_harness.c
+    test -s "$literal_source" && test -s "$literal_harness"
+    set +e
+    (
+      cd /workspace/edgcpp/build/gcc-release
+      CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+        timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" run --quiet \
+        --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
+        -- /audit-tmp/edg-static-literal-native.o --gcc --c11 \
+        --no_strict_gnu --gnu_version "$gnu_number" "$literal_source"
+    ) > /audit-tmp/edg-static-literal-native.log 2>&1
+    native_rc=$?
+    set -e
+    if (( native_rc == 0 )); then
+      readelf -h /audit-tmp/edg-static-literal-native.o >/dev/null
+      readelf -rW /audit-tmp/edg-static-literal-native.o \
+        > /audit-tmp/edg-static-literal-native-relocs.txt
+      reloc_count=$(grep -c 'R_X86_64_64' \
+        /audit-tmp/edg-static-literal-native-relocs.txt || true)
+      echo "EDG_C_LITERAL_NATIVE_ELF_RELOCATIONS=$reloc_count"
+      if [[ "$reloc_count" != "5" ]]; then native_rc=11; fi
+    fi
+    echo "EDG_C_LITERAL_TYPEID_ELF_EXIT=$native_rc"
+    set +e
+    gcc -std=c11 -O0 -c "$literal_source" -o /audit-tmp/edg-static-literal-gcc.o &&
+      gcc -std=c11 -O0 -fno-pie -no-pie \
+        /audit-tmp/edg-static-literal-gcc.o "$literal_harness" \
+        -o /audit-tmp/edg-static-literal-gcc-exe &&
+      /audit-tmp/edg-static-literal-gcc-exe \
+        > /audit-tmp/edg-static-literal-gcc.out
+    gcc_oracle_rc=$?
+    # The minimal EDG runner image may not have coreutils cmp. Keep
+    # link, execution and byte comparison as independent numeric oracles.
+    native_link_rc=11
+    native_run_rc=11
+    native_parity_rc=11
+    if (( native_rc == 0 )); then
+      gcc -std=c11 -O0 -fno-pie -no-pie \
+        /audit-tmp/edg-static-literal-native.o "$literal_harness" \
+        -o /audit-tmp/edg-static-literal-native-exe
+      native_link_rc=$?
+      if (( native_link_rc == 0 )); then
+        /audit-tmp/edg-static-literal-native-exe \
+          > /audit-tmp/edg-static-literal-native.out \
+          2> /audit-tmp/edg-static-literal-native.stderr
+        native_run_rc=$?
+        if (( native_run_rc == 0 && gcc_oracle_rc == 0 )); then
+          python3 - /audit-tmp/edg-static-literal-gcc.out \
+              /audit-tmp/edg-static-literal-native.out <<'PY'
+from pathlib import Path
+import sys
+expected=Path(sys.argv[1]).read_bytes()
+observed=Path(sys.argv[2]).read_bytes()
+if expected!=b"STATIC_LITERAL_ELF_PARITY_OK\n" or observed!=expected:
+    raise SystemExit(1)
+PY
+          native_parity_rc=$?
+        fi
+      fi
+    fi
+    echo "EDG_C_LITERAL_NATIVE_LINK_EXIT=$native_link_rc"
+    echo "EDG_C_LITERAL_NATIVE_RUN_EXIT=$native_run_rc"
+    echo "EDG_C_LITERAL_NATIVE_PARITY_EXIT=$native_parity_rc"
+    if (( native_link_rc == 0 && native_run_rc == 0 && native_parity_rc == 0 )); then
+      native_oracle_rc=0
+    else
+      native_oracle_rc=1
+    fi
+    set -e
+    echo "EDG_C_LITERAL_GCC_ELF_ORACLE_EXIT=$gcc_oracle_rc"
+    echo "EDG_C_LITERAL_NATIVE_ELF_ORACLE_EXIT=$native_oracle_rc"
+    if (( native_rc != 0 || gcc_oracle_rc != 0 || native_oracle_rc != 0 )); then
+      python3 - /audit-tmp/edg-static-literal-native.log <<'PY'
+from pathlib import Path
+import re,sys
+lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
+selected=[line for line in lines if "error[E" in line or "error:" in line or "rejected source" in line]
+for i,line in enumerate(selected[-8:],1):
+    msg=re.sub(r"/workspace/[^ :]+","<public-path>",line.strip())
+    msg=re.sub(r"[^A-Za-z0-9 _./:><()\[\],=-]","?",msg)
+    print(f"EDG_C_LITERAL_NATIVE_DIAG_{i}={msg[:230]}")
+PY
+    fi
+
+    # A second public C11 original-source acceptance test: one I32 global
+    # plus one literal-bearing union, with a real global load in a function.
+    # The consumer must prove the *entire* disjoint ownership partition.
+    mixed_source=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_literal_mixed_elf.c
+    mixed_harness=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_literal_mixed_elf_harness.c
+    test -s "$mixed_source" && test -s "$mixed_harness"
+    set +e
+    (
+      cd /workspace/edgcpp/build/gcc-release
+      CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+        timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" run --quiet \
+        --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
+        -- /audit-tmp/edg-static-literal-mixed-native.o --gcc --c11 \
+        --no_strict_gnu --gnu_version "$gnu_number" "$mixed_source"
+    ) > /audit-tmp/edg-static-literal-mixed-native.log 2>&1
+    mixed_native_rc=$?
+    set -e
+    if (( mixed_native_rc == 0 )); then
+      readelf -h /audit-tmp/edg-static-literal-mixed-native.o >/dev/null
+      readelf -rW /audit-tmp/edg-static-literal-mixed-native.o \
+        > /audit-tmp/edg-static-literal-mixed-native-relocs.txt
+      mixed_reloc_count=$(python3 - /audit-tmp/edg-static-literal-mixed-native-relocs.txt <<'PY'
+from pathlib import Path
+import re,sys
+section=""
+count=0
+for line in Path(sys.argv[1]).read_text().splitlines():
+    match=re.match(r"Relocation section '([^']+)'",line)
+    if match:
+        section=match.group(1)
+    elif "R_X86_64_64" in line and (
+        section.startswith(".rela.data") or section.startswith(".rela.rodata")):
+        count+=1
+print(count)
+PY
+)
+      echo "EDG_C_LITERAL_MIXED_RELOCATIONS=$mixed_reloc_count"
+      if [[ "$mixed_reloc_count" != "2" ]]; then mixed_native_rc=11; fi
+    fi
+    echo "EDG_C_LITERAL_MIXED_TYPEID_ELF_EXIT=$mixed_native_rc"
+    set +e
+    gcc -std=c11 -O0 -c "$mixed_source" -o /audit-tmp/edg-static-literal-mixed-gcc.o &&
+      gcc -std=c11 -O0 -fno-pie -no-pie \
+        /audit-tmp/edg-static-literal-mixed-gcc.o "$mixed_harness" \
+        -o /audit-tmp/edg-static-literal-mixed-gcc-exe &&
+      /audit-tmp/edg-static-literal-mixed-gcc-exe \
+        > /audit-tmp/edg-static-literal-mixed-gcc.out
+    mixed_gcc_rc=$?
+    mixed_link_rc=11
+    mixed_run_rc=11
+    mixed_parity_rc=11
+    if (( mixed_native_rc == 0 )); then
+      gcc -std=c11 -O0 -fno-pie -no-pie \
+        /audit-tmp/edg-static-literal-mixed-native.o "$mixed_harness" \
+        -o /audit-tmp/edg-static-literal-mixed-native-exe
+      mixed_link_rc=$?
+      if (( mixed_link_rc == 0 )); then
+        /audit-tmp/edg-static-literal-mixed-native-exe \
+          > /audit-tmp/edg-static-literal-mixed-native.out \
+          2> /audit-tmp/edg-static-literal-mixed-native.stderr
+        mixed_run_rc=$?
+        if (( mixed_run_rc == 0 && mixed_gcc_rc == 0 )); then
+          python3 - /audit-tmp/edg-static-literal-mixed-gcc.out \
+              /audit-tmp/edg-static-literal-mixed-native.out <<'PY'
+from pathlib import Path
+import sys
+expected=Path(sys.argv[1]).read_bytes()
+observed=Path(sys.argv[2]).read_bytes()
+if expected!=b"MIXED_STATIC_LITERAL_ELF_PARITY_OK\n" or observed!=expected:
+    raise SystemExit(1)
+PY
+          mixed_parity_rc=$?
+        fi
+      fi
+    fi
+    set -e
+    echo "EDG_C_LITERAL_MIXED_GCC_EXIT=$mixed_gcc_rc"
+    echo "EDG_C_LITERAL_MIXED_LINK_EXIT=$mixed_link_rc"
+    echo "EDG_C_LITERAL_MIXED_RUN_EXIT=$mixed_run_rc"
+    echo "EDG_C_LITERAL_MIXED_PARITY_EXIT=$mixed_parity_rc"
+    if (( mixed_native_rc != 0 || mixed_gcc_rc != 0 ||
+          mixed_link_rc != 0 || mixed_run_rc != 0 || mixed_parity_rc != 0 )); then
+      python3 - /audit-tmp/edg-static-literal-mixed-native.log <<'PY'
+from pathlib import Path
+import re,sys
+lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
+selected=[line for line in lines if any(
+    needle in line for needle in ("error[E","error:","Error:","rejected source","panicked"))]
+for i,line in enumerate(selected[-8:],1):
+    msg=re.sub(r"/workspace/[^ :]+","<public-path>",line.strip())
+    msg=re.sub(r"[^A-Za-z0-9 _./:><()\[\],=-]","?",msg)
+    print(f"EDG_C_LITERAL_MIXED_DIAG_{i}={msg[:230]}")
+PY
+    fi
+    # The real 32-byte union's rejected leaf is a ck_address carrying an
+    # explicitly cast original pointer in a C integer word slot. Assert
+    # native symbolic R_X86_64_64 + independently GCC-linked runtime parity
+    # on this public reproduction; no pointer bits or mrustc text are logged.
+    word_source=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_integer_literal_address.c
+    word_harness=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_integer_literal_address_harness.c
+    test -s "$word_source" && test -s "$word_harness"
+    set +e
+    (
+      cd /workspace/edgcpp/build/gcc-release
+      CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+        timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" run --quiet \
+        --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
+        -- /audit-tmp/edg-static-literal-word-native.o --gcc --c11 \
+        --no_strict_gnu --gnu_version "$gnu_number" "$word_source"
+    ) > /audit-tmp/edg-static-literal-word-native.log 2>&1
+    word_native_rc=$?
+    word_reloc_count=0
+    if (( word_native_rc == 0 )); then
+      readelf -rW /audit-tmp/edg-static-literal-word-native.o \
+        > /audit-tmp/edg-static-literal-word-relocs.txt
+      word_reloc_count=$(python3 - /audit-tmp/edg-static-literal-word-relocs.txt <<'PY'
+from pathlib import Path
+import re,sys
+section=""
+count=0
+for line in Path(sys.argv[1]).read_text().splitlines():
+    match=re.match(r"Relocation section '([^']+)'",line)
+    if match:section=match.group(1)
+    elif "R_X86_64_64" in line and (
+        section.startswith(".rela.data") or section.startswith(".rela.rodata")):
+        count+=1
+print(count)
+PY
+)
+      if [[ "$word_reloc_count" != "1" ]]; then word_native_rc=11; fi
+    fi
+    gcc -std=c11 -O0 -Wall -Wextra -Werror -c "$word_source" \
+      -o /audit-tmp/edg-static-literal-word-gcc.o &&
+      gcc -std=c11 -O0 -Wall -Wextra -Werror -no-pie \
+        /audit-tmp/edg-static-literal-word-gcc.o "$word_harness" \
+        -o /audit-tmp/edg-static-literal-word-gcc-exe &&
+      /audit-tmp/edg-static-literal-word-gcc-exe \
+        > /audit-tmp/edg-static-literal-word-gcc.out
+    word_gcc_rc=$?
+    word_native_link_rc=11
+    word_native_run_rc=11
+    word_parity_rc=11
+    if (( word_native_rc == 0 )); then
+      gcc -std=c11 -O0 -Wall -Wextra -Werror -no-pie \
+        /audit-tmp/edg-static-literal-word-native.o "$word_harness" \
+        -o /audit-tmp/edg-static-literal-word-native-exe
+      word_native_link_rc=$?
+      if (( word_native_link_rc == 0 )); then
+        /audit-tmp/edg-static-literal-word-native-exe \
+          > /audit-tmp/edg-static-literal-word-native.out
+        word_native_run_rc=$?
+        if (( word_native_run_rc == 0 && word_gcc_rc == 0 )); then
+          python3 - /audit-tmp/edg-static-literal-word-gcc.out \
+              /audit-tmp/edg-static-literal-word-native.out <<'PY'
+from pathlib import Path
+import sys
+expected=Path(sys.argv[1]).read_bytes()
+observed=Path(sys.argv[2]).read_bytes()
+if expected!=b"STATIC_INTEGER_ADDRESS_PARITY_OK\n" or expected!=observed:
+    raise SystemExit(1)
+PY
+          word_parity_rc=$?
+        fi
+      fi
+    fi
+    set -e
+    echo "EDG_C_LITERAL_WORD_ELF_EXIT=$word_native_rc"
+    echo "EDG_C_LITERAL_WORD_DATA_RELOCATIONS=$word_reloc_count"
+    echo "EDG_C_LITERAL_WORD_GCC_EXIT=$word_gcc_rc"
+    echo "EDG_C_LITERAL_WORD_LINK_EXIT=$word_native_link_rc"
+    echo "EDG_C_LITERAL_WORD_RUN_EXIT=$word_native_run_rc"
+    echo "EDG_C_LITERAL_WORD_PARITY_EXIT=$word_parity_rc"
+    if (( word_native_rc != 0 || word_gcc_rc != 0 ||
+          word_native_link_rc != 0 || word_native_run_rc != 0 ||
+          word_parity_rc != 0 )); then
+      python3 - /audit-tmp/edg-static-literal-word-native.log <<'PY'
+from pathlib import Path
+import re,sys
+lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
+selected=[line for line in lines if any(
+    needle in line for needle in ("error[E","error:","rejected source","panicked"))]
+for i,line in enumerate(selected[-8:],1):
+    msg=re.sub(r"/workspace/[^ :]+","<public-path>",line.strip())
+    msg=re.sub(r"[^A-Za-z0-9 _./:><()\[\],=-]","?",msg)
+    print(f"EDG_C_LITERAL_WORD_DIAG_{i}={msg[:230]}")
+PY
+    fi
+    # Public function-as-word C11 union, independently linked with GCC.
+    # The actual original EDG event 105 must identify the callee, and the
+    # shared x86 writer must emit one .rela.data R_X86_64_64 relocation.
+    routine_source=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_routine_union_elf.c
+    routine_harness=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_routine_union_elf_harness.c
+    test -s "$routine_source" && test -s "$routine_harness"
+    set +e
+    (
+      cd /workspace/edgcpp/build/gcc-release
+      CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+        timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" run --quiet \
+        --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
+        -- /audit-tmp/edg-static-routine-native.o --gcc --c11 \
+        --no_strict_gnu --gnu_version "$gnu_number" "$routine_source"
+    ) > /audit-tmp/edg-static-routine-native.log 2>&1
+    routine_native_rc=$?
+    routine_reloc_count=0
+    routine_reloc_symbol_match=0
+    if (( routine_native_rc == 0 )); then
+      readelf -rW /audit-tmp/edg-static-routine-native.o \
+        > /audit-tmp/edg-static-routine-relocations.txt
+      routine_reloc_count=$(python3 - /audit-tmp/edg-static-routine-relocations.txt <<'PY'
+from pathlib import Path
+import re,sys
+section=""
+count=0
+symbol_ok=0
+for line in Path(sys.argv[1]).read_text().splitlines():
+    match=re.match(r"Relocation section '([^']+)'",line)
+    if match:section=match.group(1)
+    elif "R_X86_64_64" in line and (
+        section.startswith(".rela.data") or section.startswith(".rela.rodata")):
+        count+=1
+        if re.search(r"\bbootstrap_routine_target\b",line):symbol_ok+=1
+print(count)
+PY
+)
+      routine_reloc_symbol_match=$(python3 - /audit-tmp/edg-static-routine-relocations.txt <<'PY'
+from pathlib import Path
+import re,sys
+section=""
+count=0
+for line in Path(sys.argv[1]).read_text().splitlines():
+    match=re.match(r"Relocation section '([^']+)'",line)
+    if match:section=match.group(1)
+    elif "R_X86_64_64" in line and (
+        section.startswith(".rela.data") or section.startswith(".rela.rodata")) and (
+        re.search(r"\bbootstrap_routine_target\b",line)):
+        count+=1
+print(count)
+PY
+)
+      if [[ "$routine_reloc_count" != "1" ||
+            "$routine_reloc_symbol_match" != "1" ]]; then
+        routine_native_rc=11
+      fi
+    fi
+    gcc -std=c11 -O0 -Wall -Wextra -Werror -c "$routine_source" \
+      -o /audit-tmp/edg-static-routine-gcc.o &&
+      gcc -std=c11 -O0 -Wall -Wextra -Werror -no-pie \
+        /audit-tmp/edg-static-routine-gcc.o "$routine_harness" \
+        -o /audit-tmp/edg-static-routine-gcc-exe &&
+      /audit-tmp/edg-static-routine-gcc-exe \
+        > /audit-tmp/edg-static-routine-gcc.out
+    routine_gcc_rc=$?
+    routine_link_rc=11
+    routine_run_rc=11
+    routine_parity_rc=11
+    if (( routine_native_rc == 0 )); then
+      gcc -std=c11 -O0 -Wall -Wextra -Werror -no-pie \
+        /audit-tmp/edg-static-routine-native.o "$routine_harness" \
+        -o /audit-tmp/edg-static-routine-native-exe
+      routine_link_rc=$?
+      if (( routine_link_rc == 0 )); then
+        /audit-tmp/edg-static-routine-native-exe \
+          > /audit-tmp/edg-static-routine-native.out
+        routine_run_rc=$?
+        if (( routine_run_rc == 0 && routine_gcc_rc == 0 )); then
+          python3 - /audit-tmp/edg-static-routine-gcc.out \
+              /audit-tmp/edg-static-routine-native.out <<'PY'
+from pathlib import Path
+import sys
+expected=Path(sys.argv[1]).read_bytes()
+observed=Path(sys.argv[2]).read_bytes()
+if expected!=b"STATIC_ROUTINE_ADDRESS_PARITY_OK\n" or observed!=expected:
+    raise SystemExit(1)
+PY
+          routine_parity_rc=$?
+        fi
+      fi
+    fi
+    set -e
+    echo "EDG_C_LITERAL_ROUTINE_ELF_EXIT=$routine_native_rc"
+    echo "EDG_C_LITERAL_ROUTINE_DATA_RELOCATIONS=$routine_reloc_count"
+    echo "EDG_C_LITERAL_ROUTINE_SYMBOL_RELOCATIONS=$routine_reloc_symbol_match"
+    echo "EDG_C_LITERAL_ROUTINE_GCC_EXIT=$routine_gcc_rc"
+    echo "EDG_C_LITERAL_ROUTINE_LINK_EXIT=$routine_link_rc"
+    echo "EDG_C_LITERAL_ROUTINE_RUN_EXIT=$routine_run_rc"
+    echo "EDG_C_LITERAL_ROUTINE_PARITY_EXIT=$routine_parity_rc"
+    if (( routine_native_rc != 0 || routine_gcc_rc != 0 ||
+          routine_link_rc != 0 || routine_run_rc != 0 ||
+          routine_parity_rc != 0 )); then
+      python3 - /audit-tmp/edg-static-routine-native.log <<'PY'
+from pathlib import Path
+import re,sys
+lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
+selected=[line for line in lines if any(
+    needle in line for needle in ("error[E","error:","rejected source","panicked"))]
+for i,line in enumerate(selected[-8:],1):
+    msg=re.sub(r"/workspace/[^ :]+","<public-path>",line.strip())
+    msg=re.sub(r"[^A-Za-z0-9 _./:><()\\[\\],=-]","?",msg)
+    print(f"EDG_C_LITERAL_ROUTINE_DIAG_{i}={msg[:230]}")
+PY
+    fi
+  else
+    echo "EDG_C_LITERAL_TYPEID_ELF_EXIT=skipped_no_compiler"
+    echo "EDG_C_LITERAL_GCC_ELF_ORACLE_EXIT=skipped_no_compiler"
+    echo "EDG_C_LITERAL_NATIVE_ELF_ORACLE_EXIT=skipped_no_compiler"
+  fi
+fi
 
 # Baseline: these public C fixtures independently isolate GNU layout,
 # linkage, calling-convention, and naked attributes. GCC is the dialect
@@ -150,6 +762,8 @@ probe_generated_c() {
   echo "${prefix}_WALL_SECONDS=$((ended-started))"
   echo "${prefix}_PEAK_RSS_KB=$rss"
   grep -m 1 '^EDG_PROBE_RESULT ' "$logfile" || true
+  grep -m 1 '^EDG_PROBE_GLOBALS ' "$logfile" || true
+  grep -m 1 '^EDG_PROBE_STATIC_LITERALS ' "$logfile" || true
   case "$rc" in
     0) echo "${prefix}_CLASS=accepted" ;;
     124|137) echo "${prefix}_CLASS=timeout_or_forced_kill" ;;
@@ -173,6 +787,192 @@ probe_generated_c EDG_C_PARSE "$AUDIT_SOURCE" 90s /audit-tmp/edg-generated-c-par
 # Preserve the SMALL source's result for its own native TypeId gate.
 parse_rc=$last_generated_c_probe_rc
 
+# Bound and validate all fields of the opt-in native C union constant-tree
+# diagnostic. Never print source/identifier, diagnostic addresses or logs.
+python3 - /audit-tmp/edg-union-image-failures.txt <<'PY'
+from pathlib import Path
+import re,sys
+fields=("type_size","type_align","root_kind","first_kind",
+        "second_kind","third_kind","first_child_kind",
+        "child_count_bounded","root_dynamic","first_address_kind",
+        "first_designator")
+n=0
+diagnostics=Path(sys.argv[1])
+for line in (diagnostics.read_text(errors="replace").splitlines()
+             if diagnostics.is_file() else []):
+    prefix="EDG_C_UNION_IMAGE_DIAG "
+    if not line.startswith(prefix):
+        continue
+    entries=line[len(prefix):].split()
+    if len(entries)!=len(fields):
+        continue
+    out=[]
+    for entry,key in zip(entries,fields):
+        match=re.fullmatch(re.escape(key)+r"=([0-9]{1,10})",entry)
+        if match is None:
+            break
+        out.append(match.group(1))
+    else:
+        print(prefix+" ".join(f"{key}={value}"
+                           for key,value in zip(fields,out)))
+        n+=1
+        if n==4:
+            break
+PY
+
+# Independent upstream frontend control: build EDG's normal `cpfe`
+# executable from the same pinned upstream sources as the callable library.
+# Unlike the Rust/C++ callback bridge, this runs EDG's own source frontend
+# with --no_code_gen, so a successful parse distinguishes a bridge crash
+# from a native EDG parsing failure.
+# Opt-in here: routine bootstrap audits must not build a second frontend.
+if [[ "${EDG_UPSTREAM_CHECK:-0}" == "1" ]]; then
+  echo "EDG_UPSTREAM_REVISION=$EDGCPP_EDG_REVISION"
+  echo "EDG_UPSTREAM_INPUT_BYTES=$(stat -c %s "$AUDIT_SOURCE")"
+  echo "EDG_UPSTREAM_INPUT_SHA256=$(sha256sum "$AUDIT_SOURCE" | cut -d' ' -f1)"
+  upstream=/workspace/edgcpp/build/gcc-release/bin/cpfe
+  set +e
+  timeout --signal=TERM --kill-after=10s 14m \
+    cmake --build /workspace/edgcpp/build/gcc-release --target cpfe --parallel 2 \
+    > /audit-tmp/edg-upstream-build.log 2>&1
+  build_rc=$?
+  set -e
+  echo "EDG_UPSTREAM_BUILD_EXIT=$build_rc"
+  if (( build_rc == 0 )) && [[ -x "$upstream" ]]; then
+    # A public fixture proves this separate executable was configured
+    # correctly before attributing any real input failure to upstream EDG.
+    for kind in control real; do
+      if [[ "$kind" == "control" ]]; then
+        input=/workspace/bootstrap/fixtures/edg-gnu-attributes/alignment.c
+      else
+        input="$AUDIT_SOURCE"
+      fi
+      set +e
+      (
+        cd /workspace/edgcpp/build/gcc-release
+        ulimit -c 0
+        timeout --signal=TERM --kill-after=10s 120s \
+          "$upstream" --gcc --c11 --no_strict_gnu \
+          --gnu_version "$gnu_number" --no_code_gen \
+          "${include_args[@]}" "$input"
+      ) > "/audit-tmp/edg-upstream-$kind.log" 2>&1
+      upstream_rc=$?
+      set -e
+      if [[ "$kind" == "real" ]]; then
+        echo "EDG_UPSTREAM_REAL_C_EXIT=$upstream_rc"
+      else
+        echo "EDG_UPSTREAM_CONTROL_EXIT=$upstream_rc"
+      fi
+    done
+    echo "EDG_UPSTREAM_COMPARISON_BRIDGE_EXIT=$parse_rc"
+  else
+    echo "EDG_UPSTREAM_RESULT=not_tested_frontend_build_failed"
+  fi
+fi
+
+# Debug native SIGSEGV on the smallest real mrustc C input; a Rust panic
+# backtrace cannot diagnose EDG's C++/FFI segfault.
+# This expensive diagnostic is enabled only by this PR/manual opt-in;
+# regular main bootstrap retains its cheap parse/stack result without APT.
+# Keep the raw GDB log and generated C runner-private. Publish only bounded
+# frames with arguments and paths removed.
+if (( parse_rc == 139 )) && [[ "${EDG_RUN_CREDUCE:-0}" == "1" ]]; then
+  echo "EDG_C_GDB_TRIGGER=small_real_source_sigsegv"
+  # Install binary distro packages only ONCE in this container, not per
+  # C-Reduce candidate. The mounted /audit-tmp cache contains .deb archives
+  # restored across ephemeral GitHub runners by actions/cache; APT still
+  # verifies package metadata and dependencies before installation.
+  debug_packages=(gdb)
+  if [[ "${EDG_RUN_CREDUCE:-0}" == "1" ]]; then
+    debug_packages+=(creduce)
+  fi
+  need_packages=false
+  for package in "${debug_packages[@]}"; do
+    if ! command -v "$package" >/dev/null 2>&1; then
+      need_packages=true
+    fi
+  done
+  if [[ "$need_packages" == "true" ]] && command -v apt-get >/dev/null 2>&1; then
+    apt_cache=/audit-tmp/edg-debug-apt-cache
+    mkdir -p "$apt_cache/partial"
+    chmod 1777 "$apt_cache" "$apt_cache/partial"
+    set +e
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq \
+      > /audit-tmp/edg-debug-apt.log 2>&1 &&
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+      -o "Dir::Cache::archives=$apt_cache" \
+      -o 'APT::Keep-Downloaded-Packages=true' \
+      --no-install-recommends "${debug_packages[@]}" \
+      >> /audit-tmp/edg-debug-apt.log 2>&1
+    apt_rc=$?
+    set -e
+    echo "EDG_CREDUCE_APT_INSTALL_EXIT=$apt_rc"
+  fi
+  if [[ "${EDG_RUN_CREDUCE:-0}" == "1" ]] &&
+     command -v creduce >/dev/null 2>&1; then
+    # Log only the binary package version. All install logs stay runner-local.
+    echo "EDG_CREDUCE_PACKAGE_VERSION=$(dpkg-query -W -f='${Version}' creduce 2>/dev/null || echo unknown)"
+  fi
+  if command -v gdb >/dev/null 2>&1; then
+    set +e
+    (
+      cd /workspace/edgcpp/build/gcc-release
+      timeout --signal=TERM --kill-after=10s 120s \
+        gdb -nx --batch --quiet \
+          -ex 'set pagination off' \
+          -ex 'set confirm off' \
+          -ex 'set debuginfod enabled off' \
+          -ex 'set print frame-arguments none' \
+          -ex 'set print static off' \
+          -ex 'run' \
+          -ex 'thread apply all bt 32' \
+          --args "$parser" --gcc --c11 --no_strict_gnu \
+          --gnu_version "$gnu_number" "${include_args[@]}" "$AUDIT_SOURCE"
+    ) > /audit-tmp/edg-small-real-gdb.log 2>&1
+    gdb_rc=$?
+    set -e
+    python3 - /audit-tmp/edg-small-real-gdb.log "$gdb_rc" <<'PY'
+from pathlib import Path
+import re
+import sys
+raw = Path(sys.argv[1]).read_text(errors="replace")
+print("EDG_C_GDB_EXIT=" + sys.argv[2])
+print("EDG_C_GDB_SIGSEGV=" + ("yes" if "Program received signal SIGSEGV" in raw else "no"))
+frames = []
+for line in raw.splitlines():
+    if not re.match(r"^\s*#\d+\s+", line):
+        continue
+    line = re.sub(r"\s+(?:at|from)\s+.*$", "", line.strip())
+    line = re.sub(r"\([^()]*\)", "(...)", line)
+    line = re.sub(r"/(?:[^\s]+)", "<path>", line)
+    frames.append(line[:240])
+print("EDG_C_GDB_FRAMES=" + str(len(frames)))
+for n, frame in enumerate(frames[:32]):
+    print(f"EDG_C_GDB_FRAME_{n}={frame}")
+PY
+  else
+    echo "EDG_C_GDB_STATUS=unavailable_no_gdb"
+  fi
+else
+  echo "EDG_C_GDB_TRIGGER=not_requested_or_no_sigsegv"
+fi
+
+# Only minimize the real C input if the initial EDG run truly SIGSEGVed.
+# C-Reduce uses GDB as its interestingness test to preserve the exact
+# plain_cpp_record top frame, not merely any crash or frontend failure.
+# The original and the minimized source stay inside the mounted runner temp.
+if (( parse_rc == 139 )) && [[ "${EDG_RUN_CREDUCE:-0}" == "1" ]]; then
+  set +e
+  bash /workspace/bootstrap/reduce-mrustc-edg-crash.sh \
+    "$parser" "$gnu_number" "$AUDIT_SOURCE" "${include_args[@]}" \
+    > /audit-tmp/edg-creduce-summary.log 2>&1
+  reduce_wrapper_rc=$?
+  set -e
+  echo "EDG_CREDUCE_WRAPPER_EXIT=$reduce_wrapper_rc"
+  grep -E '^EDG_CREDUCE_[A-Z0-9_]+=' /audit-tmp/edg-creduce-summary.log || true
+else
+  echo "EDG_CREDUCE_STATUS=not_requested_or_no_small_source_sigsegv"
+fi
 if [[ -n "${AUDIT_LARGE_SOURCE:-}" && -s "$AUDIT_LARGE_SOURCE" &&
       "$AUDIT_LARGE_SOURCE" != "$AUDIT_SOURCE" ]]; then
   echo "EDG_C_LARGE_BYTES=$(stat -c %s "$AUDIT_LARGE_SOURCE")"
@@ -194,6 +994,25 @@ fi
 # driver even if the real C parser rejected its larger workload.
 timeout --signal=TERM --kill-after=10s 20m cargo build --quiet \
   --manifest-path compiler/tools/edg-driver/Cargo.toml
+if [[ "${EDG_TYPEID_UNIT_REGRESSION:-0}" == "1" ]]; then
+  # Run only the new public, deterministic proof regression. Cargo can reuse
+  # the just-built EDG/native and compiler workspace artifacts.
+  set +e
+  timeout --signal=TERM --kill-after=10s 3m cargo test --quiet \
+    --manifest-path compiler/tools/edg-driver/Cargo.toml \
+    --bin compiler-edg-driver \
+    mixed_c_static_data_and_source_proven_external_imports_are_separate \
+    > /audit-tmp/edg-typeid-mixed-global-regression.log 2>&1
+  unit_rc=$?
+  set -e
+  echo "EDG_TYPEID_MIXED_GLOBAL_UNIT_EXIT=$unit_rc"
+  if (( unit_rc != 0 )); then
+    # This test contains public inline fixtures only, never generated input.
+    grep -E '^error|^test result:|^test .*FAILED|panicked at' \
+      /audit-tmp/edg-typeid-mixed-global-regression.log | tail -n 8 | \
+      sed 's/^/EDG_TYPEID_MIXED_GLOBAL_UNIT_DIAG=/' || true
+  fi
+fi
 native=/workspace/compiler/tools/edg-driver/target/debug/compiler-edg-driver
 test -x "$native"
 for kind in alignment linkage abi naked control_globals weak_function section_function control_asm aligned_global scalar_global weak_scalar_global; do
@@ -265,15 +1084,91 @@ set +e
 native_rc=$?
 set -e
 echo "EDG_C_TYPEID_EXIT=$native_rc"
-# Native compiler diagnostics may contain private generated source lines:
-# expose only exit status and a bounded error-category count.
+# The original generated C can contain private symbols/source paths.
+# Classify the *native adapter's rejection message* with an allowlist of
+# hard-coded categories. Never print, hash or copy the raw error line.
 python3 - /audit-tmp/edg-generated-c-native.log <<'PY'
 from pathlib import Path
-import re, sys
+import re,sys
 data = Path(sys.argv[1]).read_text(errors="replace")
 print("EDG_C_TYPEID_DIAGNOSTIC_COUNTS "
       + " ".join(f"{word}={len(re.findall(re.escape(word), data, re.I))}"
                  for word in ("error", "unsupported", "reject", "invalid", "panic")))
+markers = {
+    "EDG -> compiler-ir rejected source:": "typeid-adapter",
+    "EDG bridge:": "bridge-callback",
+    "EDG compilation failed with status": "frontend-diagnostic",
+}
+line = next((line for line in data.splitlines()
+             if any(marker in line for marker in markers)), "")
+if not line:
+    stage = "no-adapter-rejection"
+    reason = ""
+else:
+    stage = next(value for marker,value in markers.items() if marker in line)
+    reason = line.split(next(marker for marker in markers if marker in line),1)[-1].lower()
+# The rejection class is a constant enum, not the source-dependent message.
+if "native global" in reason and "not a proven imported data declaration" in reason:
+    classification = "global-definition-not-import"
+elif "global" in reason and ("import" in reason or "declaration" in reason):
+    classification = "global-import-or-storage-admission"
+elif "global" in reason and ("lifetime" in reason or "initializer" in reason):
+    classification = "global-lifetime-or-initializer"
+elif "source definition" in reason or "statement" in reason or "nested control flow" in reason:
+    classification = "function-body-or-control-flow"
+elif "expression" in reason or "operator" in reason or "conversion" in reason:
+    classification = "expression-or-conversion"
+elif "aggregate" in reason or "record" in reason or "class" in reason:
+    classification = "aggregate-or-class-abi"
+elif "parameter" in reason or "variadic" in reason or "signature" in reason or "call" in reason:
+    classification = "routine-or-call-abi"
+elif "optimizer" in reason or "machine" in reason or "ssa" in reason:
+    classification = "typed-optimizer-or-machine"
+elif "symbol" in reason or "link" in reason:
+    classification = "symbol-or-linkage"
+elif stage == "frontend-diagnostic":
+    classification = "frontend-error"
+else:
+    classification = "unclassified"
+print("EDG_C_TYPEID_FAILURE_STAGE=" + stage)
+print("EDG_C_TYPEID_REJECTION_CLASS=" + classification)
+# Further bounded *non-source-derived* feature flags help distinguish a
+# missing adapter capability from a malformed graph, without leaking names.
+for key,needles in {
+    "UNSUPPORTED":("unsupported","not supported"),
+    "UNPROVEN":("not a proven","not proven","cannot prove"),
+    "MISSING":("missing","not found"),
+    "INCOMPLETE":("incomplete","truncated"),
+    "MALFORMED":("malformed","invalid native"),
+    "DYNAMIC":("dynamic","startup","init_array"),
+}.items():
+    print("EDG_C_TYPEID_REASON_" + key + "="
+          + ("yes" if any(word in reason for word in needles) else "no"))
+PY
+# The compiler's opt-in diagnostic records ONLY numeric EDG source facts.
+# Validate every key/value in an explicit allowlist before echoing to CI;
+# never grep raw source/diagnostic text directly into public Action logs.
+python3 - /audit-tmp/edg-generated-c-native.log <<'PY'
+from pathlib import Path
+import re,sys
+fields=("linkage","explicit","tls","local","type_class","init_kind",
+        "init_explicit","init_uninitialized","image_kind",
+        "layout_bytes","layout_align","field_count","base_count","dynamic",
+        "materialized","weak","alias","section","nonreal",
+        "compiler_generated","globals","definitions")
+for line in Path(sys.argv[1]).read_text(errors="replace").splitlines():
+    prefix="EDG_TYPEID_SAFE_FAIL_GLOBAL "
+    if not line.startswith(prefix): continue
+    entries=line[len(prefix):].split()
+    if len(entries)!=len(fields): continue
+    values=[]
+    for entry,key in zip(entries,fields):
+        m=re.fullmatch(re.escape(key)+r"=([0-9]{1,10})",entry)
+        if m is None: break
+        values.append(m.group(1))
+    else:
+        print(prefix+" ".join(f"{k}={v}" for k,v in zip(fields,values)))
+        break
 PY
 if (( native_rc == 0 )); then
   test -s /audit-tmp/mrustc-edg-native.o
