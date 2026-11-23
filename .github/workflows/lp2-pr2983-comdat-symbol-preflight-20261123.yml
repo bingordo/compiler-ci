@@ -1,0 +1,72 @@
+name: LP2 PR2983 COMDAT symbol preflight
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/lp2-pr2983-comdat-symbol-preflight-20261123.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linker-comdat:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: 608ea67cff5cf5536cc330aa01f11547f016f472
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler commit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source
+        shell: bash
+        run: test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Setup private frontend git auth
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Install public GNU linker plugin ABI headers
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! test -f /usr/include/plugin-api.h; then
+            sudo apt-get update -qq
+            sudo apt-get install -y binutils-dev
+          fi
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: lp2-pr2983-comdat-symbol-preflight
+      - name: Compile real Rust LTO core, compiler and GNU plugin
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo build -p compiler-lto-plugin-core -p compiler --bin compiler
+          cc -std=c11 -Wall -Wextra -Werror -fPIC -shared \
+            tools/lto-plugin-probe/simple_typeid_plugin.c \
+            -L target/debug -lcompiler_lto_plugin_core \
+            -Wl,-rpath,"$(pwd)/target/debug" \
+            -o target/debug/simple_typeid_plugin.so
+          test -s target/debug/simple_typeid_plugin.so
+      - name: GNU linker COMDAT group and resolution tests
+        shell: bash
+        working-directory: compiler
+        env:
+          LP2_PLUGIN_SO: ${{ github.workspace }}/compiler/target/debug/simple_typeid_plugin.so
+          LP2_COMPILER_BIN: ${{ github.workspace }}/compiler/target/debug/compiler
+          LD_LIBRARY_PATH: ${{ github.workspace }}/compiler/target/debug
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-lto-plugin-core --test comdat_single_function_gnu -- --nocapture
+          cargo test -p compiler-lto-plugin-core --test fat_member_admission -- --nocapture
+      - name: Check relevant C plugin warnings
+        working-directory: compiler
+        run: cc -std=c11 -Wall -Wextra -Werror -fsyntax-only tools/lto-plugin-probe/simple_typeid_plugin.c
