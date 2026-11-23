@@ -1,0 +1,57 @@
+name: AArch64 native TypeId atomic LDAR STLR acceptance
+on:
+  push:
+    branches: [ci/a64-atomic-memory-typeid-20261122]
+    paths: ['.github/workflows/a64-atomic-memory-typeid-20261122.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  a64-atomic-memory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Checkout pinned compiler under test
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 849174bd51a1e1daa37dbaa43025bd388f09cd95
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install independent AArch64 GCC, GAS and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu qemu-user
+          command -v qemu-aarch64
+          command -v aarch64-linux-gnu-gcc
+          command -v aarch64-linux-gnu-as
+      - name: Check source identity and isolate native backend workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 849174bd51a1e1daa37dbaa43025bd388f09cd95
+          printf '[workspace]\nresolver = "2"\nmembers = ["crates/ir", "crates/backend", "crates/backend-aarch64"]\n' > compiler/Cargo.toml
+          rm -f compiler/Cargo.lock
+      - name: Compile every AArch64 backend target
+        working-directory: compiler
+        run: cargo check -p compiler-backend-aarch64 --all-targets
+      - name: Native source atomic memory, GNU assembler, GAS and GCC/QEMU oracle
+        working-directory: compiler
+        env:
+          COMPILER_REQUIRE_AARCH64_QEMU: "1"
+        run: cargo test -p compiler-backend-aarch64 --test typeid_atomic_memory -- --nocapture
+      - name: Preserve already merged thread/signal fence semantics
+        working-directory: compiler
+        run: cargo test -p compiler-backend-aarch64 --test typeid_atomic_fences -- --nocapture
+      - name: Existing shared AArch64 backend unit regressions
+        working-directory: compiler
+        run: cargo test -p compiler-backend-aarch64 --lib
+      - name: Scoped strict Clippy for native AArch64 code
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings -A unused-imports -A dead-code -A unused-variables -A clippy::collapsible-match -A clippy::empty-line-after-doc-comments
