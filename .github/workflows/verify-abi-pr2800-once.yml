@@ -1,10 +1,10 @@
 # One-off source-pinned ABI validation for compiler PR #2800.
 # This workflow runs on a push to main that introduces this file, avoiding
 # workflow_dispatch permissions that are unavailable through the connector.
-name: Validate compiler ABI PR 2800 once
+name: Validate compiler ABI PR 2800 nested stack GCC interoperability
 on:
   push:
-    branches: [main]
+    branches: [main, 'ci/abi-pr2800-nested-stack-20261122']
     paths:
       - '.github/workflows/verify-abi-pr2800-once.yml'
   workflow_dispatch:
@@ -22,14 +22,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 170e0243370bcb7166a8b6c7275b1c7eea5891dc
+          ref: db8f44155280781de301114d0828959655d4430
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - name: Verify source revision
         run: |
           set -euo pipefail
-          test "$(git -C compiler rev-parse HEAD)" = 170e0243370bcb7166a8b6c7275b1c7eea5891dc
+          test "$(git -C compiler rev-parse HEAD)" = db8f44155280781de301114d0828959655d4430
           test -s compiler/tools/mini-c-driver/tests/differential.py
       - name: Make Mini-C dependency available over HTTPS
         run: |
@@ -46,7 +46,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: compiler/tools/mini-c-driver -> target
-          key: abi-pr2800
+          key: abi-pr2800-nested-stack-20261122
       - name: Build Mini-C driver
         run: |
           set -euo pipefail
@@ -54,6 +54,20 @@ jobs:
             --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
             -p compiler-mini-c --bin compiler-mini-c \
             2>&1 | tee "$RUNNER_TEMP/abi-build.log"
+      - name: Run named nested-stack ABI smoke against GCC
+        run: |
+          set -euo pipefail
+          python3 -m py_compile compiler/tools/mini-c-driver/tests/differential.py
+          timeout --signal=TERM --kill-after=10s 3m python3 \
+            compiler/tools/mini-c-driver/tests/differential.py \
+            --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" \
+            --mixed-only \
+            --mixed-case gcc_calls_mini_nested_stack_values \
+            --mixed-case mini_calls_gcc_nested_stack_values \
+            --timeout 15 \
+            --artifacts "$RUNNER_TEMP/abi-reproducers-focused" \
+            2>&1 | tee "$RUNNER_TEMP/abi-focused.log"
+          grep -Fxq 'PASS: mixed ABI calls' "$RUNNER_TEMP/abi-focused.log"
       - name: Run mixed-object ABI tests against GCC
         run: |
           set -euo pipefail
@@ -64,7 +78,7 @@ jobs:
             --artifacts "$RUNNER_TEMP/abi-reproducers" \
             2>&1 | tee "$RUNNER_TEMP/abi-tests.log"
           grep -Fxq 'PASS: mixed ABI calls' "$RUNNER_TEMP/abi-tests.log"
-          echo "ABI mixed-object tests passed for compiler 170e0243370bcb7166a8b6c7275b1c7eea5891dc" >> "$GITHUB_STEP_SUMMARY"
+          echo "ABI mixed-object tests passed for compiler db8f44155280781de301114d0828959655d4430" >> "$GITHUB_STEP_SUMMARY"
       - name: Preserve failures
         if: failure()
         uses: actions/upload-artifact@v4
@@ -73,6 +87,8 @@ jobs:
           path: |
             ${{ runner.temp }}/abi-build.log
             ${{ runner.temp }}/abi-tests.log
+            ${{ runner.temp }}/abi-focused.log
+            ${{ runner.temp }}/abi-reproducers-focused/
             ${{ runner.temp }}/abi-reproducers/
           if-no-files-found: ignore
           retention-days: 14
