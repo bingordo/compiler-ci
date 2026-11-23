@@ -1,0 +1,74 @@
+name: Validate native Rust GCC compile mode
+on:
+  push:
+    branches: ['ci/native-gcc-driver-rust-slice-20261122']
+  pull_request:
+    paths: ['.github/workflows/verify-rust-gcc-compile-mode.yml']
+permissions:
+  contents: read
+jobs:
+  native-rust-gcc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 22
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1236133c2727aa3e3b2fcfc9e76aad4c1bb6bb3a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Build native production compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C compiler rev-parse HEAD
+          timeout --signal=TERM --kill-after=10s 14m cargo build -p compiler --bin compiler --manifest-path compiler/Cargo.toml
+      - name: Rust GCC planner regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 5m cargo test --manifest-path compiler/Cargo.toml -p compiler --bin compiler gcc_driver_cases -- --nocapture
+      - name: Native Rust GCC vs Python adapter and original CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          d="$(mktemp -d)"
+          trap 'rm -rf "$d"' EXIT
+          compiler="$PWD/compiler/target/debug/compiler"
+          adapter="$PWD/compiler/tools/compiler-gcc.py"
+          cd "$d"
+          cat > hello.c <<'EOF'
+          int helper(void);
+          int main(void) { return helper() == 42 ? 0 : 1; }
+          EOF
+          printf 'int helper(void) { return 42; }\n' > helper.c
+          "$compiler" --gcc-driver -c hello.c helper.c -g0
+          test -s hello.o && test -s helper.o
+          gcc hello.o helper.o -o rust-compiled
+          ./rust-compiled
+          "$compiler" --gcc-driver -S hello.c -o hello.s
+          test -s hello.s
+          gcc hello.s helper.o -o rust-assembly
+          ./rust-assembly
+          COMPILER_NATIVE_DRIVER="$compiler" python3 "$adapter" -c hello.c -o python.o
+          test -s python.o
+          "$compiler" hello.c --language mini-c --target x86_64 --emit obj -o native.o
+          test -s native.o
+          gcc native.o helper.o -o original-cli
+          ./original-cli
+          for rejected in '-O2' '-MD' '-Iinc' '-std=c11' '-Werror'; do
+            if "$compiler" --gcc-driver -c hello.c "$rejected" -o invalid.o; then
+              echo "Rust GCC mode unexpectedly accepted $rejected" >&2
+              exit 1
+            fi
+          done
+          test ! -e invalid.o
+          if "$compiler" --gcc-driver hello.c -o program; then
+            echo 'Rust GCC mode unexpectedly accepted link request' >&2
+            exit 1
+          fi
+          echo 'RUST_GCC_IN_PROCESS_COMPILE_AND_ASM=PASS' >> "$GITHUB_STEP_SUMMARY"
