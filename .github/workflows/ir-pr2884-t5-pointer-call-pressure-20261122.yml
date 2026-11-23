@@ -1,0 +1,56 @@
+# Exact-source native TypeId T5 pointer-PHI and call/ABI migration acceptance.
+name: IR PR2884 T5 native pointer and call pressure
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ir-pr2884-t5-pointer-call-pressure-20261122.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  pressure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: e5d20f2df845e73efdac2300483d68f50efbf17e
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check revision and isolate core Rust workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+          cc --version | head -n 1
+      - name: Cache isolated Rust compilation
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-pr2884-t5-pointer-call
+      - name: Full T5 x86 GAS ELF C11 and PHI-pressure tests
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_native_parity -- --nocapture
+          cargo test -p compiler-opt --test m4_integer_effects -- --nocapture
+      - name: Scoped Clippy except established unrelated backend-x86 warnings
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-opt --test typed_native_parity -- -D clippy::all -A clippy::empty_line_after_doc_comments -A clippy::collapsible_match
