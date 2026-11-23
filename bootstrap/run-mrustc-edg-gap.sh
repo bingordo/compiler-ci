@@ -540,6 +540,120 @@ for i,line in enumerate(selected[-8:],1):
     print(f"EDG_C_LITERAL_WORD_DIAG_{i}={msg[:230]}")
 PY
     fi
+    # Public function-as-word C11 union, independently linked with GCC.
+    # The actual original EDG event 105 must identify the callee, and the
+    # shared x86 writer must emit one .rela.data R_X86_64_64 relocation.
+    routine_source=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_routine_union_elf.c
+    routine_harness=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_routine_union_elf_harness.c
+    test -s "$routine_source" && test -s "$routine_harness"
+    set +e
+    (
+      cd /workspace/edgcpp/build/gcc-release
+      CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+        timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" run --quiet \
+        --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
+        -- /audit-tmp/edg-static-routine-native.o --gcc --c11 \
+        --no_strict_gnu --gnu_version "$gnu_number" "$routine_source"
+    ) > /audit-tmp/edg-static-routine-native.log 2>&1
+    routine_native_rc=$?
+    routine_reloc_count=0
+    routine_reloc_symbol_match=0
+    if (( routine_native_rc == 0 )); then
+      readelf -rW /audit-tmp/edg-static-routine-native.o \
+        > /audit-tmp/edg-static-routine-relocations.txt
+      routine_reloc_count=$(python3 - /audit-tmp/edg-static-routine-relocations.txt <<'PY'
+from pathlib import Path
+import re,sys
+section=""
+count=0
+symbol_ok=0
+for line in Path(sys.argv[1]).read_text().splitlines():
+    match=re.match(r"Relocation section '([^']+)'",line)
+    if match:section=match.group(1)
+    elif "R_X86_64_64" in line and (
+        section.startswith(".rela.data") or section.startswith(".rela.rodata")):
+        count+=1
+        if re.search(r"\\bbootstrap_routine_target\\b",line):symbol_ok+=1
+print(count)
+PY
+)
+      routine_reloc_symbol_match=$(python3 - /audit-tmp/edg-static-routine-relocations.txt <<'PY'
+from pathlib import Path
+import re,sys
+section=""
+count=0
+for line in Path(sys.argv[1]).read_text().splitlines():
+    match=re.match(r"Relocation section '([^']+)'",line)
+    if match:section=match.group(1)
+    elif "R_X86_64_64" in line and (
+        section.startswith(".rela.data") or section.startswith(".rela.rodata")) and (
+        re.search(r"\\bbootstrap_routine_target\\b",line)):
+        count+=1
+print(count)
+PY
+)
+      if [[ "$routine_reloc_count" != "1" ||
+            "$routine_reloc_symbol_match" != "1" ]]; then
+        routine_native_rc=11
+      fi
+    fi
+    gcc -std=c11 -O0 -Wall -Wextra -Werror -c "$routine_source" \
+      -o /audit-tmp/edg-static-routine-gcc.o &&
+      gcc -std=c11 -O0 -Wall -Wextra -Werror -no-pie \
+        /audit-tmp/edg-static-routine-gcc.o "$routine_harness" \
+        -o /audit-tmp/edg-static-routine-gcc-exe &&
+      /audit-tmp/edg-static-routine-gcc-exe \
+        > /audit-tmp/edg-static-routine-gcc.out
+    routine_gcc_rc=$?
+    routine_link_rc=11
+    routine_run_rc=11
+    routine_parity_rc=11
+    if (( routine_native_rc == 0 )); then
+      gcc -std=c11 -O0 -Wall -Wextra -Werror -no-pie \
+        /audit-tmp/edg-static-routine-native.o "$routine_harness" \
+        -o /audit-tmp/edg-static-routine-native-exe
+      routine_link_rc=$?
+      if (( routine_link_rc == 0 )); then
+        /audit-tmp/edg-static-routine-native-exe \
+          > /audit-tmp/edg-static-routine-native.out
+        routine_run_rc=$?
+        if (( routine_run_rc == 0 && routine_gcc_rc == 0 )); then
+          python3 - /audit-tmp/edg-static-routine-gcc.out \
+              /audit-tmp/edg-static-routine-native.out <<'PY'
+from pathlib import Path
+import sys
+expected=Path(sys.argv[1]).read_bytes()
+observed=Path(sys.argv[2]).read_bytes()
+if expected!=b"STATIC_ROUTINE_ADDRESS_PARITY_OK\\n" or observed!=expected:
+    raise SystemExit(1)
+PY
+          routine_parity_rc=$?
+        fi
+      fi
+    fi
+    set -e
+    echo "EDG_C_LITERAL_ROUTINE_ELF_EXIT=$routine_native_rc"
+    echo "EDG_C_LITERAL_ROUTINE_DATA_RELOCATIONS=$routine_reloc_count"
+    echo "EDG_C_LITERAL_ROUTINE_SYMBOL_RELOCATIONS=$routine_reloc_symbol_match"
+    echo "EDG_C_LITERAL_ROUTINE_GCC_EXIT=$routine_gcc_rc"
+    echo "EDG_C_LITERAL_ROUTINE_LINK_EXIT=$routine_link_rc"
+    echo "EDG_C_LITERAL_ROUTINE_RUN_EXIT=$routine_run_rc"
+    echo "EDG_C_LITERAL_ROUTINE_PARITY_EXIT=$routine_parity_rc"
+    if (( routine_native_rc != 0 || routine_gcc_rc != 0 ||
+          routine_link_rc != 0 || routine_run_rc != 0 ||
+          routine_parity_rc != 0 )); then
+      python3 - /audit-tmp/edg-static-routine-native.log <<'PY'
+from pathlib import Path
+import re,sys
+lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
+selected=[line for line in lines if any(
+    needle in line for needle in ("error[E","error:","rejected source","panicked"))]
+for i,line in enumerate(selected[-8:],1):
+    msg=re.sub(r"/workspace/[^ :]+","<public-path>",line.strip())
+    msg=re.sub(r"[^A-Za-z0-9 _./:><()\\[\\],=-]","?",msg)
+    print(f"EDG_C_LITERAL_ROUTINE_DIAG_{i}={msg[:230]}")
+PY
+    fi
   else
     echo "EDG_C_LITERAL_TYPEID_ELF_EXIT=skipped_no_compiler"
     echo "EDG_C_LITERAL_GCC_ELF_ORACLE_EXIT=skipped_no_compiler"
