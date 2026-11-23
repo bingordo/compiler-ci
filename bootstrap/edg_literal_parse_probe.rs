@@ -81,9 +81,9 @@ fn main() {
                 explicit.iter().filter(|g|!weak.contains(&g.symbol)).count(),
                 missing.len(),missing.iter().filter(|g|weak.contains(&g.symbol)).count(),
                 missing.iter().filter(|g|!weak.contains(&g.symbol)).count(),
-                agg_images.iter().filter(|id|weak.contains(id)).count(),
-                agg_images.iter().filter(|id|!weak.contains(id)).count(),
-                image_owners.iter().filter(|id|!def_owners.contains(id)).count(),
+                agg_images.iter().filter(|id|weak.contains(*id)).count(),
+                agg_images.iter().filter(|id|!weak.contains(*id)).count(),
+                image_owners.iter().filter(|id|!def_owners.contains(*id)).count(),
                 il.global_literal_relocations.iter()
                     .map(|r|r.symbol).collect::<std::collections::HashSet<_>>().len(),
                 il.global_routine_relocations.iter()
