@@ -1,0 +1,66 @@
+name: TEMP FP Mini-C scalar globals exact-source native GCC gate
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temp-fp-mini-c-checked-globals-20261123.yml'
+permissions:
+  contents: read
+jobs:
+  native-mini-c-fp-globals:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Authorize pinned Mini-C frontend dependency
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub host key
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - name: Checkout compiler FP globals candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 58b30ab9ab3a4dc32ee4075b423222c11fa052c8
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact compiler candidate
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = '58b30ab9ab3a4dc32ee4075b423222c11fa052c8'
+          echo "FP scalar-global candidate SHA $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: temp-fp-globals-source-gcc-20261123
+      - name: Build all Mini-C library and global serializer tests
+        working-directory: compiler
+        run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib
+      - name: Check strict Mini-C all-target compilation and Clippy
+        working-directory: compiler
+        run: |
+          RUSTFLAGS='-Dwarnings' cargo check --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --all-targets
+          cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --all-targets -- -D warnings
+      - name: Native checked FP static/const/BSS/GP data, mutable alias and GCC ELF/GAS/PIC oracle
+        working-directory: compiler
+        run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test fp_scalar_globals -- --nocapture
+      - name: Existing source mixed GP/FP and full control flow regression
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test fp_mixed_module
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test fp_mixed_abi
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test fp_mixed_ssa
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test fp_pointer_memory
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test fp_scalar
+      - name: Exact TypeId backend SSE all-target regression
+        working-directory: compiler
+        run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c
