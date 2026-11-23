@@ -1,0 +1,64 @@
+name: ASM3 P04 pinned physical GNU template substitution GAS ELF
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-asm3-p04-physical-template-binding.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: asm3-p04-physical-binding
+  cancel-in-progress: true
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 6f3426b5067ec92adbd8d20b5c8bc5b8697f8c1d
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - name: Assert exact compiler source and GNU assembler toolchain
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = '6f3426b5067ec92adbd8d20b5c8bc5b8697f8c1d'
+          as --version
+          objcopy --version
+          readelf --version
+      - name: Use isolated shared Rust compiler workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: asm3-p04-post-ra-binding
+      - name: Test source-opaque substitution and direct GNU as ELF differential
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test asm3_p04_bound_template -- --nocapture
+      - name: Test pre-existing standalone AT&T and source basic asm behavior
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test att_asm -- --nocapture
+          cargo test -p compiler-backend-x86 --lib asm_basic -- --nocapture
+          cargo test -p compiler-backend-x86 --lib
+      - name: Check all core backends and strict targeted Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check --workspace
+          cargo clippy -p compiler-backend-x86 --test asm3_p04_bound_template -- -D warnings -A dead_code -A unused_imports -A clippy::empty_line_after_doc_comments
+          cargo clippy -p compiler-backend-x86 --lib -- -D warnings -A dead_code -A unused_imports -A clippy::empty_line_after_doc_comments -A clippy::collapsible_match
+          echo 'ASM3 P04=PASS: physical GNU operand substitution; existing typed GAS/ELF encoder; atomic failures' >> "$GITHUB_STEP_SUMMARY"
