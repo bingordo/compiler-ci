@@ -1,0 +1,56 @@
+# Isolated source-pinned TypeId induction fixture acceptance.
+name: IR PR2791 native induction parameterized
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ir-pr2791-native-induction-20261122.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  induction-migration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: 7b02d5e5bab18e9ffe3e52c809e0b2e45eee4bf6
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout pinned private compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify revision and isolate core Rust workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+          cc --version | head -n 1
+      - name: Cache isolated Rust compilation
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-pr2791-native-induction
+      - name: Test induction, ABI, GAS and direct ELF routes
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_induction_native -- --nocapture
+          cargo test -p compiler-opt --test m4_integer_effects -- --nocapture
+      - name: Targeted Clippy, existing unrelated doc spacing excluded
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-opt --test typed_induction_native -- -D clippy::all -A clippy::empty_line_after_doc_comments
