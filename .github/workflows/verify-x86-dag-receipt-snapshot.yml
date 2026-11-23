@@ -1,0 +1,48 @@
+name: x86 DAG receipt validated source snapshot
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-x86-dag-receipt-snapshot.yml']
+permissions:
+  contents: read
+jobs:
+  receipt-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact compiler source candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ba5775d177c108fe4bfda6e2de38e4e4cf16075a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require immutable compiler SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "ba5775d177c108fe4bfda6e2de38e4e4cf16075a"
+      - name: Source-pinned DAG structural and receipt negative suites
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/tools"
+          python3 -m py_compile tools/regen_x86_dag_rule_groups.py tools/test_x86_dag_rule_groups.py
+          python3 -m unittest discover -s tools -p test_x86_dag_rule_groups.py -v
+          python3 -m unittest discover -s tools -p test_x86_dag_codegen.py -v
+      - name: Check exact generated Rust bytes and stable JSON receipts
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/tools"
+          python3 tools/regen_x86_dag_rule_groups.py --check
+          python3 tools/regen_x86_dag_rule_groups.py --check --receipt-json /tmp/dag-receipt.json
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from regen_x86_dag_rule_groups import OUTPUT, SPEC, checked, source_receipt
+          spec = json.loads(SPEC.read_text())
+          expected = source_receipt(spec, checked(spec))
+          actual = json.loads(open("/tmp/dag-receipt.json").read())
+          assert expected == actual
+          assert actual["index_sha256"] == hashlib.sha256(OUTPUT.read_bytes()).hexdigest()
+          assert actual["verification"] == "structural"
+          print("DAG_RECEIPT_SOURCE_PINNED_EXACT_PARITY_OK")
+          PY
