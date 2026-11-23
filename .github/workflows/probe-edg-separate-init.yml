@@ -1,0 +1,149 @@
+name: EDG separate file-scope initializer source-mode experiment
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/probe-edg-separate-init.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8
+    defaults:
+      run:
+        shell: edg-container-exec "bash -eo pipefail {0}"
+    env:
+      EDGCPP_EDG_REVISION: b195677be8b9b56c8337afad6be8064d21a54082
+      EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+      EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+      EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+      CARGO_PROFILE_DEV_DEBUG: '0'
+    steps:
+      - name: Check out exact upstream EDG
+        uses: actions/checkout@v4
+        with:
+          repository: bingundu/edgcpp
+          ref: b195677be8b9b56c8337afad6be8064d21a54082
+          path: edgcpp
+          persist-credentials: false
+      - name: Check out exact Rust bridge
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/edgcpp-rust
+          ref: 1816890dc7c3e47f15011e83235cee6c764e0259
+          path: edgcpp-rust
+          persist-credentials: false
+      - name: Build independent EDG source configuration with separate initializer routines
+        working-directory: edgcpp
+        env:
+          EDG_BASE: ${{ github.workspace }}/edgcpp/bases/docker/dev-env/gcc
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EDGCPP_EDG_REVISION"
+          # Source-backed macro configuration, not a binary/archive mismatch:
+          # EDG and the bridge MUST compile against the SAME generated header.
+          test -f cmake/macro-conf/linux-gcc-release/base.cmakedef
+          mkdir -p cmake/macro-conf/linux-gcc-separate-init
+          printf 'import <linux-gcc-release/base>\nSEPARATE_ROUTINES_FOR_FILE_SCOPE_DYNAMIC_INITS=1\n' \
+            >cmake/macro-conf/linux-gcc-separate-init/base.cmakedef
+          printf 'import <linux-gcc-release/cpfe>\n' \
+            >cmake/macro-conf/linux-gcc-separate-init/cpfe.cmakedef
+          printf 'import <linux-gcc-release/cdisp>\n' \
+            >cmake/macro-conf/linux-gcc-separate-init/cdisp.cmakedef
+          cmake --preset linux-gcc-release \
+            -DEDG_MACRO_CONF=linux-gcc-separate-init \
+            -DEDG_BUILD_LIB=OFF -DEDG_BUILD_CALLABLE_LIBRARY=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          grep -Eq '^#define SEPARATE_ROUTINES_FOR_FILE_SCOPE_DYNAMIC_INITS[[:space:]]+1$' \
+            build/gcc-release/src/includes/cmake_defines.h
+          # The usual prebuilt archive has a different native IL layout and
+          # must NEVER be used for this alternate-configuration experiment.
+          cmake --build build/gcc-release --target edgcpfe --parallel 4
+          test -s build/gcc-release/lib/libedgcpfe.a
+          echo 'EDG_SEPARATE_INIT_BUILD=source macro=1' >> "$GITHUB_STEP_SUMMARY"
+      - name: Install Rust 1.99.1 and build compatible bridge
+        run: |
+          set -euo pipefail
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --profile minimal --default-toolchain 1.99.1
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
+          source edgcpp/build/gcc-release/environment.sh
+          cargo build --manifest-path edgcpp-rust/Cargo.toml --example parse
+          cargo test --manifest-path edgcpp-rust/Cargo.toml --lib \
+            startup_provenance::tests:: -- --nocapture
+      - name: Verify original two-global source and diagnose separate native schedule
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source build/gcc-release/environment.sh
+          cat >build/gcc-release/separate-two-global.cpp <<'CPP'
+          extern "C" int puts(const char*);
+          struct Effectful {
+            int id;
+            explicit Effectful(int i):id(i) { puts(i==1?"first-ctor":"second-ctor"); }
+            ~Effectful() { puts(id==1?"first-dtor":"second-dtor"); }
+          };
+          Effectful first(1);
+          Effectful second(2);
+          int main() { puts("main"); return first.id!=1 || second.id!=2; }
+          CPP
+          cd build/gcc-release
+          version="$(g++ -dumpfullversion -dumpversion)"
+          IFS=. read -r major minor patch <<<"$version"
+          gnu_number=$((10#${major}*10000+10#${minor:-0}*100+10#${patch:-0}))
+          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" \
+            --example parse -- --g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number" \
+            separate-two-global.cpp > "$RUNNER_TEMP/separate-two-global.log" 2>&1 || {
+              tail -n 60 "$RUNNER_TEMP/separate-two-global.log"; exit 1;
+            }
+          grep -Fq 'EDG status: 0' "$RUNNER_TEMP/separate-two-global.log"
+          grep -E 'file scope init scheduler|file scope init root|file scope lowered startup|EDG_CXX5_STARTUP_EVIDENCE|EDG_CXX5_CLEANUP_CALL_LOCAL|EDG_CXX5_CLEANUP_PARTIAL|EDG_CXX5_CLEANUP_TYPED|scope dynamic init entries=' \
+            "$RUNNER_TEMP/separate-two-global.log" | head -n 60 \
+            | tee -a "$GITHUB_STEP_SUMMARY" || true
+          g++ -std=c++17 -O0 separate-two-global.cpp -o "$RUNNER_TEMP/edg-separate-gcc"
+          "$RUNNER_TEMP/edg-separate-gcc" > "$RUNNER_TEMP/edg-separate-gcc.out"
+          printf 'first-ctor\nsecond-ctor\nmain\nsecond-dtor\nfirst-dtor\n' \
+            > "$RUNNER_TEMP/edg-separate-expected.out"
+          cmp "$RUNNER_TEMP/edg-separate-gcc.out" "$RUNNER_TEMP/edg-separate-expected.out"
+      - name: Probe unchanged system GCC iostream source with exact include roots
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source build/gcc-release/environment.sh
+          cat >build/gcc-release/separate-iostream.cpp <<'CPP'
+          #include <iostream>
+          int main() { std::cout << "Hello world\n"; }
+          CPP
+          cd build/gcc-release
+          version="$(g++ -dumpfullversion -dumpversion)"
+          IFS=. read -r major minor patch <<<"$version"
+          gnu_number=$((10#${major}*10000+10#${minor:-0}*100+10#${patch:-0}))
+          mapfile -t dirs < <(g++ -std=c++17 -v -E -x c++ /dev/null 2>&1 |
+            awk '/#include <...> search starts here:/{active=1;next} /^End of search list/{active=0} active && /^ /{sub(/^[[:space:]]+/, "");print}')
+          includes=()
+          for dir in "${dirs[@]}"; do
+            test -d "$dir" && includes+=("-I$dir")
+          done
+          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" \
+            --example parse -- --g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number" \
+            "${includes[@]}" separate-iostream.cpp > "$RUNNER_TEMP/separate-iostream.log" 2>&1 || {
+              tail -n 60 "$RUNNER_TEMP/separate-iostream.log"; exit 1;
+            }
+          grep -Fq 'EDG status: 0' "$RUNNER_TEMP/separate-iostream.log"
+          grep -E 'file scope init scheduler|file scope init root|EDG_CXX5_STARTUP_EVIDENCE|EDG_CXX5_CLEANUP_CALL_LOCAL|EDG_CXX5_CLEANUP_PARTIAL' \
+            "$RUNNER_TEMP/separate-iostream.log" | head -n 40 \
+            | tee -a "$GITHUB_STEP_SUMMARY" || true
+          echo 'EDG_SEPARATE_INIT_ABI_ADMITTED=false' >> "$GITHUB_STEP_SUMMARY"
