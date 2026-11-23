@@ -18,6 +18,11 @@ on:
         required: false
         default: false
         type: boolean
+      abi_only:
+        description: 'Run only mixed-object ABI tests (manual validation)'
+        required: false
+        default: false
+        type: boolean
   schedule:
     - cron: '4,19,34,49 * * * *'
   push:
@@ -61,6 +66,7 @@ jobs:
           test -s compiler/tools/mini-c-driver/Cargo.toml
           echo "Compiler revision: $sha" >> "$GITHUB_STEP_SUMMARY"
       - name: Check for previously successful source and cohort
+        if: ${{ !inputs.abi_only }}
         id: verified
         uses: actions/cache/restore@v4
         with:
@@ -68,7 +74,7 @@ jobs:
           key: mini-c-source-v1-${{ hashFiles('.github/workflows/verify-mini-c-differential.yml') }}-${{ steps.source.outputs.sha }}-${{ inputs.seed_count || '6' }}
           lookup-only: true
       - name: Make public Mini-C dependency accessible without another deploy key
-        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
+        if: inputs.abi_only || steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
         shell: bash
         run: |
           set -euo pipefail
@@ -81,14 +87,14 @@ jobs:
           manifest.write_text(text.replace(old,'https://github.com/bingordo/mini-c.git'))
           PY
       - name: Cache Rust objects and dependencies
-        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
+        if: inputs.abi_only || steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: compiler/tools/mini-c-driver -> target
           key: mini-c-source-differential-v1
           cache-workspace-crates: 'true'
       - name: Build compiler-mini-c once
-        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
+        if: inputs.abi_only || steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
         shell: bash
         run: |
           set -euo pipefail
@@ -98,30 +104,43 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/mini-c-build.log"
           test -x compiler/tools/mini-c-driver/target/debug/compiler-mini-c
       - name: Compare compiled Mini-C against GCC
-        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
+        if: inputs.abi_only || steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
         shell: bash
         env:
           SEED_COUNT: ${{ inputs.seed_count || '6' }}
+          ABI_ONLY: ${{ inputs.abi_only || 'false' }}
         run: |
           set -euo pipefail
+          args=(--seed-count "$SEED_COUNT" --steps 120 --timeout 15
+                --artifacts "$RUNNER_TEMP/mini-c-failures")
+          if [[ "$ABI_ONLY" == true ]]; then
+            args+=(--mixed-only)
+          fi
           timeout --signal=TERM --kill-after=10s 10m python3 \
             compiler/tools/mini-c-driver/tests/differential.py \
             --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" \
-            --seed-count "$SEED_COUNT" --steps 120 --timeout 15 \
-            --artifacts "$RUNNER_TEMP/mini-c-failures" \
+            "${args[@]}" \
             2>&1 | tee "$RUNNER_TEMP/mini-c-differential.log"
-          grep -Eq "^PASS: [1-9][0-9]* fixtures, $SEED_COUNT seeds, mixed ABI calls and negative cases$" "$RUNNER_TEMP/mini-c-differential.log"
+          if [[ "$ABI_ONLY" == true ]]; then
+            grep -Fxq "PASS: mixed ABI calls" "$RUNNER_TEMP/mini-c-differential.log"
+          else
+            grep -Eq "^PASS: [1-9][0-9]* fixtures, $SEED_COUNT seeds, mixed ABI calls and negative cases$" "$RUNNER_TEMP/mini-c-differential.log"
+          fi
           mkdir -p .mini-c-verified
           printf '%s\n' "${{ steps.source.outputs.sha }}" > .mini-c-verified/source-sha.txt
-          echo "Passed fixed, seeded, ABI and negative GCC oracles" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$ABI_ONLY" == true ]]; then
+            echo "Passed focused mixed-object ABI checks" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Passed fixed, seeded, ABI and negative GCC oracles" >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Save successful exact revision evidence
-        if: success() && steps.verified.outputs.cache-hit != 'true'
+        if: success() && !inputs.abi_only && steps.verified.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: .mini-c-verified
           key: mini-c-source-v1-${{ hashFiles('.github/workflows/verify-mini-c-differential.yml') }}-${{ steps.source.outputs.sha }}-${{ inputs.seed_count || '6' }}
       - name: Report cached result
-        if: steps.verified.outputs.cache-hit == 'true' && !inputs.force_recheck
+        if: !inputs.abi_only && steps.verified.outputs.cache-hit == 'true' && !inputs.force_recheck
         run: echo "Exact compiler revision and seed cohort previously passed" >> "$GITHUB_STEP_SUMMARY"
       - name: Preserve build logs and failing test cases
         if: failure()
