@@ -893,6 +893,10 @@ probe_generated_c() {
   grep -m 1 '^EDG_PROBE_STATIC_OWNERS ' "$logfile" || true
   grep -m 16 '^EDG_PROBE_MISSING_WEAK_TYPE ' "$logfile" || true
   grep -m 1 '^EDG_PROBE_MISSING_WEAK_TYPE_GROUPS ' "$logfile" || true
+  grep -m 16 '^EDG_PROBE_STATIC_KIND ' "$logfile" || true
+  grep -m 1 '^EDG_PROBE_STATIC_KIND_GROUPS ' "$logfile" || true
+  grep -m 16 '^EDG_PROBE_DATA_TARGET ' "$logfile" || true
+  grep -m 1 '^EDG_PROBE_DATA_TARGET_GROUPS ' "$logfile" || true
   grep -m 1 '^EDG_PROBE_STATIC_LITERALS ' "$logfile" || true
   grep -m 1 '^EDG_PROBE_STATIC_ROUTINES ' "$logfile" || true
   case "$rc" in
