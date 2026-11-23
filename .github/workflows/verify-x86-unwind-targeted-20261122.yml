@@ -1,0 +1,55 @@
+name: TEMP x86 runtime-unwind targeted source-pinned regression
+on:
+  push:
+    branches: [ci/x86-unwind-diagnostic-20261122]
+    paths: ['.github/workflows/verify-x86-unwind-targeted-20261122.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  x86-unwind:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 010ea727788e54ac6cd84e986fcb013ccf344ce3
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Prepare isolated x86 backend source workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p isolated/crates
+          for crate in ir opt backend backend-x86 backend-aarch64; do
+            cp -a "compiler/crates/$crate" isolated/crates/
+          done
+          cp -a compiler/tools compiler/tests compiler/data isolated/
+          cat > isolated/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend",
+                     "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          echo 'Compiler source SHA: 010ea727788e54ac6cd84e986fcb013ccf344ce3' >> "$GITHUB_STEP_SUMMARY"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: isolated
+          key: x86-unwind-m46
+      - name: Test generated TypeId machine native unwind with C oracle
+        working-directory: isolated
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test m4_6_source_unwind_native -- --nocapture
+      - name: Test independently assembled physical machine CFI
+        working-directory: isolated
+        shell: bash
+        run: cargo test -p compiler-backend-x86 --test m4_6_unwind_native -- --nocapture
+      - name: Test PIC shared-object runtime unwinding
+        working-directory: isolated
+        shell: bash
+        run: cargo test -p compiler-backend-x86 --test m4_6_unwind_shared_native -- --nocapture
