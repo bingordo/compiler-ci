@@ -1,0 +1,72 @@
+name: Mini-C C11 atomic-qualified source to native TypeId acceptance
+on:
+  push:
+    branches: [ci/c11-atomic-qualified-source-20261123]
+    paths: ['.github/workflows/c11-atomic-qualified-source-20261123.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  qualified-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+      COMPILER_REQUIRE_AARCH64_QEMU: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 88a0b8c749922b48b6b771fefa5bb3846955073a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: dc84a0040c7e7ccd4e70ae78581fcc0f11e60520
+          path: mini-c
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Verify both candidate source identities and install independent native toolchains
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 88a0b8c749922b48b6b771fefa5bb3846955073a
+          test "$(git -C mini-c rev-parse HEAD)" = dc84a0040c7e7ccd4e70ae78581fcc0f11e60520
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
+      - name: Isolate portable native compiler crates and use exact checked Mini-C sources
+        run: |
+          printf '[workspace]\nresolver = "2"\nmembers = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]\n' > compiler/Cargo.toml
+          rm -f compiler/Cargo.lock
+          python3 - <<'PY'
+          from pathlib import Path
+          manifest=Path('compiler/tools/mini-c-driver/Cargo.toml')
+          data=manifest.read_text()
+          for crate in ('mini-c-syntax','mini-c-sema'):
+              name=crate.split('-')[-1]
+              before=f'{crate} = {{ git = "ssh://git@github.com/bingordo/mini-c.git", rev = "dc84a0040c7e7ccd4e70ae78581fcc0f11e60520" }}'
+              after=f'{crate} = {{ path = "../../../mini-c/crates/{name}" }}'
+              if data.count(before)!=1:
+                  raise SystemExit(f'expected one pinned dependency: {crate}')
+              data=data.replace(before,after)
+          manifest.write_text(data)
+          PY
+      - name: Check all native Mini-C adapter targets
+        run: cargo check --manifest-path compiler/tools/mini-c-driver/Cargo.toml --all-targets
+      - name: Mini-C checked C11 atomic semantic suite
+        working-directory: mini-c
+        run: cargo test -p mini-c-syntax -p mini-c-sema
+      - name: C11 atomic native source integration and independent GCC/QEMU
+        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test c11_atomic_qualified_source -- --nocapture
+      - name: Existing GNU atomic source lowering
+        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib gnu_atomic_
+      - name: Native Mini-C adapter library regression
+        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib
+      - name: Scoped native Mini-C strict Clippy
+        run: cargo clippy --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib -- -D warnings -A unused-imports -A clippy::too-many-arguments -A clippy::match-like-matches-macro
