@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
-"""Compare source-pinned RV64 rematerialization code and QEMU runtime.
+"""Compare source-pinned RV64 rematerialization code generation.
 
-Input objects are produced from the *same* TypeId fixture sources by the
-compiler versions immediately before and after the partial-remat change.
-Instruction and stack-access counts are exact for the emitted .text; runtime
-samples are exploratory QEMU-user host-time measurements, not CPU cycles.
+Inputs use byte-identical TypeId fixture sources before and after the
+partial-rematerialization change. This reports exact static emitted .text
+bytes, instruction counts, stack accesses and ALU/compare operand reads.
+It does NOT measure latency or predict RV64 hardware performance.
 """
 from __future__ import annotations
 import collections
 import json
-import os
 from pathlib import Path
 import re
-import statistics
 import subprocess
 import sys
-import time
 
 CASES = (
     "addi_phi", "addi_shared", "slti32_neg", "sltiu32_neg",
@@ -58,34 +55,6 @@ def count(path: Path) -> dict:
         "opcodes": dict(sorted(opcode.items())),
     }
 
-def runtime_samples(root: Path, kind: str, iterations: int) -> dict:
-    # No arbitrary source-program cap: the iteration count controls only the
-    # duration of this benchmark. It is not a compiler capability limit.
-    cpu = min(os.sched_getaffinity(0))
-    paths = {mode: root / mode / (kind + "_bench.elf") for mode in ("old", "new")}
-    for mode, elf in paths.items():
-        assert elf.is_file(), elf
-        for _ in range(2):
-            subprocess.run(["taskset", "-c", str(cpu), "qemu-riscv64",
-                            str(elf)], check=True, timeout=25)
-    order = ["old", "new", "new", "old"] * 7
-    samples = {"old": [], "new": []}
-    for mode in order:
-        t0 = time.perf_counter_ns()
-        subprocess.run(["taskset", "-c", str(cpu), "qemu-riscv64",
-                        str(paths[mode])], check=True, timeout=25)
-        samples[mode].append((time.perf_counter_ns() - t0) / 1e6)
-    med = {k: statistics.median(v) for k, v in samples.items()}
-    return {
-        "benchmark": f"{kind} executed {iterations} times in the QEMU call loop",
-        "cpu_affinity": cpu,
-        "metric": "QEMU-user process host wall time, milliseconds",
-        "samples_ms": samples,
-        "median_ms": med,
-        "candidate_vs_baseline_pct": 100 * (med["new"] / med["old"] - 1),
-        "caution": "QEMU startup, dynamic translation and host scheduling included; not target hardware cycles",
-    }
-
 def main() -> None:
     root = Path(sys.argv[1])
     results = {}
@@ -112,17 +81,15 @@ def main() -> None:
             f"{kind} did not exercise the intended high-pressure partial fold",
             results[kind],
         )
-    runtime = {
-        "addi_phi": runtime_samples(root, "addi_phi", 200000),
-        "partial32": runtime_samples(root, "partial32", 20000),
+    out = {
+        "method": "source-pinned same-TypeId-input RV64 code-generation comparison",
+        "measurement_scope": "static object-code counts only; no target runtime measurement",
+        "versions": {
+            "old": "213831b84dd5546e3aab7ee578c25de61b3c6434",
+            "new": "c1f89639e5e776d81bb4e4947b4431a6ec9cae5c",
+        },
+        "fixture_matrix": results,
     }
-    for kind, sample in runtime.items():
-        print(f"{kind} QEMU-user median host ms: {sample['median_ms']}")
-        print(f"{kind} candidate vs baseline %: {sample['candidate_vs_baseline_pct']:.2f}")
-    out = {"method": "source-pinned same-runner old/new .text and QEMU ABBA",
-           "versions": {"old": "213831b84dd5546e3aab7ee578c25de61b3c6434",
-                        "new": "c1f89639e5e776d81bb4e4947b4431a6ec9cae5c"},
-           "fixture_matrix": results, "qemu_microbenchmark": runtime}
     output = root / "comparison.json"
     output.write_text(json.dumps(out, indent=2, sort_keys=True) + "\n")
     print("JSON:", output)
