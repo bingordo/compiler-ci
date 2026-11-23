@@ -1,0 +1,59 @@
+name: AArch64 native TypeId LL/SC atomic RMW acceptance
+on:
+  push:
+    branches: [ci/a64-atomic-rmw-llsc-typeid-20261123]
+    paths: ['.github/workflows/a64-atomic-rmw-llsc-typeid-20261123.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  a64-rmw:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2e361178d1c9a7e780179c42b79cfd645745cbbd
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install independent AArch64 compiler assembler libc and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
+          command -v aarch64-linux-gnu-as
+          command -v aarch64-linux-gnu-gcc
+          command -v qemu-aarch64
+      - name: Verify SHA and isolate portable compiler crates
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 2e361178d1c9a7e780179c42b79cfd645745cbbd
+          printf '[workspace]\nresolver = "2"\nmembers = ["crates/ir", "crates/backend", "crates/backend-aarch64"]\n' > compiler/Cargo.toml
+          rm -f compiler/Cargo.lock
+      - name: Check all AArch64 backend targets
+        working-directory: compiler
+        run: cargo check -p compiler-backend-aarch64 --all-targets
+      - name: Exact-width RMW, ELF/GAS, GNU ISA and contended QEMU oracle
+        working-directory: compiler
+        env:
+          COMPILER_REQUIRE_AARCH64_QEMU: "1"
+        run: cargo test -p compiler-backend-aarch64 --test typeid_atomic_rmw -- --nocapture
+      - name: AArch64 memory and fence admission regression
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend-aarch64 --test typeid_atomic_memory
+          cargo test -p compiler-backend-aarch64 --test typeid_atomic_fences
+      - name: All shared AArch64 library unit tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend-aarch64 --lib
+      - name: Scoped strict lint (known baseline warning categories excepted)
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-aarch64 --lib -- -D warnings -A unused-imports -A dead-code -A unused-variables -A clippy::collapsible-match -A clippy::empty-line-after-doc-comments
