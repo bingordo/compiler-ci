@@ -1,0 +1,74 @@
+# Source-pinned TypeId pass-analysis contract acceptance.
+name: TypeId pass analysis contracts PR2822
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/typeid-pass-analysis-contracts-pr2822-20261122.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pass-manager:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: 736aa83a6aae84e3f33f7bd1252403cbbf3ee0e0
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Check out exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm source SHA and isolate core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+          cargo --version
+          cc --version | head -n 1
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-pass-contracts-pr2822
+      - name: Run shared dominance and existing optimizer regressions
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib loop_analysis -- --nocapture
+          cargo test -p compiler-opt --lib typed_pass_manager -- --nocapture
+          cargo test -p compiler-opt --test typeid_core_pass_manager -- --nocapture
+          cargo test -p compiler-opt --test typeid_fuzz_pass_registry -- --nocapture
+          cargo test -p compiler-opt --test pre_licm_semantic_matrix -- --nocapture
+          cargo test -p compiler-opt --test m4_integer_effects -- --nocapture
+          cargo test -p compiler-opt --test licm_preheaders -- --nocapture
+          cargo test -p compiler-opt --test typed_cse -- --nocapture
+          cargo test -p compiler-opt --test cse_native -- --nocapture
+          cargo test -p compiler-opt --test typeid_reference_native_width -- --nocapture
+          cargo test -p compiler-opt --test typed_pre_native -- --nocapture
+          cargo test -p compiler-opt --test typed_licm_native -- --nocapture
+          cargo test -p compiler-opt --test licm_native -- --nocapture
+          cargo test -p compiler-opt --test loop_trap_semantics -- --nocapture
+          cargo test -p compiler-opt --test typeid_source_profile_parity -- --nocapture
+          cargo test -p compiler-opt --test typeid_fuzz_licm_identical_targeted -- --nocapture
+          cargo test -p compiler-opt --test typeid_fuzz_pre_induction_targeted -- --nocapture
+      - name: Clippy on pass-manager and regression targets
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-opt --test typeid_core_pass_manager --test typeid_fuzz_pass_registry --test pre_licm_semantic_matrix --test typed_licm_native --test licm_preheaders -- --no-deps -D clippy::all -A clippy::empty_line_after_doc_comments
