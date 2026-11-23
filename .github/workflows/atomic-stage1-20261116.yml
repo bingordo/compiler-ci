@@ -1,0 +1,128 @@
+name: Atomic TypeId and generic builtin contracts
+on:
+  pull_request:
+    paths:
+      - .github/workflows/atomic-stage1-20261116.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  atomic-stage1:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout compiler-ci contract fixture
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Checkout pinned compiler IR contract baseline
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: dd64e796dd3bf5a64d4b633b877cc7b30a0ee9b3
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact Mini-C atomic source-contract candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: 2ba94ba7e96079d14c2053413d877a19647ccad2
+          path: mini-c
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Report pinned source revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = dd64e796dd3bf5a64d4b633b877cc7b30a0ee9b3
+          test "$(git -C mini-c rev-parse HEAD)" = 2ba94ba7e96079d14c2053413d877a19647ccad2
+          printf 'compiler: %s\nmini-c: %s\n' \
+            "$(git -C compiler rev-parse HEAD)" \
+            "$(git -C mini-c rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Restrict compiler workspace to the IR crate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: atomic-ir-stage1
+      - name: Generate and validate atomic TypeId order-width-opcode matrix
+        working-directory: compiler
+        run: cargo test -p compiler-ir
+      - name: Check production optimizer and all target backend crates
+        working-directory: compiler
+        run: |
+          cargo check --workspace
+          cargo test -p compiler-backend --test native_atomic_fence_rejection
+          cargo test -p compiler-backend-x86 --test native_atomic_tso_machine
+          cargo test -p compiler-backend-x86 --test native_atomic_generated_runtime -- --test-threads=1
+          cargo test -p compiler-opt --features typeid-memory-ssa --test native_atomic_fence_barriers
+          cargo test -p compiler-opt --features typeid-memory-ssa --test native_atomic_access_barriers
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mini-c -> target
+          key: atomic-mini-c-stage1
+      - name: Test Mini-C syntax, checked semantics and CLI diagnostics
+        working-directory: mini-c
+        run: |
+          cargo test -p mini-c-syntax -p mini-c-sema
+          cargo test -p mini-c --features internal-cpp
+          cargo check -p mini-c-cranelift
+      - name: Generate checked Mini-C GNU builtin to TypeId contract cases
+        run: cargo test --manifest-path atomic-builtin-contract/Cargo.toml
+      - name: Generated production Mini-C native TypeId atomic lowering
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          manifest = Path("compiler/tools/mini-c-driver/Cargo.toml")
+          text = manifest.read_text()
+          for package in ("mini-c-syntax", "mini-c-sema"):
+              name = package.split("-")[-1]
+              # The compiler baseline predates the checked Mini-C candidate.
+              # Patch the manifest's *actual* historical dependency, while the
+              # separately checked-out candidate remains SHA-pinned above.
+              before = f'{package} = {{ git = "ssh://git@github.com/bingordo/mini-c.git", rev = "a981db7be3ab5dc55c2c893f64aae05730b62c68" }}'
+              after = f'{package} = {{ path = "../../../mini-c/crates/{name}" }}'
+              if text.count(before) != 1:
+                  raise SystemExit(f"expected exactly one {package} pinned manifest dependency")
+              text = text.replace(before, after)
+          manifest.write_text(text)
+          # The old pinned compiler driver predates the newer Mini-C ASM2
+          # checked-statement variants. Add only fail-closed match arms in
+          # this disposable CI checkout; no compiler source is modified.
+          driver = Path("compiler/tools/mini-c-driver/src/lib.rs")
+          source = driver.read_text()
+          anchor = '            CheckedStmt::Switch { .. } | CheckedStmt::Case { .. }'
+          if source.count(anchor) != 1:
+              raise SystemExit("unexpected native Mini-C statement matcher")
+          reject = '\n'.join([
+              '            CheckedStmt::BasicAsm { .. } | CheckedStmt::ExtendedAsm { .. } => Err(',
+              '                "native TypeId Mini-C lowering does not yet support GNU asm".into()',
+              '            ),',
+              ''
+          ])
+          driver.write_text(source.replace(anchor, reject + anchor))
+          PY
+          cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            --lib generated_atomic_source_typeid_tests
+      - name: Strict Clippy for stage 1 crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd compiler && cargo clippy -p compiler-ir --lib -- -D warnings)
+          (cd mini-c && cargo clippy -p mini-c-syntax -p mini-c-sema --all-targets -- -D warnings)
+      - name: Check IR builtin module formatting
+        run: rustfmt --edition 2021 --check compiler/crates/ir/src/atomic_builtins.rs
