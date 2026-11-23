@@ -119,13 +119,34 @@ jobs:
         working-directory: compiler
         run: |
           set -euo pipefail
-          begin=$(date +%s%N)
+          # Compile once, then measure both test executions without
+          # charging cold Cargo compilation to either one.
+          timeout --signal=TERM --kill-after=10s 6m \
+            cargo test -p compiler-opt --test al05_p9_mixed_native_bridge --no-run
+          p16_begin=$(date +%s%N)
+          timeout --signal=TERM --kill-after=10s 6m \
+            cargo test -p compiler-opt --test al05_p9_mixed_native_bridge \
+              al05_p16_coverage::tests::al05_p16_selector_is_order_independent_bounded_and_nontrivial \
+              -- --exact --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/al05-p16-selector.log"
+          p16_end=$(date +%s%N)
+          p16_ms=$(( (p16_end - p16_begin) / 1000000 ))
+          grep -F "test al05_p16_coverage::tests::al05_p16_selector_is_order_independent_bounded_and_nontrivial ... ok" "$RUNNER_TEMP/al05-p16-selector.log"
+          p17_begin=$(date +%s%N)
           timeout --signal=TERM --kill-after=10s 6m \
             cargo test -p compiler-opt --test al05_p9_mixed_native_bridge \
               al05_p17_selected_mutation_concrete_witnesses -- --exact --nocapture \
             2>&1 | tee "$RUNNER_TEMP/al05-p17-ledger.log"
-          end=$(date +%s%N)
-          elapsed_ms=$(( (end - begin) / 1000000 ))
+          p17_end=$(date +%s%N)
+          elapsed_ms=$(( (p17_end - p17_begin) / 1000000 ))
+          # A relative ceiling plus small fixed launch/noise allowance:
+          # do not require unstable sub-second relative timing parity.
+          ceiling_ms=$(( p16_ms * 10 + 1500 ))
+          if (( elapsed_ms > ceiling_ms )); then
+            echo "P17 exceeded P16 selector cost ceiling: p16=${p16_ms}ms p17=${elapsed_ms}ms max=${ceiling_ms}ms" >&2
+            exit 1
+          fi
+          echo "AL05_P17_COST p16_selector_ms=${p16_ms} p17_mutations_ms=${elapsed_ms} ceiling_ms=${ceiling_ms} verdict=PASS"
           python3 - "$RUNNER_TEMP/al05-p17-ledger.log" "$(git rev-parse HEAD)" <<'PY'
           import collections, json, pathlib, sys
           lines = pathlib.Path(sys.argv[1]).read_text(errors="replace").splitlines()
@@ -156,7 +177,7 @@ jobs:
                      "unknown=REJECTED" in line for line in lines)
           print("AL05_P17_LEDGER_VALIDATED records=48 cases=24 sha="+sys.argv[2])
           PY
-          echo "AL05_P17_OWNED_TYPEID_FOCUSED sha=$(git rev-parse HEAD) elapsed_ms=$elapsed_ms records=48 verdict=PASS" >> "$GITHUB_STEP_SUMMARY"
+          echo "AL05_P17_OWNED_TYPEID_FOCUSED sha=$(git rev-parse HEAD) p16_selector_ms=$p16_ms p17_mutations_ms=$elapsed_ms ceiling_ms=$ceiling_ms records=48 verdict=PASS" >> "$GITHUB_STEP_SUMMARY"
 
       - name: FS-1 draft pointer roots, effects and actual TypeId optimizer observation barriers
         if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
