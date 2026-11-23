@@ -44,7 +44,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ inputs.source_ref || 'main' }}
+          ref: 87befe63d198831b4023785cdb88a24a966aee6f
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -58,6 +58,7 @@ jobs:
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "Compiler source SHA: $sha"
+          [[ "$sha" == "87befe63d198831b4023785cdb88a24a966aee6f" ]] || { echo "AL-05.P17 source mismatch"; exit 1; }
           # Fail rather than silently accepting a moved/absent test suite.
           for test_source in \
             crates/opt/tests/native_cfg_differential.rs \
@@ -109,6 +110,54 @@ jobs:
           workspaces: compiler -> target
           key: native-cfg-correctness-v1
           cache-workspace-crates: 'true'
+      # P17 test must run before unrelated all-crate checks and fail closed.
+      # Source checkout, module parser and independent TypeId reference are
+      # the same production/test infrastructure as P16; no second generator.
+      - name: Validate P17 owned-TypeId mutations and JSON ledger
+        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          begin=$(date +%s%N)
+          timeout --signal=TERM --kill-after=10s 6m \
+            cargo test -p compiler-opt --test al05_p9_mixed_native_bridge \
+              al05_p17_selected_mutation_concrete_witnesses -- --exact --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/al05-p17-ledger.log"
+          end=$(date +%s%N)
+          elapsed_ms=$(( (end - begin) / 1000000 ))
+          python3 - "$RUNNER_TEMP/al05-p17-ledger.log" "$(git rev-parse HEAD)" <<'PY'
+          import collections, json, pathlib, sys
+          lines = pathlib.Path(sys.argv[1]).read_text(errors="replace").splitlines()
+          token = "AL05_P17_MUTATION_LEDGER "
+          rows = [json.loads(line.split(token, 1)[1])
+                  for line in lines if token in line]
+          assert len(rows) == 48, f"expected 48 records, got {len(rows)}"
+          assert len({(r["case_id"], r["mutation_kind"]) for r in rows}) == 48
+          assert len({r["case_id"] for r in rows}) == 24
+          assert collections.Counter(r["mutation_kind"] for r in rows) == {
+              "wrong-loop-phi": 24, "dropped-latch-divs": 24
+          }
+          for row in rows:
+              assert row["schema"] == "al05-p17-mutation-ledger-v1"
+              assert row["source_sha"] == sys.argv[2]
+              assert row["verifier"] == "PASS"
+              assert row["witness"] is not None
+              assert row["semantics"] == "FS1-DRAFT-NON-NORMATIVE"
+              assert row["verdict"] == "BOUNDED"
+              expected = {"wrong-loop-phi": "wrong-return",
+                          "dropped-latch-divs": "missing-trap"}[row["mutation_kind"]]
+              assert row["expected_failure_class"] == expected
+              assert row["observed_failure_class"] == expected
+          assert any("AL05_P17_LEDGER_SUMMARY" in line and
+                     "weakened_selector=REJECTED" in line and
+                     "missing_family=REJECTED" in line and
+                     "missing_case=REJECTED" in line and
+                     "unknown=REJECTED" in line for line in lines)
+          print("AL05_P17_LEDGER_VALIDATED records=48 cases=24 sha="+sys.argv[2])
+          PY
+          echo "AL05_P17_OWNED_TYPEID_FOCUSED sha=$(git rev-parse HEAD) elapsed_ms=$elapsed_ms records=48 verdict=PASS" >> "$GITHUB_STEP_SUMMARY"
+
       - name: FS-1 draft pointer roots, effects and actual TypeId optimizer observation barriers
         if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
         shell: bash
