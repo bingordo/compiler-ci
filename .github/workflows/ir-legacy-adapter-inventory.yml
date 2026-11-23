@@ -1,4 +1,4 @@
-name: IR legacy adapter caller inventory
+name: IR legacy module bridge feature gate
 on:
   pull_request:
     paths:
@@ -6,24 +6,55 @@ on:
 permissions:
   contents: read
 jobs:
-  inventory:
+  gate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 8
+    timeout-minutes: 25
+    env:
+      SOURCE_SHA: 1106e951f686ac9f53ac90447fdceff1feca2c5c
+      CARGO_INCREMENTAL: '0'
     steps:
-      - name: Checkout exact current compiler source
+      - name: Checkout exact compiler commit
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 797d7a68bc50a37f0a84154624dea16d21114232
+          ref: ${{ env.SOURCE_SHA }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Inventory conversion callsites outside tests
+      - name: Verify source and isolate core workspace
         shell: bash
         run: |
           set -euo pipefail
-          cd compiler
-          echo '=== conversion callsites ==='
-          git grep -n -E '(to_legacy|from_legacy|project_legacy_compat_function|optimize_module)[[:space:]]*\(' -- 'crates/**/*.rs' || test "$?" = 1
-          echo '=== production only src callsites ==='
-          git grep -n -E '(to_legacy|from_legacy|project_legacy_compat_function|optimize_module)[[:space:]]*\(' -- 'crates/*/src/*.rs' || test "$?" = 1
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-legacy-module-feature-gate
+      - name: Production crate defaults strict Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir --lib --no-default-features -- -D warnings
+          cargo clippy -p compiler-opt --lib --no-default-features -- -D warnings
+          cargo clippy -p compiler-backend-x86 --lib --no-default-features -- -D warnings
+      - name: Explicit historical module adapter strict Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir --lib --no-default-features --features legacy-ssa-oracle -- -D warnings
+      - name: IR, optimizer and x86 native plus oracle regression tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --lib
+          cargo test -p compiler-ir --test typed_ssa_body
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test ct03_typed_alias_epoch_native
+          cargo test -p compiler-backend-x86 --lib
