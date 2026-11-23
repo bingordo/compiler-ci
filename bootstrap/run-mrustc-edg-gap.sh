@@ -511,7 +511,7 @@ from pathlib import Path
 import sys
 expected=Path(sys.argv[1]).read_bytes()
 observed=Path(sys.argv[2]).read_bytes()
-if expected!=b"STATIC_INTEGER_ADDRESS_PARITY_OK\\n" or expected!=observed:
+if expected!=b"STATIC_INTEGER_ADDRESS_PARITY_OK\n" or expected!=observed:
     raise SystemExit(1)
 PY
           word_parity_rc=$?
@@ -536,7 +536,7 @@ selected=[line for line in lines if any(
     needle in line for needle in ("error[E","error:","rejected source","panicked"))]
 for i,line in enumerate(selected[-8:],1):
     msg=re.sub(r"/workspace/[^ :]+","<public-path>",line.strip())
-    msg=re.sub(r"[^A-Za-z0-9 _./:><()\\[\\],=-]","?",msg)
+    msg=re.sub(r"[^A-Za-z0-9 _./:><()\[\],=-]","?",msg)
     print(f"EDG_C_LITERAL_WORD_DIAG_{i}={msg[:230]}")
 PY
     fi
