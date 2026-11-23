@@ -23,6 +23,9 @@ on:
         required: false
         default: false
         type: boolean
+  pull_request:
+    paths:
+      - '.github/workflows/verify-mini-c-differential.yml'
   schedule:
     - cron: '4,19,34,49 * * * *'
   push:
@@ -39,6 +42,7 @@ concurrency:
 
 jobs:
   differential:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -153,3 +157,60 @@ jobs:
             ${{ runner.temp }}/mini-c-failures/
           if-no-files-found: ignore
           retention-days: 14
+
+  mini-c-checked-abi:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out exact Mini-C frontend candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7eff4bf314788af2ce608669cd8776d580c717aa
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and enable public pinned Mini-C dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 7eff4bf314788af2ce608669cd8776d580c717aa
+          python3 - <<'PY'
+          from pathlib import Path
+          manifest=Path('compiler/tools/mini-c-driver/Cargo.toml')
+          text=manifest.read_text()
+          old='ssh://git@github.com/bingordo/mini-c.git'
+          assert text.count(old)==2
+          manifest.write_text(text.replace(old,'https://github.com/bingordo/mini-c.git'))
+          PY
+      - name: Cache frontend Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: source-checked-aggregate-abi-2824
+      - name: Compile and exercise source-checked aggregate ABI tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 20m cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --lib aggregate_abi::tests -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/mini-c-aggregate-abi.log"
+          grep -Eq 'test result: ok. [1-9][0-9]* passed' "$RUNNER_TEMP/mini-c-aggregate-abi.log"
+      - name: Verify existing scalar source lowering remains valid
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 8m cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --lib 2>&1 | tee "$RUNNER_TEMP/mini-c-lib-tests.log"
+          grep -Eq 'test result: ok. [1-9][0-9]* passed' "$RUNNER_TEMP/mini-c-lib-tests.log"
+      - name: Preserve diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mini-c-checked-abi-2824-errors
+          path: |
+            ${{ runner.temp }}/mini-c-aggregate-abi.log
+            ${{ runner.temp }}/mini-c-lib-tests.log
+          if-no-files-found: ignore
+          retention-days: 7
