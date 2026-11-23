@@ -1,0 +1,124 @@
+name: ASM3 P07 GNU multi-input GP source TypeId RA ELF GAS executable
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-asm3-p07-generic-multi-input-gnu.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 3fadbc940248dd8bb7a974b2898c89fc90e34c99
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - name: Assert exact source pin and allow pinned frontends
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = '3fadbc940248dd8bb7a974b2898c89fc90e34c99'
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: 357600562261a2689d1a49025826fe83d727bd2a
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: mini-c
+      - name: Check pinned Mini-C semantic fixture
+        working-directory: mini-c
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = '357600562261a2689d1a49025826fe83d727bd2a'
+          cargo test -p mini-c-sema --lib
+          cargo test -p mini-c-sema --lib asm3_p03_ -- --nocapture
+          cargo test -p mini-c-sema --lib asm3_p02b3_ -- --nocapture
+          cargo test -p mini-c-sema --lib asm3_p02c3_ -- --nocapture
+          cargo test -p mini-c-sema --lib asm3_p02d3_ -- --nocapture
+          cargo test -p mini-c-sema --lib asm3_p02f_ -- --nocapture
+          cargo test -p mini-c-sema --lib reviewed_memory_mov_source_matrix_and_negative_clobbers -- --nocapture
+          cargo clippy -p mini-c-sema --lib -- -D warnings
+      - name: Verify reviewed x86 form source and deterministic generators
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/regen_x86_scalar_bin_forms.py --check
+          python3 tools/regen_x86_gp_recipes.py --check
+          /usr/bin/time -f 'P02H shared generator/check wall=%e seconds RSS=%M KB' python3 tools/regen_x86_gp_memory_rmw_contract.py --check --mini-c-root ../mini-c
+          python3 tools/regen_x86_forms.py --check
+      - name: Prepare isolated shared compiler workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: asm3-p07-source-opaque
+      - name: Verify TypeId, all backend compilation and optimizer effects
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check --workspace
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test asm3_p07_multi_input_gnu_source_oracle -- --nocapture
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test asm3_p06_opaque_gnu_gp_source_oracle -- --nocapture
+          cargo test -p compiler-ir -p compiler-opt --lib
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-ir --test inline_asm_gp_mov_contract -- --nocapture
+          cargo test -p compiler-ir --lib asm3_p02b1_ -- --nocapture
+          cargo test -p compiler-ir --lib asm3_p02c2a_ -- --nocapture
+          cargo test -p compiler-ir --lib asm3_p02c2b_ -- --nocapture
+          cargo test -p compiler-ir --lib asm3_p02d2_ -- --nocapture
+          cargo test -p compiler-backend-x86 --lib asm3_p05_opaque_machine_ra -- --nocapture
+          cargo test -p compiler-backend-x86 --lib asm3_p02b1_ -- --nocapture
+          cargo test -p compiler-backend-x86 --lib asm3_p02c1_ -- --nocapture
+          cargo test -p compiler-backend-x86 --lib asm3_p02d1_ -- --nocapture
+          cargo test -p compiler-backend-x86 --lib asm3_p02d1b_ -- --nocapture
+          cargo test -p compiler-backend-x86 --lib asm3_p02e1_ -- --nocapture
+          cargo test -p compiler-backend-x86 --lib asm3_p02f1_ -- --nocapture
+          cargo test -p compiler-backend-x86 --test att_fill_bytes -- --nocapture
+          cargo clippy -p compiler-ir -p compiler-backend -p compiler-backend-x86 --lib -- -D warnings -A clippy::while_let_loop -A dead_code -A unused_variables -A clippy::empty_line_after_doc_comments -A unused_imports -A clippy::needless_lifetimes -A clippy::collapsible_match
+      - name: Run real checked-source to native GCC/GAS/ELF differential
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test asm3_p03_opaque_source_boundary -- --nocapture
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test asm3_p02b2_effectful_typeid -- --nocapture
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test asm3_p02b3_checked_memory_source -- --nocapture
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test asm3_p02c2b_effectful_typeid_write -- --nocapture
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test asm3_p02c3_checked_source_memory_output -- --nocapture
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test asm3_p02d2_effectful_typeid_rmw -- --nocapture
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test asm3_p02d3_checked_source_memory_rmw -- --nocapture
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test asm3_p02e3_checked_source_sub_memory_rmw -- --nocapture
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test asm3_p02f2_checked_source_noncarry_gp_rmw -- --nocapture
+      - name: Restore workspace and authenticate full compiler driver
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          git restore Cargo.toml
+          rm -f Cargo.lock
+          git config --global --unset-all 'url.https://github.com/.insteadOf' || true
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub SSH host
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - name: Check production compiler driver
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler
+          echo 'ASM3 P07=PASS; real C source opaque TypeId GP SSA, allocator, GAS/ELF and executable GCC' >> "$GITHUB_STEP_SUMMARY"
