@@ -1,0 +1,56 @@
+name: x86 latency reviewed operand validator reuse
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-x86-latency-operands.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  operand-source-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout immutable compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 0a058d5062adff571ff36b10f7386ab3d822343d
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact source commit
+        run: test "$(git -C compiler rev-parse HEAD)" = "0a058d5062adff571ff36b10f7386ab3d822343d"
+      - name: Test all reviewed operand mutations and synthetic complete import
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/tools"
+          python3 -m unittest discover -s tools -p test_x86_latency_sources.py -v
+          python3 -m unittest discover -s tools -p test_x86_operand_latencies.py -v
+          python3 -m unittest discover -s tools -p test_x86_memory_operand_latencies.py -v
+          python3 -m unittest discover -s tools -p test_import_uops_info.py -v
+      - name: Verify production compiled output bytes and exact-vs-upper-bound classification
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/tools"
+          python3 -m py_compile tools/x86_latency_sources.py tools/regen_x86_operand_latencies.py tools/regen_x86_memory_operand_latencies.py
+          python3 - <<'PY'
+          import json
+          from regen_x86_operand_latencies import DATA as RD, RUST as RR, render_rust as reg_render, payload
+          from regen_x86_memory_operand_latencies import DATA as MD, RUST as MR, render_rust as mem_render, canonical
+          reg = json.loads(RD.read_text())
+          mem = json.loads(MD.read_text())
+          assert RD.read_text() == payload(reg)
+          assert RR.read_text() == reg_render(reg)
+          assert MD.read_text() == canonical(mem)
+          assert MR.read_text() == mem_render(mem)
+          for cpu in ("SKL", "ZEN4"):
+              for item in reg["profiles"][cpu].values():
+                  assert all("cycles" in row and "data_cycles_upper_bound" not in row for row in item["edges"])
+              for item in mem["profiles"][cpu].values():
+                  assert item["memory_paths"]
+                  assert all("data_cycles_upper_bound" in row and "cycles" not in row for row in item["memory_paths"])
+                  assert all("data_cycles_upper_bound" not in row for row in item["exact_paths"])
+          print("REVIEWED_X86_OPERAND_LATENCY_BYTE_PARITY_OK")
+          PY
