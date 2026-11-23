@@ -1,0 +1,52 @@
+# Validate production TypeId verifier-boundary accounting without legacy fixtures.
+name: IR PR2840 CT03 native TypeId verifier counts
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ir-pr2840-ct03-typeid-verifier-counts-20261122.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  ct03-typeid-boundaries:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      SOURCE_SHA: b39c8822758d74323b64847daa0ef441d5860fd6
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Check out exact private compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and isolate core workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Cache CT03 Rust compilation
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-pr2840-ct03-typeid-verifier-counts
+      - name: Run all CT03 feature-gated legacy and native TypeId boundary tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib --features verify-counts ct03_verify_counts -- --nocapture --test-threads=1
+      - name: Clippy feature-gated verifier-boundary tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --lib --features verify-counts -- -D clippy::all -A clippy::collapsible_match -A clippy::empty_line_after_doc_comments
