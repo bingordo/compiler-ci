@@ -235,6 +235,45 @@ PY
   fi
 fi
 
+# Reproduce the source-owned weak routine-address shape using only
+# public GNU C11: 40, 48 and 64-byte designated word arrays. Keep the
+# independently GCC-produced ELF relocation/binding oracle separate from
+# the EDG source-image verification. Never print private generated C.
+if [[ "${EDG_WEAK_PUBLIC_C11_ORACLE:-0}" == "1" ]]; then
+  weak_public=/workspace/edgcpp-rust/tests/fixtures/bootstrap_weak_routine_word_arrays.c
+  test -s "$weak_public"
+  set +e
+  timeout --signal=TERM --kill-after=3s 30s gcc -std=gnu11 -O2 \
+    -Wall -Wextra -Werror -c "$weak_public" -o /audit-tmp/weak-word-gcc.o
+  weak_gcc_rc=$?
+  if ((weak_gcc_rc == 0)); then
+    relocs=$(readelf -rW /audit-tmp/weak-word-gcc.o |
+      grep -cE 'R_X86_64_64.*bootstrap_weak_word_target' || true)
+    weak_bindings=$(readelf -Ws /audit-tmp/weak-word-gcc.o |
+      awk '$4=="OBJECT" && $5=="WEAK" && $8 ~ /^bootstrap_weak_word[568]$/ {count++} END {print count+0}')
+    if [[ "$relocs" != 3 || "$weak_bindings" != 3 ]]; then
+      weak_gcc_rc=1
+    fi
+  fi
+  (
+    cd /workspace/edgcpp/build/gcc-release
+    timeout --signal=TERM --kill-after=10s 8m cargo run --quiet \
+      --manifest-path /workspace/edgcpp-rust/Cargo.toml \
+      --example audit_weak_routine_word_arrays -- --gcc --c11 \
+      --no_strict_gnu --gnu_version "$gnu_number" "${include_args[@]}" "$weak_public"
+  ) > /audit-tmp/edg-public-weak-word.log 2>&1
+  weak_bridge_rc=$?
+  set -e
+  echo "EDG_C_WEAK_WORD_GCC_EXIT=$weak_gcc_rc"
+  echo "EDG_C_WEAK_WORD_BRIDGE_EXIT=$weak_bridge_rc"
+  if ((weak_bridge_rc != 0)); then
+    # This log is produced only from the committed public C11 fixture.
+    grep -E '(^error|error\[E|panicked|EDG_WEAK_ROUTINE|weak union)' \
+      /audit-tmp/edg-public-weak-word.log | tail -n 9 |
+      sed -E 's@/workspace/[^ :]+@<public-fixture>@g' || true
+  fi
+fi
+
 # Source-pinned TypeId consumer compile check, deliberately separate from
 # production compiler checkout. The candidate shares the same checked EDG
 # dependency as the public producer. No source from the private mrustc TU is
