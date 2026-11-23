@@ -573,7 +573,7 @@ for line in Path(sys.argv[1]).read_text().splitlines():
     elif "R_X86_64_64" in line and (
         section.startswith(".rela.data") or section.startswith(".rela.rodata")):
         count+=1
-        if re.search(r"\\bbootstrap_routine_target\\b",line):symbol_ok+=1
+        if re.search(r"\bbootstrap_routine_target\b",line):symbol_ok+=1
 print(count)
 PY
 )
@@ -587,7 +587,7 @@ for line in Path(sys.argv[1]).read_text().splitlines():
     if match:section=match.group(1)
     elif "R_X86_64_64" in line and (
         section.startswith(".rela.data") or section.startswith(".rela.rodata")) and (
-        re.search(r"\\bbootstrap_routine_target\\b",line)):
+        re.search(r"\bbootstrap_routine_target\b",line)):
         count+=1
 print(count)
 PY
@@ -624,7 +624,7 @@ from pathlib import Path
 import sys
 expected=Path(sys.argv[1]).read_bytes()
 observed=Path(sys.argv[2]).read_bytes()
-if expected!=b"STATIC_ROUTINE_ADDRESS_PARITY_OK\\n" or observed!=expected:
+if expected!=b"STATIC_ROUTINE_ADDRESS_PARITY_OK\n" or observed!=expected:
     raise SystemExit(1)
 PY
           routine_parity_rc=$?
