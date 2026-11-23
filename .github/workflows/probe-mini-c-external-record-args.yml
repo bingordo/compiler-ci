@@ -1,0 +1,61 @@
+name: Mini-C executable external struct arguments probe
+on:
+  push:
+    branches:
+      - ci/mini-c-external-aggregate-args-20261122
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 06fbd39e084218aa32daf574f7aa13d24207e7c4
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm source and public pin
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 06fbd39e084218aa32daf574f7aa13d24207e7c4
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("compiler/tools/mini-c-driver/Cargo.toml")
+          x=p.read_text()
+          assert x.count("ssh://git@github.com/bingordo/mini-c.git")==2
+          p.write_text(x.replace("ssh://git@github.com/bingordo/mini-c.git","https://github.com/bingordo/mini-c.git"))
+          PY
+      - name: Focused checked aggregate ABI and full Mini-C library tests
+        run: |
+          set -euo pipefail
+          timeout 20m cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib aggregate_call::tests
+          timeout 8m cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib
+      - name: Build TypeId C driver for executable GCC ABI comparison
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+          cat > "$RUNNER_TEMP/our.c" <<'EOF'
+          struct Pair { long a; long b; };
+          extern long sum_pair(struct Pair p);
+          long wrapper(long a,long b) {
+              struct Pair p={a,b};
+              return sum_pair(p);
+          }
+          EOF
+          cat > "$RUNNER_TEMP/gcc.c" <<'EOF'
+          typedef struct {long a; long b;} Pair;
+          long sum_pair(Pair p) {return p.a*3+p.b*5;}
+          extern long wrapper(long,long);
+          int main(void) {
+              for(long a=-7;a<=7;a++)
+                  for(long b=-9;b<=9;b++)
+                      if(wrapper(a,b)!=a*3+b*5) return 1;
+              return 0;
+          }
+          EOF
+          compiler/tools/mini-c-driver/target/debug/compiler-mini-c "$RUNNER_TEMP/our.c" --emit obj -o "$RUNNER_TEMP/our.o"
+          gcc -std=c11 -O2 -Wall -Wextra -Werror "$RUNNER_TEMP/gcc.c" "$RUNNER_TEMP/our.o" -o "$RUNNER_TEMP/test"
+          "$RUNNER_TEMP/test"
