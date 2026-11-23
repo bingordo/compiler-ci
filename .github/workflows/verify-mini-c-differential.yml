@@ -23,6 +23,9 @@ on:
         required: false
         default: false
         type: boolean
+  pull_request:
+    paths:
+      - '.github/workflows/verify-mini-c-differential.yml'
   schedule:
     - cron: '4,19,34,49 * * * *'
   push:
@@ -39,6 +42,7 @@ concurrency:
 
 jobs:
   differential:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -153,3 +157,51 @@ jobs:
             ${{ runner.temp }}/mini-c-failures/
           if-no-files-found: ignore
           retention-days: 14
+
+  machine-multiresult:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out exact multiresult compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 61476158fe7463b83b121042328d68e98faf926e
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Isolate shared machine-SSA and allocator crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 61476158fe7463b83b121042328d68e98faf926e
+          mkdir -p "$RUNNER_TEMP/multiresult/crates"
+          for crate in ir backend; do
+            cp -a "compiler/crates/$crate" "$RUNNER_TEMP/multiresult/crates/$crate"
+          done
+          cat > "$RUNNER_TEMP/multiresult/Cargo.toml" <<'TOML'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend"]
+          TOML
+      - name: Test complete shared machine allocator suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 10m cargo test --manifest-path "$RUNNER_TEMP/multiresult/Cargo.toml" \
+            -p compiler-backend --lib 2>&1 | tee "$RUNNER_TEMP/multiresult-tests.log"
+          grep -Eq 'test result: ok. [1-9][0-9]* passed' "$RUNNER_TEMP/multiresult-tests.log"
+      - name: Strict shared allocator lint
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 5m cargo clippy --manifest-path "$RUNNER_TEMP/multiresult/Cargo.toml" \
+            -p compiler-backend --lib -- -D warnings
+      - name: Preserve diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: machine-multiresult-2804-diagnostics
+          path: ${{ runner.temp }}/multiresult-tests.log
+          if-no-files-found: ignore
