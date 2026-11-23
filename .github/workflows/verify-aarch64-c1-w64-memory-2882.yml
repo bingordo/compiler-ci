@@ -1,0 +1,128 @@
+name: C1 AArch64 W64 and memory source GCC differential
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-aarch64-c1-w64-memory-2882.yml'
+permissions:
+  contents: read
+jobs:
+  deterministic-source-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 020ba668b9294259e2858df519cf3f5436e0f841
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler source and Python generator syntax
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "020ba668b9294259e2858df519cf3f5436e0f841"
+          python3 -m py_compile compiler/tools/aarch64_c1_source_oracle.py compiler/tools/tests/test_aarch64_c1_source_oracle.py
+      - name: Deterministic seeded source and negative report mutation suite
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s compiler/tools/tests \
+            -p test_aarch64_c1_source_oracle.py -v
+  actual-native-aarch64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 020ba668b9294259e2858df519cf3f5436e0f841
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Record exact source and configure public frontend Git dependency
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          test "$(git -C compiler rev-parse HEAD)" = "020ba668b9294259e2858df519cf3f5436e0f841"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+          gcc --version | head -n 1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: c1-aarch64-real-source-oracle-v2
+      - name: Compile production checked source driver and verify report CLI
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo build --release -p compiler --bin compiler
+          cargo test -p compiler --test aarch64_selector_report_cli -- --nocapture
+      - name: "Preserve original W32 native GCC baseline"
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          python3 compiler/tools/aarch64_c1_source_oracle.py \
+            --compiler compiler/target/release/compiler \
+            --output results/w32-seed7 --seed 7 --functions 8 --samples 128 \
+            --execute-native
+      - name: "Real AAPCS64 X64 arithmetic with GCC C11 at non-PIC and PIC"
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/aarch64_c1_source_oracle.py \
+            --compiler compiler/target/release/compiler \
+            --output results/w64-seed17 --seed 17 --family w64 \
+            --functions 16 --samples 256 --execute-native
+          python3 compiler/tools/aarch64_c1_source_oracle.py \
+            --compiler compiler/target/release/compiler \
+            --output results/w64-pic-seed73 --seed 73 --family w64 \
+            --functions 16 --samples 256 --pic --execute-native
+      - name: "Real AArch64 pointer-indexed loads and observable stores with GCC"
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/aarch64_c1_source_oracle.py \
+            --compiler compiler/target/release/compiler \
+            --output results/mem-seed29 --seed 29 --family memory \
+            --functions 16 --samples 128 --execute-native
+          python3 compiler/tools/aarch64_c1_source_oracle.py \
+            --compiler compiler/target/release/compiler \
+            --output results/mem-pic-seed131 --seed 131 --family memory \
+            --functions 16 --samples 128 --pic --execute-native
+      - name: "Verify all AArch64 GCC execution and physical output receipts"
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          rows=[json.loads(p.read_text()) for p in sorted(Path("results").glob("*/summary.json"))]
+          assert len(rows)==5,rows
+          families={f:[x for x in rows if x["family"]==f] for f in ("w32","w64","memory")}
+          assert [len(families[x]) for x in ("w32","w64","memory")]==[1,2,2]
+          assert sorted(r["pic"] for r in families["w64"])==[False,True]
+          assert sorted(r["pic"] for r in families["memory"])==[False,True]
+          assert sum(r["functions"] for r in rows)==72
+          assert all(r["native_executed"] and r["object_parity"] for r in rows)
+          assert all(r["coverage"]["handwritten"]==0 for r in rows)
+          assert all(r["coverage"]["scalar"]==r["coverage"]["generated"] for r in rows)
+          assert all(r["coverage"]["text_bytes"]>0 for r in rows)
+          assert len({r["source_sha256"] for r in rows})==5
+          print("A64_C1_W64_MEMORY_GCC",json.dumps({
+              "families":{k:len(v) for k,v in families.items()},
+              "functions":sum(r["functions"] for r in rows),
+              "samples":sum(r["functions"]*r["samples_per_function"] for r in rows),
+              "scalar_rules":sum(r["coverage"]["generated"] for r in rows),
+              "terminators":sum(r["coverage"]["terminators"] for r in rows),
+              "code_bytes":sum(r["coverage"]["text_bytes"] for r in rows),
+              "gcc_native_execution_equal":True,"report_elf_parity":True,
+          },sort_keys=True),flush=True)
+          PY
+          echo 'W32/W64/memory real source execution parity with independent GCC and byte-identical A64 ELF verified on source 020ba668b9294259e2858df519cf3f5436e0f841' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: aarch64-c1-seeded-source-oracle-reproducers
+          path: results/
+          if-no-files-found: ignore
+          retention-days: 21
