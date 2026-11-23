@@ -161,7 +161,29 @@ if [[ "${EDG_LITERAL_REGRESSION:-0}" == "1" ]]; then
     timeout --signal=TERM --kill-after=10s 5m cargo test --quiet       --manifest-path /workspace/edgcpp-rust/Cargo.toml --lib       bootstrap_literal_global_wire_tests
   ) > /audit-tmp/edg-static-literal-wire.log 2>&1
   wire_rc=$?
+  (
+    cd /workspace/edgcpp/build/gcc-release
+    timeout --signal=TERM --kill-after=10s 5m cargo test --quiet \
+      --manifest-path /workspace/edgcpp-rust/Cargo.toml --lib \
+      bootstrap_static_routine_relocation_wire_tests
+  ) > /audit-tmp/edg-static-routine-wire.log 2>&1
+  routine_wire_rc=$?
   set -e
+  echo "EDG_C_LITERAL_ROUTINE_WIRE_EXIT=$routine_wire_rc"
+  if (( routine_wire_rc != 0 )); then
+    # Original in-repo public wire records only, not private mrustc.
+    python3 - /audit-tmp/edg-static-routine-wire.log <<'PY'
+from pathlib import Path
+import re,sys
+lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
+selected=[v for v in lines if any(n in v for n in
+          ("error[E","error:","panicked at","FAILED","test result:"))]
+for i,line in enumerate(selected[-10:],1):
+    value=re.sub(r"/workspace/[^ :]+","<public-path>",line.strip())
+    value=re.sub(r"[^A-Za-z0-9 _./:><()\\[\\],=-]","?",value)
+    print(f"EDG_C_LITERAL_ROUTINE_WIRE_DIAG_{i}={value[:200]}")
+PY
+  fi
   echo "EDG_C_LITERAL_GCC_EXIT=$gcc_rc"
   echo "EDG_C_LITERAL_BRIDGE_EXIT=$bridge_rc"
   echo "EDG_C_LITERAL_WIRE_EXIT=$wire_rc"
@@ -199,7 +221,7 @@ fi
 # dependency as the public producer. No source from the private mrustc TU is
 # supplied to this check.
 if [[ "${EDG_LITERAL_REGRESSION:-0}" == "1" ]]; then
-  candidate_sha=83ab252e7f3d526f1de1a1f012d1dcce90e55ab3
+  candidate_sha=011bcc925accc27743022a8fd4c82a77ced5d7df
   test "$(git -c safe.directory=/workspace/compiler-literal-source -C /workspace/compiler-literal-source rev-parse HEAD)" = "$candidate_sha"
   # Actions checkout is mounted read-only. Make a disposable compilation
   # copy in the private runner temp so Cargo can update its local lockfile.
