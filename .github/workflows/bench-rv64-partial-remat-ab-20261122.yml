@@ -49,6 +49,14 @@ jobs:
           echo "Candidate: c1f89639e5e776d81bb4e4947b4431a6ec9cae5c" >> "$GITHUB_STEP_SUMMARY"
           echo "Fixture files and backend emitter: byte-identical" >> "$GITHUB_STEP_SUMMARY"
       - uses: dtolnay/rust-toolchain@stable
+      - name: Overlay byte-identical high-pressure TypeId workload on both commits
+        run: |
+          set -euo pipefail
+          python3 harness/tools/rv64_partial_pressure_overlay.py old new
+          cmp old/crates/backend-riscv64/tests/fixtures/mod.rs \
+              new/crates/backend-riscv64/tests/fixtures/mod.rs
+          cmp old/crates/backend-riscv64/examples/rv64_leaf.rs \
+              new/crates/backend-riscv64/examples/rv64_leaf.rs
       - name: Build same source-owned TypeId examples at both commits
         run: |
           set -euo pipefail
@@ -72,7 +80,7 @@ jobs:
             mkdir -p "benchmark-output/$mode"
             for kind in addi_phi addi_shared slti32_neg sltiu32_neg \
                         bitwise_shared spillsum pressure16 pressure48 \
-                        spillbranch branch same; do
+                        spillbranch branch same partial16 partial32; do
               "$mode/target/release/examples/rv64_leaf" \
                 "benchmark-output/$mode/$kind.o" \
                 "benchmark-output/$mode/$kind.s" "$kind" --isa=rv64i
@@ -126,6 +134,40 @@ jobs:
               "benchmark-output/$mode/addi_phi.o" \
               -o "benchmark-output/$mode/addi_phi_bench.elf"
             timeout 20s qemu-riscv64 "benchmark-output/$mode/addi_phi_bench.elf"
+          cat > benchmark-output/rv64_partial_pressure_start.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            li s0, 20000
+            li s1, 0
+          loop:
+            li a0, -31
+            call rv64_partial_pressure_32
+            add s1, s1, a0
+            addi s0, s0, -1
+            bnez s0, loop
+            li t0, 21120000
+            bne s1, t0, bad
+            li a0, 0
+            j done
+          bad:
+            li a0, 61
+          done:
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+            benchmark-output/rv64_partial_pressure_start.s \
+            -o benchmark-output/rv64_partial_pressure_start.o
+          for mode in old new; do
+            riscv64-linux-gnu-ld -static -m elf64lriscv --no-relax -e _start \
+              benchmark-output/rv64_partial_pressure_start.o \
+              "benchmark-output/$mode/partial32.o" \
+              -o "benchmark-output/$mode/partial32_bench.elf"
+            timeout 20s qemu-riscv64 "benchmark-output/$mode/partial32_bench.elf"
+          done
           done
       - name: Record exact code metrics and ABBA QEMU-host time
         run: |
