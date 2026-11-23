@@ -651,12 +651,12 @@ PY
       fi
     fi
     set -e
-    echo "EDG_C_LITERAL_ROUTINE_ELF_EXIT=$routine_native_rc"
-    echo "EDG_C_LITERAL_ROUTINE_DATA_RELOCATIONS=$routine_reloc_count"
-    echo "EDG_C_LITERAL_ROUTINE_GCC_EXIT=$routine_gcc_rc"
-    echo "EDG_C_LITERAL_ROUTINE_LINK_EXIT=$routine_native_link_rc"
-    echo "EDG_C_LITERAL_ROUTINE_RUN_EXIT=$routine_native_run_rc"
-    echo "EDG_C_LITERAL_ROUTINE_PARITY_EXIT=$routine_parity_rc"
+    echo "EDG_C_ROUTINE_ELF_EXIT=$routine_native_rc"
+    echo "EDG_C_ROUTINE_DATA_RELOCATIONS=$routine_reloc_count"
+    echo "EDG_C_ROUTINE_GCC_EXIT=$routine_gcc_rc"
+    echo "EDG_C_ROUTINE_LINK_EXIT=$routine_native_link_rc"
+    echo "EDG_C_ROUTINE_RUN_EXIT=$routine_native_run_rc"
+    echo "EDG_C_ROUTINE_PARITY_EXIT=$routine_parity_rc"
     if (( routine_native_rc != 0 || routine_gcc_rc != 0 ||
           routine_native_link_rc != 0 || routine_native_run_rc != 0 ||
           routine_parity_rc != 0 )); then
@@ -669,7 +669,7 @@ selected=[line for line in lines if any(
 for i,line in enumerate(selected[-8:],1):
     msg=re.sub(r"/workspace/[^ :]+","<public-path>",line.strip())
     msg=re.sub(r"[^A-Za-z0-9 _./:><()\[\],=-]","?",msg)
-    print(f"EDG_C_LITERAL_ROUTINE_DIAG_{i}={msg[:230]}")
+    print(f"EDG_C_ROUTINE_DIAG_{i}={msg[:230]}")
 PY
     fi
   else
