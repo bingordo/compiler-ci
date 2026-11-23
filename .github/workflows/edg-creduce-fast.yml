@@ -847,6 +847,58 @@ jobs:
             echo "EDG_C_WEAK_TYPEID_${label}_EXIT=0" >> "$GITHUB_STEP_SUMMARY"
           done
 
+      - name: Require numeric real-C owner and data-target census reconciliation
+        if: always() && steps.translate.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/mrustc-edg-audit.log" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          from pathlib import Path
+          import re,sys
+          lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
+          def find_one(prefix):
+              matches=[line for line in lines if line.startswith(prefix+" ")]
+              if len(matches)!=1: raise SystemExit("missing or repeated numeric census")
+              result={}
+              for token in matches[0][len(prefix)+1:].split():
+                  match=re.fullmatch(r"([a-z_]+)=([0-9]{1,10})",token)
+                  if not match: raise SystemExit("invalid census schema")
+                  name,value=match.groups()
+                  if name in result: raise SystemExit("duplicate census key")
+                  result[name]=int(value)
+              return result
+          owner=find_one("EDG_PROBE_STATIC_OWNERS")
+          source=find_one("EDG_PROBE_GLOBALS")
+          kinds=find_one("EDG_PROBE_STATIC_KIND_GROUPS")
+          targets=find_one("EDG_PROBE_DATA_TARGET_GROUPS")
+          if set(kinds)!={"total","reported","owners"} or \
+             set(targets)!={"total","reported","relocations"}:
+              raise SystemExit("unexpected census group schema")
+          if kinds["owners"]!=owner["definitions"] or \
+             kinds["reported"]!=min(16,kinds["total"]) or \
+             targets["relocations"]!=source["relocations"] or \
+             targets["reported"]!=min(16,targets["total"]):
+              raise SystemExit("numeric source census totals disagree")
+          def check_rows(prefix,expected):
+              rows=[line for line in lines if line.startswith(prefix+" ")]
+              if len(rows)!=expected: raise SystemExit("numeric census truncated")
+              counts=[]
+              for line in rows:
+                  match=re.search(r"(?:^| )count=([0-9]{1,10})$",line)
+                  if match is None:raise SystemExit("missing numeric row count")
+                  counts.append(int(match.group(1)))
+              return sum(counts)
+          owner_sum=check_rows("EDG_PROBE_STATIC_KIND",kinds["reported"])
+          target_sum=check_rows("EDG_PROBE_DATA_TARGET",targets["reported"])
+          if (kinds["reported"]==kinds["total"] and
+              owner_sum!=owner["definitions"]) or \
+             (targets["reported"]==targets["total"] and
+              target_sum!=source["relocations"]):
+              raise SystemExit("numeric census rows do not cover source owners")
+          print("EDG_C_STATIC_OWNER_CENSUS_MATCH=1")
+          print("EDG_C_DATA_TARGET_CENSUS_MATCH=1")
+          PY
+
       - name: Restore host C-Reduce binary package cache
         if: always() && steps.translate.outcome == 'success' && (github.event_name == 'workflow_dispatch' && inputs.edg_creduce)
         id: host-creduce-cache
