@@ -1,0 +1,47 @@
+name: Native TypeId atomic signal fence shared-machine acceptance
+on:
+  push:
+    branches: [ci/atomic-signal-fence-shared-machine-20261122]
+    paths: ['.github/workflows/atomic-signal-fence-shared-machine-20261122.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  atomic-signal-fence:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c14d145c0bd3a82a212c7f5ca4076a27e1955f5d
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Verify exact source and restrict to public core crates
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = c14d145c0bd3a82a212c7f5ca4076a27e1955f5d
+          printf '[workspace]\nresolver = "2"\nmembers = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]\n' > compiler/Cargo.toml
+          rm -f compiler/Cargo.lock
+      - name: Compile common IR, allocator and x86 encoder
+        working-directory: compiler
+        run: cargo check --workspace
+      - name: Verify thread/signal fence differentiation and ELF/GAS parity
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend-x86 --lib atomic_typeid_shared_machine_tests -- --nocapture
+          cargo test -p compiler-backend-x86 --lib shared_machine_thread_fence_emits_real_mfence_in_gas_and_elf -- --nocapture
+          cargo test -p compiler-backend-x86 --lib shared_physical_atomic_thread_fence_emits_mfence_in_elf_and_gas -- --nocapture
+      - name: Verify native atomic widths and GCC execution
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --lib atomic_load_store_native_basic_tests -- --nocapture
+      - name: Strict core and x86 clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-ir -p compiler-backend -p compiler-backend-x86 --lib -- -D warnings
