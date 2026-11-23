@@ -1,0 +1,135 @@
+name: RV64 R25 target-verified LP64 Mini-C CPP with GNU GCC QEMU
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, 'ci/riscv-r25-target-aware-minic-cpp-20261122']
+    paths: ['.github/workflows/verify-riscv-r25-target-aware-minic-cpp-20261122.yml']
+permissions:
+  contents: read
+jobs:
+  rv64-source-external-calls:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Permit pinned private frontend checkout
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub SSH host
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - name: Checkout exact R25 source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 577ef0ff8888ddf7b4effc7bc6ab90fbde6c96c2
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Fail if compiler source SHA mismatches pin
+        run: test "$(git -C compiler rev-parse HEAD)" = 577ef0ff8888ddf7b4effc7bc6ab90fbde6c96c2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install independent RISC-V C compiler, GNU binutils and QEMU
+        run: |
+          sudo env DEBIAN_FRONTEND=noninteractive timeout 600s apt-get install -y \
+            --no-install-recommends gcc-riscv64-linux-gnu \
+            binutils-riscv64-linux-gnu qemu-user
+      - name: Check exact source driver, backend and reused oracle
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools/tests -p test_riscv_route_matrix_oracle.py -v
+          python3 -m unittest discover -s tools/tests -p test_riscv_route_seeded_oracle.py -v
+          cargo test -p compiler --test riscv64_source_preview
+          cargo test -p compiler --test riscv64_load_ir
+          cargo test -p compiler-backend-riscv64 --lib --tests
+          cargo clippy -p compiler-backend-riscv64 --tests -- -D warnings
+          # Other backend workstreams can change driver Clippy linting.
+          cargo check -p compiler --bin compiler
+          cargo build -q -p compiler --bin compiler
+      - name: R25 real RV64 cross-preprocessed Mini-C wrappers call independent GNU C
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          root=/tmp/rv64-r25-cross-cpp
+          python3 tools/riscv_route_matrix_oracle.py --output "$root" \
+            --seed 20261121 --vectors 24 --max-cases 24 --cpp-wrappers
+          python3 tools/riscv_route_matrix_oracle.py --output /tmp/rv64-r25-cross-cpp-replay \
+            --seed 20261121 --vectors 24 --max-cases 24 --cpp-wrappers
+          diff -qr "$root" /tmp/rv64-r25-cross-cpp-replay
+          python3 -c 'import json; m=json.load(open("/tmp/rv64-r25-cross-cpp/manifest.json")); assert len(m["cases"])==24 and m["vectors_per_case"]==24 and m["coverage"]["incoming_arities"]==[0,1,2,3,4,7,8,9,12,13,15,16]'
+          test -f "$root/r25_headers/r25_types.h"
+          riscv64-linux-gnu-gcc -march=rv64i -mabi=lp64 -ffreestanding -dM -E -x c /dev/null | grep -E '^#define __riscv_xlen 64$'
+          for index in $(seq 0 23); do
+            kind=route$index
+            # Target-correct CPP with local header, function-like macros
+            # and ordered -D/-U. Native and historical CLI must agree.
+            cpp=(-I "$root/r25_headers" -DR25_CLI_ENABLED=1
+                 -DR25_CLI_DISABLED=1 -UR25_CLI_DISABLED)
+            target/debug/compiler "$root/$kind"_cpp_driver.c \
+              --target riscv64 --riscv-isa rv64i \
+              "${cpp[@]}" --emit obj -o "$root/$kind.o"
+            target/debug/compiler "$root/$kind"_cpp_driver.c \
+              --target riscv64 --riscv-isa rv64i \
+              "${cpp[@]}" --emit asm -o "$root/$kind"_native.s
+            target/debug/compiler "$root/$kind"_cpp_driver.c \
+              --target riscv64 --riscv-source --riscv-isa rv64i \
+              "${cpp[@]}" --emit obj -o "$root/$kind"_compat.o
+            target/debug/compiler "$root/$kind"_cpp_driver.c \
+              --target riscv64 --riscv-source --riscv-isa rv64i \
+              "${cpp[@]}" --emit asm -o "$root/$kind"_compat.s
+            cmp "$root/$kind.o" "$root/$kind"_compat.o
+            cmp "$root/$kind"_native.s "$root/$kind"_compat.s
+            target/debug/compiler "$root/$kind"_driver.c \
+              --target riscv64 --riscv-isa rv64i \
+              --emit obj -o "$root/$kind"_plain.o
+            cmp "$root/$kind.o" "$root/$kind"_plain.o
+            grep -q "^rv64_$kind:" "$root/$kind"_native.s
+            grep -q 'R_RISCV_CALL_PLT' "$root/$kind"_native.s
+            riscv64-linux-gnu-readelf -A "$root/$kind.o" | \
+              grep -F 'Tag_RISCV_arch: "rv64i2p1"'
+            riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+              "$root/$kind"_native.s -o "$root/$kind"_gas.o
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "$root/$kind.o" "$root/$kind"_native.bin
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "$root/$kind"_gas.o "$root/$kind"_gas.bin
+            cmp "$root/$kind"_native.bin "$root/$kind"_gas.bin
+            riscv64-linux-gnu-gcc -march=rv64im -mabi=lp64 -O2 \
+              -ffreestanding -fno-builtin -fno-pie -fno-stack-protector \
+              -fwrapv -c "$root/$kind.c" -o "$root/$kind"_gcc.o
+            riscv64-linux-gnu-as -march=rv64im -mabi=lp64 \
+              "$root/$kind.s" -o "$root/$kind"_harness.o
+            riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax -e _start \
+              "$root/$kind"_harness.o "$root/$kind.o" "$root/$kind"_gcc.o \
+              -o "$root/$kind.elf"
+            set +e
+            timeout 20s qemu-riscv64 "$root/$kind.elf"
+            status=$?
+            set -e
+            if [ "$status" -ne 0 ]; then
+              echo "R25 cross-CPP external GCC LP64 mismatch $kind exit=$status" >&2
+              python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); n=int(sys.argv[3]); c=next(x for x in m["cases"] if x["case"]==sys.argv[2]); print("R25 failed mapping:",c["mapping"]); print("R25 vector:",c["vectors"][n-1] if 1<=n<=len(c["vectors"]) else "SP/s-registers/native code failure")' "$root/manifest.json" "$kind" "$status"
+              exit 1
+            fi
+            echo "$kind: 24 target-CPP Mini-C/GCC QEMU comparisons, plain and legacy source ELF parity"
+          done
+          echo "PASSED R25 24 cross-preprocessed RV64 source programs x 24 = 576 GCC/QEMU comparisons; CPP outputs same ELF/GAS as plain source"
+      - name: Upload source/ABI reproducers on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rv64-r25-cross-cpp-repro-${{ github.run_id }}
+          path: |
+            /tmp/rv64-r25-cross-cpp/manifest.json
+            /tmp/rv64-r25-cross-cpp/route*_driver.c
+            /tmp/rv64-r25-cross-cpp/route*_cpp_driver.c
+            /tmp/rv64-r25-cross-cpp/r25_headers/r25_types.h
+            /tmp/rv64-r25-cross-cpp/route*.c
+            /tmp/rv64-r25-cross-cpp/route*.s
+            /tmp/rv64-r25-cross-cpp/route*_native.s
+          if-no-files-found: warn
+          retention-days: 14
