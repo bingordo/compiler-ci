@@ -1,0 +1,212 @@
+name: Test experimental unoptimized TypeId source emission
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-typeid-no-source-opt.yml']
+permissions:
+  contents: read
+jobs:
+  native-main:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 22
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ac97126f5f14eb8964240100a02e0b8770f78352
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Install credentials for pinned private Oberon dependency
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Build main TypeId driver
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C compiler rev-parse HEAD
+          timeout --signal=TERM --kill-after=10s 14m cargo build -p compiler --bin compiler --manifest-path compiler/Cargo.toml
+          test -x compiler/target/debug/compiler
+      - name: Compare unoptimized native TypeId with GCC
+        shell: bash
+        run: |
+          set -euo pipefail
+          d="$(mktemp -d)"
+          trap 'rm -rf "$d"' EXIT
+          cat > "$d/fixture.c" <<'EOF'
+          int add(int a, int b) { return a+b; }
+          int main(void) {
+              int n=0;
+              for (int i=0;i<10;i=i+1) n=add(n,i);
+              return n == 45 ? 0 : 1;
+          }
+          EOF
+          gcc -std=c11 -O0 "$d/fixture.c" -o "$d/gcc"
+          "$d/gcc"
+          compiler/target/debug/compiler "$d/fixture.c" --language mini-c \
+            --target x86_64 --emit obj \
+            --experimental-no-source-opt -o "$d/fixture.o"
+          test -s "$d/fixture.o"
+          gcc "$d/fixture.o" -o "$d/native"
+          "$d/native"
+          echo 'NATIVE_NO_SOURCE_OPT_RUNTIME=PASS' >> "$GITHUB_STEP_SUMMARY"
+      - name: Differential native unoptimized source matrix and assembly parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          d="$(mktemp -d)"
+          trap 'rm -rf "$d"' EXIT
+          cat > "$d/branch.c" <<'EOF'
+          int calc(int x) {
+              if (x < 0) return -x;
+              return x * 2;
+          }
+          int main(void) { return calc(-3) == 3 && calc(4) == 8 ? 0 : 1; }
+          EOF
+          cat > "$d/pointers.c" <<'EOF'
+          int add_to(int *p) { *p = *p + 7; return *p; }
+          int main(void) { int value = 5; int answer = add_to(&value);
+              return value == 12 && answer == 12 ? 0 : 1; }
+          EOF
+          cat > "$d/globals.c" <<'EOF'
+          static int counter = 4;
+          int bump(void) { counter = counter + 1; return counter; }
+          int main(void) { int a = bump(); int b = bump();
+              return a == 5 && b == 6 ? 0 : 1; }
+          EOF
+          cat > "$d/divide.c" <<'EOF'
+          int quotient(int a, int b) { return a / b; }
+          int main(void) { return quotient(27, 4) == 6 ? 0 : 1; }
+          EOF
+          cat > "$d/loops.c" <<'EOF'
+          int main(void) { int x = 0; int i = 0;
+              while (i < 9) { x = x + i; i = i + 1; }
+              return x == 36 ? 0 : 1; }
+          EOF
+          for case in branch pointers globals divide loops; do
+              gcc -std=c11 -O0 "$d/$case.c" -o "$d/$case.gcc"
+              "$d/$case.gcc"
+              compiler/target/debug/compiler "$d/$case.c" \
+                --language mini-c --target x86_64 --emit obj \
+                --experimental-no-source-opt -o "$d/$case.o"
+              gcc "$d/$case.o" -o "$d/$case.native"
+              "$d/$case.native"
+              compiler/target/debug/compiler "$d/$case.c" \
+                --language mini-c --target x86_64 --emit asm \
+                --experimental-no-source-opt -o "$d/$case.s"
+              gcc "$d/$case.s" -o "$d/$case.asm"
+              "$d/$case.asm"
+          done
+          echo 'NATIVE_NO_SOURCE_OPT_5_CASES_OBJECT_ASSEMBLY=PASS' >> "$GITHUB_STEP_SUMMARY"
+      - name: Reject unsupported experimental mode combinations
+        shell: bash
+        run: |
+          set -euo pipefail
+          if compiler/target/debug/compiler --experimental-no-source-opt \
+            --target aarch64 --language mini-c --emit obj \
+            compiler/examples/hello.c -o "$RUNNER_TEMP/invalid.o"; then
+            echo 'unexpectedly accepted non-x86 unoptimized mode' >&2
+            exit 1
+          fi
+      - name: Reject source-optimizer flag on module fastpaths
+        shell: bash
+        run: |
+          set -euo pipefail
+          if compiler/target/debug/compiler \
+            --compose-modules --experimental-no-source-opt \
+            > "$RUNNER_TEMP/noopt-compose.log" 2>&1; then
+            echo 'module compose silently accepted noopt' >&2
+            exit 1
+          fi
+          grep -F 'cannot be used for module composition' \
+            "$RUNNER_TEMP/noopt-compose.log"
+      - name: Require native main TypeId CMake ABI probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          abi_source="$(find /usr/local/share /usr/share -path '*/Modules/CMakeCCompilerABI.c' -print -quit 2>/dev/null)"
+          if test -z "$abi_source"; then
+            echo 'CMake ABI probe source not found' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          modules="$(dirname "$abi_source")"
+          export COMPILER_NATIVE_DRIVER="$PWD/compiler/target/debug/compiler"
+          out="$RUNNER_TEMP/typeid-cmake-abi.o"
+          set +e
+          python3 compiler/tools/compiler-gcc.py -I"$modules" -c \
+            "$abi_source" -o "$out" >"$RUNNER_TEMP/typeid-cmake-abi.log" 2>&1
+          result="$?"
+          set -e
+          echo "Native main-driver CMakeCCompilerABI.c compile exit=$result" >> "$GITHUB_STEP_SUMMARY"
+          if test "$result" -ne 0; then
+            cat "$RUNNER_TEMP/typeid-cmake-abi.log"
+            echo 'CMake ABI source native compilation failed' >&2
+            exit 1
+          fi
+          strings "$out" | grep -F 'INFO:sizeof_dptr[08]'
+          strings "$out" | grep -F 'INFO:byte_order[LITTLE_ENDIAN]'
+          strings "$out" | grep -F 'INFO:abi[ELF]'
+          echo 'NATIVE_MAIN_CMAKE_ABI_OBJECT=PASS' >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload CMake ABI evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: main-typeid-cmake-abi-diagnostics
+          path: ${{ runner.temp }}/typeid-cmake-abi.log
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Main driver CMake compile-link and header rebuild
+        shell: bash
+        run: |
+          set -euo pipefail
+          d="$(mktemp -d)"
+          trap 'rm -rf "$d"' EXIT
+          mkdir -p "$d/p"
+          printf 'cmake_minimum_required(VERSION 3.20)\nproject(main_probe C)\nif(NOT CMAKE_C_COMPILER_ID STREQUAL "TypeId")\n  message(FATAL_ERROR "Expected truthful TypeId compiler identity, got: ${CMAKE_C_COMPILER_ID}")\nendif()\nadd_executable(probe main.c)\n' > "$d/p/CMakeLists.txt"
+          printf '#include "answer.h"\nint main(void) { return ANSWER == 42 ? 0 : 1; }\n' > "$d/p/main.c"
+          printf '#define ANSWER 42\n' > "$d/p/answer.h"
+          chmod +x compiler/tools/compiler-gcc.py
+          export COMPILER_NATIVE_DRIVER="$PWD/compiler/target/debug/compiler"
+          cmake -S "$d/p" -B "$d/b" -G Ninja \
+            -DCMAKE_C_COMPILER="$PWD/compiler/tools/compiler-gcc.py" \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/compiler/tools/cmake/typeid-gcc-adapter-toolchain.cmake"
+          cmake --build "$d/b"
+          "$d/b/probe"
+          object="$d/b/CMakeFiles/probe.dir/main.c.o"
+          before="$(stat -c %Y "$object")"
+          sleep 1
+          cmake --build "$d/b"
+          test "$(stat -c %Y "$object")" = "$before"
+          sleep 1
+          printf '#define ANSWER 43\n' > "$d/p/answer.h"
+          cmake --build "$d/b"
+          test "$(stat -c %Y "$object")" -gt "$before"
+          if "$d/b/probe"; then
+            echo 'header rebuild result incorrect'
+            exit 1
+          else
+            test "$?" -eq 1
+          fi
+          # Independently verify CMake's Unix Makefiles dependency path.
+          printf '#define ANSWER 42\n' > "$d/p/answer.h"
+          cmake -S "$d/p" -B "$d/make" -G 'Unix Makefiles' \
+            -DCMAKE_C_COMPILER="$PWD/compiler/tools/compiler-gcc.py" \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/compiler/tools/cmake/typeid-gcc-adapter-toolchain.cmake"
+          cmake --build "$d/make"
+          "$d/make/probe"
+          make_object="$d/make/CMakeFiles/probe.dir/main.c.o"
+          make_before="$(stat -c %Y "$make_object")"
+          sleep 1
+          cmake --build "$d/make"
+          test "$(stat -c %Y "$make_object")" = "$make_before"
+          sleep 1
+          printf '#define ANSWER 43\n' > "$d/p/answer.h"
+          cmake --build "$d/make"
+          test "$(stat -c %Y "$make_object")" -gt "$make_before"
+          if "$d/make/probe"; then
+            echo 'Makefiles header rebuild result incorrect'
+            exit 1
+          else
+            test "$?" -eq 1
+          fi
+          echo 'MAIN_DRIVER_NATIVE_CMAKE_TYPEID_ID_AND_ABI_NINJA_AND_MAKEFILES=PASS' >> "$GITHUB_STEP_SUMMARY"
