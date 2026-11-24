@@ -1,0 +1,56 @@
+name: Validate source TypeId dynamic memset through x86 REP STOSB
+on:
+  push:
+    branches: [ci-dynamic-typeid-memset-20261123]
+    paths: ['.github/workflows/ci-dynamic-typeid-memset-20261123.yml']
+  pull_request:
+    paths: ['.github/workflows/ci-dynamic-typeid-memset-20261123.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source-fill:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a05e1a474afb70beef51639459cfc0ef08d80baf
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Source commit identity
+        run: test "$(git -C compiler rev-parse HEAD)" = a05e1a474afb70beef51639459cfc0ef08d80baf
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: source-typeid-dynamic-memset
+      - name: Rustfmt new source and tests
+        working-directory: compiler
+        run: rustfmt --check --edition 2021 crates/ir/src/typed_memset_provenance.rs crates/ir/tests/unit/typed_memset_provenance.rs crates/driver/tests/native_lp64_dynamic_memset.rs
+      - name: Full workspace compile including all tests and target crates
+        working-directory: compiler
+        run: cargo check --workspace --all-targets
+      - name: GCC C11 native GAS/direct ELF executable dynamic memset oracle
+        working-directory: compiler
+        run: cargo test -p compiler --test native_lp64_dynamic_memset -- --nocapture
+      - name: Independent LP64 memset local bounds tests
+        working-directory: compiler
+        run: cargo test -p compiler-ir --lib typed_memset_provenance -- --nocapture
+      - name: Binary memory-op wire roundtrip
+        working-directory: compiler
+        run: cargo test -p compiler-ir --lib native_binary_v1 -- --nocapture
+      - name: Source-level overlapping memmove and memcpy regressions
+        working-directory: compiler
+        run: cargo test -p compiler --test native_lp64_disjoint_memmove -- --nocapture && cargo test -p compiler --test native_lp64_bounded_dynamic_memcpy -- --nocapture
+      - name: Mini-C checked local-memory regressions
+        working-directory: compiler
+        run: cargo test -p compiler-mini-c --lib checked_local_memcpy -- --nocapture
