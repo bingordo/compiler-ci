@@ -860,7 +860,9 @@ for path in map(Path,sys.argv[1:]):
     for line in path.read_text(errors="replace").splitlines():
         if any(k in line for k in ("error[E","error:","FAILED","panicked","test result:")):
             line=re.sub(r"/(?:workspace|audit-tmp)/[^ :]+","<public-fixture>",line)
-            line=re.sub(r"[^A-Za-z0-9 _./:><()\\[\\],=-]","?",line)
+            # Keep redacted punctuation in the diagnostic schema accepted by the
+            # workflow summary, so source-public Rust failures are visible.
+            line=re.sub(r"[^A-Za-z0-9 _./:><()\\[\\],=-]","_",line)
             messages.append(line.strip()[:180])
 for i,msg in enumerate(messages[-8:],1):
     print(f"EDG_C_BYTE_STATIC_DIAG_{i}={msg}")
