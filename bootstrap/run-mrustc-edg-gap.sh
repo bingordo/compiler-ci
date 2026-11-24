@@ -446,7 +446,8 @@ from pathlib import Path
 import re,sys
 lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
 errors=[line for line in lines if any(k in line for k in
-        ("error[E","error:","panicked","FAILED","test result:"))]
+        ("error[E","error:","panicked","FAILED","test result:",
+         "EDG_PUBLIC_C_BYTE_RETURN_REASON="))]
 for i,line in enumerate(errors[-8:],1):
     msg=re.sub(r"/(?:workspace|audit-tmp)/[^ :]+","public_fixture",line.strip())
     msg=re.sub(r"[^A-Za-z0-9 _.,=:/()><-]","_",msg)
@@ -1049,7 +1050,8 @@ messages=[]
 for path in map(Path,sys.argv[1:]):
     if not path.is_file():continue
     for line in path.read_text(errors="replace").splitlines():
-        if any(k in line for k in ("error[E","error:","FAILED","panicked","test result:")):
+        if any(k in line for k in ("error[E","error:","FAILED","panicked","test result:",
+            "EDG_PUBLIC_C_BYTE_RETURN_REASON=")):
             line=re.sub(r"/(?:workspace|audit-tmp)/[^ :]+","public_fixture",line.strip())
             line=re.sub(r"[^A-Za-z0-9 _.,=:/()><-]","_",line)
             messages.append(line[:180])
