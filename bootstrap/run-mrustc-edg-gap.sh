@@ -974,6 +974,90 @@ for i,msg in enumerate(messages[-8:],1):
 PY
     fi
   fi
+  # Original C11 signed/unsigned/_Bool AL return parity. The checked-in
+  # source object is built by the native TypeId backend and GCC separately;
+  # an independently compiled GCC harness checks actual function-call ABI
+  # and the source-owned nested byte-return calls. No private mrustc input.
+  if [[ "${EDG_C_BYTE_STATIC_ORACLE:-0}" == "1" ]]; then
+    result_source=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_c_byte_returns.c
+    result_harness=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_c_byte_returns_harness.c
+    test -s "$result_source" && test -s "$result_harness"
+    byte_result_unit_rc=${local_typedef_rc:-11}
+    byte_result_native_rc=11
+    byte_result_gcc_rc=11
+    byte_result_link_rc=11
+    byte_result_run_rc=11
+    byte_result_parity_rc=11
+    set +e
+    if (( byte_result_unit_rc == 0 )); then
+      (
+        cd /workspace/edgcpp/build/gcc-release
+        CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+          timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" run --quiet \
+          --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
+          -- /audit-tmp/edg-c-byte-result-typeid.o --gcc --c11 --no_strict_gnu \
+          --gnu_version "$gnu_number" "$result_source"
+      ) > /audit-tmp/edg-c-byte-result-native.log 2>&1
+      byte_result_native_rc=$?
+    fi
+    gcc -std=gnu11 -O0 -Wall -Wextra -Werror -c "$result_source" \
+      -o /audit-tmp/edg-c-byte-result-gcc.o
+    byte_result_gcc_rc=$?
+    if (( byte_result_native_rc == 0 && byte_result_gcc_rc == 0 )); then
+      for obj in /audit-tmp/edg-c-byte-result-typeid.o /audit-tmp/edg-c-byte-result-gcc.o; do
+        symbols=$(readelf -Ws "$obj" | awk '$4=="FUNC" && $5=="GLOBAL" &&
+          $8 ~ /^bootstrap_byte_(unsigned|signed|boolean|returns_main)$/ {n++}
+          END {print n+0}')
+        if [[ "$symbols" != 4 ]]; then
+          if [[ "$obj" == *typeid.o ]]; then byte_result_native_rc=12
+          else byte_result_gcc_rc=12; fi
+        fi
+      done
+    fi
+    if (( byte_result_native_rc == 0 && byte_result_gcc_rc == 0 )); then
+      gcc -std=gnu11 -O0 -fno-pie -no-pie \
+        /audit-tmp/edg-c-byte-result-gcc.o "$result_harness" \
+        -o /audit-tmp/edg-c-byte-result-gcc-exe &&
+      gcc -std=gnu11 -O0 -fno-pie -no-pie \
+        /audit-tmp/edg-c-byte-result-typeid.o "$result_harness" \
+        -o /audit-tmp/edg-c-byte-result-typeid-exe
+      byte_result_link_rc=$?
+      if (( byte_result_link_rc == 0 )); then
+        /audit-tmp/edg-c-byte-result-gcc-exe > /audit-tmp/edg-c-byte-result-gcc.out &&
+        /audit-tmp/edg-c-byte-result-typeid-exe > /audit-tmp/edg-c-byte-result-typeid.out
+        byte_result_run_rc=$?
+        if (( byte_result_run_rc == 0 )); then
+          cmp -s /audit-tmp/edg-c-byte-result-gcc.out \
+            /audit-tmp/edg-c-byte-result-typeid.out
+          byte_result_parity_rc=$?
+        fi
+      fi
+    fi
+    set -e
+    echo "EDG_C_BYTE_RESULT_UNIT_EXIT=$byte_result_unit_rc"
+    echo "EDG_C_BYTE_RESULT_ELF_EXIT=$byte_result_native_rc"
+    echo "EDG_C_BYTE_RESULT_GCC_EXIT=$byte_result_gcc_rc"
+    echo "EDG_C_BYTE_RESULT_LINK_EXIT=$byte_result_link_rc"
+    echo "EDG_C_BYTE_RESULT_RUN_EXIT=$byte_result_run_rc"
+    echo "EDG_C_BYTE_RESULT_PARITY_EXIT=$byte_result_parity_rc"
+    if (( byte_result_native_rc != 0 || byte_result_unit_rc != 0 )); then
+      python3 - /audit-tmp/edg-c-byte-result-native.log \
+        /audit-tmp/edg-c-local-typedef-unit.log <<'PY'
+from pathlib import Path
+import re,sys
+messages=[]
+for path in map(Path,sys.argv[1:]):
+    if not path.is_file():continue
+    for line in path.read_text(errors="replace").splitlines():
+        if any(k in line for k in ("error[E","error:","FAILED","panicked","test result:")):
+            line=re.sub(r"/(?:workspace|audit-tmp)/[^ :]+","public_fixture",line.strip())
+            line=re.sub(r"[^A-Za-z0-9 _.,=:/()><-]","_",line)
+            messages.append(line[:180])
+for i,message in enumerate(messages[-8:],1):
+    print(f"EDG_C_BYTE_RESULT_DIAG_{i}={message}")
+PY
+    fi
+  fi
   # Independently compiled original C11 initialized-struct oracle.
   # Reuse the existing source-owned byte-image/relocation writer; verify
   # both strong and weak C struct records, tentative BSS and routine/data
