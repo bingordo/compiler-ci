@@ -1,0 +1,52 @@
+# Isolated, source-pinned compiler-ir musttail proof tests; never compiler Actions.
+name: Musttail source ABI admission (#545)
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/issue545-musttail-admission.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  musttail-ir:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - name: Pin compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 84523c7d450437ee12f6f976ebdca80c285079e3
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = '84523c7d450437ee12f6f976ebdca80c285079e3'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build minimal IR workspace
+        run: |
+          mkdir -p work/crates
+          cp -a compiler/crates/ir work/crates/
+          cat > work/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: work
+          key: issue545-musttail-ir
+      - name: Strict native IR compile
+        working-directory: work
+        run: RUSTFLAGS="-D warnings" cargo check -p compiler-ir --all-targets
+      - name: Musttail positive and negative ABI proofs
+        working-directory: work
+        run: cargo test -p compiler-ir --test musttail_verifier -- --nocapture
+      - name: Existing native IR library suite
+        working-directory: work
+        run: cargo test -p compiler-ir --lib -- --test-threads=2
+      - name: Clippy correctness of proof and tests
+        working-directory: work
+        run: |
+          cargo clippy -p compiler-ir --lib -- -D clippy::correctness
+          cargo clippy -p compiler-ir --test musttail_verifier -- -D clippy::correctness
