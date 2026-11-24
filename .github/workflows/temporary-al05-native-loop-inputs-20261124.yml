@@ -1,0 +1,69 @@
+# One-time exact-source AL-05 native TypeId loop cutover proof gate.
+name: Temporary AL05 native generated loop input
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temporary-al05-native-loop-inputs-20261124.yml'
+permissions:
+  contents: read
+jobs:
+  al05-native-loops:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: 1bd6e387dfd902dab0e2e9ba719a7682b0b2d868
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and isolate standalone native workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "Pinned compiler source $SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - name: Cache Rust build for native Alive-lite proof corpus
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: temporary-al05-native-loops
+      - name: Execute complete non-Z3 Alive-lite and native fixture inventories
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test alive_lite -- --nocapture
+          cargo test -p compiler-opt --test native_v3_fixture_inventory -- --nocapture
+      - name: Install Z3 solver
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y z3
+          z3 --version
+      - name: Prove changed finite-trip and affine AL05 native loops and negative mutants
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test alive_lite al05_fixed_trip_changed_typeid_cse_and_negative_controls -- --ignored --exact --nocapture --test-threads=1
+          cargo test -p compiler-opt --test alive_lite al05_affine_changed_typeid_cse_and_sat_mutants -- --ignored --nocapture --test-threads=1
+      - name: Focused Clippy with scoped unrelated baseline warnings
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --test alive_lite --test native_v3_fixture_inventory -- -D clippy::all -A clippy::too_many_arguments -A clippy::needless_lifetimes -A clippy::empty_line_after_doc_comments -A clippy::collapsible_if -A clippy::collapsible_match -A clippy::needless_range_loop -A clippy::needless_borrows_for_generic_args
