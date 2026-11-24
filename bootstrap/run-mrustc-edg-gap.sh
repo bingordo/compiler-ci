@@ -422,6 +422,39 @@ PY
     fi
   fi
 
+  # Original public C11 typedef-local proof: exactly one source-owned
+  # canonical layout, preserving scalar/pointer/array/record identity.
+  # Keep this independent from the GP-pair ABI check and from private C.
+  if [[ "${EDG_C_MIXED_GLOBAL_PROBE:-0}" == "1" ]]; then
+    local_typedef_rc=11
+    if (( typeid_check_rc == 0 )); then
+      set +e
+      (
+        cd /workspace/edgcpp/build/gcc-release
+        CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+          timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" test --quiet \
+          --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
+          --bin compiler-edg-driver c_local_typedef_tests -- --test-threads=1
+      ) > /audit-tmp/edg-c-local-typedef-unit.log 2>&1
+      local_typedef_rc=$?
+      set -e
+    fi
+    echo "EDG_C_LOCAL_TYPEDEF_UNIT_EXIT=$local_typedef_rc"
+    if (( local_typedef_rc != 0 )) && [[ -s /audit-tmp/edg-c-local-typedef-unit.log ]]; then
+      python3 - /audit-tmp/edg-c-local-typedef-unit.log <<'PY'
+from pathlib import Path
+import re,sys
+lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
+errors=[line for line in lines if any(k in line for k in
+        ("error[E","error:","panicked","FAILED","test result:"))]
+for i,line in enumerate(errors[-8:],1):
+    msg=re.sub(r"/(?:workspace|audit-tmp)/[^ :]+","public_fixture",line.strip())
+    msg=re.sub(r"[^A-Za-z0-9 _.,=:/()><-]","_",msg)
+    if msg:print(f"EDG_C_LOCAL_TYPEDEF_DIAG_{i}={msg[:180]}")
+PY
+    fi
+  fi
+
   # Full public GNU C11 weak data/routine combined proof. The source
   # fixture and harness are both committed with the candidate compiler.
   # Private mrustc generated C is not part of this positive oracle.
