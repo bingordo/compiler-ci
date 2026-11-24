@@ -455,6 +455,91 @@ PY
         sed -E 's@/(workspace|audit-tmp)/[^ :]+@<public-fixture>@g' || true
     fi
   fi
+  # Public C11 strong integer plus three weak aggregate definitions forming
+  # a source-owned address cycle. Original GCC and selected TypeId ELF must
+  # both contain exact symbolic relocations, weak binding and runnable code.
+  # Private generated mrustc C remains completely separate.
+  if [[ "${EDG_WEAK_AGGREGATE_CYCLE_ORACLE:-0}" == "1" ]]; then
+    cycle_src=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_weak_union_aggregate_cycle.c
+    cycle_harness=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_weak_union_aggregate_cycle_harness.c
+    test -s "$cycle_src" && test -s "$cycle_harness"
+    set +e
+    (
+      cd /workspace/edgcpp/build/gcc-release
+      CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+        timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" test --quiet \
+        --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
+        --bin compiler-edg-driver weak_aggregate_to_aggregate_cycles -- --test-threads=1
+    ) > /audit-tmp/weak-cycle-typeid-unit.log 2>&1
+    cycle_unit_rc=$?
+    cycle_typeid_rc=11
+    if (( cycle_unit_rc == 0 )); then
+      (
+        cd /workspace/edgcpp/build/gcc-release
+        CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+          timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" run --quiet \
+          --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
+          -- /audit-tmp/weak-cycle-typeid.o --gcc --c11 --no_strict_gnu \
+          --gnu_version "$gnu_number" "$cycle_src"
+      ) > /audit-tmp/weak-cycle-typeid-object.log 2>&1
+      cycle_typeid_rc=$?
+    fi
+    gcc -std=gnu11 -O0 -Wall -Wextra -Werror -c "$cycle_src" \
+      -o /audit-tmp/weak-cycle-gcc.o
+    cycle_gcc_rc=$?
+    if (( cycle_gcc_rc == 0 && cycle_typeid_rc == 0 )); then
+      for obj in /audit-tmp/weak-cycle-gcc.o /audit-tmp/weak-cycle-typeid.o; do
+        routine=$(readelf -rW "$obj" |
+          grep -cE 'R_X86_64_64.*edg_weak_cycle_routine' || true)
+        data=$(readelf -rW "$obj" |
+          grep -cE 'R_X86_64_64.*edg_weak_[abc]' || true)
+        weak=$(readelf -Ws "$obj" |
+          awk '$4=="OBJECT" && $5=="WEAK" &&
+               $8 ~ /^edg_weak_[abc]$/ {n++} END {print n+0}')
+        if [[ "$routine" != 3 || "$data" != 3 || "$weak" != 3 ]]; then
+          if [[ "$obj" == *typeid.o ]]; then cycle_typeid_rc=12
+          else cycle_gcc_rc=12; fi
+        fi
+      done
+    fi
+    cycle_link_rc=11
+    cycle_run_rc=11
+    cycle_parity_rc=11
+    if (( cycle_gcc_rc == 0 && cycle_typeid_rc == 0 )); then
+      gcc -std=gnu11 -O0 -fno-pie -no-pie \
+        /audit-tmp/weak-cycle-gcc.o "$cycle_harness" -o /audit-tmp/weak-cycle-gcc-exe &&
+      gcc -std=gnu11 -O0 -fno-pie -no-pie \
+        /audit-tmp/weak-cycle-typeid.o "$cycle_harness" -o /audit-tmp/weak-cycle-typeid-exe
+      cycle_link_rc=$?
+      if (( cycle_link_rc == 0 )); then
+        /audit-tmp/weak-cycle-gcc-exe > /audit-tmp/weak-cycle-gcc.out &&
+        /audit-tmp/weak-cycle-typeid-exe > /audit-tmp/weak-cycle-typeid.out
+        cycle_run_rc=$?
+        if (( cycle_run_rc == 0 )); then
+          python3 -c 'from pathlib import Path; import sys; sys.exit(
+              0 if Path(sys.argv[1]).read_bytes()==Path(sys.argv[2]).read_bytes()
+              else 1)' \
+            /audit-tmp/weak-cycle-gcc.out /audit-tmp/weak-cycle-typeid.out
+          cycle_parity_rc=$?
+        fi
+      fi
+    fi
+    set -e
+    echo "EDG_C_WEAK_CYCLE_UNIT_EXIT=$cycle_unit_rc"
+    echo "EDG_C_WEAK_CYCLE_ELF_EXIT=$cycle_typeid_rc"
+    echo "EDG_C_WEAK_CYCLE_GCC_EXIT=$cycle_gcc_rc"
+    echo "EDG_C_WEAK_CYCLE_LINK_EXIT=$cycle_link_rc"
+    echo "EDG_C_WEAK_CYCLE_RUN_EXIT=$cycle_run_rc"
+    echo "EDG_C_WEAK_CYCLE_PARITY_EXIT=$cycle_parity_rc"
+    if (( cycle_unit_rc != 0 || cycle_typeid_rc != 0 )); then
+      # Only public fixture/compiler diagnostics may be printed, never the
+      # private generated mrustc C or original routine address bits.
+      grep -E '(error\[E|^error:|rejected source|panicked|FAILED|test result:)' \
+        /audit-tmp/weak-cycle-typeid-unit.log \
+        /audit-tmp/weak-cycle-typeid-object.log | tail -n 15 |
+        sed -E 's@/(workspace|audit-tmp)/[^ :]+@<public-fixture>@g' || true
+    fi
+  fi
   # An actual ELF+GCC executable oracle, not just a bridge snapshot.
   # These two original C11 source files are public, checked-in compiler
   # fixtures and do not depend on/print the private generated mrustc TU.
