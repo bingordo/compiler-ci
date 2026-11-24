@@ -370,6 +370,22 @@ PY
       set -e
     fi
     echo "EDG_C_MIXED_REASON_UNIT_EXIT=$mixed_reason_rc"
+    if (( mixed_reason_rc != 0 )) && [[ -s /audit-tmp/edg-mixed-reason-unit.log ]]; then
+      # The mixed_global_ suite is public, checked-in compiler test code.
+      # Sanitizing still prevents paths, unexpected control characters or
+      # accidental nonpublic EDG diagnostics escaping from the runner.
+      python3 - /audit-tmp/edg-mixed-reason-unit.log <<'PY'
+from pathlib import Path
+import re,sys
+lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
+selected=[line for line in lines if any(s in line for s in
+    ("error[E","error:","panicked","FAILED","test result:"))]
+for i,line in enumerate(selected[-8:],1):
+    msg=re.sub(r"/(?:workspace|audit-tmp)/[^ :]+","public_fixture",line.strip())
+    msg=re.sub(r"[^A-Za-z0-9 _.,=:/()><-]","_",msg)
+    if msg:print(f"EDG_C_MIXED_REASON_DIAG_{i}={msg[:180]}")
+PY
+    fi
   fi
 
   # Full public GNU C11 weak data/routine combined proof. The source
@@ -1843,6 +1859,8 @@ schemas={
         "EDG_C_REAL_BODY_EXPR_KIND",("kind","op","count"),32),
     "EDG_C_BODY_LOCAL_KIND":(
         "EDG_C_REAL_BODY_LOCAL_KIND",("kind","static","count"),24),
+    "EDG_C_BODY_PARAM_KIND":(
+        "EDG_C_REAL_BODY_PARAM_KIND",("kind","role","count"),24),
 }
 counts={key:0 for key in schemas}
 for line in Path(sys.argv[1]).read_text(errors="replace").splitlines():
