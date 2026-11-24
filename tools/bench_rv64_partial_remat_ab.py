@@ -3,7 +3,9 @@
 
 Inputs use byte-identical TypeId fixture sources before and after the
 partial-rematerialization change. This reports exact static emitted .text
-bytes, instruction counts, stack accesses and ALU/compare operand reads.\nTemporary *identical* allocator observers also report true spill-slot and\nframe statistics, distinct from inferred stack-access counts.
+bytes, instruction counts, stack accesses and ALU/compare operand reads.
+Temporary *identical* allocator observers also report true spill-slot and
+frame statistics, distinct from inferred stack-access counts.
 It does NOT measure latency or predict RV64 hardware performance.
 """
 from __future__ import annotations
@@ -24,8 +26,8 @@ IMM_OPS = {"addi", "andi", "ori", "xori", "slti", "sltiu"}
 DISASM = re.compile(r"^\s*[0-9a-f]+:\s+[0-9a-f]{4,8}\s+([a-z][.a-z0-9]*)\b(.*)$")
 
 ALLOC = re.compile(
-    r"^RV64_ALLOC_STATS name=(\\S+) spill_slots=(\\d+) spill_values=(\\d+) "
-    r"callee_saved=(\\d+) frame_bytes=(\\d+) virtual_homes=(\\d+) blocks=(\\d+)$",
+    r"^RV64_ALLOC_STATS name=(\S+) spill_slots=(\d+) spill_values=(\d+) "
+    r"callee_saved=(\d+) frame_bytes=(\d+) virtual_homes=(\d+) blocks=(\d+)$",
     re.MULTILINE,
 )
 
