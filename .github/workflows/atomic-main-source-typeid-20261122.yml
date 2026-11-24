@@ -83,3 +83,45 @@ jobs:
             -A clippy::match-like-matches-macro -A clippy::too-many-arguments
       - name: Full native Mini-C driver library acceptance
         run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib
+  baseline-native-mini-c:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Checkout exact unmodified compiler base
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 59982564731a385cda673a8dc942117c51d09655
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout original Mini-C dependency pin
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: 3a18c92ee68b7c1857a847cdce45d8d6b0e09e6f
+          path: mini-c
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Configure identical minimal workspace and local frontend
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('compiler/tools/mini-c-driver/Cargo.toml')
+          s = p.read_text()
+          for crate in ('mini-c-syntax', 'mini-c-sema'):
+              old = f'{crate} = {{ git = "ssh://git@github.com/bingordo/mini-c.git", rev = "3a18c92ee68b7c1857a847cdce45d8d6b0e09e6f" }}'
+              assert s.count(old) == 1, crate
+              s = s.replace(old, f'{crate} = {{ path = "../../../mini-c/crates/{crate.split("-")[-1]}" }}')
+          p.write_text(s)
+          PY
+      - name: Full unmodified baseline native driver library acceptance
+        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib
