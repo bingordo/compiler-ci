@@ -859,11 +859,14 @@ for index,path in enumerate(map(Path,sys.argv[1:])):
     if not path.is_file():continue
     lines=path.read_text(errors="replace").splitlines()
     if index==0:
-        # Public test only: numeric categories reveal whether cargo did not
-        # compile or the Rust test actually panicked. Do not print mrustc C.
+        # This log contains only the public C fixture and Rust unit test.
+        # Retain numeric facts, not arbitrary generated-C or Cargo text.
         print(f"EDG_C_BYTE_STATIC_UNIT_LOG_LINES={min(len(lines),999999)}")
         print(f"EDG_C_BYTE_STATIC_UNIT_RUST_ERRORS={min(sum('error:' in s or 'error[E' in s for s in lines),9999)}")
         print(f"EDG_C_BYTE_STATIC_UNIT_PANICS={min(sum('panicked' in s or 'FAILED' in s for s in lines),9999)}")
+        stages=[int(m.group(1)) for s in lines
+                if (m:=re.search(r'EDG_PUBLIC_BYTE_STAGE=([1-9])',s))]
+        print(f"EDG_C_BYTE_STATIC_LAST_STAGE={max(stages,default=0)}")
     for line in lines:
         if any(k in line for k in ("error[E","error:","FAILED","panicked","test result:")):
             line=re.sub(r"/(?:workspace|audit-tmp)/[^ :]+","<public-fixture>",line)
