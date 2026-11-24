@@ -13,23 +13,15 @@ on:
         required: false
         default: '6'
         type: string
-      force_recheck:
-        description: 'Repeat previously passing cohort'
-        required: false
-        default: false
-        type: boolean
       abi_only:
         description: 'Run only mixed-object ABI tests (manual validation)'
         required: false
         default: false
         type: boolean
+  # One full run weekly on compiler/main, not every 15 minutes or per PR.
+  # GitHub interprets schedule cron in UTC.
   schedule:
-    - cron: '4,19,34,49 * * * *'
-  # CI source changes are polled on a schedule; only workflow edits need a
-  # PR-specific trigger. Avoid redundant self-only push event checks.
-  pull_request:
-    paths:
-      - '.github/workflows/verify-mini-c-differential.yml'
+    - cron: '23 9 * * 1'
 
 permissions:
   contents: read
@@ -66,16 +58,7 @@ jobs:
           test -s compiler/tools/mini-c-driver/tests/differential.py
           test -s compiler/tools/mini-c-driver/Cargo.toml
           echo "Compiler revision: $sha" >> "$GITHUB_STEP_SUMMARY"
-      - name: Check for previously successful source and cohort
-        if: ${{ !inputs.abi_only }}
-        id: verified
-        uses: actions/cache/restore@v4
-        with:
-          path: .mini-c-verified
-          key: mini-c-source-v1-${{ hashFiles('.github/workflows/verify-mini-c-differential.yml') }}-${{ steps.source.outputs.sha }}-${{ inputs.seed_count || '6' }}
-          lookup-only: true
       - name: Make public Mini-C dependency accessible without another deploy key
-        if: inputs.abi_only || steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
         shell: bash
         run: |
           set -euo pipefail
@@ -88,14 +71,12 @@ jobs:
           manifest.write_text(text.replace(old,'https://github.com/bingordo/mini-c.git'))
           PY
       - name: Cache Rust objects and dependencies
-        if: inputs.abi_only || steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: compiler/tools/mini-c-driver -> target
           key: mini-c-source-differential-v1
           cache-workspace-crates: 'true'
       - name: Build compiler-mini-c once
-        if: inputs.abi_only || steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
         shell: bash
         run: |
           set -euo pipefail
@@ -105,7 +86,6 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/mini-c-build.log"
           test -x compiler/tools/mini-c-driver/target/debug/compiler-mini-c
       - name: Compare compiled Mini-C against GCC
-        if: inputs.abi_only || steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
         shell: bash
         env:
           SEED_COUNT: ${{ inputs.seed_count || '6' }}
@@ -127,22 +107,23 @@ jobs:
           else
             grep -Eq "^PASS: [1-9][0-9]* fixtures, $SEED_COUNT seeds, mixed ABI calls and negative cases$" "$RUNNER_TEMP/mini-c-differential.log"
           fi
-          mkdir -p .mini-c-verified
-          printf '%s\n' "${{ steps.source.outputs.sha }}" > .mini-c-verified/source-sha.txt
           if [[ "$ABI_ONLY" == true ]]; then
             echo "Passed focused mixed-object ABI checks" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "Passed fixed, seeded, ABI and negative GCC oracles" >> "$GITHUB_STEP_SUMMARY"
           fi
-      - name: Save successful exact revision evidence
-        if: success() && !inputs.abi_only && steps.verified.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: .mini-c-verified
-          key: mini-c-source-v1-${{ hashFiles('.github/workflows/verify-mini-c-differential.yml') }}-${{ steps.source.outputs.sha }}-${{ inputs.seed_count || '6' }}
-      - name: Report cached result
-        if: !inputs.abi_only && steps.verified.outputs.cache-hit == 'true' && !inputs.force_recheck
-        run: echo "Exact compiler revision and seed cohort previously passed" >> "$GITHUB_STEP_SUMMARY"
+      - name: Check complete mixed-object ABI matrix with frame pointers
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 5m python3 \
+            compiler/tools/mini-c-driver/tests/differential.py \
+            --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" \
+            --mixed-only --mixed-frame-pointer --timeout 15 \
+            --artifacts "$RUNNER_TEMP/mini-c-frame-pointer-failures" \
+            2>&1 | tee "$RUNNER_TEMP/mini-c-frame-pointer.log"
+          grep -Fxq "PASS: mixed ABI calls" "$RUNNER_TEMP/mini-c-frame-pointer.log"
+          echo "Passed mixed-object ABI with frame pointers" >> "$GITHUB_STEP_SUMMARY"
       - name: Preserve build logs and failing test cases
         if: failure()
         uses: actions/upload-artifact@v4
@@ -151,6 +132,8 @@ jobs:
           path: |
             ${{ runner.temp }}/mini-c-build.log
             ${{ runner.temp }}/mini-c-differential.log
+            ${{ runner.temp }}/mini-c-frame-pointer.log
             ${{ runner.temp }}/mini-c-failures/
+            ${{ runner.temp }}/mini-c-frame-pointer-failures/
           if-no-files-found: ignore
           retention-days: 14
