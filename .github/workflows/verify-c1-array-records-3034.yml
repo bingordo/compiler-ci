@@ -61,11 +61,13 @@ jobs:
           set -euo pipefail
           cargo build --release -p compiler --bin compiler
           cargo test -p compiler --test aarch64_selector_report_cli -- --nocapture
-      - name: Full Mini-C driver library regression suite including shared record paths
+      - name: Target-independent checked aggregate regression suite
         working-directory: compiler
         run: |
           set -euo pipefail
-          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib -- --nocapture
+          for filter in aggregate_abi:: checked_plain_struct_fields checked_w12i; do
+            cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib "$filter" -- --nocapture
+          done
       - name: "Baseline native W32/W64/memory, W32/mixed/deep fixed GP calls"
         run: |
           set -euo pipefail
@@ -136,4 +138,79 @@ jobs:
           name: aarch64-c1-seeded-source-oracle-reproducers
           path: results/
           if-no-files-found: ignore
+          retention-days: 21
+
+  x86-library-regression-comparison:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      CARGO_TARGET_DIR: ${{ github.workspace }}/compiler/target
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e75bf01e3c9dbb7bc84bf0f766f618c27eb6e7a2
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 09ac8e0fe8d4d2dc59284cab0caa6d8f944e24ac
+          path: baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify exact candidate and original merge base
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          test "$(git -C compiler rev-parse HEAD)" = e75bf01e3c9dbb7bc84bf0f766f618c27eb6e7a2
+          test "$(git -C baseline rev-parse HEAD)" = 09ac8e0fe8d4d2dc59284cab0caa6d8f944e24ac
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: c1-x86-record-library-v1
+      - name: Run both full native x86 library suites without hiding failures
+        run: |
+          set -euo pipefail
+          mkdir -p library-results
+          for tree in baseline compiler; do
+            set +e
+            (cd "$tree" && cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib -- --test-threads=1) > "library-results/$tree.log" 2>&1
+            rc=$?
+            set -e
+            printf '%s\n' "$rc" > "library-results/$tree.exit"
+            cat "library-results/$tree.log"
+          done
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          def read(tree):
+              log=Path(f"library-results/{tree}.log").read_text()
+              statuses=dict(re.findall(r"^test (\S+) \.\.\. (ok|FAILED|ignored)(?:,.*)?$",log,re.M))
+              assert statuses and re.search(r"test result: (?:ok|FAILED)\.",log), f"{tree}: missing completed test suite"
+              code=int(Path(f"library-results/{tree}.exit").read_text())
+              assert (code==0)==all(s!="FAILED" for s in statuses.values()), (tree,code)
+              return statuses
+          base,candidate=read("baseline"),read("compiler")
+          known={n for n,s in base.items() if s=="FAILED"}
+          failed={n for n,s in candidate.items() if s=="FAILED"}
+          print("Baseline failures:",sorted(known))
+          print("Candidate failures:",sorted(failed))
+          assert not set(base)-set(candidate), "Existing tests disappeared"
+          assert not {n for n,s in base.items() if s!="ignored" and candidate.get(n)=="ignored"}, "Active tests became ignored"
+          assert not failed-known, f"New x86 failures: {sorted(failed-known)}"
+          assert all(candidate.get(n)=="ok" for n in candidate if "array_record" in n)
+          print("No additional x86 failures relative to exact merge base")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x86-library-regression-comparison
+          path: library-results/
           retention-days: 21
