@@ -784,7 +784,7 @@ PY
       CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
         timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" test --quiet \
         --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
-        --bin compiler-edg-driver source_owned_c_byte_globals -- --test-threads=1
+        --bin compiler-edg-driver source_owned_c_byte_globals -- --nocapture --test-threads=1
     ) > /audit-tmp/edg-c-byte-unit.log 2>&1
     byte_unit_rc=$?
     byte_native_rc=11
@@ -855,15 +855,24 @@ PY
 from pathlib import Path
 import re,sys
 messages=[]
-for path in map(Path,sys.argv[1:]):
+for index,path in enumerate(map(Path,sys.argv[1:])):
     if not path.is_file():continue
-    for line in path.read_text(errors="replace").splitlines():
+    lines=path.read_text(errors="replace").splitlines()
+    if index==0:
+        # Public test only: numeric categories reveal whether cargo did not
+        # compile or the Rust test actually panicked. Do not print mrustc C.
+        print(f"EDG_C_BYTE_STATIC_UNIT_LOG_LINES={min(len(lines),999999)}")
+        print(f"EDG_C_BYTE_STATIC_UNIT_RUST_ERRORS={min(sum('error:' in s or 'error[E' in s for s in lines),9999)}")
+        print(f"EDG_C_BYTE_STATIC_UNIT_PANICS={min(sum('panicked' in s or 'FAILED' in s for s in lines),9999)}")
+    for line in lines:
         if any(k in line for k in ("error[E","error:","FAILED","panicked","test result:")):
             line=re.sub(r"/(?:workspace|audit-tmp)/[^ :]+","<public-fixture>",line)
             # Keep redacted punctuation in the diagnostic schema accepted by the
             # workflow summary, so source-public Rust failures are visible.
             line=re.sub(r"[^A-Za-z0-9 _./:><()\\[\\],=-]","_",line)
             messages.append(line.strip()[:180])
+if not messages:
+    messages=["no_matching_public_unit_diagnostic"]
 for i,msg in enumerate(messages[-8:],1):
     print(f"EDG_C_BYTE_STATIC_DIAG_{i}={msg}")
 PY
