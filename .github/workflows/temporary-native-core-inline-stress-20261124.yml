@@ -1,0 +1,59 @@
+# One-time validation for TypeId core inliner stress inputs; close unmerged.
+name: Temporary native core inliner inputs
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temporary-native-core-inline-stress-20261124.yml'
+permissions:
+  contents: read
+jobs:
+  core-inline-native-inputs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: f0955f98d52e9fc0f2a497f3b5f8abd380e93f9c
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check source SHA and isolate native workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "Verified compiler source SHA: $SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - name: Cache isolated native Rust target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: temporary-core-inline-typeid-inputs
+      - name: Execute core inliner and adjacent full suites
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_core_inline_integration -- --nocapture
+          cargo test -p compiler-opt --features verify-counts --test typed_core_inline_integration -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_postopt_native_trial -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_cfg_native -- --nocapture
+          cargo test -p compiler-opt --test native_v3_fixture_inventory -- --nocapture
+      - name: Focused Clippy with unrelated upstream exceptions
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --test typed_core_inline_integration -- -D clippy::all -A clippy::empty_line_after_doc_comments -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::needless_range_loop -A clippy::needless_borrows_for_generic_args -A clippy::too_many_arguments
