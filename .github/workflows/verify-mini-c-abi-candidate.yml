@@ -1,0 +1,132 @@
+# ABI candidate verification runs from compiler-ci, never compiler Actions.
+# Update .github/ci-inputs/mini-c-abi-candidate.sha to check a new source revision.
+name: Mini-C source-pinned ABI candidate
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/ci-inputs/mini-c-abi-candidate.sha'
+      - '.github/workflows/verify-mini-c-abi-candidate.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  mixed-abi:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out CI candidate configuration
+        uses: actions/checkout@v4
+      - name: Select exact compiler revision
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(tr -d '[:space:]' < .github/ci-inputs/mini-c-abi-candidate.sha)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Candidate compiler revision: $sha" >> "$GITHUB_STEP_SUMMARY"
+      - name: Check out source using existing read-only key
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ steps.source.outputs.sha }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "${{ steps.source.outputs.sha }}"
+          test -s compiler/tools/mini-c-driver/tests/differential.py
+      - name: Make Mini-C dependency available over HTTPS
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('compiler/tools/mini-c-driver/Cargo.toml')
+          source = p.read_text()
+          old = 'ssh://git@github.com/bingordo/mini-c.git'
+          assert source.count(old) == 2, 'Mini-C dependency manifest changed'
+          p.write_text(source.replace(old, 'https://github.com/bingordo/mini-c.git'))
+          PY
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: mini-c-abi-candidate-v1
+      - name: Build Mini-C driver
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 12m cargo build \
+            --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --bin compiler-mini-c \
+            2>&1 | tee "$RUNNER_TEMP/abi-build.log"
+      - name: Run focused ABI candidate checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          script=compiler/tools/mini-c-driver/tests/differential.py
+          compiler="$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c"
+          timeout --signal=TERM --kill-after=10s 5m python3 "$script" \
+            --compiler "$compiler" --mixed-only --timeout 15 \
+            --mixed-case gcc_calls_mini_preserve_nonvolatile_gp \
+            --mixed-case gcc_calls_mini_spill_pressure_12 \
+            --mixed-case gcc_calls_mini_spill_pressure_24 \
+            --artifacts "$RUNNER_TEMP/abi-focused-reproducers" \
+            2>&1 | tee "$RUNNER_TEMP/abi-focused.log"
+          grep -Fxq 'PASS: mixed ABI calls' "$RUNNER_TEMP/abi-focused.log"
+      - name: Run entire ABI matrix in default and frame-pointer modes
+        shell: bash
+        run: |
+          set -euo pipefail
+          script=compiler/tools/mini-c-driver/tests/differential.py
+          compiler="$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c"
+          for mode in default frame-pointer; do
+            opts=()
+            if [[ "$mode" == frame-pointer ]]; then opts+=(--mixed-frame-pointer); fi
+            timeout --signal=TERM --kill-after=10s 5m python3 "$script" \
+              --compiler "$compiler" --mixed-only --timeout 15 "${opts[@]}" \
+              --artifacts "$RUNNER_TEMP/abi-$mode-reproducers" \
+              2>&1 | tee "$RUNNER_TEMP/abi-$mode.log"
+            grep -Fxq 'PASS: mixed ABI calls' "$RUNNER_TEMP/abi-$mode.log"
+            echo "Passed mixed-object ABI matrix ($mode)" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Preserve build logs and test reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mini-c-abi-candidate-failures
+          path: |
+            ${{ runner.temp }}/abi-build.log
+            ${{ runner.temp }}/abi-focused.log
+            ${{ runner.temp }}/abi-default.log
+            ${{ runner.temp }}/abi-frame-pointer.log
+            ${{ runner.temp }}/abi-focused-reproducers/
+            ${{ runner.temp }}/abi-default-reproducers/
+            ${{ runner.temp }}/abi-frame-pointer-reproducers/
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Publish discoverable candidate result
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          case "$RESULT" in
+            success) state=success ;;
+            *) state=failure ;;
+          esac
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$state" \
+            -f context="abi/candidate" \
+            -f description="Source-pinned GCC/Mini-C default+RBP ABI: $RESULT" \
+            -f target_url="$RUN_URL"
