@@ -1,0 +1,61 @@
+name: Temporary AL05 P9 x86 C11 oracle timeout diagnosis
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temporary-al05-p9-x86-trace.yml'
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      SOURCE_SHA: 59982564731a385cda673a8dc942117c51d09655
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and isolate optimizer
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Instrument test worktree only for per-input C11 diagnostics
+        working-directory: compiler
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          root=Path('crates/opt/tests')
+          rust=root/'al05_p9_mixed_native_bridge.rs'
+          s=rust.read_text()
+          a='let output = command.output().expect(context);'
+          b='let output = command.stderr(std::process::Stdio::inherit()).output().expect(context);'
+          assert s.count(a)==1
+          rust.write_text(s.replace(a,b))
+          c=root/'oracles/al05_p9_mixed_native_bridge.c'
+          s=c.read_text()
+          a='const uint32_t got = (uint32_t)fn(x, y, n);'
+          b='fprintf(stderr,"AL05_CASE fn=%u x=%d y=%d n=%d\\n",fn_index,x,y,n);\n                    const uint32_t got = (uint32_t)fn(x, y, n);'
+          assert s.count(a)==1
+          c.write_text(s.replace(a,b))
+          PY
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: al05-p9-x86-trace
+      - name: Execute only x86 P9 oracle with 45-second total deadline
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test al05_p9_mixed_native_bridge --no-run
+          timeout --signal=TERM --kill-after=5s 45s cargo test -p compiler-opt --test al05_p9_mixed_native_bridge al05_p9_mixed_native_x86_elf_and_gas_match_c11_reference -- --exact --nocapture --test-threads=1
