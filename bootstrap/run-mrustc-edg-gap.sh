@@ -492,7 +492,7 @@ PY
         routine=$(readelf -rW "$obj" |
           grep -cE 'R_X86_64_64.*edg_weak_cycle_routine' || true)
         data=$(readelf -rW "$obj" |
-          grep -cE 'R_X86_64_64.*edg_weak_[abc]' || true)
+          grep -cE 'R_X86_64_64.*edg_weak_[abc]([[:space:]]|$)' || true)
         weak=$(readelf -Ws "$obj" |
           awk '$4=="OBJECT" && $5=="WEAK" &&
                $8 ~ /^edg_weak_[abc]$/ {n++} END {print n+0}')
