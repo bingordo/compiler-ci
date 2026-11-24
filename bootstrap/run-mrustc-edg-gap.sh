@@ -1009,6 +1009,16 @@ for line in lines:
         if msg:errors.append(msg[:180])
 for i,msg in enumerate(errors[-8:],1):
     print(f"EDG_C_STRUCT_INIT_DIAG_{i}={msg}")
+# The trace belongs only to the checked-in public C fixture and the
+# public Rust test. A bounded sanitized tail makes an unexpected panic
+# actionable even if it does not use Cargo's normal 'error:' spelling.
+source=Path(sys.argv[1])
+if source.is_file():
+    tail=source.read_text(errors="replace").splitlines()[-16:]
+    for i,line in enumerate(tail,1):
+        msg=re.sub(r"/(?:workspace|audit-tmp)/[^ :]+","public_fixture",line.strip())
+        msg=re.sub(r"[^A-Za-z0-9 _./:><()\\[\\],=-]","_",msg)
+        if msg:print(f"EDG_C_STRUCT_INIT_TRACE_{i}={msg[:180]}")
 PY
   fi
   # An actual ELF+GCC executable oracle, not just a bridge snapshot.
@@ -1804,6 +1814,26 @@ if len(matches)==1:
         f"{field}={value}" for field,value in zip(fields,matches[0])))
 else:
     print("EDG_C_REAL_MIXED_PROOF_PRESENT=0")
+PY
+  # A source-independent, bounded aggregate of rejected original/canonical
+  # EDG type categories. No TypeIds, names, paths or initializer bytes.
+  python3 - /audit-tmp/edg-generated-c-native.log <<'PY'
+from pathlib import Path
+import re,sys
+keys=("root_raw","root_kind","raw","kind","role","aliases","count")
+prefix="EDG_C_MIXED_TYPE_SHAPE "
+sent=0
+for line in Path(sys.argv[1]).read_text(errors="replace").splitlines():
+    if not line.startswith(prefix):continue
+    words=line[len(prefix):].split()
+    if len(words)!=len(keys):continue
+    matches=[re.fullmatch(re.escape(k)+r"=([0-9]{1,10})",v)
+             for k,v in zip(keys,words)]
+    if any(v is None for v in matches):continue
+    if sent>=16:break
+    print("EDG_C_REAL_MIXED_TYPE_SHAPE "+" ".join(
+        f"{k}={v.group(1)}" for k,v in zip(keys,matches)))
+    sent+=1
 PY
   python3 - /audit-tmp/edg-generated-c-native.log <<'PY'
 from pathlib import Path
