@@ -891,6 +891,101 @@ for i,msg in enumerate(messages[-8:],1):
 PY
     fi
   fi
+  # Independently compiled original C11 initialized-struct oracle.
+  # Reuse the existing source-owned byte-image/relocation writer; verify
+  # both strong and weak C struct records, tentative BSS and routine/data
+  # address slots against GCC, never against private mrustc source text.
+  if [[ "${EDG_C_RECORD_INIT_ORACLE:-0}" == "1" ]]; then
+    struct_source=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_initialized_struct_elf.c
+    struct_harness=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_initialized_struct_elf_harness.c
+    test -s "$struct_source" && test -s "$struct_harness"
+    set +e
+    (
+      cd /workspace/edgcpp/build/gcc-release
+      CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+        timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" test --quiet \
+        --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
+        --bin compiler-edg-driver source_owned_c_initialized_structs_share_verified_aggregate_elf_storage \
+        -- --nocapture --test-threads=1
+    ) > /audit-tmp/edg-c-struct-init-unit.log 2>&1
+    struct_unit_rc=$?
+    struct_native_rc=11
+    if (( struct_unit_rc == 0 )); then
+      (
+        cd /workspace/edgcpp/build/gcc-release
+        CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+          timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" run --quiet \
+          --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
+          -- /audit-tmp/edg-c-struct-init-typeid.o --gcc --c11 --no_strict_gnu \
+          --gnu_version "$gnu_number" "$struct_source"
+      ) > /audit-tmp/edg-c-struct-init-native.log 2>&1
+      struct_native_rc=$?
+    fi
+    gcc -std=gnu11 -O0 -Wall -Wextra -Werror -c "$struct_source" \
+      -o /audit-tmp/edg-c-struct-init-gcc.o
+    struct_gcc_rc=$?
+    if (( struct_native_rc == 0 && struct_gcc_rc == 0 )); then
+      for obj in /audit-tmp/edg-c-struct-init-typeid.o /audit-tmp/edg-c-struct-init-gcc.o; do
+        strong=$(readelf -Ws "$obj" | awk '$4=="OBJECT" && $5=="GLOBAL" && $3==32 &&
+            $8=="edg_struct_strong" {n++} END {print n+0}')
+        weak=$(readelf -Ws "$obj" | awk '$4=="OBJECT" && $5=="WEAK" && $3==32 &&
+            $8=="edg_struct_weak" {n++} END {print n+0}')
+        tentative=$(readelf -Ws "$obj" | awk '$4=="OBJECT" && $5=="GLOBAL" && $3==32 &&
+            $8=="edg_struct_tentative" {n++} END {print n+0}')
+        pure=$(readelf -Ws "$obj" | awk '$4=="OBJECT" && $5=="GLOBAL" && $3==24 &&
+            $8=="edg_struct_pure" {n++} END {print n+0}')
+        reloc=$(readelf -rW "$obj" | grep -cE 'R_X86_64_64.*edg_struct_(fn|value)' || true)
+        bss=$(readelf -SW "$obj" | grep -Ec '[[:space:]]\\.bss[[:space:]]+NOBITS' || true)
+        if [[ "$strong" != 1 || "$weak" != 1 || "$tentative" != 1 ||
+              "$pure" != 1 || "$reloc" != 4 || "$bss" -lt 1 ]]; then
+          if [[ "$obj" == *typeid.o ]]; then struct_native_rc=12
+          else struct_gcc_rc=12; fi
+        fi
+      done
+    fi
+    struct_link_rc=11
+    struct_run_rc=11
+    struct_parity_rc=11
+    if (( struct_native_rc == 0 && struct_gcc_rc == 0 )); then
+      gcc -std=gnu11 -O0 -fno-pie -no-pie \
+        /audit-tmp/edg-c-struct-init-gcc.o "$struct_harness" -o /audit-tmp/edg-c-struct-init-gcc-exe &&
+      gcc -std=gnu11 -O0 -fno-pie -no-pie \
+        /audit-tmp/edg-c-struct-init-typeid.o "$struct_harness" -o /audit-tmp/edg-c-struct-init-typeid-exe
+      struct_link_rc=$?
+      if (( struct_link_rc == 0 )); then
+        /audit-tmp/edg-c-struct-init-gcc-exe > /audit-tmp/edg-c-struct-init-gcc.out &&
+        /audit-tmp/edg-c-struct-init-typeid-exe > /audit-tmp/edg-c-struct-init-typeid.out
+        struct_run_rc=$?
+        if (( struct_run_rc == 0 )); then
+          cmp -s /audit-tmp/edg-c-struct-init-gcc.out /audit-tmp/edg-c-struct-init-typeid.out
+          struct_parity_rc=$?
+        fi
+      fi
+    fi
+    set -e
+    echo "EDG_C_STRUCT_INIT_UNIT_EXIT=$struct_unit_rc"
+    echo "EDG_C_STRUCT_INIT_ELF_EXIT=$struct_native_rc"
+    echo "EDG_C_STRUCT_INIT_GCC_EXIT=$struct_gcc_rc"
+    echo "EDG_C_STRUCT_INIT_LINK_EXIT=$struct_link_rc"
+    echo "EDG_C_STRUCT_INIT_RUN_EXIT=$struct_run_rc"
+    echo "EDG_C_STRUCT_INIT_PARITY_EXIT=$struct_parity_rc"
+    if (( struct_unit_rc != 0 || struct_native_rc != 0 )); then
+      python3 - /audit-tmp/edg-c-struct-init-unit.log /audit-tmp/edg-c-struct-init-native.log <<'PY'
+from pathlib import Path
+import re,sys
+seen=[]
+for p in map(Path,sys.argv[1:]):
+    if not p.is_file():continue
+    for line in p.read_text(errors="replace").splitlines():
+        if any(v in line for v in ("error[E","error:","panicked","FAILED","test result:")):
+            msg=re.sub(r"/(?:workspace|audit-tmp)/[^ :]+","public_fixture",line.strip())
+            msg=re.sub(r"[^A-Za-z0-9 _./:><()\\[\\],=-]","_",msg)
+            if msg:seen.append(msg[:180])
+for i,msg in enumerate(seen[-8:],1):
+    print(f"EDG_C_STRUCT_INIT_DIAG_{i}={msg}")
+PY
+    fi
+  fi
   # An actual ELF+GCC executable oracle, not just a bridge snapshot.
   # These two original C11 source files are public, checked-in compiler
   # fixtures and do not depend on/print the private generated mrustc TU.
