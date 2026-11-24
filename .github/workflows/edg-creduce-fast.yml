@@ -44,7 +44,7 @@ jobs:
           # Test the merged source-verified TypeId adapter (not the old mixed-global
           # branch) without changing compiler production history.
           # Manual dispatch can still select any explicit source_ref.
-          ref: ${{ inputs.source_ref || '770b1d8792f33c9a9b6bfd5a9281cd549b120836' }}
+          ref: ${{ inputs.source_ref || '22d4713664cec4131e682aacf969ec2b6aa3197e' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -322,7 +322,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 770b1d8792f33c9a9b6bfd5a9281cd549b120836
+          ref: 22d4713664cec4131e682aacf969ec2b6aa3197e
           path: compiler-literal-source
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -355,7 +355,7 @@ jobs:
         run: |
           set -euo pipefail
           actual=$(git -C compiler-literal-source rev-parse HEAD)
-          expected=770b1d8792f33c9a9b6bfd5a9281cd549b120836
+          expected=22d4713664cec4131e682aacf969ec2b6aa3197e
           test "$actual" = "$expected"
           # Public and private probes must compile the SAME candidate.
           # A stale root checkout otherwise makes the private failure
@@ -999,17 +999,52 @@ jobs:
                   "scope_dynamic","init_routines","runtime_links",
                   "lowered_startups","lifetimes","local_static","fp_images")
           selected=[s for s in lines if s.startswith(prefix)]
+          complete_prefix="EDG_C_REAL_MIXED_COMPLETE "
+          complete=[s for s in lines if s.startswith(complete_prefix)]
           accepted=lines.count("EDG_C_TYPEID_EXIT=0")==1
-          if not selected and accepted:
-              print("EDG_C_REAL_MIXED_PROOF_STATUS=adapter_accepted")
+          if len(complete)>1 or len(selected)>1 or (complete and selected):
+              raise SystemExit("contradictory source ownership proof")
+          if complete:
+              names=("integer","aggregate","owners","literal_objects",
+                     "routine_relocs","data_relocs")
+              parts=complete[0][len(complete_prefix):].split()
+              if len(parts)!=len(names) or any(
+                  re.fullmatch(re.escape(k)+r"=[0-9]{1,10}",v) is None
+                  for k,v in zip(names,parts)):
+                  raise SystemExit("unsafe completed C static source proof")
+              print(complete[0])
+          if not selected and (accepted or complete):
+              print("EDG_C_REAL_MIXED_PROOF_STATUS="+(
+                  "adapter_accepted" if accepted else "static_source_owned_body_pending"))
           else:
-              if len(selected)!=1:raise SystemExit("missing or duplicate source-safe proof")
+              if len(selected)!=1:raise SystemExit("missing source-safe proof")
               parts=selected[0][len(prefix):].split()
               if len(parts)!=len(fields):raise SystemExit("unexpected proof schema")
               for key,value in zip(fields,parts):
                   if not re.fullmatch(re.escape(key)+r"=[0-9]{1,10}",value):
                       raise SystemExit("unsafe mixed C proof field")
               print(selected[0])
+          # Source global proof success is not function-body success. The
+          # original mrustc source/diagnostic stays private; publish only
+          # bounded numeric EDG categories from the first rejected body.
+          body_schemas=(
+              ("EDG_C_REAL_BODY_FAILURE",
+                  ("class","prior","locals","statements","expressions","controls"),1),
+              ("EDG_C_REAL_BODY_STMT_KIND",("kind","count"),24),
+              ("EDG_C_REAL_BODY_EXPR_KIND",("kind","op","count"),32),
+              ("EDG_C_REAL_BODY_LOCAL_KIND",("kind","static","count"),24),
+          )
+          for key,fields,limit in body_schemas:
+              marker=key+" "
+              found=[s for s in lines if s.startswith(marker)]
+              if len(found)>limit:raise SystemExit("excess body shape records")
+              for record in found:
+                  values=record[len(marker):].split()
+                  if len(values)!=len(fields) or any(
+                      re.fullmatch(re.escape(k)+r"=[0-9]{1,10}",v) is None
+                      for k,v in zip(fields,values)):
+                      raise SystemExit("unsafe body shape record")
+                  print(record)
           aux="EDG_C_REAL_MIXED_PARTITION "
           extra=[s for s in lines if s.startswith(aux)]
           if len(extra)>1:raise SystemExit("duplicate numeric partition")
