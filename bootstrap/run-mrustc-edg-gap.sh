@@ -867,6 +867,16 @@ for index,path in enumerate(map(Path,sys.argv[1:])):
         stages=[int(m.group(1)) for s in lines
                 if (m:=re.search(r'EDG_PUBLIC_BYTE_STAGE=([1-9])',s))]
         print(f"EDG_C_BYTE_STATIC_LAST_STAGE={max(stages,default=0)}")
+        for s in lines:
+            if "EDG_PUBLIC_BYTE_ERROR=" not in s:continue
+            # Only original checked-in public test diagnostics, never
+            # generated mrustc C or arbitrary raw compiler output.
+            reason=s.split("EDG_PUBLIC_BYTE_ERROR=",1)[1].strip()
+            reason=re.sub(r"/(?:workspace|audit-tmp)/[^ :]+","source",reason)
+            reason=re.sub(r"[^A-Za-z0-9]+","_",reason).strip("_")[:160]
+            if reason:
+                print(f"EDG_C_BYTE_STATIC_PUBLIC_REASON={reason}")
+                break
     for line in lines:
         if any(k in line for k in ("error[E","error:","FAILED","panicked","test result:")):
             line=re.sub(r"/(?:workspace|audit-tmp)/[^ :]+","<public-fixture>",line)
