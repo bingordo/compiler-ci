@@ -985,22 +985,31 @@ PY
     echo "EDG_C_STRUCT_INIT_LINK_EXIT=$struct_link_rc"
     echo "EDG_C_STRUCT_INIT_RUN_EXIT=$struct_run_rc"
     echo "EDG_C_STRUCT_INIT_PARITY_EXIT=$struct_parity_rc"
-    if (( struct_unit_rc != 0 || struct_native_rc != 0 )); then
-      python3 - /audit-tmp/edg-c-struct-init-unit.log /audit-tmp/edg-c-struct-init-native.log <<'PY'
+    # Only the newly checked-in *public* C fixture enters these unit logs.
+    # Do not serialize any source names or excerpts from private mrustc C.
+    python3 - /audit-tmp/edg-c-struct-init-unit.log /audit-tmp/edg-c-struct-init-native.log <<'PY'
 from pathlib import Path
 import re,sys
-seen=[]
+lines=[]
 for p in map(Path,sys.argv[1:]):
-    if not p.is_file():continue
-    for line in p.read_text(errors="replace").splitlines():
-        if any(v in line for v in ("error[E","error:","panicked","FAILED","test result:")):
-            msg=re.sub(r"/(?:workspace|audit-tmp)/[^ :]+","public_fixture",line.strip())
-            msg=re.sub(r"[^A-Za-z0-9 _./:><()\\[\\],=-]","_",msg)
-            if msg:seen.append(msg[:180])
-for i,msg in enumerate(seen[-8:],1):
+    if p.is_file():lines.extend(p.read_text(errors="replace").splitlines())
+stages=re.findall(r"EDG_PUBLIC_STRUCT_STAGE=(\\d+)", "\\n".join(lines))
+print("EDG_C_STRUCT_INIT_LAST_STAGE="+(stages[-1] if stages else "0"))
+for line in lines:
+    if "EDG_PUBLIC_STRUCT_COUNTS " in line:
+        nums=re.search(r"EDG_PUBLIC_STRUCT_COUNTS owners=(\\d+) images=(\\d+) int=(\\d+) materializations=(\\d+) arrays=(\\d+) relocs=(\\d+)",line)
+        if nums:print("EDG_C_STRUCT_INIT_PUBLIC_COUNTS="+"_".join(nums.groups()))
+        break
+errors=[]
+for line in lines:
+    if any(k in line for k in ("EDG_PUBLIC_STRUCT_ERROR=", "error[E", "error:", "panicked", "FAILED", "test result:")):
+        msg=line.split("EDG_PUBLIC_STRUCT_ERROR=",1)[-1].strip()
+        msg=re.sub(r"/(?:workspace|audit-tmp)/[^ :]+","public_fixture",msg)
+        msg=re.sub(r"[^A-Za-z0-9 _./:><()\\[\\],=-]","_",msg)
+        if msg:errors.append(msg[:180])
+for i,msg in enumerate(errors[-8:],1):
     print(f"EDG_C_STRUCT_INIT_DIAG_{i}={msg}")
 PY
-    fi
   fi
   # An actual ELF+GCC executable oracle, not just a bridge snapshot.
   # These two original C11 source files are public, checked-in compiler
