@@ -93,6 +93,10 @@ fn main() {
             // Canonicalize original EDG typedef/qualifier chains (role 4);
             // every output is a bounded aggregate of numeric type/layout
             // facts, never source names, paths, symbol IDs or image bytes.
+            let symbol_types:std::collections::HashMap<_,_>=il.symbol_types.iter()
+                .map(|t|(t.symbol,t.ty)).collect();
+            let type_defs:std::collections::HashMap<_,_>=il.types.iter()
+                .map(|t|(t.id,t)).collect();
             let layouts:std::collections::HashMap<_,_>=il.type_object_sizes.iter()
                 .map(|t|(t.owner,t)).collect();
             let mut groups=std::collections::BTreeMap::<(u32,u32,u64,u64),usize>::new();
@@ -124,10 +128,6 @@ fn main() {
             println!("EDG_PROBE_MISSING_WEAK_TYPE_GROUPS total={} reported={} owners={}",
                 groups.len(),groups.len().min(16),
                 missing.iter().filter(|g|weak.contains(&g.symbol)).count());
-            let symbol_types:std::collections::HashMap<_,_>=il.symbol_types.iter()
-                .map(|t|(t.symbol,t.ty)).collect();
-            let type_defs:std::collections::HashMap<_,_>=il.types.iter()
-                .map(|t|(t.id,t)).collect();
             // Complete source-free owner taxonomy across *all* defined C
             // globals, not only the missing weak subset. Separate raw native
             // EDG type kind, verified image family and source relocation
