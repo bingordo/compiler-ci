@@ -9,7 +9,7 @@ on:
         description: 'Exact bingordo/compiler revision (defaults to verified baseline)'
         required: false
         type: string
-        default: '274eaa89e80d3f1dfae63377619633daa12e35e8'
+        default: '8d6838f8612dd90d8705fce45491e32145233f84'
   pull_request:
     paths: ['.github/workflows/verify-external-cmake-cjson.yml']
 permissions:
@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ inputs.compiler_sha || '274eaa89e80d3f1dfae63377619633daa12e35e8' }}
+          ref: ${{ inputs.compiler_sha || '8d6838f8612dd90d8705fce45491e32145233f84' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -131,6 +131,28 @@ jobs:
           fi
           # Onboarding gate: baseline+reproducibility must pass. A new language
           # coverage failure in the external source is evidence, not CI success.
+          # The exploratory gate stays green for a *classified* frontend
+          # blocker, but must never present an unsupported build as passed.
+          # Emit stable key-value facts for downstream source-coverage tracking.
+          printf 'compiler_sha=%s\\nupstream_sha=%s\\nconfigure_rc=%s\\nbuild_rc=%s\\n' \\
+            '8d6838f8612dd90d8705fce45491e32145233f84' 'c859b25da02955fef659d658b8f324b5cde87be3' \\
+            "$configure_rc" "$build_rc" > cjson-result.txt
+          if test "$configure_rc" -eq 0 && test "$build_rc" -ne 0; then
+            if grep -Fq "unsupported GNU symbol attribute '__mode__'" typeid-build.log; then
+              echo 'first_blocker=gnu_mode_attribute' >> cjson-result.txt
+            elif grep -Eq 'unsupported|error:|fatal error:' typeid-build.log; then
+              echo 'first_blocker=other_compiler_diagnostic' >> cjson-result.txt
+            else
+              echo 'first_blocker=unclassified_build_failure' >> cjson-result.txt
+              echo 'TypeId build failed without a compiler diagnostic' >&2
+              exit 1
+            fi
+          elif test "$configure_rc" -ne 0; then
+            echo 'first_blocker=cmake_configure' >> cjson-result.txt
+          else
+            echo 'first_blocker=none' >> cjson-result.txt
+          fi
+          cat cjson-result.txt
           if test "$configure_rc" -ne 0; then
             echo "TYPEID_CJSON_STAGE=configure"
           elif test "$build_rc" -ne 0; then
@@ -144,6 +166,7 @@ jobs:
           name: cjson-typeid-compatibility-logs
           path: |
             cjson-upstream-revision.txt
+            cjson-result.txt
             typeid-configure.log
             typeid-build.log
           if-no-files-found: ignore
