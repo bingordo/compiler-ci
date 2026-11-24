@@ -1,0 +1,82 @@
+# Temporary source-pinned validation of checked Mini-C -> canonical LTO v2.
+name: LTO PR3047 canonical source binary-v2
+on:
+  push:
+    branches: [validate/lto-pr3047-v2-source-20261124]
+    paths:
+      - '.github/workflows/lto-pr3047-v2-source-20261124.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  statuses: write
+jobs:
+  source-v2:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: c99d812e71a845293fdf0215d3a8205fa2e061e3
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact candidate compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source commit identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          git -C compiler log -1 --oneline
+      - name: Authenticate private compiler frontend dependencies
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: lto-pr3047-binary-v2-source
+      - name: Source-owned v2 standalone, bound co-emission and GCC native oracle
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test lto_binary_v2_source -- --nocapture
+      - name: Existing source, coemission, prevailing and LTO CLI regressions
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test lto_source_sidecar -- --nocapture
+          cargo test -p compiler --test lto_coemit -- --nocapture
+          cargo test -p compiler --test lto_prevailing_weak_strong -- --nocapture
+          cargo test -p compiler --test lto_cli lto_cli_emits_executable_and_preserves_output_on_invalid_inputs -- --nocapture
+      - name: Build source compiler and scope Clippy to new test
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check -p compiler --bin compiler
+          cargo clippy -p compiler --test lto_binary_v2_source -- -D clippy::all -A clippy::empty_line_after_doc_comments -A clippy::collapsible_if
+      - name: Publish discoverable validation status
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_OUTCOME: ${{ job.status }}
+        run: |
+          case "$RUN_OUTCOME" in
+            success) state=success ;;
+            cancelled) state=error ;;
+            *) state=failure ;;
+          esac
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$state" \
+            -f context="candidate/lto-pr3047-binary-v2-source" \
+            -f description="PR3047 exact compiler SHA $SOURCE_SHA" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
