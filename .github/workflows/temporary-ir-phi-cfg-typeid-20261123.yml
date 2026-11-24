@@ -1,0 +1,56 @@
+# Temporary source-pinned compiler IR cutover validation; close PR unmerged.
+name: Temporary TypeId PHI CFG production selector acceptance
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temporary-ir-phi-cfg-typeid-20261123.yml'
+permissions:
+  contents: read
+jobs:
+  phi-cfg-typeid:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: 29b5a727f5ffa18ff5db3f6e7b0f00c649890589
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Check out exact compiler PR commit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned source and isolate core Rust workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - name: Cache isolated Rust compilation
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: temporary-ir-phi-cfg-production
+      - name: Execute TypeId PHI CFG native GAS ELF mode matrix and neighboring regressions
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_phi_cfg -- --nocapture
+          cargo test -p compiler-opt --test typed_cfg_validation -- --nocapture
+          cargo test -p compiler-opt --test typed_phi_dead_linear -- --nocapture
+      - name: Focused test Clippy
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --test typed_phi_cfg --test typed_cfg_validation -- -D clippy::all -A clippy::empty_line_after_doc_comments -A clippy::collapsible_match -A clippy::collapsible_if
