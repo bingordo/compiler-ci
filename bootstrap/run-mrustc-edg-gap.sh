@@ -1841,6 +1841,27 @@ for line in Path(sys.argv[1]).read_text(errors="replace").splitlines():
         f"{k}={v.group(1)}" for k,v in zip(keys,matches)))
     sent+=1
 PY
+  # This fires only when the compiler encounters an unsupported storage
+  # category. The exact native kind, normalized category and layout are
+  # numeric target ABI facts, not source-specific symbol identities.
+  python3 - /audit-tmp/edg-generated-c-native.log <<'PY'
+from pathlib import Path
+import re,sys
+keys=("raw","kind","aliases","bytes","alignment")
+prefix="EDG_C_MIXED_STORAGE_KIND "
+count=0
+for line in Path(sys.argv[1]).read_text(errors="replace").splitlines():
+    if not line.startswith(prefix):continue
+    parts=line[len(prefix):].split()
+    if len(parts)!=len(keys):continue
+    matches=[re.fullmatch(re.escape(k)+r"=([0-9]{1,10})",v)
+             for k,v in zip(keys,parts)]
+    if any(v is None for v in matches):continue
+    if count>=8:break
+    print("EDG_C_REAL_MIXED_STORAGE_KIND "+" ".join(
+        f"{k}={v.group(1)}" for k,v in zip(keys,matches)))
+    count+=1
+PY
   python3 - /audit-tmp/edg-generated-c-native.log <<'PY'
 from pathlib import Path
 import re,sys
