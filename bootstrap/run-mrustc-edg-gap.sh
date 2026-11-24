@@ -229,7 +229,7 @@ for p in sys.argv[1:]:
         ("error[E","error:","panicked","FAILED","test result:"))]
     for i,line in enumerate(selected[-8:],1):
         msg=re.sub(r"/workspace/[^ :]+","<public-path>",line.strip())
-        msg=re.sub(r"[^A-Za-z0-9 _./:><()\\[\\],=-]","?",msg)
+        msg=re.sub(r"[^A-Za-z0-9 _.,=:/()><-]","?",msg)
         print(f"EDG_C_ROUTINE_PUBLIC_DIAG_{i}={msg[:230]}")
 PY
   fi
@@ -564,7 +564,7 @@ for path in map(Path,sys.argv[1:]):
         if any(key in line for key in
                ("error[E","error:","FAILED","panicked","test result:")):
             line=re.sub(r"/(?:workspace|audit-tmp)/[^ :]+","<public-fixture>",line)
-            line=re.sub(r"[^A-Za-z0-9 _./:><()\\[\\],=-]","?",line)
+            line=re.sub(r"[^A-Za-z0-9 _.,=:/()><-]","?",line)
             messages.append(line.strip()[:180])
 for i,line in enumerate(messages[-8:],1):
     print(f"EDG_C_WEAK_CYCLE_DIAG_{i}={line}")
@@ -663,7 +663,7 @@ for path in map(Path,sys.argv[1:]):
     for line in path.read_text(errors="replace").splitlines():
         if any(key in line for key in ("error[E","error:","FAILED","panicked","test result:")):
             line=re.sub(r"/(?:workspace|audit-tmp)/[^ :]+","<public-fixture>",line)
-            line=re.sub(r"[^A-Za-z0-9 _./:><()\\[\\],=-]","?",line)
+            line=re.sub(r"[^A-Za-z0-9 _.,=:/()><-]","?",line)
             messages.append(line.strip()[:180])
 for i,line in enumerate(messages[-8:],1):
     print(f"EDG_C_RECORD_BSS_DIAG_{i}={line}")
@@ -764,7 +764,7 @@ for path in map(Path,sys.argv[1:]):
     for line in path.read_text(errors="replace").splitlines():
         if any(k in line for k in ("error[E","error:","FAILED","panicked","test result:")):
             line=re.sub(r"/(?:workspace|audit-tmp)/[^ :]+","<public-fixture>",line)
-            line=re.sub(r"[^A-Za-z0-9 _./:><()\\[\\],=-]","?",line)
+            line=re.sub(r"[^A-Za-z0-9 _.,=:/()><-]","?",line)
             messages.append(line.strip()[:180])
 for i,msg in enumerate(messages[-8:],1):
     print(f"EDG_C_CONST_STATIC_DIAG_{i}={msg}")
@@ -882,7 +882,7 @@ for index,path in enumerate(map(Path,sys.argv[1:])):
             line=re.sub(r"/(?:workspace|audit-tmp)/[^ :]+","<public-fixture>",line)
             # Keep redacted punctuation in the diagnostic schema accepted by the
             # workflow summary, so source-public Rust failures are visible.
-            line=re.sub(r"[^A-Za-z0-9 _./:><()\\[\\],=-]","_",line)
+            line=re.sub(r"[^A-Za-z0-9 _.,=:/()><-]","_",line)
             messages.append(line.strip()[:180])
 if not messages:
     messages=["no_matching_public_unit_diagnostic"]
@@ -995,6 +995,10 @@ for p in map(Path,sys.argv[1:]):
     if p.is_file():lines.extend(p.read_text(errors="replace").splitlines())
 stages=re.findall(r"EDG_PUBLIC_STRUCT_STAGE=(\d+)", "\n".join(lines))
 print("EDG_C_STRUCT_INIT_LAST_STAGE="+(stages[-1] if stages else "0"))
+reasons=re.findall(r"EDG_PUBLIC_STRUCT_PARTITION_REASON=([0-9]{1,4})",
+                   "\n".join(lines))
+print("EDG_C_STRUCT_INIT_PARTITION_REASON="+(
+      reasons[-1] if reasons else "0"))
 for line in lines:
     if "EDG_PUBLIC_STRUCT_COUNTS " in line:
         nums=re.search(r"EDG_PUBLIC_STRUCT_COUNTS owners=(\d+) images=(\d+) int=(\d+) materializations=(\d+) arrays=(\d+) relocs=(\d+)",line)
@@ -1005,7 +1009,7 @@ for line in lines:
     if any(k in line for k in ("EDG_PUBLIC_STRUCT_ERROR=", "error[E", "error:", "panicked", "FAILED", "test result:")):
         msg=line.split("EDG_PUBLIC_STRUCT_ERROR=",1)[-1].strip()
         msg=re.sub(r"/(?:workspace|audit-tmp)/[^ :]+","public_fixture",msg)
-        msg=re.sub(r"[^A-Za-z0-9 _./:><()\\[\\],=-]","_",msg)
+        msg=re.sub(r"[^A-Za-z0-9 _.,=:/()><-]","_",msg)
         if msg:errors.append(msg[:180])
 for i,msg in enumerate(errors[-8:],1):
     print(f"EDG_C_STRUCT_INIT_DIAG_{i}={msg}")
@@ -1017,7 +1021,7 @@ if source.is_file():
     tail=source.read_text(errors="replace").splitlines()[-16:]
     for i,line in enumerate(tail,1):
         msg=re.sub(r"/(?:workspace|audit-tmp)/[^ :]+","public_fixture",line.strip())
-        msg=re.sub(r"[^A-Za-z0-9 _./:><()\\[\\],=-]","_",msg)
+        msg=re.sub(r"[^A-Za-z0-9 _.,=:/()><-]","_",msg)
         if msg:print(f"EDG_C_STRUCT_INIT_TRACE_{i}={msg[:180]}")
 PY
   fi
