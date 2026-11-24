@@ -1,4 +1,4 @@
-# Source-pinned native TypeId crossunit LTO migration acceptance.
+# Exact three-file candidate overlay on current compiler TypeId/native backend main.
 name: IR PR2999 native LTO crossunit TypeId
 on:
   push:
@@ -13,23 +13,37 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
-      SOURCE_SHA: 3871a7c0cacb63bf135403a6b59ee6054f81ab49
+      MAIN_SHA: 29857946526e5c453cfe1113a2ad305dc1bd1c14
+      PR_SHA: 3871a7c0cacb63bf135403a6b59ee6054f81ab49
       CARGO_INCREMENTAL: '0'
       CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
     steps:
-      - name: Checkout exact compiler PR source
+      - name: Checkout exact current compiler main
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ env.SOURCE_SHA }}
+          ref: ${{ env.MAIN_SHA }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Verify source SHA and isolate core Rust workspace
+      - name: Checkout exact candidate PR source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.PR_SHA }}
+          path: candidate
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Overlay only candidate-owned files and isolate Rust core workspace
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git -C compiler rev-parse HEAD)" = "$MAIN_SHA"
+          test "$(git -C candidate rev-parse HEAD)" = "$PR_SHA"
+          for path in crates/opt/tests/lto_crossunit_optimization.rs crates/opt/tests/fixtures/lto_increment_native_v3.ir crates/opt/tests/fixtures/lto_compute_native_v3.ir; do
+            cp "candidate/$path" "compiler/$path"
+          done
+          test "$(git -C compiler status --porcelain --untracked-files=all | wc -l)" -eq 3
           cat > compiler/Cargo.toml <<'EOF'
           [workspace]
           resolver = "2"
@@ -42,18 +56,15 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: compiler -> target
-          key: ir-pr2999-native-lto
-      - name: Test LTO native split and merged ELF execution and M4
+          key: ir-pr2999-lto-latest-main-overlay
+      - name: Test LTO source-native split merged ELF and M4 on current main
         working-directory: compiler
         shell: bash
         run: |
           set -euo pipefail
           cargo test -p compiler-opt --test lto_crossunit_optimization -- --nocapture
           cargo test -p compiler-opt --test m4_integer_effects -- --nocapture
-      # Existing compiler-backend/src/elf/comdat_compose.rs triggers
-      # suspicious_assignment_formatting, needless_lifetimes and chunks_exact_to_as_chunks.
-      # These exceptions are unrelated to the TypeId LTO test-only diff.
-      - name: Targeted Clippy with documented unrelated baseline exceptions
+      - name: Targeted Clippy except documented unrelated backend baseline warnings
         working-directory: compiler
         run: |
           cargo clippy -p compiler-opt --test lto_crossunit_optimization -- -D clippy::all -A clippy::empty_line_after_doc_comments -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::suspicious_assignment_formatting -A clippy::needless_lifetimes -A clippy::chunks_exact_to_as_chunks
