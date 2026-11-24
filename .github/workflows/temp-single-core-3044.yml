@@ -1,0 +1,78 @@
+name: TEMP single core optimizer schedule gate
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temp-single-core-3044.yml'
+permissions:
+  contents: read
+jobs:
+  fp-conservative-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Authorize pinned Mini-C frontend
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - name: Checkout exact FP optimizer candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 42087d4a72046f455311ddc5c81230a88f9ccb9e
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact compiler source
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = '42087d4a72046f455311ddc5c81230a88f9ccb9e'
+          echo "FP optimizer compiler source $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: temp-fp-conservative-optimizer-20261123
+      - name: New source FP optimizer transactional SSA and independent GCC fenv oracle
+        working-directory: compiler
+        run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test fp_optimizer_admission -- --nocapture
+      - name: Original numeric FP source, mixed ABI, pointer memory, globals and CFG oracle
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for target in fp_scalar fp_mixed_abi fp_mixed_module fp_mixed_ssa fp_pointer_memory fp_scalar_globals; do
+            cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test "$target"
+          done
+      - name: Strict production Mini-C code and targeted FP lint
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          RUSTFLAGS='-Dwarnings' cargo check --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib
+          # These two longstanding style warnings are unrelated to FP and
+          # the existing ASM2/ASM3 test regressions are separately tracked.
+          cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib --test fp_optimizer_admission -- -D warnings -A clippy::match_like_matches_macro -A clippy::too_many_arguments
+      - name: Existing compiler-opt library regressions in isolated core workspace
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The stand-alone Mini-C workspace owns only compiler-mini-c;
+          # compiler-opt's dev tests require the native core workspace.
+          # Isolate it without changing the pinned compiler sources.
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f Cargo.lock
+          cargo test -p compiler-opt --lib -- --test-threads=2
+      - name: Summary
+        run: echo "PASS FP optimizer transaction, strict IEEE C11 fenv 4-mode x86 ELF/GAS PIC, previous source FP tests and warnings-denied build" >> "$GITHUB_STEP_SUMMARY"
