@@ -1,0 +1,57 @@
+name: Temporary bounded TypeId optimizer core execution
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temporary-opt-core-runtime.yml'
+permissions:
+  contents: read
+jobs:
+  core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 22
+    env:
+      SOURCE_SHA: 59982564731a385cda673a8dc942117c51d09655
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source and isolate optimizer workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: bounded-opt-core-runtime
+      - name: Compile optimizer library and selected regression targets once
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib --no-run
+          for name in alive_lite ct03_typed_alias_epoch_native if_conversion_typeid_multimerge if_conversion_typeid_remaining review_nested_same_successor_phi typeid_target_gp_abi ir_opt_native_v3_only native_ir_pass_replay native_cfg_differential; do
+            cargo test -p compiler-opt --test "$name" --no-run
+          done
+      - name: Run bounded optimizer test binaries and report first timeout
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RUST_TEST_THREADS=4
+          echo '=== optimizer library ==='
+          timeout --signal=TERM --kill-after=5s 120s cargo test -p compiler-opt --lib -- --test-threads=4
+          for name in alive_lite ct03_typed_alias_epoch_native if_conversion_typeid_multimerge if_conversion_typeid_remaining review_nested_same_successor_phi typeid_target_gp_abi ir_opt_native_v3_only native_ir_pass_replay native_cfg_differential; do
+            echo "=== OPT_BINARY_START $name ==="
+            timeout --signal=TERM --kill-after=5s 120s cargo test -p compiler-opt --test "$name" -- --test-threads=4
+            echo "=== OPT_BINARY_PASS $name ==="
+          done
