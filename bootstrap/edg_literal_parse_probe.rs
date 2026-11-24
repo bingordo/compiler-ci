@@ -128,6 +128,75 @@ fn main() {
             println!("EDG_PROBE_MISSING_WEAK_TYPE_GROUPS total={} reported={} owners={}",
                 groups.len(),groups.len().min(16),
                 missing.iter().filter(|g|weak.contains(&g.symbol)).count());
+            // Complete source-free owner taxonomy across *all* defined C
+            // globals, not only the missing weak subset. Separate raw native
+            // EDG type kind, verified image family and source relocation
+            // ownership without emitting SymbolIds, names, paths or bytes.
+            let literal_owner:std::collections::HashSet<_>=il.global_literal_relocations
+                .iter().map(|r|r.symbol).collect();
+            let routine_owner:std::collections::HashSet<_>=il.global_routine_relocations
+                .iter().map(|r|r.symbol).collect();
+            let data_owner:std::collections::HashSet<_>=il.global_aggregate_relocations
+                .iter().map(|r|r.symbol).collect();
+            let materializations:std::collections::HashMap<_,_>=
+                il.global_materializations.iter().map(|m|(m.symbol,m)).collect();
+            let mut kind_groups=std::collections::BTreeMap::<
+                (u32,u32,u32,u32,u32,u32,u32,u32),usize>::new();
+            for g in &defs {
+                let kind=symbol_types.get(&g.symbol)
+                    .and_then(|id|type_defs.get(id)).map_or(0,|t|t.kind);
+                let image_membership=u32::from(int_images.contains(&g.symbol))+
+                    u32::from(fp_images.contains(&g.symbol))+
+                    u32::from(agg_images.contains(&g.symbol));
+                let image=if image_membership>1 {4} else if int_images.contains(&g.symbol){1}
+                    else if fp_images.contains(&g.symbol){2}
+                    else if agg_images.contains(&g.symbol){3} else {0};
+                let visibility=materializations.get(&g.symbol)
+                    .and_then(|m|m.elf_visibility).unwrap_or(9);
+                *kind_groups.entry((
+                    kind,u32::from(weak.contains(&g.symbol)),
+                    u32::from(g.explicit_initializer),image,
+                    u32::from(literal_owner.contains(&g.symbol)),
+                    u32::from(routine_owner.contains(&g.symbol)),
+                    u32::from(data_owner.contains(&g.symbol)),visibility
+                )).or_default()+=1;
+            }
+            for ((kind,weak,explicit,image,literal,routine,data,visibility),count)
+                in kind_groups.iter().take(16) {
+                println!("EDG_PROBE_STATIC_KIND kind={} weak={} explicit={} image={} literal={} routine={} data={} visibility={} count={}",
+                    kind,weak,explicit,image,literal,routine,data,visibility,count);
+            }
+            println!("EDG_PROBE_STATIC_KIND_GROUPS total={} reported={} owners={}",
+                kind_groups.len(),kind_groups.len().min(16),defs.len());
+            // Independently classify every original data relocation *target*,
+            // not just its owner. This identifies whether aggregate pointers
+            // refer to source-proven scalar, other aggregate or imported data.
+            let mut target_groups=std::collections::BTreeMap::<
+                (u32,u32,u32,u32,u32,u32),usize>::new();
+            for reloc in &il.global_aggregate_relocations {
+                let target=reloc.target;
+                let target_kind=symbol_types.get(&target)
+                    .and_then(|id|type_defs.get(id)).map_or(0,|t|t.kind);
+                let target_image=if int_images.contains(&target){1}
+                    else if fp_images.contains(&target){2}
+                    else if agg_images.contains(&target){3} else {0};
+                *target_groups.entry((
+                    u32::from(weak.contains(&reloc.symbol)),
+                    target_kind,
+                    u32::from(def_owners.contains(&target)),
+                    u32::from(weak.contains(&target)),
+                    target_image,
+                    u32::from(reloc.offset%8==0 && reloc.addend==0),
+                )).or_default()+=1;
+            }
+            for ((owner_weak,target_kind,defined,target_weak,image,slot_valid),count)
+                in target_groups.iter().take(16) {
+                println!("EDG_PROBE_DATA_TARGET owner_weak={} target_kind={} defined={} target_weak={} image={} slot_valid={} count={}",
+                    owner_weak,target_kind,defined,target_weak,image,slot_valid,count);
+            }
+            println!("EDG_PROBE_DATA_TARGET_GROUPS total={} reported={} relocations={}",
+                target_groups.len(),target_groups.len().min(16),
+                il.global_aggregate_relocations.len());
             // Literal definitions and slots must be a closed, consistent
             // snapshot before any backend may consume them. This source-free
             // census is allowed for private generated C; no literal bytes or
