@@ -1920,6 +1920,8 @@ schemas={
     "EDG_C_BODY_FAILURE":(
         "EDG_C_REAL_BODY_FAILURE",
         ("class","prior","locals","statements","expressions","controls"),1),
+    "EDG_C_BODY_STAGE":(
+        "EDG_C_REAL_BODY_STAGE",("stage",),1),
     "EDG_C_BODY_STMT_KIND":(
         "EDG_C_REAL_BODY_STMT_KIND",("kind","count"),24),
     "EDG_C_BODY_EXPR_KIND":(
