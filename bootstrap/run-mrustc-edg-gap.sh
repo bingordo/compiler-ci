@@ -936,10 +936,21 @@ PY
             $8=="edg_struct_pure" {n++} END {print n+0}')
         bss_ref=$(readelf -Ws "$obj" | awk '$4=="OBJECT" && $5=="GLOBAL" && $3==16 &&
             $8=="edg_struct_bss_ref" {n++} END {print n+0}')
-        reloc=$(readelf -rW "$obj" | grep -cE 'R_X86_64_64.*edg_struct_(fn|value|tentative)' || true)
+        array_strong=$(readelf -Ws "$obj" | awk '$4=="OBJECT" && $5=="GLOBAL" && $3==24 &&
+            $8=="edg_array_strong" {n++} END {print n+0}')
+        array_weak=$(readelf -Ws "$obj" | awk '$4=="OBJECT" && $5=="WEAK" && $3==16 &&
+            $8=="edg_array_weak" {n++} END {print n+0}')
+        array_bss=$(readelf -Ws "$obj" | awk '$4=="OBJECT" && $5=="GLOBAL" && $3==32 &&
+            $8=="edg_array_tentative" {n++} END {print n+0}')
+        array_pure=$(readelf -Ws "$obj" | awk '$4=="OBJECT" && $5=="GLOBAL" && $3==32 &&
+            $8=="edg_array_pure" {n++} END {print n+0}')
+        reloc=$(readelf -rW "$obj" |
+          grep -cE 'R_X86_64_64.*(edg_struct_(fn|value|tentative)|edg_array_tentative)' || true)
         bss=$(readelf -SW "$obj" | grep -Ec '[[:space:]]\.bss[[:space:]]+NOBITS' || true)
         if [[ "$strong" != 1 || "$weak" != 1 || "$tentative" != 1 ||
-              "$pure" != 1 || "$bss_ref" != 1 || "$reloc" != 5 || "$bss" -lt 1 ]]; then
+              "$pure" != 1 || "$bss_ref" != 1 || "$array_strong" != 1 ||
+              "$array_weak" != 1 || "$array_bss" != 1 ||
+              "$array_pure" != 1 || "$reloc" != 9 || "$bss" -lt 1 ]]; then
           if [[ "$obj" == *typeid.o ]]; then struct_native_rc=12
           else struct_gcc_rc=12; fi
         fi
