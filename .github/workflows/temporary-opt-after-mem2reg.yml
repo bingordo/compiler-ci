@@ -69,25 +69,33 @@ jobs:
           cases=[line.rstrip("\n").split("\t",1) for line in open("/tmp/opt-cases.tsv")]
           passed=ignored=0
           for index,(name,path) in enumerate(cases,1):
-              # P9-P16 is intentionally four expensive executable C11 matrices;
-              # a 75s cap on the whole binary incorrectly timed out at P16.
-              cap=300 if name=="al05_p9_mixed_native_bridge" else 120
-              print(f"OPT_START {index}/{len(cases)} {name} limit={cap}s",flush=True)
-              start=time.monotonic()
-              try:
-                  run=subprocess.run([path,"--test-threads=4"],text=True,capture_output=True,timeout=cap)
-              except subprocess.TimeoutExpired:
-                  print(f"OPT_TIMEOUT {name} elapsed={time.monotonic()-start:.2f}s",flush=True)
-                  sys.exit(124)
-              if run.returncode:
-                  print(f"OPT_FAIL {name} code={run.returncode} elapsed={time.monotonic()-start:.2f}s",flush=True)
-                  print(run.stdout[-14000:],flush=True);print(run.stderr[-14000:],flush=True)
-                  sys.exit(run.returncode)
-              summaries=re.findall(r"test result: ok\. (\d+) passed; 0 failed; (\d+) ignored;",run.stdout)
-              if len(summaries)!=1:
-                  print(f"OPT_NO_SUMMARY {name} stdout={run.stdout[-8000:]}",flush=True)
-                  sys.exit(1)
-              good,skipped=map(int,summaries[0]);passed+=good;ignored+=skipped
-              print(f"OPT_PASS {name} tests={good} ignored={skipped} elapsed={time.monotonic()-start:.2f}s",flush=True)
+              # P9/P14/P15/P16 plus reference, proof and PHI fault-injection
+              # tests share ONE Rust test binary. Its aggregate exceeded 300s.
+              # Preserve full coverage but isolate each Rust test and its time.
+              if name=="al05_p9_mixed_native_bridge":
+                  listing=subprocess.run([path,"--list"],text=True,capture_output=True,check=True)
+                  test_names=re.findall(r"^([^:\\n]+): test$",listing.stdout,re.M)
+                  assert len(test_names)>=10,(name,listing.stdout)
+                  invocations=[(f"{name}::{t}",[path,t,"--exact","--test-threads=1"],180) for t in test_names]
+              else:
+                  invocations=[(name,[path,"--test-threads=4"],120)]
+              for tag,args,cap in invocations:
+                  print(f"OPT_START {index}/{len(cases)} {tag} limit={cap}s",flush=True)
+                  start=time.monotonic()
+                  try:
+                      run=subprocess.run(args,text=True,capture_output=True,timeout=cap)
+                  except subprocess.TimeoutExpired:
+                      print(f"OPT_TIMEOUT {tag} elapsed={time.monotonic()-start:.2f}s",flush=True)
+                      sys.exit(124)
+                  if run.returncode:
+                      print(f"OPT_FAIL {tag} code={run.returncode} elapsed={time.monotonic()-start:.2f}s",flush=True)
+                      print(run.stdout[-14000:],flush=True);print(run.stderr[-14000:],flush=True)
+                      sys.exit(run.returncode)
+                  summaries=re.findall(r"test result: ok\\. (\\d+) passed; 0 failed; (\\d+) ignored;",run.stdout)
+                  if len(summaries)!=1:
+                      print(f"OPT_NO_SUMMARY {tag} stdout={run.stdout[-8000:]}",flush=True)
+                      sys.exit(1)
+                  good,skipped=map(int,summaries[0]);passed+=good;ignored+=skipped
+                  print(f"OPT_PASS {tag} tests={good} ignored={skipped} elapsed={time.monotonic()-start:.2f}s",flush=True)
           print(f"OPT_COMPLETE binaries={len(cases)} passed={passed} ignored={ignored} failures=0",flush=True)
           PY
