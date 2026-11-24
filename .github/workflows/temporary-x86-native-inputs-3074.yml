@@ -1,0 +1,54 @@
+# Temporary exact-source migration gate. Close unmerged once verified.
+name: Temporary x86 native frame and call pressure input cutover
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temporary-x86-native-inputs-3074.yml'
+permissions:
+  contents: read
+jobs:
+  native-x86-oracles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: db6843f5675a91e1e06d36f306646e5b8ec4b6cd
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and isolate backend workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - name: Cache core workspace
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: temporary-x86-native-oracles-3074
+      - name: Run mixed-frame and call-pressure native C oracles
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test mixed_frame_native --test call_clobber_pressure_native -- --nocapture
+      - name: Focused Clippy with unrelated baseline allowances
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-backend-x86 --test mixed_frame_native --test call_clobber_pressure_native -- -D clippy::all -A clippy::needless_borrows_for_generic_args -A clippy::too_many_arguments -A clippy::needless_range_loop -A clippy::collapsible_if -A clippy::collapsible_match
