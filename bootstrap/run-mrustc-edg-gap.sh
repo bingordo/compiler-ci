@@ -1823,6 +1823,41 @@ else:
 PY
   # A source-independent, bounded aggregate of rejected original/canonical
   # EDG type categories. No TypeIds, names, paths or initializer bytes.
+  # A successful complete source-owned C static partition is a durable
+  # result even when lowering the first real mrustc function fails later.
+  # All C body evidence is bounded numeric EDG semantic categories; the
+  # original function name, native symbol ID, path and error remain private.
+  python3 - /audit-tmp/edg-generated-c-native.log <<'PY'
+from pathlib import Path
+import re,sys
+schemas={
+    "EDG_C_MIXED_PROOF_COMPLETE":(
+        "EDG_C_REAL_MIXED_COMPLETE",
+        ("integer","aggregate","owners","literal_objects","routine_relocs","data_relocs"),1),
+    "EDG_C_BODY_FAILURE":(
+        "EDG_C_REAL_BODY_FAILURE",
+        ("class","prior","locals","statements","expressions","controls"),1),
+    "EDG_C_BODY_STMT_KIND":(
+        "EDG_C_REAL_BODY_STMT_KIND",("kind","count"),24),
+    "EDG_C_BODY_EXPR_KIND":(
+        "EDG_C_REAL_BODY_EXPR_KIND",("kind","op","count"),32),
+    "EDG_C_BODY_LOCAL_KIND":(
+        "EDG_C_REAL_BODY_LOCAL_KIND",("kind","static","count"),24),
+}
+counts={key:0 for key in schemas}
+for line in Path(sys.argv[1]).read_text(errors="replace").splitlines():
+    for key,(dest,fields,maximum) in schemas.items():
+        if not line.startswith(key+" "):continue
+        words=line[len(key)+1:].split()
+        if len(words)!=len(fields):continue
+        matches=[re.fullmatch(re.escape(k)+r"=([0-9]{1,10})",v)
+                 for k,v in zip(fields,words)]
+        if any(v is None for v in matches):continue
+        if counts[key]>=maximum:continue
+        print(dest+" "+" ".join(
+            f"{field}={m.group(1)}" for field,m in zip(fields,matches)))
+        counts[key]+=1
+PY
   python3 - /audit-tmp/edg-generated-c-native.log <<'PY'
 from pathlib import Path
 import re,sys
