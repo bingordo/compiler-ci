@@ -532,12 +532,24 @@ PY
     echo "EDG_C_WEAK_CYCLE_RUN_EXIT=$cycle_run_rc"
     echo "EDG_C_WEAK_CYCLE_PARITY_EXIT=$cycle_parity_rc"
     if (( cycle_unit_rc != 0 || cycle_typeid_rc != 0 )); then
-      # Only public fixture/compiler diagnostics may be printed, never the
-      # private generated mrustc C or original routine address bits.
-      grep -E '(error\[E|^error:|rejected source|panicked|FAILED|test result:)' \
-        /audit-tmp/weak-cycle-typeid-unit.log \
-        /audit-tmp/weak-cycle-typeid-object.log | tail -n 15 |
-        sed -E 's@/(workspace|audit-tmp)/[^ :]+@<public-fixture>@g' || true
+      # Both files originate exclusively from committed public C11 fixture
+      # and TypeId tests. Limit output and strip absolute runner paths.
+      python3 - /audit-tmp/weak-cycle-typeid-unit.log \
+        /audit-tmp/weak-cycle-typeid-object.log <<'PY'
+from pathlib import Path
+import re,sys
+messages=[]
+for path in map(Path,sys.argv[1:]):
+    if not path.is_file():continue
+    for line in path.read_text(errors="replace").splitlines():
+        if any(key in line for key in
+               ("error[E","error:","FAILED","panicked","test result:")):
+            line=re.sub(r"/(?:workspace|audit-tmp)/[^ :]+","<public-fixture>",line)
+            line=re.sub(r"[^A-Za-z0-9 _./:><()\\[\\],=-]","?",line)
+            messages.append(line.strip()[:180])
+for i,line in enumerate(messages[-8:],1):
+    print(f"EDG_C_WEAK_CYCLE_DIAG_{i}={line}")
+PY
     fi
   fi
   # An actual ELF+GCC executable oracle, not just a bridge snapshot.
