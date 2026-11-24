@@ -1861,6 +1861,10 @@ schemas={
         "EDG_C_REAL_BODY_LOCAL_KIND",("kind","static","count"),24),
     "EDG_C_BODY_PARAM_KIND":(
         "EDG_C_REAL_BODY_PARAM_KIND",("kind","role","count"),24),
+    "EDG_C_BODY_PARAM_CANON":(
+        "EDG_C_REAL_BODY_PARAM_CANON",
+        ("root","kind","role","aliases","qualifiers","refs","bits",
+         "signed","boolean","bytes","align","pointee","count"),24),
 }
 counts={key:0 for key in schemas}
 for line in Path(sys.argv[1]).read_text(errors="replace").splitlines():
