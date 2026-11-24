@@ -934,10 +934,12 @@ PY
             $8=="edg_struct_tentative" {n++} END {print n+0}')
         pure=$(readelf -Ws "$obj" | awk '$4=="OBJECT" && $5=="GLOBAL" && $3==24 &&
             $8=="edg_struct_pure" {n++} END {print n+0}')
-        reloc=$(readelf -rW "$obj" | grep -cE 'R_X86_64_64.*edg_struct_(fn|value)' || true)
+        bss_ref=$(readelf -Ws "$obj" | awk '$4=="OBJECT" && $5=="GLOBAL" && $3==16 &&
+            $8=="edg_struct_bss_ref" {n++} END {print n+0}')
+        reloc=$(readelf -rW "$obj" | grep -cE 'R_X86_64_64.*edg_struct_(fn|value|tentative)' || true)
         bss=$(readelf -SW "$obj" | grep -Ec '[[:space:]]\.bss[[:space:]]+NOBITS' || true)
         if [[ "$strong" != 1 || "$weak" != 1 || "$tentative" != 1 ||
-              "$pure" != 1 || "$reloc" != 4 || "$bss" -lt 1 ]]; then
+              "$pure" != 1 || "$bss_ref" != 1 || "$reloc" != 5 || "$bss" -lt 1 ]]; then
           if [[ "$obj" == *typeid.o ]]; then struct_native_rc=12
           else struct_gcc_rc=12; fi
         fi
