@@ -1,0 +1,84 @@
+name: Temporary timed all TypeId optimizer integration binaries
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temporary-opt-per-binary.yml'
+permissions:
+  contents: read
+jobs:
+  inventory-and-execute:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 28
+    env:
+      SOURCE_SHA: 59982564731a385cda673a8dc942117c51d09655
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin source and isolate native optimizer
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: opt-per-binary-timed
+      - name: Compile all optimizer test binaries and capture exact executables
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --tests --no-run --message-format=json > /tmp/opt-test-artifacts.jsonl
+          python3 - <<'PY'
+          import json
+          executables={}
+          for line in open("/tmp/opt-test-artifacts.jsonl"):
+              try: item=json.loads(line)
+              except ValueError: continue
+              if item.get("reason")!="compiler-artifact": continue
+              target=item.get("target",{})
+              path=item.get("executable")
+              if not path or not item.get("profile",{}).get("test"): continue
+              if not item.get("package_id","").startswith("path+file://") and "compiler-opt" not in item.get("package_id",""): continue
+              if target.get("name") and "test" in target.get("kind",[]): executables[target["name"]]=path
+          with open("/tmp/opt-test-binaries.tsv","w") as out:
+              for name,path in sorted(executables.items()):out.write(name+"\t"+path+"\n")
+          print(f"OPT_BINARY_COUNT={len(executables)}",flush=True)
+          assert len(executables)>=150, "unexpectedly incomplete test executable inventory"
+          PY
+      - name: Execute all optimizer integration binaries with explicit per-test cap
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess,time
+          cases=[line.rstrip("\n").split("\t",1) for line in open("/tmp/opt-test-binaries.tsv")]
+          passed=0
+          for name,path in cases:
+              print(f"OPT_START {name}",flush=True)
+              start=time.monotonic()
+              try:
+                  p=subprocess.run([path,"--test-threads=4"],capture_output=True,text=True,timeout=75)
+              except subprocess.TimeoutExpired as e:
+                  print(f"OPT_TIMEOUT {name} elapsed={time.monotonic()-start:.1f}s",flush=True)
+                  raise SystemExit(124)
+              if p.returncode:
+                  print(f"OPT_FAIL {name} exit={p.returncode} elapsed={time.monotonic()-start:.1f}s",flush=True)
+                  print(p.stdout[-12000:]);print(p.stderr[-12000:])
+                  raise SystemExit(p.returncode)
+              passed+=1
+              print(f"OPT_PASS {name} elapsed={time.monotonic()-start:.1f}s",flush=True)
+          print(f"OPT_ALL_PASS {passed}",flush=True)
+          PY
