@@ -1,0 +1,53 @@
+# Temporary source-pinned composed TypeId inliner acceptance. Close unmerged.
+name: Temporary TypeId composed inliner native cutover
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temporary-core-native-3064.yml'
+permissions:
+  contents: read
+jobs:
+  composed-core-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: b1fcebc00a01c42788a53ced05fa104607763211
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify compiler SHA and isolate core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Cache workspace
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: temporary-core-native-3064
+      - name: Run composed native TypeId core inliner full suite
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_core_inline_integration -- --nocapture
+      - name: Scoped Clippy, excluding known unrelated baseline lints
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --test typed_core_inline_integration -- -D clippy::all -A clippy::needless_range_loop -A clippy::empty_line_after_doc_comments -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::needless_borrows_for_generic_args -A clippy::too_many_arguments
