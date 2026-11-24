@@ -1,0 +1,56 @@
+# Source-pinned TypeId FS1 external effect and sparse-definition-index migration.
+name: IR PR2990 native FS1 effects and sparse PHIs
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ir-pr2990-fs1-sparse-native-20261123.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-fs1-sparse:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: 63a03bde2d91a9e0c8bcdf283d9b400925d290fe
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact private compiler PR commit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check source SHA and isolate core Rust workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - name: Cache isolated Rust compilation
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-pr2990-fs1-sparse
+      - name: Test FS1 and 67 sparse PHI cases plus scalar M4 regression
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test fs1_effect_preservation -- --nocapture
+          cargo test -p compiler-opt --test sparse_definition_index_phi -- --nocapture
+          cargo test -p compiler-opt --test m4_integer_effects -- --nocapture
+      - name: Targeted Clippy with documented unrelated x86 and IR exceptions
+        working-directory: compiler
+        run: |
+          cargo clippy -p compiler-opt --test fs1_effect_preservation --test sparse_definition_index_phi -- -D clippy::all -A clippy::empty_line_after_doc_comments -A clippy::collapsible_match -A clippy::collapsible_if
