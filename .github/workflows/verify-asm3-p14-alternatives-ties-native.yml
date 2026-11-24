@@ -1,0 +1,92 @@
+name: ASM3 P14 GNU alternatives and matching GP inputs GCC GAS ELF
+# Exact-source P14 native differential; never run in compiler-repo Actions.
+# Dedicated off-repository exact-source verification for compiler and Mini-C.
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-asm3-p14-alternatives-ties-native.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 96106e2c466c9feaf7659947bdfdfd80465ad822
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: 958e0ba43b53c6ea0eab11e08b8e41c66c5f5913
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: mini-c
+      - name: Verify both exact input commits and authenticated dependencies
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 96106e2c466c9feaf7659947bdfdfd80465ad822
+          test "$(git -C mini-c rev-parse HEAD)" = 958e0ba43b53c6ea0eab11e08b8e41c66c5f5913
+          grep -q 958e0ba43b53c6ea0eab11e08b8e41c66c5f5913 compiler/tools/mini-c-driver/Cargo.toml
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mini-c
+          key: asm3-p14-mini-c-source
+      - name: Mini-C syntax and semantic named-reference checks
+        working-directory: mini-c
+        run: |
+          set -euo pipefail
+          cargo test -p mini-c-syntax --lib
+          cargo test -p mini-c-syntax --test asm3_p11_multi_output_parse -- --nocapture
+          cargo test -p mini-c-sema --lib
+          cargo test -p mini-c-sema --test asm3_p13_gp_output_roles -- --nocapture
+          cargo test -p mini-c-sema --test asm3_p14_gp_alternatives -- --nocapture
+          cargo clippy -p mini-c-syntax -p mini-c-sema --lib -- -D warnings
+      - name: Prepare isolated shared compiler workspace
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: asm3-p14-native
+      - name: Compiler and generic typed-machine verification
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check --workspace
+          cargo test -p compiler-ir -p compiler-opt --lib
+          cargo test -p compiler-ir --test asm3_p12_dual_output -- --nocapture
+          cargo test -p compiler-ir --test asm3_p13_dual_gp_roles -- --nocapture
+          cargo test -p compiler-ir --test asm3_p14_tied_gp -- --nocapture
+          python3 tools/regen_x86_att_forms.py --check
+          cargo test -p compiler-backend-x86 --test asm3_p10_att_memory_writes -- --nocapture
+          cargo test -p compiler-backend-x86 --test asm3_p04_bound_template -- --nocapture
+      - name: End-to-end GNU named operand native executable differential
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test asm3_p14_alternatives_ties_native -- --nocapture
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test asm3_p13_gp_output_roles_native -- --nocapture
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test asm3_p12_dual_gp_native -- --nocapture
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test asm3_p11_mixed_outputs_native -- --nocapture
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test asm3_p10_opaque_memory_outputs_native -- --nocapture
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test asm3_p09_opaque_memory_native -- --nocapture
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test asm3_p08_named_source_native -- --nocapture
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test asm3_p07_opaque_two_inputs_native -- --nocapture
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test asm3_p06_opaque_gnu_gp_source_oracle -- --nocapture
+          echo 'ASM3 P14=PASS: true checked memory address, optimized TypeId, RA, GAS/ELF and executable GCC' >> "$GITHUB_STEP_SUMMARY"
