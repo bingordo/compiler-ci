@@ -154,6 +154,13 @@ def main() -> None:
     output = root / "comparison.json"
     output.write_text(json.dumps(out, indent=2, sort_keys=True) + "\n")
     print("JSON:", output)
+    # Gate only objective negative deltas. Save the complete JSON and
+    # generated assembly first so a counterexample remains diagnosable.
+    if regressions:
+        raise SystemExit(
+            "RV64 partial remat worsened objective code/allocator metrics "
+            f"on {len(regressions)} source-identical cases; see {output}"
+        )
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["--list-cases"]:
