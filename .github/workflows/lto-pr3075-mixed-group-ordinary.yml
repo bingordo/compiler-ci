@@ -1,0 +1,88 @@
+name: LTO PR3075 mixed grouped and ordinary ELF
+on:
+  push:
+    branches: [validate/lto-pr3075-mixed-group-ordinary-20261124]
+    paths:
+      - '.github/workflows/lto-pr3075-mixed-group-ordinary.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  statuses: write
+jobs:
+  mixed-elf:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: dc9275d6b378d47fb81302846ac74b33fffa9b47
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact source compiler SHA
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned source and ELF oracle tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          git -C compiler log -1 --oneline
+          readelf --version | head -n1
+          gcc --version | head -n1
+      - name: Authenticate private frontend dependencies
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: lto-pr3075-mixed-group-ordinary
+      - name: Mixed native and LTO ELF group ownership GCC execution
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test lto_source_comdat -- --nocapture
+      - name: Existing LTO and binary-v2 source compatibility
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test lto_binary_v2_source -- --nocapture
+          cargo test -p compiler --test lto_binary_v2_metadata_source -- --nocapture
+          cargo test -p compiler --test lto_source_sidecar -- --nocapture
+          cargo test -p compiler --test lto_coemit -- --nocapture
+          cargo test -p compiler --test lto_common_elf -- --nocapture
+          cargo test -p compiler --test lto_elf_visibility -- --nocapture
+          cargo test -p compiler-ir --test lto_binary_v2_metadata -- --nocapture
+          cargo test -p compiler-ir --test lto_target_envelope -- --nocapture
+      - name: Driver, backend and IR build plus scoped Clippy
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check -p compiler --bin compiler
+          cargo check -p compiler-ir -p compiler-backend -p compiler-backend-x86
+          cargo clippy -p compiler --test lto_source_comdat -- -D clippy::all -A clippy::empty_line_after_doc_comments -A clippy::collapsible_if -A clippy::needless_borrows_for_generic_args -A clippy::too_many_arguments
+      - name: Publish exact compiler candidate status
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_OUTCOME: ${{ job.status }}
+        run: |
+          case "$JOB_OUTCOME" in
+            success) state=success ;;
+            cancelled) state=error ;;
+            *) state=failure ;;
+          esac
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$state" \
+            -f context="candidate/lto-pr3075-mixed-ordinary" \
+            -f description="Exact PR3075 compiler SHA $SOURCE_SHA" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
