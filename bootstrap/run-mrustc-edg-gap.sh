@@ -364,7 +364,7 @@ PY
         CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
           timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" test --quiet \
           --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
-          --bin compiler-edg-driver mixed_global_reason_codes_are_stable -- --test-threads=1
+          --bin compiler-edg-driver mixed_global_ -- --test-threads=1
       ) > /audit-tmp/edg-mixed-reason-unit.log 2>&1
       mixed_reason_rc=$?
       set -e
@@ -1463,6 +1463,26 @@ if len(matches)==1:
         f"{field}={value}" for field,value in zip(fields,matches[0])))
 else:
     print("EDG_C_REAL_MIXED_PROOF_PRESENT=0")
+PY
+  python3 - /audit-tmp/edg-generated-c-native.log <<'PY'
+from pathlib import Path
+import re,sys
+keys=("integer","aggregate","owners","materializations","integer_images")
+prefix="EDG_C_MIXED_PARTITION "
+records=[]
+for line in Path(sys.argv[1]).read_text(errors="replace").splitlines():
+    if not line.startswith(prefix):continue
+    words=line[len(prefix):].split()
+    if len(words)!=len(keys):continue
+    values=[]
+    for key,word in zip(keys,words):
+        found=re.fullmatch(re.escape(key)+r"=([0-9]{1,10})",word)
+        if not found:break
+        values.append(found.group(1))
+    else:records.append(values)
+if len(records)==1:
+    print("EDG_C_REAL_MIXED_PARTITION "+" ".join(
+        f"{key}={val}" for key,val in zip(keys,records[0])))
 PY
 fi
 
