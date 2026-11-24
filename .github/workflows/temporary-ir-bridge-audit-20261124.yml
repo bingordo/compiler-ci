@@ -1,0 +1,59 @@
+# One-time read-only source inventory, not a recurring CI gate.
+name: Temporary IR compatibility bridge audit
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temporary-ir-bridge-audit-20261124.yml'
+permissions:
+  contents: read
+jobs:
+  inventory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    env:
+      SOURCE_SHA: ca34917e0bba3b72c1cec0e1735c5f4b366a5536
+    steps:
+      - name: Checkout source-pinned compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Inventory source and test compatibility constructors
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          python3 - <<'PY'
+          from pathlib import Path
+          from collections import Counter
+          import re
+          root=Path("compiler/crates")
+          tokens=("from_legacy(", ".to_legacy(", "legacy_function_signature(", "TypeAnnotatedModule::")
+          sources=[]
+          tests=[]
+          for p in root.rglob("*.rs"):
+              rel=p.relative_to(root)
+              lines=p.read_text(errors="replace").splitlines()
+              hits=[(i+1,line.strip()) for i,line in enumerate(lines) if any(token in line for token in tokens)]
+              if not hits: continue
+              key="source" if "src" in rel.parts else "tests"
+              counts=Counter(token for _,line in hits for token in tokens if token in line)
+              result=(str(rel),dict(counts),hits)
+              (sources if key=="source" else tests).append(result)
+          print("PINNED_SOURCE",__import__("os").environ["SOURCE_SHA"])
+          print("SOURCE_WITH_COMPATIBILITY_TOKENS",len(sources))
+          for path,counts,hits in sorted(sources):
+              print("SRC",path,counts)
+              for ln,line in hits:
+                  if "from_legacy(" in line or "legacy_function_signature(" in line or "TypeAnnotatedModule::" in line:
+                      print(" ",ln,line[:220])
+          print("TEST_FILES_WITH_LEGACY_CONSTRUCTION",sum(any("from_legacy(" in h[1] or "legacy_function_signature(" in h[1] for h in hits) for _,_,hits in tests))
+          for path,counts,hits in sorted(tests):
+              focus=[(ln,s) for ln,s in hits if "from_legacy(" in s or "legacy_function_signature(" in s]
+              if focus:
+                  print("TEST",path,counts)
+                  for ln,line in focus[:12]: print(" ",ln,line[:210])
+          PY
