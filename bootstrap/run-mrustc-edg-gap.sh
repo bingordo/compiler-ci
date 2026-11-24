@@ -353,6 +353,25 @@ PY
     fi
   fi
   echo "EDG_C_LITERAL_TYPEID_UNIT_EXIT=$typeid_unit_rc"
+  # Source-independent reason-code tests live in the candidate compiler;
+  # no generated C source is ever supplied to the numeric diagnostic.
+  if [[ "${EDG_C_MIXED_GLOBAL_PROBE:-0}" == "1" ]]; then
+    mixed_reason_rc=11
+    if (( typeid_check_rc == 0 )); then
+      set +e
+      (
+        cd /workspace/edgcpp/build/gcc-release
+        CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+          timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" test --quiet \
+          --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
+          --bin compiler-edg-driver mixed_global_ -- --test-threads=1
+      ) > /audit-tmp/edg-mixed-reason-unit.log 2>&1
+      mixed_reason_rc=$?
+      set -e
+    fi
+    echo "EDG_C_MIXED_REASON_UNIT_EXIT=$mixed_reason_rc"
+  fi
+
   # Full public GNU C11 weak data/routine combined proof. The source
   # fixture and harness are both committed with the candidate compiler.
   # Private mrustc generated C is not part of this positive oracle.
@@ -1415,6 +1434,58 @@ set +e
 native_rc=$?
 set -e
 echo "EDG_C_TYPEID_EXIT=$native_rc"
+
+# Re-export ONLY the compiler's fixed numeric code and counters. Do not
+# export any real generated-C source, symbol names, paths, or raw diagnostics.
+if [[ "${EDG_C_MIXED_GLOBAL_PROBE:-0}" == "1" ]]; then
+  python3 - /audit-tmp/edg-generated-c-native.log <<'PY'
+from pathlib import Path
+import re,sys
+fields=("reason","string_literals","literal_objects","literal_relocs",
+        "routine_relocs","data_relocs","dynamic","initializer_exprs",
+        "scope_dynamic","init_routines","runtime_links","lowered_startups",
+        "lifetimes","local_static","fp_images")
+prefix="EDG_C_MIXED_PROOF "
+matches=[]
+for line in Path(sys.argv[1]).read_text(errors="replace").splitlines():
+    if not line.startswith(prefix): continue
+    parts=line[len(prefix):].split()
+    if len(parts)!=len(fields): continue
+    decoded=[]
+    for key,entry in zip(fields,parts):
+        m=re.fullmatch(re.escape(key)+r"=([0-9]{1,10})",entry)
+        if not m:break
+        decoded.append(m.group(1))
+    else:
+        matches.append(decoded)
+if len(matches)==1:
+    print("EDG_C_REAL_MIXED_PROOF "+" ".join(
+        f"{field}={value}" for field,value in zip(fields,matches[0])))
+else:
+    print("EDG_C_REAL_MIXED_PROOF_PRESENT=0")
+PY
+  python3 - /audit-tmp/edg-generated-c-native.log <<'PY'
+from pathlib import Path
+import re,sys
+keys=("integer","aggregate","owners","materializations","integer_images")
+prefix="EDG_C_MIXED_PARTITION "
+records=[]
+for line in Path(sys.argv[1]).read_text(errors="replace").splitlines():
+    if not line.startswith(prefix):continue
+    words=line[len(prefix):].split()
+    if len(words)!=len(keys):continue
+    values=[]
+    for key,word in zip(keys,words):
+        found=re.fullmatch(re.escape(key)+r"=([0-9]{1,10})",word)
+        if not found:break
+        values.append(found.group(1))
+    else:records.append(values)
+if len(records)==1:
+    print("EDG_C_REAL_MIXED_PARTITION "+" ".join(
+        f"{key}={val}" for key,val in zip(keys,records[0])))
+PY
+fi
+
 # The original generated C can contain private symbols/source paths.
 # Classify the *native adapter's rejection message* with an allowlist of
 # hard-coded categories. Never print, hash or copy the raw error line.

@@ -44,7 +44,7 @@ jobs:
           # Test the merged source-verified TypeId adapter (not the old mixed-global
           # branch) without changing compiler production history.
           # Manual dispatch can still select any explicit source_ref.
-          ref: ${{ inputs.source_ref || '181e6bab665ec27ffb7c9e2a21a952792cd6f6c9' }}
+          ref: ${{ inputs.source_ref || '044d28843c9f916053fca2679ef5cc3d7d39a2c0' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -322,7 +322,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 303e26623235ad1245c3e01ede060aa301b5a8d0
+          ref: 044d28843c9f916053fca2679ef5cc3d7d39a2c0
           path: compiler-literal-source
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -355,9 +355,15 @@ jobs:
         run: |
           set -euo pipefail
           actual=$(git -C compiler-literal-source rev-parse HEAD)
-          expected=303e26623235ad1245c3e01ede060aa301b5a8d0
+          expected=044d28843c9f916053fca2679ef5cc3d7d39a2c0
           test "$actual" = "$expected"
+          # Public and private probes must compile the SAME candidate.
+          # A stale root checkout otherwise makes the private failure
+          # appear unchanged while public acceptance is ahead.
+          real=$(git -C compiler rev-parse HEAD)
+          test "$real" = "$actual"
           echo "EDG_RECORD_BSS_CANDIDATE_SHA=$expected" >> "$GITHUB_STEP_SUMMARY"
+          echo "EDG_REAL_AND_PUBLIC_COMPILER_MATCH=1" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Probe real mrustc C through EDG parse and native TypeId gates
         if: always() && steps.translate.outcome == 'success'
@@ -415,6 +421,8 @@ jobs:
             -e "EDG_WEAK_AGGREGATE_CYCLE_ORACLE=1" \
             -e "EDG_STATIC_RECORD_ORACLE=1" \
             -e "EDG_TYPEID_SAFE_GLOBAL_DIAG=1" \
+            -e "EDG_C_MIXED_GLOBAL_DIAG=1" \
+            -e "EDG_C_MIXED_GLOBAL_PROBE=1" \
             -e "EDG_RUN_CREDUCE=0" \
             -e "EDG_UPSTREAM_CHECK=0" \
             ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8 \
@@ -969,6 +977,48 @@ jobs:
           for stage in UNIT ELF GCC LINK RUN PARITY; do
             grep -Fqx "EDG_C_RECORD_BSS_${stage}_EXIT=0" "$log"
           done
+
+      - name: Require source-free mixed C static proof reason and candidate tests
+        if: always() && steps.translate.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/mrustc-edg-audit.log"
+          test -s "$log"
+          grep -Fqx 'EDG_C_MIXED_REASON_UNIT_EXIT=0' "$log"
+          python3 - "$log" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          from pathlib import Path
+          import re,sys
+          lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
+          prefix="EDG_C_REAL_MIXED_PROOF "
+          fields=("reason","string_literals","literal_objects","literal_relocs",
+                  "routine_relocs","data_relocs","dynamic","initializer_exprs",
+                  "scope_dynamic","init_routines","runtime_links",
+                  "lowered_startups","lifetimes","local_static","fp_images")
+          selected=[s for s in lines if s.startswith(prefix)]
+          accepted=lines.count("EDG_C_TYPEID_EXIT=0")==1
+          if not selected and accepted:
+              print("EDG_C_REAL_MIXED_PROOF_STATUS=adapter_accepted")
+          else:
+              if len(selected)!=1:raise SystemExit("missing or duplicate source-safe proof")
+              parts=selected[0][len(prefix):].split()
+              if len(parts)!=len(fields):raise SystemExit("unexpected proof schema")
+              for key,value in zip(fields,parts):
+                  if not re.fullmatch(re.escape(key)+r"=[0-9]{1,10}",value):
+                      raise SystemExit("unsafe mixed C proof field")
+              print(selected[0])
+          aux="EDG_C_REAL_MIXED_PARTITION "
+          extra=[s for s in lines if s.startswith(aux)]
+          if len(extra)>1:raise SystemExit("duplicate numeric partition")
+          if extra:
+              names=("integer","aggregate","owners","materializations","integer_images")
+              parts=extra[0][len(aux):].split()
+              if len(parts)!=len(names) or any(
+                  re.fullmatch(re.escape(k)+r"=[0-9]{1,10}",v) is None
+                  for k,v in zip(names,parts)):
+                  raise SystemExit("unsafe partition count")
+              print(extra[0])
+          PY
 
       - name: Restore host C-Reduce binary package cache
         if: always() && steps.translate.outcome == 'success' && (github.event_name == 'workflow_dispatch' && inputs.edg_creduce)
