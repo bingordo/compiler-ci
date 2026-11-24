@@ -771,6 +771,102 @@ for i,msg in enumerate(messages[-8:],1):
 PY
     fi
   fi
+  # Original public GNU C11 byte-global differential. TypeId must retain
+  # exact one-byte ELF storage, signed/unsigned narrow loads/stores and
+  # source-verified weak routine address, not inflate bytes into I32 data.
+  if [[ "${EDG_C_BYTE_STATIC_ORACLE:-0}" == "1" ]]; then
+    byte_source=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_c_byte_static.c
+    byte_harness=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_c_byte_static_harness.c
+    test -s "$byte_source" && test -s "$byte_harness"
+    set +e
+    (
+      cd /workspace/edgcpp/build/gcc-release
+      CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+        timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" test --quiet \
+        --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
+        --bin compiler-edg-driver source_owned_c_byte_globals -- --test-threads=1
+    ) > /audit-tmp/edg-c-byte-unit.log 2>&1
+    byte_unit_rc=$?
+    byte_native_rc=11
+    if (( byte_unit_rc == 0 )); then
+      (
+        cd /workspace/edgcpp/build/gcc-release
+        CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+          timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" run --quiet \
+          --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
+          -- /audit-tmp/edg-c-byte-typeid.o --gcc --c11 --no_strict_gnu \
+          --gnu_version "$gnu_number" "$byte_source"
+      ) > /audit-tmp/edg-c-byte-native.log 2>&1
+      byte_native_rc=$?
+    fi
+    gcc -std=gnu11 -O0 -Wall -Wextra -Werror -c "$byte_source" \
+      -o /audit-tmp/edg-c-byte-gcc.o
+    byte_gcc_rc=$?
+    if (( byte_gcc_rc == 0 && byte_native_rc == 0 )); then
+      for obj in /audit-tmp/edg-c-byte-gcc.o /audit-tmp/edg-c-byte-typeid.o; do
+        byte_symbols=$(readelf -Ws "$obj" |
+          awk '$4=="OBJECT" && $5=="GLOBAL" && $3==1 &&
+               $8 ~ /^edg_c_byte_(signed|unsigned|zero|const)$/ {n++} END {print n+0}')
+        weak=$(readelf -Ws "$obj" |
+          awk '$4=="OBJECT" && $5=="WEAK" && $3==40 &&
+               $8=="edg_c_byte_weak" {n++} END {print n+0}')
+        reloc=$(readelf -rW "$obj" |
+          grep -cE 'R_X86_64_64.*edg_c_byte_fn' || true)
+        bss=$(readelf -SW "$obj" | grep -Ec '[[:space:]]\.bss[[:space:]]+NOBITS' || true)
+        rodata=$(readelf -SW "$obj" | grep -Ec '[[:space:]]\.rodata[[:space:]]+PROGBITS' || true)
+        if [[ "$byte_symbols" != 4 || "$weak" != 1 || "$reloc" != 1 ||
+              "$bss" -lt 1 || "$rodata" -lt 1 ]]; then
+          if [[ "$obj" == *typeid.o ]]; then byte_native_rc=12
+          else byte_gcc_rc=12; fi
+        fi
+      done
+    fi
+    byte_link_rc=11
+    byte_run_rc=11
+    byte_parity_rc=11
+    if (( byte_native_rc == 0 && byte_gcc_rc == 0 )); then
+      gcc -std=gnu11 -O0 -fno-pie -no-pie \
+        /audit-tmp/edg-c-byte-gcc.o "$byte_harness" -o /audit-tmp/edg-c-byte-gcc-exe &&
+      gcc -std=gnu11 -O0 -fno-pie -no-pie \
+        /audit-tmp/edg-c-byte-typeid.o "$byte_harness" -o /audit-tmp/edg-c-byte-typeid-exe
+      byte_link_rc=$?
+      if (( byte_link_rc == 0 )); then
+        /audit-tmp/edg-c-byte-gcc-exe > /audit-tmp/edg-c-byte-gcc.out &&
+        /audit-tmp/edg-c-byte-typeid-exe > /audit-tmp/edg-c-byte-typeid.out
+        byte_run_rc=$?
+        if (( byte_run_rc == 0 )); then
+          python3 -c 'from pathlib import Path; import sys; sys.exit(
+              0 if Path(sys.argv[1]).read_bytes()==Path(sys.argv[2]).read_bytes()
+              else 1)' \
+            /audit-tmp/edg-c-byte-gcc.out /audit-tmp/edg-c-byte-typeid.out
+          byte_parity_rc=$?
+        fi
+      fi
+    fi
+    set -e
+    echo "EDG_C_BYTE_STATIC_UNIT_EXIT=$byte_unit_rc"
+    echo "EDG_C_BYTE_STATIC_ELF_EXIT=$byte_native_rc"
+    echo "EDG_C_BYTE_STATIC_GCC_EXIT=$byte_gcc_rc"
+    echo "EDG_C_BYTE_STATIC_LINK_EXIT=$byte_link_rc"
+    echo "EDG_C_BYTE_STATIC_RUN_EXIT=$byte_run_rc"
+    echo "EDG_C_BYTE_STATIC_PARITY_EXIT=$byte_parity_rc"
+    if (( byte_unit_rc != 0 || byte_native_rc != 0 )); then
+      python3 - /audit-tmp/edg-c-byte-unit.log /audit-tmp/edg-c-byte-native.log <<'PY'
+from pathlib import Path
+import re,sys
+messages=[]
+for path in map(Path,sys.argv[1:]):
+    if not path.is_file():continue
+    for line in path.read_text(errors="replace").splitlines():
+        if any(k in line for k in ("error[E","error:","FAILED","panicked","test result:")):
+            line=re.sub(r"/(?:workspace|audit-tmp)/[^ :]+","<public-fixture>",line)
+            line=re.sub(r"[^A-Za-z0-9 _./:><()\\[\\],=-]","?",line)
+            messages.append(line.strip()[:180])
+for i,msg in enumerate(messages[-8:],1):
+    print(f"EDG_C_BYTE_STATIC_DIAG_{i}={msg}")
+PY
+    fi
+  fi
   # An actual ELF+GCC executable oracle, not just a bridge snapshot.
   # These two original C11 source files are public, checked-in compiler
   # fixtures and do not depend on/print the private generated mrustc TU.
