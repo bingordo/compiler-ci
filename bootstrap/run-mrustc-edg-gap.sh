@@ -670,6 +670,107 @@ for i,line in enumerate(messages[-8:],1):
 PY
     fi
   fi
+  # Original public C11 const scalar fixture. The independent GCC object
+  # and TypeId object must both retain exact readonly byte images (including
+  # const zero), a mutable global, one weak relocation, and runtime parity.
+  if [[ "${EDG_C_CONST_STATIC_ORACLE:-0}" == "1" ]]; then
+    const_source=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_const_static_scalar.c
+    const_harness=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_const_static_scalar_harness.c
+    test -s "$const_source" && test -s "$const_harness"
+    set +e
+    (
+      cd /workspace/edgcpp/build/gcc-release
+      CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+        timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" test --quiet \
+        --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
+        --bin compiler-edg-driver source_owned_c_const_scalars -- --test-threads=1
+    ) > /audit-tmp/edg-c-const-unit.log 2>&1
+    const_unit_rc=$?
+    const_native_rc=11
+    if (( const_unit_rc == 0 )); then
+      (
+        cd /workspace/edgcpp/build/gcc-release
+        CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+          timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" run --quiet \
+          --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
+          -- /audit-tmp/edg-c-const-typeid.o --gcc --c11 --no_strict_gnu \
+          --gnu_version "$gnu_number" "$const_source"
+      ) > /audit-tmp/edg-c-const-native.log 2>&1
+      const_native_rc=$?
+    fi
+    gcc -std=gnu11 -O0 -Wall -Wextra -Werror -c "$const_source" \
+      -o /audit-tmp/edg-c-const-gcc.o
+    const_gcc_rc=$?
+    if (( const_gcc_rc == 0 && const_native_rc == 0 )); then
+      for obj in /audit-tmp/edg-c-const-gcc.o /audit-tmp/edg-c-const-typeid.o; do
+        ro=$(readelf -SW "$obj" | grep -Ec '[[:space:]]\.rodata[[:space:]]+PROGBITS' || true)
+        ci32=$(readelf -Ws "$obj" |
+          awk '$4=="OBJECT" && $5=="GLOBAL" && $3==4 &&
+               $8=="edg_c_const_i32" {n++} END {print n+0}')
+        cu64=$(readelf -Ws "$obj" |
+          awk '$4=="OBJECT" && $5=="GLOBAL" && $3==8 &&
+               $8=="edg_c_const_u64_zero" {n++} END {print n+0}')
+        mi32=$(readelf -Ws "$obj" |
+          awk '$4=="OBJECT" && $5=="GLOBAL" && $3==4 &&
+               $8=="edg_c_mutable_i32" {n++} END {print n+0}')
+        wk=$(readelf -Ws "$obj" |
+          awk '$4=="OBJECT" && $5=="WEAK" && $3==40 &&
+               $8=="edg_c_const_weak_union" {n++} END {print n+0}')
+        reloc=$(readelf -rW "$obj" |
+          grep -cE 'R_X86_64_64.*edg_c_const_routine' || true)
+        if [[ "$ro" -lt 1 || "$ci32" != 1 || "$cu64" != 1 ||
+              "$mi32" != 1 || "$wk" != 1 || "$reloc" != 1 ]]; then
+          if [[ "$obj" == *typeid.o ]]; then const_native_rc=12
+          else const_gcc_rc=12; fi
+        fi
+      done
+    fi
+    const_link_rc=11
+    const_run_rc=11
+    const_parity_rc=11
+    if (( const_gcc_rc == 0 && const_native_rc == 0 )); then
+      gcc -std=gnu11 -O0 -fno-pie -no-pie \
+        /audit-tmp/edg-c-const-gcc.o "$const_harness" -o /audit-tmp/edg-c-const-gcc-exe &&
+      gcc -std=gnu11 -O0 -fno-pie -no-pie \
+        /audit-tmp/edg-c-const-typeid.o "$const_harness" -o /audit-tmp/edg-c-const-typeid-exe
+      const_link_rc=$?
+      if (( const_link_rc == 0 )); then
+        /audit-tmp/edg-c-const-gcc-exe > /audit-tmp/edg-c-const-gcc.out &&
+        /audit-tmp/edg-c-const-typeid-exe > /audit-tmp/edg-c-const-typeid.out
+        const_run_rc=$?
+        if (( const_run_rc == 0 )); then
+          python3 -c 'from pathlib import Path; import sys; sys.exit(
+              0 if Path(sys.argv[1]).read_bytes()==Path(sys.argv[2]).read_bytes()
+              else 1)' \
+            /audit-tmp/edg-c-const-gcc.out /audit-tmp/edg-c-const-typeid.out
+          const_parity_rc=$?
+        fi
+      fi
+    fi
+    set -e
+    echo "EDG_C_CONST_STATIC_UNIT_EXIT=$const_unit_rc"
+    echo "EDG_C_CONST_STATIC_ELF_EXIT=$const_native_rc"
+    echo "EDG_C_CONST_STATIC_GCC_EXIT=$const_gcc_rc"
+    echo "EDG_C_CONST_STATIC_LINK_EXIT=$const_link_rc"
+    echo "EDG_C_CONST_STATIC_RUN_EXIT=$const_run_rc"
+    echo "EDG_C_CONST_STATIC_PARITY_EXIT=$const_parity_rc"
+    if (( const_unit_rc != 0 || const_native_rc != 0 )); then
+      python3 - /audit-tmp/edg-c-const-unit.log /audit-tmp/edg-c-const-native.log <<'PY'
+from pathlib import Path
+import re,sys
+messages=[]
+for path in map(Path,sys.argv[1:]):
+    if not path.is_file():continue
+    for line in path.read_text(errors="replace").splitlines():
+        if any(k in line for k in ("error[E","error:","FAILED","panicked","test result:")):
+            line=re.sub(r"/(?:workspace|audit-tmp)/[^ :]+","<public-fixture>",line)
+            line=re.sub(r"[^A-Za-z0-9 _./:><()\\[\\],=-]","?",line)
+            messages.append(line.strip()[:180])
+for i,msg in enumerate(messages[-8:],1):
+    print(f"EDG_C_CONST_STATIC_DIAG_{i}={msg}")
+PY
+    fi
+  fi
   # An actual ELF+GCC executable oracle, not just a bridge snapshot.
   # These two original C11 source files are public, checked-in compiler
   # fixtures and do not depend on/print the private generated mrustc TU.
