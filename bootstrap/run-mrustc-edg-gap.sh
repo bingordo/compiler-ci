@@ -959,7 +959,10 @@ PY
         /audit-tmp/edg-c-struct-init-typeid-exe > /audit-tmp/edg-c-struct-init-typeid.out
         struct_run_rc=$?
         if (( struct_run_rc == 0 )); then
-          cmp -s /audit-tmp/edg-c-struct-init-gcc.out /audit-tmp/edg-c-struct-init-typeid.out
+          python3 -c 'from pathlib import Path; import sys; sys.exit(
+              0 if Path(sys.argv[1]).read_bytes()==Path(sys.argv[2]).read_bytes()
+              else 1)' \
+            /audit-tmp/edg-c-struct-init-gcc.out /audit-tmp/edg-c-struct-init-typeid.out
           struct_parity_rc=$?
         fi
       fi
