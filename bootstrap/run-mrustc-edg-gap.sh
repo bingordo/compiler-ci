@@ -552,6 +552,105 @@ for i,line in enumerate(messages[-8:],1):
 PY
     fi
   fi
+  # Public original GNU C11 proof for tentative struct BSS, explicit
+  # strong byte-image union and source-owned weak symbolic routine union.
+  # No source programs or symbols from the private mrustc TU are exported.
+  if [[ "${EDG_STATIC_RECORD_ORACLE:-0}" == "1" ]]; then
+    record_source=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_static_bytes_bss_weak.c
+    record_harness=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_static_bytes_bss_weak_harness.c
+    test -s "$record_source" && test -s "$record_harness"
+    set +e
+    (
+      cd /workspace/edgcpp/build/gcc-release
+      CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+        timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" test --quiet \
+        --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
+        --bin compiler-edg-driver original_c_tentative_struct_and_strong_union_bytes -- --test-threads=1
+    ) > /audit-tmp/static-record-unit.log 2>&1
+    record_unit_rc=$?
+    record_native_rc=11
+    if (( record_unit_rc == 0 )); then
+      (
+        cd /workspace/edgcpp/build/gcc-release
+        CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+          timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" run --quiet \
+          --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
+          -- /audit-tmp/static-record-typeid.o --gcc --c11 --no_strict_gnu \
+          --gnu_version "$gnu_number" "$record_source"
+      ) > /audit-tmp/static-record-object.log 2>&1
+      record_native_rc=$?
+    fi
+    gcc -std=gnu11 -O0 -Wall -Wextra -Werror -c "$record_source" \
+      -o /audit-tmp/static-record-gcc.o
+    record_gcc_rc=$?
+    if (( record_native_rc == 0 && record_gcc_rc == 0 )); then
+      for obj in /audit-tmp/static-record-typeid.o /audit-tmp/static-record-gcc.o; do
+        bss=$(readelf -Ws "$obj" |
+          awk '$4=="OBJECT" && $5=="GLOBAL" && $3==16 &&
+               $8=="edg_static_record_bss" {n++} END {print n+0}')
+        strong=$(readelf -Ws "$obj" |
+          awk '$4=="OBJECT" && $5=="GLOBAL" && $3==40 &&
+               $8=="edg_static_record_bytes" {n++} END {print n+0}')
+        weak=$(readelf -Ws "$obj" |
+          awk '$4=="OBJECT" && $5=="WEAK" && $3==40 &&
+               $8=="edg_static_record_weak" {n++} END {print n+0}')
+        reloc=$(readelf -rW "$obj" |
+          grep -cE 'R_X86_64_64.*edg_static_record_fn' || true)
+        bss_section=$(readelf -SW "$obj" |
+          grep -Ec '[[:space:]]\.bss[[:space:]]+NOBITS' || true)
+        if [[ "$bss" != 1 || "$strong" != 1 || "$weak" != 1 ||
+              "$reloc" != 1 || "$bss_section" -lt 1 ]]; then
+          if [[ "$obj" == *typeid.o ]]; then record_native_rc=12
+          else record_gcc_rc=12; fi
+        fi
+      done
+    fi
+    record_link_rc=11
+    record_run_rc=11
+    record_parity_rc=11
+    if (( record_native_rc == 0 && record_gcc_rc == 0 )); then
+      gcc -std=gnu11 -O0 -fno-pie -no-pie \
+        /audit-tmp/static-record-gcc.o "$record_harness" -o /audit-tmp/static-record-gcc-exe &&
+      gcc -std=gnu11 -O0 -fno-pie -no-pie \
+        /audit-tmp/static-record-typeid.o "$record_harness" -o /audit-tmp/static-record-typeid-exe
+      record_link_rc=$?
+      if (( record_link_rc == 0 )); then
+        /audit-tmp/static-record-gcc-exe > /audit-tmp/static-record-gcc.out &&
+        /audit-tmp/static-record-typeid-exe > /audit-tmp/static-record-typeid.out
+        record_run_rc=$?
+        if (( record_run_rc == 0 )); then
+          python3 -c 'from pathlib import Path; import sys; sys.exit(
+              0 if Path(sys.argv[1]).read_bytes()==Path(sys.argv[2]).read_bytes()
+              else 1)' \
+            /audit-tmp/static-record-gcc.out /audit-tmp/static-record-typeid.out
+          record_parity_rc=$?
+        fi
+      fi
+    fi
+    set -e
+    echo "EDG_C_RECORD_BSS_UNIT_EXIT=$record_unit_rc"
+    echo "EDG_C_RECORD_BSS_ELF_EXIT=$record_native_rc"
+    echo "EDG_C_RECORD_BSS_GCC_EXIT=$record_gcc_rc"
+    echo "EDG_C_RECORD_BSS_LINK_EXIT=$record_link_rc"
+    echo "EDG_C_RECORD_BSS_RUN_EXIT=$record_run_rc"
+    echo "EDG_C_RECORD_BSS_PARITY_EXIT=$record_parity_rc"
+    if (( record_unit_rc != 0 || record_native_rc != 0 )); then
+      python3 - /audit-tmp/static-record-unit.log /audit-tmp/static-record-object.log <<'PY'
+from pathlib import Path
+import re,sys
+messages=[]
+for path in map(Path,sys.argv[1:]):
+    if not path.is_file():continue
+    for line in path.read_text(errors="replace").splitlines():
+        if any(key in line for key in ("error[E","error:","FAILED","panicked","test result:")):
+            line=re.sub(r"/(?:workspace|audit-tmp)/[^ :]+","<public-fixture>",line)
+            line=re.sub(r"[^A-Za-z0-9 _./:><()\\[\\],=-]","?",line)
+            messages.append(line.strip()[:180])
+for i,line in enumerate(messages[-8:],1):
+    print(f"EDG_C_RECORD_BSS_DIAG_{i}={line}")
+PY
+    fi
+  fi
   # An actual ELF+GCC executable oracle, not just a bridge snapshot.
   # These two original C11 source files are public, checked-in compiler
   # fixtures and do not depend on/print the private generated mrustc TU.
