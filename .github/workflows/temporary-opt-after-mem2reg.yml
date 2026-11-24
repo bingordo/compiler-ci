@@ -1,0 +1,101 @@
+name: Temporary full optimizer runtime after mem2reg parity correction
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temporary-opt-after-mem2reg.yml'
+permissions:
+  contents: read
+jobs:
+  optimizer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      SOURCE_SHA: e4a4b05cb9b9b34a52d673d4f32bd0e068fceaba
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and isolate native optimizer core
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: opt-post-mem2reg-full-runtime
+      - name: Compile all optimizer integration binaries exactly once
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --tests --no-run --message-format=json > /tmp/opt-artifacts.jsonl
+          python3 - <<'PY'
+          import json
+          cases={}
+          for line in open("/tmp/opt-artifacts.jsonl"):
+              try: item=json.loads(line)
+              except ValueError: continue
+              if item.get("reason")!="compiler-artifact":continue
+              target=item.get("target",{})
+              path=item.get("executable")
+              package=item.get("package_id","")
+              if path and target.get("name") and "test" in target.get("kind",[]) and "compiler-opt" in package:
+                  cases[target["name"]]=path
+          assert len(cases)>=200, f"incomplete optimizer test inventory: {len(cases)}"
+          with open("/tmp/opt-cases.tsv","w") as out:
+              for name,path in sorted(cases.items()):out.write(name+"\t"+path+"\n")
+          print(f"OPT_INVENTORY={len(cases)}",flush=True)
+          PY
+      - name: Execute optimizer lib and all integration binaries with per-binary timeout
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib -- --test-threads=4
+          python3 - <<'PY'
+          import re,subprocess,time,sys
+          cases=[line.rstrip("\n").split("\t",1) for line in open("/tmp/opt-cases.tsv")]
+          passed=ignored=0
+          for index,(name,path) in enumerate(cases,1):
+              # P9/P14/P15/P16 plus reference, proof and PHI fault-injection
+              # tests share ONE Rust test binary. Its aggregate exceeded 300s.
+              # Preserve full coverage but isolate each Rust test and its time.
+              if name=="al05_p9_mixed_native_bridge":
+                  listing=subprocess.run([path,"--list"],text=True,capture_output=True,check=True)
+                  test_names=[line[:-6] for line in listing.stdout.splitlines() if line.endswith(": test")]
+                  assert len(test_names)>=10,(name,listing.stdout)
+                  invocations=[(f"{name}::{t}",[path,t,"--exact","--test-threads=1"],180) for t in test_names]
+              else:
+                  invocations=[(name,[path,"--test-threads=4"],120)]
+              for tag,args,cap in invocations:
+                  print(f"OPT_START {index}/{len(cases)} {tag} limit={cap}s",flush=True)
+                  start=time.monotonic()
+                  try:
+                      run=subprocess.run(args,text=True,capture_output=True,timeout=cap)
+                  except subprocess.TimeoutExpired:
+                      print(f"OPT_TIMEOUT {tag} elapsed={time.monotonic()-start:.2f}s",flush=True)
+                      sys.exit(124)
+                  if run.returncode:
+                      print(f"OPT_FAIL {tag} code={run.returncode} elapsed={time.monotonic()-start:.2f}s",flush=True)
+                      print(run.stdout[-14000:],flush=True);print(run.stderr[-14000:],flush=True)
+                      sys.exit(run.returncode)
+                  summaries=[tuple(int(n) for n in match) for match in re.findall(r"test result: ok[.] ([0-9]+) passed; 0 failed; ([0-9]+) ignored;",run.stdout)]
+                  if len(summaries)!=1:
+                      print(f"OPT_NO_SUMMARY {tag} stdout={run.stdout[-8000:]}",flush=True)
+                      sys.exit(1)
+                  good,skipped=map(int,summaries[0]);passed+=good;ignored+=skipped
+                  print(f"OPT_PASS {tag} tests={good} ignored={skipped} elapsed={time.monotonic()-start:.2f}s",flush=True)
+          print(f"OPT_COMPLETE binaries={len(cases)} passed={passed} ignored={ignored} failures=0",flush=True)
+          PY
