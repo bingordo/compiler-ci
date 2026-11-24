@@ -44,7 +44,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ inputs.source_ref || 'main' }}
+          ref: 8988163ea13adb251d56b46a3be55fd219d8d17a
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -58,6 +58,11 @@ jobs:
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "Compiler source SHA: $sha"
+          [[ "$sha" == "8988163ea13adb251d56b46a3be55fd219d8d17a" ]] || { echo "Unexpected compiler source revision"; exit 1; }
+          # Checkout is shallow; verify source and run the concrete gate
+          # rather than requiring the ancestor's Git object to be fetched.
+          grep -F 'fn al05_p17_selected_mutation_concrete_witnesses' crates/opt/tests/al05_p9_mixed_native_bridge.rs
+          grep -F 'AL05_P17_MUTATION_LEDGER' crates/opt/tests/al05_p9_mixed_native_bridge.rs
           # Fail rather than silently accepting a moved/absent test suite.
           for test_source in \
             crates/opt/tests/native_cfg_differential.rs \
@@ -109,6 +114,89 @@ jobs:
           workspaces: compiler -> target
           key: native-cfg-correctness-v1
           cache-workspace-crates: 'true'
+      # P17 test must run before unrelated all-crate checks and fail closed.
+      # Source checkout, module parser and independent TypeId reference are
+      # the same production/test infrastructure as P16; no second generator.
+      - name: Validate P17 owned-TypeId mutations and JSON ledger
+        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          # Compile once, then measure both test executions without
+          # charging cold Cargo compilation to either one.
+          timeout --signal=TERM --kill-after=10s 6m \
+            cargo test -p compiler-opt --test al05_p9_mixed_native_bridge --no-run
+          p16_begin=$(date +%s%N)
+          timeout --signal=TERM --kill-after=10s 6m \
+            cargo test -p compiler-opt --test al05_p9_mixed_native_bridge \
+              al05_p16_coverage::tests::al05_p16_selector_is_order_independent_bounded_and_nontrivial \
+              -- --exact --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/al05-p16-selector.log"
+          p16_end=$(date +%s%N)
+          p16_ms=$(( (p16_end - p16_begin) / 1000000 ))
+          grep -F "test al05_p16_coverage::tests::al05_p16_selector_is_order_independent_bounded_and_nontrivial ... ok" "$RUNNER_TEMP/al05-p16-selector.log"
+          p17_begin=$(date +%s%N)
+          timeout --signal=TERM --kill-after=10s 6m \
+            cargo test -p compiler-opt --test al05_p9_mixed_native_bridge \
+              al05_p17_selected_mutation_concrete_witnesses -- --exact --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/al05-p17-ledger.log"
+          p17_end=$(date +%s%N)
+          elapsed_ms=$(( (p17_end - p17_begin) / 1000000 ))
+          # A relative ceiling plus small fixed launch/noise allowance:
+          # do not require unstable sub-second relative timing parity.
+          ceiling_ms=$(( p16_ms * 10 + 1500 ))
+          if (( elapsed_ms > ceiling_ms )); then
+            echo "P17 exceeded P16 selector cost ceiling: p16=${p16_ms}ms p17=${elapsed_ms}ms max=${ceiling_ms}ms" >&2
+            exit 1
+          fi
+          echo "AL05_P17_COST p16_selector_ms=${p16_ms} p17_mutations_ms=${elapsed_ms} ceiling_ms=${ceiling_ms} verdict=PASS"
+          python3 - "$RUNNER_TEMP/al05-p17-ledger.log" "$(git rev-parse HEAD)" <<'PY'
+          import collections, json, pathlib, sys
+          lines = pathlib.Path(sys.argv[1]).read_text(errors="replace").splitlines()
+          token = "AL05_P17_MUTATION_LEDGER "
+          rows = [json.loads(line.split(token, 1)[1])
+                  for line in lines if token in line]
+          assert len(rows) == 48, f"expected 48 records, got {len(rows)}"
+          assert len({(r["case_id"], r["mutation_kind"]) for r in rows}) == 48
+          assert len({r["case_id"] for r in rows}) == 24
+          assert collections.Counter(r["mutation_kind"] for r in rows) == {
+              "wrong-loop-phi": 24, "dropped-latch-divs": 24
+          }
+          for row in rows:
+              assert row["schema"] == "al05-p17-mutation-ledger-v1"
+              assert row["source_sha"] == sys.argv[2]
+              assert row["verifier"] == "PASS"
+              assert row["expected_oracle"] == "independent-host-i32-recurrence"
+              assert row["mutant_oracle"] == "bounded-typeid-reference"
+              assert row["witness"] is not None
+              assert row["semantics"] == "FS1-DRAFT-NON-NORMATIVE"
+              assert row["verdict"] == "BOUNDED"
+              expected = {"wrong-loop-phi": "wrong-return",
+                          "dropped-latch-divs": "missing-trap"}[row["mutation_kind"]]
+              assert row["expected_failure_class"] == expected
+              assert row["observed_failure_class"] == expected
+          assert any("AL05_P17_LEDGER_SUMMARY" in line and
+                     "weakened_selector=REJECTED" in line and
+                     "missing_family=REJECTED" in line and
+                     "missing_case=REJECTED" in line and
+                     "unknown=REJECTED" in line and
+                     "host_oracle=INDEPENDENT" in line for line in lines)
+          print("AL05_P17_LEDGER_VALIDATED records=48 cases=24 sha="+sys.argv[2])
+          PY
+          echo "AL05_P17_OWNED_TYPEID_FOCUSED sha=$(git rev-parse HEAD) p16_selector_ms=$p16_ms p17_mutations_ms=$elapsed_ms ceiling_ms=$ceiling_ms records=48 verdict=PASS" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify target-neutral INTEGER ABI call lowering and aggregate tests
+        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 5m \
+            cargo test -p compiler-backend --lib typeid_integer_call::tests -- --nocapture
+          timeout --signal=TERM --kill-after=10s 3m \
+            cargo clippy -p compiler-backend --lib -- -D warnings
+
       - name: FS-1 draft pointer roots, effects and actual TypeId optimizer observation barriers
         if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
         shell: bash
