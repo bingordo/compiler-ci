@@ -1,0 +1,114 @@
+name: RV64 cross-block pure expression exact-source static A/B
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/bench-rv64-crossblock-pure-source-ab-20261124.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source-pinned-static-ab:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler-ci
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: fc1e6617982dcd073110e5b606635657ae5e3816
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 08da87df1bea72ac38bfc34e517bc08cf49c56d8
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source revisions and unchanged machine emitter
+        run: |
+          set -euo pipefail
+          test "$(git -C before rev-parse HEAD)" = 'fc1e6617982dcd073110e5b606635657ae5e3816'
+          test "$(git -C after rev-parse HEAD)" = '08da87df1bea72ac38bfc34e517bc08cf49c56d8'
+          for file in \
+            crates/backend-riscv64/src/leaf.rs \
+            crates/backend-riscv64/src/machine.rs \
+            crates/backend-riscv64/src/generated_native_selector_rules.rs \
+            crates/backend-riscv64/src/encoding.rs; do
+            cmp "before/$file" "after/$file"
+          done
+          echo "Before: fc1e6617982dcd073110e5b606635657ae5e3816" >> "$GITHUB_STEP_SUMMARY"
+          echo "After: 08da87df1bea72ac38bfc34e517bc08cf49c56d8" >> "$GITHUB_STEP_SUMMARY"
+      - name: Overlay source-owned TypeId fixture without modifying either compiler implementation
+        run: |
+          set -euo pipefail
+          python3 harness/tools/overlay_rv64_crossblock_pure_fixture.py before after
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build both release source compilers
+        run: |
+          set -euo pipefail
+          for mode in before after; do
+            cat > "$mode/Cargo.toml" <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-riscv64"]
+          EOF
+            rm -f "$mode/Cargo.lock"
+            (cd "$mode" && cargo build --release -p compiler-backend-riscv64 --example rv64_leaf)
+          done
+      - name: Install GNU binutils for deterministic code metrics
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y binutils-riscv64-linux-gnu
+      - name: Compare identical TypeId machine-code output and GNU GAS parity
+        run: |
+          set -euo pipefail
+          mkdir -p outputs
+          for mode in before after; do
+            "$mode/target/release/examples/rv64_leaf" \
+              "outputs/$mode.o" "outputs/$mode.s" pure_addi_crossblock --isa=rv64i
+            riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+              "outputs/$mode.s" -o "outputs/$mode.gas.o"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "outputs/$mode.o" "outputs/$mode.bin"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "outputs/$mode.gas.o" "outputs/$mode.gas.bin"
+            cmp "outputs/$mode.bin" "outputs/$mode.gas.bin"
+            riscv64-linux-gnu-objdump -d "outputs/$mode.o" > "outputs/$mode.disasm"
+          done
+          python3 - <<'PY' | tee outputs/summary.txt
+          import json
+          import re
+          from pathlib import Path
+          def inspect(mode):
+              binary = Path(f"outputs/{mode}.bin")
+              text = Path(f"outputs/{mode}.disasm").read_text()
+              instructions = [
+                  line for line in text.splitlines()
+                  if re.match(r"^\s*[0-9a-f]+:\s+[0-9a-f]{4,8}\s+[a-z]", line)
+              ]
+              return {"text_bytes": binary.stat().st_size,
+                      "instructions": len(instructions)}
+          before, after = inspect("before"), inspect("after")
+          print(f"baseline: {before}; candidate: {after}")
+          delta = after["text_bytes"] - before["text_bytes"]
+          print(f"Static .text byte delta: {delta}")
+          Path("outputs/comparison.json").write_text(json.dumps(
+              {"before": before, "after": after, "delta_bytes": delta}, indent=2) + "\n")
+          assert after["text_bytes"] < before["text_bytes"], (
+              "Dominance-safe cross-block source fixture did not reduce emitted code")
+          PY
+          cat outputs/summary.txt >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rv64-crossblock-pure-source-static-ab
+          path: outputs/
+          if-no-files-found: warn
