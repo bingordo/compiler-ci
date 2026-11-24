@@ -993,11 +993,11 @@ import re,sys
 lines=[]
 for p in map(Path,sys.argv[1:]):
     if p.is_file():lines.extend(p.read_text(errors="replace").splitlines())
-stages=re.findall(r"EDG_PUBLIC_STRUCT_STAGE=(\\d+)", "\\n".join(lines))
+stages=re.findall(r"EDG_PUBLIC_STRUCT_STAGE=(\d+)", "\n".join(lines))
 print("EDG_C_STRUCT_INIT_LAST_STAGE="+(stages[-1] if stages else "0"))
 for line in lines:
     if "EDG_PUBLIC_STRUCT_COUNTS " in line:
-        nums=re.search(r"EDG_PUBLIC_STRUCT_COUNTS owners=(\\d+) images=(\\d+) int=(\\d+) materializations=(\\d+) arrays=(\\d+) relocs=(\\d+)",line)
+        nums=re.search(r"EDG_PUBLIC_STRUCT_COUNTS owners=(\d+) images=(\d+) int=(\d+) materializations=(\d+) arrays=(\d+) relocs=(\d+)",line)
         if nums:print("EDG_C_STRUCT_INIT_PUBLIC_COUNTS="+"_".join(nums.groups()))
         break
 errors=[]
