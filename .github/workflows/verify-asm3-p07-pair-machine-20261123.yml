@@ -1,0 +1,54 @@
+name: ASM3 P07 two-input machine RA regression (source pinned)
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-asm3-p07-pair-machine-20261123.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 114d2f69d8a037f4f6d811193b8ee060d85e8e75
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - name: Assert exact candidate source
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 114d2f69d8a037f4f6d811193b8ee060d85e8e75
+      - name: Isolate public backend crates from private frontend dependencies
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: asm3-p07-pair-machine-regression
+      - name: Compile all backends and run x86 machine regression
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check --workspace
+          cargo test -p compiler-backend-x86 --lib opaque_two_input_machine_contract_tracks_uses_clobbers_and_ra_homes -- --nocapture
+          cargo test -p compiler-backend-x86 --lib asm3_p05_opaque_machine_ra -- --nocapture
+          cargo clippy -p compiler-backend-x86 --lib -- -D warnings
+      - name: Report whole x86 baseline separately (known ABI/FP argument-cap failures)
+        continue-on-error: true
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib
