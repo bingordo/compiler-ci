@@ -1,0 +1,53 @@
+name: Validate AArch64 native TypeId disjoint bulk memcpy
+on:
+  push:
+    branches: [ci-aarch64-typeid-bulkcopy-20261123]
+    paths: ['.github/workflows/ci-aarch64-typeid-bulkcopy-20261123.yml']
+  pull_request:
+    paths: ['.github/workflows/ci-aarch64-typeid-bulkcopy-20261123.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  aarch64-copy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 0153419d8c7142f9e551f8f704ac741727b3fe52
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned compiler head
+        run: test "$(git -C compiler rev-parse HEAD)" = 0153419d8c7142f9e551f8f704ac741727b3fe52
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: aarch64-typeid-bulkcopy
+      - name: Check rustfmt in native copy loop and ELF test
+        working-directory: compiler
+        run: rustfmt --check --edition 2021 crates/backend-aarch64/src/bulk_copy.rs crates/driver/tests/native_lp64_aarch64_dynamic_memset.rs
+      - name: All-target workspace compile
+        working-directory: compiler
+        run: cargo check --workspace --all-targets
+      - name: AArch64 compiler source-to-ELF LDRB STRB loops and move fallback
+        working-directory: compiler
+        run: cargo test -p compiler --test native_lp64_aarch64_dynamic_memset -- --nocapture
+      - name: AArch64 backend unit suite
+        working-directory: compiler
+        run: cargo test -p compiler-backend-aarch64 --lib -- --nocapture
+      - name: Independent Mini-C native memcpy capability test
+        working-directory: compiler
+        run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib native_bulk_memcpy_capability -- --nocapture
+      - name: x86 memcpy and memset C11 executable regression
+        working-directory: compiler
+        run: cargo test -p compiler --test native_lp64_bounded_dynamic_memcpy -- --nocapture && cargo test -p compiler --test native_lp64_dynamic_memset -- --nocapture
