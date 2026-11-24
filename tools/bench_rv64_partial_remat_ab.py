@@ -20,6 +20,9 @@ CASES = (
     "addi_phi", "addi_shared", "slti32_neg", "sltiu32_neg",
     "bitwise_shared", "spillsum", "pressure16", "pressure48",
     "spillbranch", "branch", "same", "partial16", "partial32",
+    "mix8", "mix16", "mix32", "mix64",
+    "sparse16", "sparse32", "sparse64",
+    "interleave16", "interleave32",
 )
 REG_OPS = {"add", "and", "or", "xor", "slt", "sltu"}
 IMM_OPS = {"addi", "andi", "ori", "xori", "slti", "sltiu"}
@@ -122,6 +125,22 @@ def main() -> None:
             f"{kind} did not exercise the intended high-pressure partial fold",
             results[kind],
         )
+    # A regression means this heuristic makes allocator homes or emitted
+    # code strictly worse on an identical source workload. Report every
+    # counterexample, including its source configuration and all raw counts.
+    regressions = {}
+    for kind, row in results.items():
+        changes = {
+            key: row["delta"][key]
+            for key in ("spill_slots", "spilled_virtual_values",
+                        "frame_bytes", "text_bytes",
+                        "stack_load_store_instructions")
+            if row["delta"][key] > 0
+        }
+        if changes:
+            regressions[kind] = changes
+            print(f"REGRESSION {kind}: {changes}")
+    print(f"static A/B: {len(CASES)} cases; {len(regressions)} regression cases")
     out = {
         "method": "source-pinned same-TypeId-input RV64 code-generation comparison",
         "measurement_scope": "static object code and exact shared-register-allocator spill/frame counts; no target runtime measurement",
@@ -130,10 +149,14 @@ def main() -> None:
             "new": "c1f89639e5e776d81bb4e4947b4431a6ec9cae5c",
         },
         "fixture_matrix": results,
+        "regressions": regressions,
     }
     output = root / "comparison.json"
     output.write_text(json.dumps(out, indent=2, sort_keys=True) + "\n")
     print("JSON:", output)
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["--list-cases"]:
+        print("\n".join(CASES))
+    else:
+        main()
