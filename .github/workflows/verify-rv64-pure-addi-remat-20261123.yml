@@ -1,0 +1,134 @@
+name: RV64 shared pure ADDI expression rematerialization
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-rv64-pure-addi-remat-20261123.yml']
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Compiler source commit SHA
+        type: string
+        required: true
+        default: 'ef60e2a642cc8c8073f74b8395199317791ff50c'
+permissions:
+  contents: read
+jobs:
+  rv64-pure-addi-remat:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || 'ef60e2a642cc8c8073f74b8395199317791ff50c' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert pinned compiler commit
+        run: |
+          set -euo pipefail
+          actual="$(git -C compiler rev-parse HEAD)"
+          echo "Pure expression remat source: $actual" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$GITHUB_EVENT_NAME" = push ]; then test "$actual" = 'ef60e2a642cc8c8073f74b8395199317791ff50c'; fi
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Isolate native RV64 workspace
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend", "crates/backend-riscv64"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: rv64-pure-addi-20261123
+      - name: Confirm source-reviewed generated selection stays identical
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/regen_riscv_native_selector_rules.py --check
+          python3 -m unittest discover -s tools -p test_riscv_native_selector_rules.py -v
+          python3 tools/riscv_udb_rust_leaf_forms.py \
+            --catalog data/riscv_udb_r0_catalog.json \
+            --output crates/backend-riscv64/src/generated_encoding.rs --check
+      - name: Test pure expression planner, all RV64 targets and strict Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib remat::tests
+          cargo test -p compiler-backend-riscv64 --lib pure_addi_tests -- --nocapture
+          cargo test -p compiler-backend-riscv64 --all-targets
+          cargo clippy -p compiler-backend-riscv64 --all-targets -- --no-deps -D warnings
+      - name: Install independent RISC-V binutils and QEMU for correctness only
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y binutils-riscv64-linux-gnu qemu-user
+      - name: Match direct ELF text bytes to GAS for source CFG fixtures
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for kind in addi_phi addi_shared slti32_neg; do
+            cargo run -p compiler-backend-riscv64 --example rv64_leaf -- \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}.s" "$kind" --isa=rv64i
+            riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+              "/tmp/rv64_${kind}.s" -o "/tmp/rv64_${kind}_gas.o"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}.o" "/tmp/rv64_${kind}_direct.bin"
+            riscv64-linux-gnu-objcopy -O binary -j .text \
+              "/tmp/rv64_${kind}_gas.o" "/tmp/rv64_${kind}_gas.bin"
+            cmp "/tmp/rv64_${kind}_direct.bin" "/tmp/rv64_${kind}_gas.bin"
+          done
+      - name: QEMU correctness oracle, no performance or timing measurements
+        run: |
+          set -euo pipefail
+          cat > /tmp/rv64_pure_addi_start.s <<'EOF'
+          .option norvc
+          .option norelax
+          .text
+          .globl _start
+          _start:
+            li a0, 7
+            li a1, 18
+            call rv64_addi_phi
+            li t0, 29
+            bne a0, t0, fail1
+            li a0, 20
+            li a1, 6
+            call rv64_addi_phi
+            li t0, 42
+            bne a0, t0, fail2
+            li a0, 7
+            call rv64_addi_shared
+            li t0, 81
+            bne a0, t0, fail3
+            li a0, -20
+            call rv64_slti32_neg
+            li t0, 1
+            bne a0, t0, fail4
+            li a0, 0
+            j exit
+          fail1: li a0, 1
+            j exit
+          fail2: li a0, 2
+            j exit
+          fail3: li a0, 3
+            j exit
+          fail4: li a0, 4
+          exit:
+            li a7, 93
+            ecall
+          EOF
+          riscv64-linux-gnu-as -march=rv64i -mabi=lp64 \
+            /tmp/rv64_pure_addi_start.s -o /tmp/rv64_pure_addi_start.o
+          riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax \
+            -e _start /tmp/rv64_pure_addi_start.o \
+            /tmp/rv64_addi_phi.o /tmp/rv64_addi_shared.o \
+            /tmp/rv64_slti32_neg.o -o /tmp/rv64_pure_addi.elf
+          timeout 15s qemu-riscv64 /tmp/rv64_pure_addi.elf
+          echo 'Four independent RV64 correctness cases passed (no timing)'
