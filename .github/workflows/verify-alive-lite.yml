@@ -47,7 +47,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ inputs.source_ref || 'main' }}
+          ref: 8988163ea13adb251d56b46a3be55fd219d8d17a
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -61,6 +61,11 @@ jobs:
           test -s compiler/crates/opt/tests/alive_lite.rs
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "Compiler revision: $sha" >> "$GITHUB_STEP_SUMMARY"
+          [[ "$sha" == "8988163ea13adb251d56b46a3be55fd219d8d17a" ]] || { echo "Unexpected compiler source revision"; exit 1; }
+          # Checkout is shallow; verify source and run the concrete gate
+          # rather than requiring the ancestor's Git object to be fetched.
+          grep -F 'fn al05_p17_selected_mutation_concrete_witnesses' compiler/crates/opt/tests/al05_p9_mixed_native_bridge.rs
+          grep -F 'AL05_P17_MUTATION_LEDGER' compiler/crates/opt/tests/al05_p9_mixed_native_bridge.rs
       - name: Skip proofs already validated for exact source and workflow
         id: verified
         uses: actions/cache/restore@v4
@@ -110,6 +115,22 @@ jobs:
         run: |
           timeout --signal=TERM --kill-after=10s 3m \
             cargo clippy -p compiler-opt --test alive_lite -- -D warnings
+      - name: Verify P17 selected shared-plan TypeId/parity smoke without legacy production fallback
+        if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 5m \
+            cargo test -p compiler-opt --test alive_lite \
+              al05_p17_cross_view::al05_p17_selected_plans_legacy_proof_and_direct_typeid_reference_agree \
+              -- --exact --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/al05-p17-cross-view.log"
+          grep -F 'test al05_p17_cross_view::al05_p17_selected_plans_legacy_proof_and_direct_typeid_reference_agree ... ok' \
+            "$RUNNER_TEMP/al05-p17-cross-view.log"
+          grep -F 'AL05_P17_SHARED_PLAN_TYPEID_PARITY selected=24 observations=120 legacy=PROOF_ONLY native=OWNED_TYPEID verdict=PASS' \
+            "$RUNNER_TEMP/al05-p17-cross-view.log"
+
       - name: Verify native TypeId and legacy narrow-store reconstruction parity
         if: steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck || github.event_name == 'push'
         shell: bash
