@@ -1926,6 +1926,10 @@ schemas={
         "EDG_C_REAL_BODY_EXPR_KIND",("kind","op","count"),32),
     "EDG_C_BODY_LOCAL_KIND":(
         "EDG_C_REAL_BODY_LOCAL_KIND",("kind","static","count"),24),
+    "EDG_C_BODY_LOCAL_CANON":(
+        "EDG_C_REAL_BODY_LOCAL_CANON",
+        ("root","kind","aliases","qualifiers","refs","bytes",
+         "align","admit","count"),24),
     "EDG_C_BODY_PARAM_KIND":(
         "EDG_C_REAL_BODY_PARAM_KIND",("kind","role","count"),24),
     "EDG_C_BODY_PARAM_CANON":(
