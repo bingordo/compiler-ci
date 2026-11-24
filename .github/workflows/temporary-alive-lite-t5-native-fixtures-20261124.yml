@@ -1,0 +1,67 @@
+# One-time source-pinned migration gate; close PR without merging.
+name: Temporary Alive-lite T5 native fixture migration
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temporary-alive-lite-t5-native-fixtures-20261124.yml'
+permissions:
+  contents: read
+jobs:
+  t5-native-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: 39e7a4ccb0ac287bd305cc919c81bb347b173164
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and isolate standalone native workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "Tested compiler SHA $SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - name: Reuse scoped Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: temporary-alive-t5-native-source
+      - name: Check full concrete Alive-lite and native v3 inventory suites
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test alive_lite -- --nocapture
+          cargo test -p compiler-opt --test native_v3_fixture_inventory -- --nocapture
+      - name: Install Z3
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y z3
+          z3 --version
+      - name: Prove all changed T5 pass chains and intermediate stages
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test alive_lite t5_typed -- --ignored --nocapture --test-threads=1
+      - name: Focused Clippy (unrelated baseline lint exceptions)
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --test alive_lite --test native_v3_fixture_inventory -- -D clippy::all -A clippy::too_many_arguments -A clippy::needless_lifetimes -A clippy::empty_line_after_doc_comments -A clippy::collapsible_if -A clippy::collapsible_match -A clippy::needless_range_loop -A clippy::needless_borrows_for_generic_args
