@@ -1,0 +1,59 @@
+# One-time source-pinned CI for native IR memory-inliner and if-conversion inputs.
+name: Temporary native IR memory/ifconv builders
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temporary-ir-memory-ifconv-builders-20261124.yml'
+permissions:
+  contents: read
+jobs:
+  ir-native-inputs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: 13fc64a780b4c71a79558c830587aa25bdcab7c7
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler commit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check pinned SHA and isolate core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "Tested compiler SHA $SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - name: Cache isolated Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: temporary-ir-memory-ifconv-inputs
+      - name: Execute full modified suites and neighboring native tests
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_inline_memory_native -- --nocapture
+          cargo test -p compiler-opt --test typed_if_conversion_native -- --nocapture
+          cargo test -p compiler-opt --test typed_if_conversion_pure -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_postopt_native_trial -- --nocapture
+          cargo test -p compiler-opt --test native_v3_fixture_inventory -- --nocapture
+      - name: Test source Clippy, scoped baseline exceptions only
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --test typed_inline_memory_native --test typed_if_conversion_native -- -D clippy::all -A clippy::empty_line_after_doc_comments -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::needless_range_loop -A clippy::needless_borrows_for_generic_args -A clippy::too_many_arguments
