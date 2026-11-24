@@ -1585,6 +1585,28 @@ if len(records)==1:
     print("EDG_C_REAL_MIXED_PARTITION "+" ".join(
         f"{key}={val}" for key,val in zip(keys,records[0])))
 PY
+  # The compiler emits this only for the first unsupported qualified or
+  # narrow source integer. No source names, TypeIds or bytes are exported.
+  python3 - /audit-tmp/edg-generated-c-native.log <<'PY'
+from pathlib import Path
+import re,sys
+fields=("bits","readonly","c","explicit")
+prefix="EDG_C_STATIC_SCALAR_REJECT "
+found=[]
+for line in Path(sys.argv[1]).read_text(errors="replace").splitlines():
+    if not line.startswith(prefix):continue
+    cells=line[len(prefix):].split()
+    if len(cells)!=len(fields):continue
+    vals=[]
+    for field,cell in zip(fields,cells):
+        match=re.fullmatch(re.escape(field)+r"=([0-9]{1,3})",cell)
+        if match is None:break
+        vals.append(match.group(1))
+    else:found.append(vals)
+if len(found)==1:
+    print("EDG_C_REAL_STATIC_SCALAR_REJECT "+" ".join(
+        f"{key}={val}" for key,val in zip(fields,found[0])))
+PY
 fi
 
 # The original generated C can contain private symbols/source paths.
