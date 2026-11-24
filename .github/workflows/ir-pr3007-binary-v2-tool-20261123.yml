@@ -1,0 +1,57 @@
+# Exact-source validation of opt-in v2 ir-tool replay; never run compiler Actions.
+name: IR PR3007 binary-v2 CLI
+on:
+  push:
+    branches: [validate/ir-pr3007-binary-v2-20261123]
+    paths:
+      - '.github/workflows/ir-pr3007-binary-v2-tool-20261123.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  codec:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SOURCE_SHA: db9343041db8eced6b371aa623209110e351b249
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler PR head
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned SHA and isolate core
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Cache isolated Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-pr3007-binary-v2-tool
+      - name: Verify v2 CLI roundtrips and established IR codecs
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test native_binary_v2 -- --nocapture
+          cargo test -p compiler-ir --test native_binary_v1 -- --nocapture
+          cargo test -p compiler-ir --test native_module_text_v3 -- --nocapture
+          cargo test -p compiler-ir --test lto_merge -- --nocapture
+          cargo check -p compiler-ir --bin ir-tool
+      - name: Focused Clippy (CLI and v2 regression)
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir --bin ir-tool --test native_binary_v2 -- -D clippy::all -A clippy::empty_line_after_doc_comments -A clippy::collapsible_if
