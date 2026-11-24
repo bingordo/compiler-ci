@@ -1,0 +1,63 @@
+# One-time exact-source validation of native TypeId LTO inputs and probes.
+name: Temporary native TypeId LTO/probe migration
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temporary-ir-direct-probes-lto-20261124.yml'
+permissions:
+  contents: read
+jobs:
+  ir-native-probe-lto:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: 81cf40cdb6d856b945c9c84ab5e69d9d75401ac4
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout pinned compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check exact commit and native host toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          printf 'Tested compiler SHA: %s\n' "$SOURCE_SHA"
+          rustc --version
+          cc --version | head -n1
+      - name: Enable private frontend dependency checkouts
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Cache Rust test builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: temporary-ir-direct-probe-lto-inputs
+      - name: Full LTO driver CLI tests with independently linked C11 oracle
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test lto_cli -- --nocapture
+      - name: Build both directly-generated TypeId diagnostic probes
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-ir --example ssa_cache_probe
+          cargo check -p compiler-opt --example borrowed_dependency_probe
+      - name: Scoped Clippy for all three changed Rust targets
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler --test lto_cli -- -D clippy::all -A clippy::too_many_arguments -A clippy::needless_borrows_for_generic_args -A clippy::collapsible_if -A clippy::collapsible_match -A clippy::needless_range_loop -A clippy::empty_line_after_doc_comments
+          cargo clippy -p compiler-ir --example ssa_cache_probe -- -D clippy::all -A clippy::too_many_arguments -A clippy::needless_borrows_for_generic_args -A clippy::collapsible_if -A clippy::collapsible_match -A clippy::needless_range_loop -A clippy::empty_line_after_doc_comments
+          cargo clippy -p compiler-opt --example borrowed_dependency_probe -- -D clippy::all -A clippy::too_many_arguments -A clippy::needless_borrows_for_generic_args -A clippy::collapsible_if -A clippy::collapsible_match -A clippy::needless_range_loop -A clippy::empty_line_after_doc_comments
