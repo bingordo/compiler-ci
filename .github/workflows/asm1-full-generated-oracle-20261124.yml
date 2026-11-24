@@ -1,0 +1,52 @@
+name: ASM1 full generated physical GP vs GNU as
+on:
+  pull_request:
+    paths: ['.github/workflows/asm1-full-generated-oracle-20261124.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  generated-oracle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 76e1b2e809040f65dab12a924201294e5fb80e5c
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - name: Assert source pinned exactly
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 76e1b2e809040f65dab12a924201294e5fb80e5c
+      - name: Validate generator source and checked output
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/test_regen_x86_att_forms.py
+          python3 tools/regen_x86_att_forms.py --check
+      - name: Isolate backend crates from private frontends
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: asm1-all-physical-generated
+      - name: Compile standalone assembler and compare every generated form with GAS
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo build -p compiler-backend-x86 --bin compiler-x86-as
+          python3 tools/test_x86_att_generated_differential.py --assembler target/debug/compiler-x86-as
+          cargo test -p compiler-backend-x86 --test att_asm -- --nocapture
