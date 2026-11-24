@@ -388,6 +388,40 @@ PY
     fi
   fi
 
+  # Original public C11 TypeId record and field witnesses certify only
+  # the representable SysV INTEGER/INTEGER two-eightbyte aggregate shape.
+  # No by-value lowering, invented integer carrier, or private mrustc
+  # source is admitted on the strength of this separate layout test.
+  if [[ "${EDG_C_MIXED_GLOBAL_PROBE:-0}" == "1" ]]; then
+    gp_pair_rc=11
+    if (( typeid_check_rc == 0 )); then
+      set +e
+      (
+        cd /workspace/edgcpp/build/gcc-release
+        CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+          timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" test --quiet \
+          --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
+          --bin compiler-edg-driver c_gp_pair_formal_ -- --test-threads=1
+      ) > /audit-tmp/edg-c-gp-pair-unit.log 2>&1
+      gp_pair_rc=$?
+      set -e
+    fi
+    echo "EDG_C_GP_PAIR_UNIT_EXIT=$gp_pair_rc"
+    if (( gp_pair_rc != 0 )) && [[ -s /audit-tmp/edg-c-gp-pair-unit.log ]]; then
+      python3 - /audit-tmp/edg-c-gp-pair-unit.log <<'PY'
+from pathlib import Path
+import re,sys
+lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
+errors=[line for line in lines if any(k in line for k in
+        ("error[E","error:","panicked","FAILED","test result:"))]
+for i,line in enumerate(errors[-8:],1):
+    msg=re.sub(r"/(?:workspace|audit-tmp)/[^ :]+","public_fixture",line.strip())
+    msg=re.sub(r"[^A-Za-z0-9 _.,=:/()><-]","_",msg)
+    if msg:print(f"EDG_C_GP_PAIR_DIAG_{i}={msg[:180]}")
+PY
+    fi
+  fi
+
   # Full public GNU C11 weak data/routine combined proof. The source
   # fixture and harness are both committed with the candidate compiler.
   # Private mrustc generated C is not part of this positive oracle.
