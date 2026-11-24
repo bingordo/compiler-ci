@@ -1028,7 +1028,10 @@ PY
         /audit-tmp/edg-c-byte-result-typeid-exe > /audit-tmp/edg-c-byte-result-typeid.out
         byte_result_run_rc=$?
         if (( byte_result_run_rc == 0 )); then
-          cmp -s /audit-tmp/edg-c-byte-result-gcc.out \
+          python3 -c 'from pathlib import Path; import sys; sys.exit(
+              0 if Path(sys.argv[1]).read_bytes()==Path(sys.argv[2]).read_bytes()
+              else 1)' \
+            /audit-tmp/edg-c-byte-result-gcc.out \
             /audit-tmp/edg-c-byte-result-typeid.out
           byte_result_parity_rc=$?
         fi
