@@ -38,7 +38,7 @@ def overlay(before: Path, after: Path) -> None:
         '        "addi_phi" =>', 1)[0]
     # The baseline already has a newline after ANCHOR; avoid inserting
     # the trailing source newline twice when overlaying the candidate.
-    a.write_text(old.replace(ANCHOR, ANCHOR + inserted.rstrip("\\n"), 1))
+    a.write_text(old.replace(ANCHOR, ANCHOR + inserted.rstrip("\n"), 1))
     assert a.read_bytes() == b.read_bytes(), "example source drift"
     print("Both exact-commit compilers consume byte-identical TypeId source.")
 
