@@ -1899,6 +1899,10 @@ schemas={
         "EDG_C_REAL_BODY_PARAM_CANON",
         ("root","kind","role","aliases","qualifiers","refs","bits",
          "signed","boolean","bytes","align","pointee","count"),24),
+    "EDG_C_BODY_PARAM_FIELD":(
+        "EDG_C_REAL_BODY_PARAM_FIELD",
+        ("bytes","align","members","position","offset","kind","bits",
+         "width","field_align","bit_offset","bit_width","count"),32),
 }
 counts={key:0 for key in schemas}
 for line in Path(sys.argv[1]).read_text(errors="replace").splitlines():
