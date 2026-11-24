@@ -36,7 +36,9 @@ def overlay(before: Path, after: Path) -> None:
         assert new.count(f'"{name}" =>') == 1
     inserted = new.split(ANCHOR, 1)[1].split(
         '        "addi_phi" =>', 1)[0]
-    a.write_text(old.replace(ANCHOR, ANCHOR + inserted, 1))
+    # The baseline already has a newline after ANCHOR; avoid inserting
+    # the trailing source newline twice when overlaying the candidate.
+    a.write_text(old.replace(ANCHOR, ANCHOR + inserted.rstrip("\\n"), 1))
     assert a.read_bytes() == b.read_bytes(), "example source drift"
     print("Both exact-commit compilers consume byte-identical TypeId source.")
 
