@@ -1,0 +1,54 @@
+# Temporary exact-source x86 X4 TypeId cutover validation; close without merge.
+name: Temporary X4 native TypeId CFG and pressure
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temporary-x4-native-ir-3079.yml'
+permissions:
+  contents: read
+jobs:
+  x4-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: 50947d2150b26e053942def0721a0ae06102eab3
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler commit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify compiler source and isolate core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - name: Cache core workspace
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: temporary-x4-native-3079
+      - name: Execute X4 native CFG and pressure GAS/ELF C oracle
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test x4_cfg_pressure_native -- --nocapture
+      - name: Focused Clippy with unrelated baseline allowances
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-backend-x86 --test x4_cfg_pressure_native -- -D clippy::all -A clippy::needless_borrows_for_generic_args -A clippy::too_many_arguments -A clippy::needless_range_loop -A clippy::collapsible_if -A clippy::collapsible_match -A clippy::needless_lifetimes -A clippy::type_complexity
