@@ -17,6 +17,7 @@ import sys
 
 from gcc_compat_abi_pilot import GCC_REVISION, GCC_COMPAT_DIR, command, succeeds
 from gcc_compat_inventory import inventory
+from gcc_compat_return_probes import generate
 
 ROLES = ("main", "x", "y")
 
@@ -151,6 +152,8 @@ def main():
                    help="JSON mapping frontend names to argv arrays containing {source} (preprocessed) or {original}, plus {object}")
     p.add_argument("--prefix", action="append")
     p.add_argument("--cc", default="gcc")
+    p.add_argument("--include-return-probes", action="store_true")
+    p.add_argument("--compiler-sha", help="exact tested source revision")
     args = p.parse_args()
     checkout = args.checkout.resolve()
     revision = subprocess.check_output(
@@ -178,12 +181,19 @@ def main():
         p.error("empty or overlapping corpus selection")
     work = args.work_dir.resolve()
     work.mkdir(parents=True, exist_ok=True)
+    sources = [(root, case, "upstream") for case in cases]
+    if args.include_return_probes:
+        probe_root = work / "generated"
+        generate(probe_root)
+        sources.extend((probe_root, case, "generated-return-probe")
+                       for case in inventory(probe_root, "probe-return-"))
     records = []
     for opt in ("-O0", "-O2"):
         flags = ["-std=gnu11", opt, "-w", "-fno-pie"]
-        for case in cases:
-            result = run_case(case, root, work / opt[1:] / case["case"],
+        for case_root, case, origin in sources:
+            result = run_case(case, case_root, work / opt[1:] / case["case"],
                               args.cc, flags, adapters)
+            result["origin"] = origin
             records.append(result)
             print(f"{opt} {case['case']}: {result['status']}", flush=True)
             for name, entry in result["frontends"].items():
@@ -191,7 +201,8 @@ def main():
                       "directions", {k: d["status"] for k, d in entry["directions"].items()}, flush=True)
             (work / "report.json").write_text(json.dumps({
                 "gcc_revision": revision, "records": records,
-                "planned_records": 2 * len(cases),
+                "compiler_sha": args.compiler_sha,
+                "planned_records": 2 * len(sources),
             }, indent=2) + "\n")
     if not any(r["status"] == "REFERENCE_PASS" for r in records):
         return 1
