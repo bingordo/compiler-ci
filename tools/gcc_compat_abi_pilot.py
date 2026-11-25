@@ -125,12 +125,25 @@ def run_case(name: str, compiler: Path, cc: str, root: Path,
         record["directions"][replacement] = entry
         source = home / f"{base}{replacement}.c"
         processed = home / f"{replacement}.preprocessed.c"
-        preproc = command([cc, "-std=gnu11", "-E", "-P", "-w",
-                           "-I", str(home), str(source)])
+        # Preprocessed C can exceed ordinary diagnostic log limits, notably
+        # when GCC expands <stdarg.h>; stream the full source into a file.
+        preproc_args = [cc, "-std=gnu11", "-E", "-P", "-w",
+                        "-I", str(home), str(source)]
+        try:
+            with processed.open("wb") as output:
+                preproc_run = subprocess.run(
+                    preproc_args, stdout=output, stderr=subprocess.PIPE,
+                    timeout=45, check=False)
+            preproc = {
+                "argv": preproc_args, "exit_code": preproc_run.returncode,
+                "stderr": preproc_run.stderr.decode("utf-8", "replace")[:16000],
+            }
+        except subprocess.TimeoutExpired:
+            preproc = {"argv": preproc_args, "exit_code": None,
+                       "stderr": "preprocessor timed out"}
         if not succeeds(preproc):
             entry.update(status="PREPROCESS_FAILED", result=preproc)
             continue
-        processed.write_text(preproc["stdout"])
         obj = home / f"{replacement}.mini.o"
         build = command([str(compiler), str(processed), "--emit", "obj",
                          "-o", str(obj)], timeout=60)
