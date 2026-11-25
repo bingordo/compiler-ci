@@ -487,9 +487,9 @@ PY
     if (( rec_native_rc == 0 && rec_gcc_rc == 0 )); then
       for obj in /audit-tmp/edg-c-record-ptr-typeid.o /audit-tmp/edg-c-record-ptr-gcc.o; do
         count=$(readelf -Ws "$obj" | awk '$4=="FUNC" && $5=="GLOBAL" &&
-          $8 ~ /^bootstrap_c_(local_aliases|record_pointer_(formal|get|set|truth|negated|equal|forward|forward_set|address_local|address_truth)|scalar_pointer_(truth|unequal)|pair_(inreg|forward|local|external_forward|copy_ptr|deref_field|deref_forward)|implicit_(scalar_assignment|record_field)|or_(local_field|gp_field|signed32_unsigned64|unsigned32_signed64|signed32_unsigned32|nested_shift)|shift_(left64_count32|right64_count32|left32_count64)|field_(compound_lshift|compound_rshift|compound_mixed|compound_add|post_increment)|local_compound_update|while_(predec|postdec|record_predec|record_postdec|local_field_predec)|if_postdec)$/ {n++}
+          $8 ~ /^bootstrap_c_(local_aliases|record_pointer_(formal|get|set|truth|negated|equal|forward|forward_set|address_local|address_truth)|scalar_pointer_(truth|unequal)|pair_(inreg|forward|local|external_forward|copy_ptr|deref_field|deref_forward)|implicit_(scalar_assignment|record_field)|or_(local_field|gp_field|signed32_unsigned64|unsigned32_signed64|signed32_unsigned32|nested_shift)|shift_(left64_count32|right64_count32|left32_count64)|field_(compound_lshift|compound_rshift|compound_mixed|compound_add|post_increment)|local_compound_update|while_(predec|postdec|record_predec|record_postdec|local_field_predec)|if_postdec|discarded_cast_(local|record|call|comma))$/ {n++}
           END {print n+0}')
-        if [[ "$count" != 43 ]]; then
+        if [[ "$count" != 47 ]]; then
           if [[ "$obj" == *typeid.o ]]; then rec_native_rc=12
           else rec_gcc_rc=12; fi
         fi
