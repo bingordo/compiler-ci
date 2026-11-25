@@ -1,113 +1,128 @@
-name: source-pinned generic machine remat x86 and aarch64
+name: exact source mixed addsub remat measured x86 A B
 on:
   push:
-    branches: [main]
-    paths: [.github/workflows/verify-shared-machine-remat-ab-20261118.yml]
-  workflow_dispatch:
+    branches: [benchmark/x86-mixed-addsub-source-20261124]
+    paths: ['.github/workflows/verify-shared-machine-remat-ab-20261118.yml']
 permissions:
   contents: read
+  statuses: write
 jobs:
-  correctness:
+  source-measure:
     runs-on: ubuntu-24.04
-    timeout-minutes: 55
+    timeout-minutes: 80
     env:
       CARGO_INCREMENTAL: '0'
       CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      BEFORE_SHA: '1c880d39fb314a6f32320768720e37b32c87ede7'
+      AFTER_SHA: '5ed779f9344dbc80abd1a9e7bd3464850bf43b6a'
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: e7b79a843fbe6b1d861fa9967c6c279ab97aeba3
-          path: old
+          ref: '1c880d39fb314a6f32320768720e37b32c87ede7'
+          path: before
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 192d60ba8888efa5036e897ec3792f3942edc77f
-          path: new
+          ref: '5ed779f9344dbc80abd1a9e7bd3464850bf43b6a'
+          path: after
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Assert exact source pins
+      - name: Assert exact compilers and extract one identical Mini-C/GCC fixture
         run: |
           set -euo pipefail
-          test "$(git -C old rev-parse HEAD)" = "e7b79a843fbe6b1d861fa9967c6c279ab97aeba3"
-          test "$(git -C new rev-parse HEAD)" = "192d60ba8888efa5036e897ec3792f3942edc77f"
-          lscpu | grep -E '^Model name:|^Architecture:' || true
+          test "$(git -C before rev-parse HEAD)" = "$BEFORE_SHA"
+          test "$(git -C after rev-parse HEAD)" = "$AFTER_SHA"
+          echo "Before $BEFORE_SHA After $AFTER_SHA" >> "$GITHUB_STEP_SUMMARY"
           git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          mkdir -p bench
+          python3 - <<'PY'
+          from pathlib import Path
+          text=Path('after/crates/driver/tests/x86_pure_remat_source.rs').read_text()
+          for name,filename in [('SOURCE','source.c'),('ORACLE','oracle.c')]:
+              tag='const '+name+':&str=r#"'
+              assert text.count(tag)==1,(name,'source fixture altered')
+              payload=text.split(tag,1)[1].split('"#;',1)[0]
+              Path('bench/'+filename).write_text(payload)
+          PY
+          sha256sum bench/source.c bench/oracle.c
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
-            old -> target
-            new -> target
-          key: shared-remat-20261118
-      - name: Generic planner and cross-target correctness and strict Clippy
-        working-directory: new
+            before -> target
+            after -> target
+          key: mixed-addsub-real-source-ab-20261124
+      - name: Build exact compiler binaries, compile same source and run GCC C11 oracle
         run: |
           set -euo pipefail
-          cargo test -p compiler-backend --lib remat::tests -- --nocapture
-          cargo test -p compiler-backend --lib
-          cargo test -p compiler-backend-x86 --lib
-          cargo test -p compiler-backend-aarch64 --lib
-          cargo clippy -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --lib -- -D warnings
-          cargo test -p compiler --test x86_inline_source_ablation -- --nocapture
-          cargo test -p compiler --test x7_s4_rolling_checksum_source -- --nocapture
-      - name: Exact benchmark overlay on both pinned compiler sources
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          path=Path('crates/driver/tests/x86_source_runtime_performance.rs')
-          orig=(Path('old')/path).read_bytes()
-          updated=(Path('new')/path).read_bytes()
-          assert orig==updated, 'benchmark fixture changed between commits'
-          needle=b'REPS=7, ITERS=1800'
-          assert orig.count(needle)==1
-          for root in ('old','new'):
-              (Path(root)/path).write_bytes(orig.replace(needle,b'REPS=7, ITERS=18000'))
-          PY
-          for case in old new; do
-            (cd "$case" && cargo test --release -p compiler --test x86_source_runtime_performance --no-run)
+          for variant in before after; do
+            cargo build --release -p compiler --bin compiler --manifest-path "$variant/Cargo.toml"
+            echo "$variant: source SHA $(git -C "$variant" rev-parse HEAD)"
+            COMPILER_X86_PURE_REMAT_TRACE=1 "$variant/target/release/compiler" \
+              bench/source.c --language mini-c --target x86_64 \
+              --emit obj -o "bench/$variant.o" 2>&1 | tee "bench/$variant.trace"
+            gcc -std=c11 -O2 -Wall -Wextra -Werror \
+              bench/oracle.c "bench/$variant.o" -o "bench/$variant.exe"
+            "bench/$variant.exe"
+            objcopy -O binary --only-section=.text \
+              "bench/$variant.o" "bench/$variant.text"
+            objdump -d --no-show-raw-insn "bench/$variant.o" > "bench/$variant.dis"
           done
-      - name: Source-pinned same-CPU old new new old native and GCC oracle
+      - name: Report actual per-function instruction counts and .text bytes
         run: |
-          set -euo pipefail
-          cpu=$(awk '/^Cpus_allowed_list:/ {split($2,a,/[-,]/); print a[1]}' /proc/self/status)
-          test -n "$cpu"
-          echo "CPU_PIN=$cpu"
-          index=0
-          for case in old new new old; do
-            index=$((index+1))
-            logfile="$RUNNER_TEMP/ab-$index-$case.log"
-            (cd "$case" && taskset -c "$cpu" cargo test --release -p compiler --test x86_source_runtime_performance -- --ignored --nocapture) 2>&1 | tee "$logfile"
-            grep -q 'X86_RUNTIME_FUNCTION mode=mini_default symbol=scan>' "$logfile"
-            grep -q 'X86_SOURCE_RUNTIME mode=mini_default workload=combined ' "$logfile"
-            grep -q 'X86_SOURCE_RUNTIME mode=gcc_O2 workload=combined ' "$logfile"
-          done
-          python3 - "$RUNNER_TEMP" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
           from pathlib import Path
-          import sys,statistics
-          root=Path(sys.argv[1])
-          results=[]
-          for index,case in enumerate(('old','new','new','old'),1):
-              data=(root/f'ab-{index}-{case}.log').read_text(errors='replace')
-              def last(prefix):
-                  lines=[l for l in data.splitlines() if prefix in l]
-                  assert lines,(index,case,prefix)
-                  return dict(token.split('=',1) for token in lines[-1].split() if '=' in token)
-              mini=last('X86_SOURCE_RUNTIME mode=mini_default workload=combined ')
-              gcc=last('X86_SOURCE_RUNTIME mode=gcc_O2 workload=combined ')
-              scan=last('X86_RUNTIME_FUNCTION mode=mini_default symbol=scan>')
-              assert mini['checksum']==gcc['checksum']
-              results.append((case,int(mini['median_ns']),scan))
-              print(f'{index} {case}: native_ns={mini["median_ns"]} gcc_ns={gcc["median_ns"]} scan_instr={scan["instructions"]} moves={scan["moves"]} stack_mem={scan["stack_memory"]}')
-          for case in ('old','new'):
-              medians=[ns for name,ns,_ in results if name==case]
-              print(f'{case} avg_median_ns={statistics.mean(medians):.1f}')
+          import re
+          expected=('add_sub','sub_add','sub_sub','mixed_branch')
+          rows={}
+          for variant in ('before','after'):
+              counts={};name=None
+              for line in Path(f'bench/{variant}.dis').read_text().splitlines():
+                  match=re.match(r'^[0-9a-f]+ <([^>]+)>:$',line.strip())
+                  if match:
+                      name=match.group(1);counts.setdefault(name,0)
+                      continue
+                  if name and re.match(r'^\s*[0-9a-f]+:\s+[A-Za-z]',line):
+                      counts[name]+=1
+              size=Path(f'bench/{variant}.text').stat().st_size
+              print(f'{variant} real .text bytes={size}')
+              for symbol in expected:
+                  assert symbol in counts,(variant,symbol,counts)
+                  print(f'{variant} symbol={symbol} instructions={counts[symbol]}')
+              rows[variant]=(size,counts)
+          for symbol in expected:
+              old=rows['before'][1][symbol]
+              new=rows['after'][1][symbol]
+              print(f'delta symbol={symbol} instructions={new-old:+d}')
+          print('delta total .text bytes=',rows['after'][0]-rows['before'][0])
+          trace=Path('bench/after.trace').read_text()
+          summaries=[line for line in trace.splitlines()
+                     if line.startswith('X86_PURE_REMAT_SUMMARY ')]
+          assert summaries,'missing source-actual pure remat observations'
+          print('Real source selected planning reports:')
+          for line in summaries: print(line)
+          print('Code size is physical; estimated_saved_bytes above is only planner estimate.')
           PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: source-pinned-generic-remat-ab
-          path: ${{ runner.temp }}/ab-*.log
-          if-no-files-found: ignore
+          name: x86-addsub-real-source-elf-and-traces
+          path: bench/
+      - name: Publish exact source comparison status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUTCOME: ${{ job.status }}
+        run: |
+          case "$OUTCOME" in
+            success) state=success ;;
+            cancelled) state=error ;;
+            *) state=failure ;;
+          esac
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$state" -f context="compiler/x86-mixed-addsub-source-ab" \
+            -f description="Physical source A/B ${BEFORE_SHA:0:12} to ${AFTER_SHA:0:12}: $OUTCOME" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
