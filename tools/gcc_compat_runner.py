@@ -143,6 +143,24 @@ def fatal(record):
     return False
 
 
+def missing_required(records, requirements, frontends):
+    """Check explicit previously verified mixed directions, including absent cases."""
+    actual = {}
+    for record in records:
+        for frontend, entry in record["frontends"].items():
+            for option in record["gcc_flags"]:
+                for direction, result in entry["directions"].items():
+                    if result["status"] == "PASS":
+                        actual[(frontend, record["case"], option, direction)] = True
+    expected = {
+        (group["frontend"], case, option, direction)
+        for group in requirements if group["frontend"] in frontends
+        for case in group["cases"] for option in group["options"]
+        for direction in group["directions"]
+    }
+    return sorted(expected - actual.keys())
+
+
 def main():
     """Run an explicitly scoped subset and write a report even on test failures."""
     p = argparse.ArgumentParser(description=__doc__)
@@ -154,6 +172,7 @@ def main():
     p.add_argument("--cc", default="gcc")
     p.add_argument("--include-return-probes", action="store_true")
     p.add_argument("--compiler-sha", help="exact tested source revision")
+    p.add_argument("--required", type=Path, help="verified mixed-direction regression manifest")
     args = p.parse_args()
     checkout = args.checkout.resolve()
     revision = subprocess.check_output(
@@ -204,6 +223,18 @@ def main():
                 "compiler_sha": args.compiler_sha,
                 "planned_records": 2 * len(sources),
             }, indent=2) + "\n")
+    if args.required:
+        required = json.loads(args.required.read_text())
+        if required["gcc_revision"] != revision:
+            p.error("required coverage manifest targets another GCC revision")
+        missing = missing_required(records, required["requirements"], adapters)
+        report = json.loads((work / "report.json").read_text())
+        report["required_missing"] = missing
+        report["required_source_run"] = required["source_run"]
+        (work / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+        print("REQUIRED_MISSING", json.dumps(missing), flush=True)
+        if missing:
+            return 1
     if not any(r["status"] == "REFERENCE_PASS" for r in records):
         return 1
     return int(any(fatal(r) for r in records))
