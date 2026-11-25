@@ -1,7 +1,7 @@
-name: Pinned AArch64 physical trace CFG source ABBA
+name: Pinned AArch64 SCC loop-aware layout real-source and alignment ABBA
 on:
   push:
-    branches: [benchmark/a64-trace-layout-20261125]
+    branches: [benchmark/a64-scc-loop-20261125]
     paths: ['.github/workflows/verify-shared-machine-remat-ab-20261118.yml']
 permissions:
   contents: read
@@ -11,22 +11,22 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 95
     env:
-      OLD_SHA: 'ccf20e941a9f1622c84210009cd1e0b47530a021'
-      NEW_SHA: '7ea54c0f00ff003993898f9489693b9a9e85d71f'
+      OLD_SHA: '41a40b84a4503d742fb81ab8d2eab9f67b32f73e'
+      NEW_SHA: '21ece0e95c2bc0f7b5ff2cc24f87165855ee2926'
       CARGO_INCREMENTAL: '0'
       CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 'ccf20e941a9f1622c84210009cd1e0b47530a021'
+          ref: '41a40b84a4503d742fb81ab8d2eab9f67b32f73e'
           path: old
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: '7ea54c0f00ff003993898f9489693b9a9e85d71f'
+          ref: '21ece0e95c2bc0f7b5ff2cc24f87165855ee2926'
           path: new
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -40,9 +40,11 @@ jobs:
           cmp old/tests/fixtures/remat/aarch64_loop_pressure.c new/tests/fixtures/remat/aarch64_loop_pressure.c
           cmp old/tests/fixtures/remat/aarch64_loop_pressure_oracle.c new/tests/fixtures/remat/aarch64_loop_pressure_oracle.c
           mkdir -p results
-          cp new/tests/fixtures/remat/aarch64_loop_pressure.c results/source.c
-          cp new/tests/fixtures/remat/aarch64_loop_pressure_oracle.c results/oracle.c
-          sha256sum results/source.c results/oracle.c
+          cp new/tests/fixtures/remat/aarch64_loop_pressure.c results/loops.c
+          cp new/tests/fixtures/remat/aarch64_loop_pressure_oracle.c results/loops_oracle.c
+          cp new/tests/fixtures/remat/aarch64_nested_control_flow.c results/nested.c
+          cp new/tests/fixtures/remat/aarch64_nested_control_flow_oracle.c results/nested_oracle.c
+          sha256sum results/loops.c results/loops_oracle.c results/nested.c results/nested_oracle.c
           printf 'A64 physical CFG layout: baseline `%s`, candidate `%s`\n' "$OLD_SHA" "$NEW_SHA" >> "$GITHUB_STEP_SUMMARY"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -50,56 +52,133 @@ jobs:
           workspaces: |
             old -> target
             new -> target
-          key: a64-physical-cfg-trace-20261125
-      - name: Build exact compiler revisions and independently validate both ELF/GAS encodings
+          key: a64-scc-cfg-loop-abba-20261125
+      - name: Build exact production compiler revisions and native C11 differential for both sources
         run: |
           set -euo pipefail
           for rev in old new; do
             cargo build -p compiler --bin compiler --manifest-path "$rev/Cargo.toml"
-            "$rev/target/debug/compiler" results/source.c --language mini-c --target aarch64 --emit obj -o "results/$rev.o"
-            "$rev/target/debug/compiler" results/source.c --language mini-c --target aarch64 --emit asm -o "results/$rev.s"
-            gcc -c "results/$rev.s" -o "results/$rev-gas.o"
-            for variant in "$rev" "$rev-gas"; do
-              gcc -std=c11 -O2 -Wall -Wextra -Werror results/oracle.c "results/$variant.o" -o "results/$variant.exe"
-              "results/$variant.exe"
+            for fixture in loops nested; do
+              "$rev/target/debug/compiler" "results/$fixture.c" --language mini-c --target aarch64 --emit obj -o "results/$rev-$fixture.o"
+              "$rev/target/debug/compiler" "results/$fixture.c" --language mini-c --target aarch64 --emit asm -o "results/$rev-$fixture.s"
+              gcc -c "results/$rev-$fixture.s" -o "results/$rev-$fixture-gas.o"
+              for variant in "$rev-$fixture" "$rev-$fixture-gas"; do
+                gcc -std=c11 -O2 -Wall -Wextra -Werror "results/${fixture}_oracle.c" "results/$variant.o" -o "results/$variant.exe"
+                "results/$variant.exe"
+              done
+              objcopy -O binary --only-section=.text "results/$rev-$fixture.o" "results/$rev-$fixture.text"
+              objcopy -O binary --only-section=.text "results/$rev-$fixture-gas.o" "results/$rev-$fixture-gas.text"
+              cmp "results/$rev-$fixture.text" "results/$rev-$fixture-gas.text"
+              objdump -d --no-show-raw-insn "results/$rev-$fixture.o" > "results/$rev-$fixture.dis"
             done
-            objcopy -O binary --only-section=.text "results/$rev.o" "results/$rev.text"
-            objcopy -O binary --only-section=.text "results/$rev-gas.o" "results/$rev-gas.text"
-            cmp "results/$rev.text" "results/$rev-gas.text"
-            objdump -d --no-show-raw-insn "results/$rev.o" > "results/$rev.dis"
           done
-      - name: Physical code-size, branch and per-function counts
+      - name: Independent physical code size and branch counts for loops and nested control flow
         run: |
           python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
           import re
           from pathlib import Path
-          data={}
-          names=('chain_loop','branch_loop','pressure_loop','call_pressure_loop')
+          for fixture,names in (
+              ('loops',('chain_loop','branch_loop','pressure_loop','call_pressure_loop')),
+              ('nested',('nested_loops','interleaved_loops','guarded_loop'))):
+              data={}
+              for rev in ('old','new'):
+                  code=Path(f'results/{rev}-{fixture}.text').read_bytes()
+                  assert code and len(code)%4==0
+                  words=[int.from_bytes(code[i:i+4],'little') for i in range(0,len(code),4)]
+                  b=sum((w&0xfc000000)==0x14000000 for w in words)
+                  counts={};fn=None
+                  for line in Path(f'results/{rev}-{fixture}.dis').read_text().splitlines():
+                      m=re.match(r'^\s*[0-9a-f]+ <([^>]+)>:$',line)
+                      if m:
+                          fn=m.group(1);counts[fn]=0
+                      elif fn and re.match(r'^\s*[0-9a-f]+:\s+[A-Za-z]',line):
+                          counts[fn]+=1
+                  assert all(n in counts for n in names),counts
+                  data[rev]=(len(code),b,counts)
+                  print(f'{fixture} {rev} .text={len(code)} words={len(words)} unconditional_B={b}')
+                  for fn in names:
+                      print(f'{fixture} {rev} {fn} instructions={counts[fn]}')
+              old,new=data['old'],data['new']
+              print(f'{fixture} DELTA text={new[0]-old[0]} B={new[1]-old[1]}')
+              for fn in names:
+                  print(f'{fixture} DELTA {fn} instructions={new[2][fn]-old[2][fn]}')
+              assert new[1]<=old[1],f'Unexpected extra B for {fixture}'
+          print('Both independent native C11 sources pass exact ELF and GAS oracle for both compiler revisions.')
+          PY
+      - name: Native 7-layout ABBA study for nested loop variants, without performance pins
+        run: |
+          set -euo pipefail
+          cat > results/timing.c <<'EOF'
+          #define _POSIX_C_SOURCE 200809L
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <time.h>
+          extern unsigned int nested_loops(unsigned int,unsigned int,unsigned int);
+          extern unsigned int interleaved_loops(unsigned int,unsigned int);
+          extern unsigned int guarded_loop(unsigned int,unsigned int);
+          int main(void){
+              struct timespec t;
+              volatile unsigned int check=0;
+              clock_gettime(CLOCK_MONOTONIC_RAW,&t);
+              unsigned long long start=(unsigned long long)t.tv_sec*1000000000ull+t.tv_nsec;
+              for(unsigned int i=0;i<12000u;i++){
+                  check=check+nested_loops(0x12345678u+i*7u,16u,13u);
+                  check=check+interleaved_loops(i^0x123u,19u);
+                  check=check+guarded_loop(i*13u,23u);
+              }
+              clock_gettime(CLOCK_MONOTONIC_RAW,&t);
+              unsigned long long end=(unsigned long long)t.tv_sec*1000000000ull+t.tv_nsec;
+              printf("%llu %u\n",end-start,check);
+              return 0;
+          }
+          EOF
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import os,statistics,subprocess
+          from pathlib import Path
+          cpu=min(os.sched_getaffinity(0));os.sched_setaffinity(0,{cpu})
+          print('AArch64 native pinned CPU:',cpu)
           for rev in ('old','new'):
-              text=Path(f'results/{rev}.text').read_bytes()
-              assert text and len(text)%4==0
-              words=[int.from_bytes(text[i:i+4],'little') for i in range(0,len(text),4)]
-              b=sum(w&0xfc000000==0x14000000 for w in words)
-              counts={};function=None
-              for line in Path(f'results/{rev}.dis').read_text().splitlines():
-                  m=re.match(r'^\s*[0-9a-f]+ <([^>]+)>:$',line)
-                  if m:
-                      function=m.group(1);counts[function]=0
-                  elif function and re.match(r'^\s*[0-9a-f]+:\s+[A-Za-z]',line):
-                      counts[function]+=1
-              assert all(n in counts for n in names)
-              data[rev]=(len(text),b,counts)
-              print(f'{rev} real A64 .text bytes={len(text)} words={len(words)} unconditional_B={b}')
-              for name in names:print(f'{rev} {name} instructions={counts[name]}')
-          a,b=data['old'],data['new']
-          print(f'DELTA total_bytes={b[0]-a[0]} total_unconditional_B={b[1]-a[1]}')
-          for name in names: print(f'DELTA {name} instructions={b[2][name]-a[2][name]}')
-          print('Native direct/GAS ELF verified byte-identical, all original and reordered variants pass independent C11 oracle.')
+              source=Path(f'results/{rev}-nested.s').read_text()
+              anchor='nested_loops:\n'
+              assert source.count(anchor)==1
+              for pad in (0,4,8,16,24,32,48):
+                  # Align only the entire function, not its internal .inst
+                  # branch offsets; unchanged relative A64 displacements.
+                  padded=source.replace(anchor,
+                      '.p2align 6\n'+('    nop\n'*(pad//4))+anchor)
+                  Path(f'results/{rev}-{pad}.s').write_text(padded)
+                  obj=f'results/{rev}-{pad}.o'
+                  subprocess.run(['gcc','-c',f'results/{rev}-{pad}.s','-o',obj],check=True)
+                  oracle=f'results/{rev}-{pad}.oracle'
+                  subprocess.run(['gcc','-std=c11','-O2','-Wall','-Wextra',
+                      '-Werror','results/nested_oracle.c',obj,'-o',oracle],check=True)
+                  out=subprocess.run([oracle],capture_output=True,text=True,check=True)
+                  assert 'A64_NESTED_CONTROL_FLOW_C11_ORACLE_OK' in out.stdout
+                  subprocess.run(['gcc','-std=c11','-O2','-Wall','-Wextra',
+                      '-Werror','results/timing.c',obj,
+                      '-o',f'results/{rev}-{pad}.bench'],check=True)
+          for pad in (0,4,8,16,24,32,48):
+              times={'old':[],'new':[]}
+              checks={'old':set(),'new':set()}
+              for rev in ('old','new'):
+                  subprocess.run([f'results/{rev}-{pad}.bench'],
+                      capture_output=True,check=True)
+              for rev in ('old','new','new','old')*3:
+                  line=subprocess.run([f'results/{rev}-{pad}.bench'],
+                      check=True,capture_output=True,text=True).stdout.split()
+                  assert len(line)==2
+                  times[rev].append(int(line[0]));checks[rev].add(int(line[1]))
+              assert len(checks['old'])==len(checks['new'])==1
+              assert checks['old']==checks['new'],(pad,checks)
+              a=statistics.median(times['old']);b=statistics.median(times['new'])
+              print(f'ABBA layout={pad} old_ns={a:.0f} new_ns={b:.0f} delta={100*(b/a-1):+.2f}%')
+              print(f'ABBA layout={pad} raw_old={times["old"]} raw_new={times["new"]}')
+          print('All 14 alignment-variant native GCC oracles pass. Timings are directional, not CI regressions.')
           PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: a64-physical-trace-cfg-pinned-ab
+          name: a64-scc-loop-source-layout-abba
           path: results/
       - name: Publish pinned A64 source AB status
         if: always()
@@ -109,6 +188,6 @@ jobs:
         run: |
           case "$OUTCOME" in success) state=success;; cancelled) state=error;; *) state=failure;; esac
           gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
-            -f state="$state" -f context="compiler/a64-physical-trace-ab" \
+            -f state="$state" -f context="compiler/a64-scc-loop-source-ab" \
             -f description="Pinned source ABI/CFG text A/B $OUTCOME" \
             -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
