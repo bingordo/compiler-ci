@@ -1,0 +1,59 @@
+name: Temporary historical algebra retirement acceptance
+on:
+  pull_request:
+    paths: ['.github/workflows/temp-ir-algebra-retirement-3226.yml']
+permissions:
+  contents: read
+jobs:
+  algebra-retirement:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      SOURCE_SHA: 5b6bb7314415089223286ed1b0009436cf66d296
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm source and isolate core workspace
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-algebra-retirement
+      - name: Audit historical algebra callers
+        working-directory: compiler
+        run: |
+          if git grep -nE 'legacy-function-algebra-oracle|(^|[^[:alnum:]_])algebra::(simplify|\{[^}]*simplify)|algebra_common::simplify\b' -- '*.rs' '*.toml'; then
+            exit 1
+          fi
+      - name: Native algebra exact rewrites and independent execution
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo test --no-fail-fast -p compiler-opt --test typed_algebra --test generated_native_integer_algebra
+      - name: Optimizer unit and all-target regression
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --lib
+          cargo check -p compiler-opt --all-targets
+          cargo test -p compiler-opt --lib
+      - name: Production graph boundary
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: python3 tools/check_mixed_function_export_boundary.py
