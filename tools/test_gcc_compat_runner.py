@@ -69,8 +69,8 @@ class CompatibilityTests(unittest.TestCase):
         root = self.root / "generated"
         generate(root)
         cases = inventory(root, "probe-return-")
-        self.assertEqual(len(cases), 41)
-        for name in ("bytes-3", "bytes-9", "bytes-17", "gp-sse"):
+        self.assertEqual(len(cases), 45)
+        for name in ("bytes-3", "bytes-9", "bytes-17", "gp-sse", "short-checks-33"):
             case = next(c for c in cases if c["case"] == "probe-return-" + name)
             record = run_case(case, root, self.root / name, "gcc", self.flags,
                               {"control": ["gcc", "-c", "{original}", "-o", "{object}"]})

@@ -48,3 +48,21 @@ def generate(root: Path):
         (root / f"{stem}_y.c").write_text(
             decl + "struct Result make_result(int seed) { struct Result r; "
             + assignments + " return r; }\n")
+
+    # Preserve the original long-expression probes unchanged. Isolate
+    # transport for large objects using independent short checks so
+    # expression recursion is not a prerequisite to testing the ABI.
+    for size in range(30, 34):
+        stem = f"probe-return-bytes-{size}"
+        isolated = f"probe-return-short-checks-{size}"
+        for role in ("main", "y"):
+            (root / f"{isolated}_{role}.c").write_text(
+                (root / f"{stem}_{role}.c").read_text())
+        fields = [f"v{i}" for i in range(size)]
+        decl = "struct Result { " + " ".join(f"unsigned char {m};" for m in fields) + " };\n"
+        checks = " ".join(f"if(a.{m} != {7+i} || b.{m} != {29+i}) return 1;"
+                          for i, m in enumerate(fields))
+        (root / f"{isolated}_x.c").write_text(
+            decl + "struct Result make_result(int seed);\n"
+            "int check_result(void) { struct Result a = make_result(7); "
+            "struct Result b = make_result(29); " + checks + " return 0; }\n")
