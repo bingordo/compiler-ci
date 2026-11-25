@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 from gcc_compat_inventory import inventory
-from gcc_compat_runner import fatal, run_case, unsupported
+from gcc_compat_runner import fatal, run_case, unsupported, missing_required
 
 
 @unittest.skipUnless(shutil.which("gcc"), "native GCC required")
@@ -42,6 +42,19 @@ class CompatibilityTests(unittest.TestCase):
         self.assertEqual(set(directions), {"main", "x", "y", "main+x", "main+y", "x+y"})
         self.assertTrue(all(d["status"] == "PASS" for d in directions.values()))
         self.assertFalse(fatal(record))
+
+    def test_required_directions_cannot_disappear(self):
+        record = run_case(self.case(), self.root, self.root / "required",
+                          "gcc", self.flags,
+                          {"control": ["gcc", "-c", "{source}", "-o", "{object}"]})
+        requirements = [{"frontend": "control", "cases": ["struct-return-0"],
+                         "options": ["-O0"], "directions": ["x", "y"]}]
+        self.assertEqual(missing_required([record], requirements, ["control"]), [])
+        record["frontends"]["control"]["directions"]["x"]["status"] = "NOT_ADMITTED"
+        self.assertEqual(missing_required([record], requirements, ["control"]),
+                         [("control", "struct-return-0", "-O0", "x")])
+        self.assertEqual(len(missing_required([], requirements, ["control"])), 2)
+        self.assertEqual(missing_required([], requirements, ["other"]), [])
 
     def test_mismatch_is_fatal(self):
         record = run_case(self.case(), self.root, self.root / "bad",
