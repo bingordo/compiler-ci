@@ -1,0 +1,121 @@
+name: Validate actual production AArch64 machine SSA dump hook
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/validate-aarch64-actual-machine-dump.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  actual-selected-machine-dump:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust pinned frontend GitHub SSH host
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5930103efdd99330ad8181c699f202f9cb9d9bae
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify actual pinned compiler code and native ARM64 host
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          test "$(git -C compiler rev-parse HEAD)" = "5930103efdd99330ad8181c699f202f9cb9d9bae"
+          echo "Compiler source SHA: 5930103efdd99330ad8181c699f202f9cb9d9bae" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: aarch64-actual-machine-dump
+      - name: Same-selector production ELF/GAS machine snapshot tests
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-aarch64 --test machine_text_v2 -- --nocapture
+          cargo clippy -p compiler-backend-aarch64 --lib --test machine_text_v2 -- -D warnings
+      - name: Build and strictly check actual source compiler
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p compiler --bin compiler
+          cargo clippy -p compiler --bin compiler -- -D warnings
+      - name: Dump actual source-selected SSA and replay ELF against C11 oracle
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          cat > "$tmp/answer.c" <<'EOF'
+          int answer(int x) { return x + 7; }
+          EOF
+          cat > "$tmp/oracle.c" <<'EOF'
+          extern int answer(int);
+          int main(void) {
+            for (int x=-100; x<=100; x++) {
+              if (answer(x)!=x+7) return 1;
+            }
+            return 0;
+          }
+          EOF
+          ./target/debug/compiler "$tmp/answer.c" --language mini-c \
+            --target aarch64 --ir typeid --emit obj --no-inline \
+            --dump-machine "$tmp/answer.mir" -o "$tmp/answer.o"
+          cargo run -p compiler-backend-aarch64 --bin aarch64-machine-ir -- \
+            verify "$tmp/answer.mir"
+          cargo run -p compiler-backend-aarch64 --bin aarch64-machine-ir -- \
+            roundtrip "$tmp/answer.mir"
+          cargo run -p compiler-backend-aarch64 --bin aarch64-machine-ir -- \
+            emit-object "$tmp/answer.mir" "$tmp/replayed.o"
+          cmp "$tmp/answer.o" "$tmp/replayed.o"
+          cc -O2 -Wall -Wextra -Werror "$tmp/oracle.c" "$tmp/answer.o" -o "$tmp/answer"
+          "$tmp/answer"
+          cat > "$tmp/answer.ir" <<'EOF'
+          compiler-ir-native-module 3
+          compiler-ir-native-types 3
+          types 1
+          type 0 int 32
+          signatures 0
+          layout little 0
+          endtypes
+          definitions 1
+          definition answer external c fixed 0 1 0
+          externals 0
+          globals 0
+          functions 1
+          function answer
+          block ^0 (%0:t0)
+            %1:t0 = const.i32 7
+            %2:t0 = add %0 %1
+            return %2
+          endblock
+          endfunction
+          endmodule
+          EOF
+          ./target/debug/compiler --load-ir "$tmp/answer.ir" --target aarch64 --ir typeid \
+            --no-inline --emit obj --dump-machine "$tmp/loaded.mir" -o "$tmp/loaded.o"
+          cargo run -p compiler-backend-aarch64 --bin aarch64-machine-ir -- \
+            emit-object "$tmp/loaded.mir" "$tmp/loaded-replay.o"
+          cmp "$tmp/loaded.o" "$tmp/loaded-replay.o"
+          if ./target/debug/compiler "$tmp/answer.c" --language mini-c --target x86_64 \
+            --dump-machine "$tmp/rejected-x86.mir" -o "$tmp/rejected-x86.o"; then
+            echo 'x86 requested an AArch64-only production dump' >&2
+            exit 1
+          fi
+          test ! -e "$tmp/rejected-x86.mir"
+          if ./target/debug/compiler "$tmp/answer.c" --language mini-c --target aarch64 \
+            --pic --dump-machine "$tmp/rejected-pic.mir" -o "$tmp/rejected-pic.o"; then
+            echo 'PIC requested unrepresented machine metadata' >&2
+            exit 1
+          fi
+          test ! -e "$tmp/rejected-pic.mir"
+          echo "PASS: normal source, native TypeId replay, real selected AArch64 machine dump, byte-identical ELF, native C11 runtime" >> "$GITHUB_STEP_SUMMARY"
