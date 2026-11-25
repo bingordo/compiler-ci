@@ -1,4 +1,4 @@
-name: EDG retained exception IL source-mode experiment
+name: EDG retained EH source-mode probe
 
 on:
   pull_request:
@@ -67,7 +67,7 @@ jobs:
           # must NEVER be used for this alternate-configuration experiment.
           cmake --build build/gcc-release --target edgcpfe --parallel 4
           test -s build/gcc-release/lib/libedgcpfe.a
-          echo 'EDG_EH_MODE=source preserved-constructs portable=0 tables=0 separate-init=1' >> "$GITHUB_STEP_SUMMARY"
+          echo 'EDG_SEPARATE_INIT_BUILD=source macro=1' >> "$GITHUB_STEP_SUMMARY"
       - name: Install Rust 1.99.1 and build compatible bridge
         run: |
           set -euo pipefail
@@ -87,83 +87,12 @@ jobs:
             startup_provenance::tests:: -- --nocapture
           cargo test --manifest-path edgcpp-rust/Cargo.toml --lib \
             startup_provenance::tests::cleanup_call_requires_exact_direct_child_list -- --nocapture
-      - name: Verify original two-global source and diagnose separate native schedule
-        working-directory: edgcpp
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/.cargo/bin:$PATH"
-          source build/gcc-release/environment.sh
-          cat >build/gcc-release/separate-two-global.cpp <<'CPP'
-          extern "C" int puts(const char*);
-          struct Effectful {
-            int id;
-            explicit Effectful(int i):id(i) { puts(i==1?"first-ctor":"second-ctor"); }
-            ~Effectful() { puts(id==1?"first-dtor":"second-dtor"); }
-          };
-          Effectful first(1);
-          Effectful second(2);
-          int main() { puts("main"); return first.id!=1 || second.id!=2; }
-          CPP
-          cd build/gcc-release
-          version="$(g++ -dumpfullversion -dumpversion)"
-          IFS=. read -r major minor patch <<<"$version"
-          gnu_number=$((10#${major}*10000+10#${minor:-0}*100+10#${patch:-0}))
-          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" \
-            --example parse -- --g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number" \
-            separate-two-global.cpp > "$RUNNER_TEMP/separate-two-global.log" 2>&1 || {
-              tail -n 60 "$RUNNER_TEMP/separate-two-global.log"; exit 1;
-            }
-          grep -Fq 'EDG status: 0' "$RUNNER_TEMP/separate-two-global.log"
-          grep -E 'file scope init scheduler|file scope init root|file scope lowered startup|EDG_CXX5_STARTUP_EVIDENCE|EDG_CXX5_CLEANUP_CALL_LOCAL|EDG_CXX5_CLEANUP_PARTIAL|EDG_CXX5_CLEANUP_TYPED|EDG_CXX5_SEPARATE_INIT|scope dynamic init entries=' \
-            "$RUNNER_TEMP/separate-two-global.log" | head -n 60 \
-            | tee -a "$GITHUB_STEP_SUMMARY" || true
-          g++ -std=c++17 -O0 separate-two-global.cpp -o "$RUNNER_TEMP/edg-separate-gcc"
-          "$RUNNER_TEMP/edg-separate-gcc" > "$RUNNER_TEMP/edg-separate-gcc.out"
-          printf 'first-ctor\nsecond-ctor\nmain\nsecond-dtor\nfirst-dtor\n' \
-            > "$RUNNER_TEMP/edg-separate-expected.out"
-          python3 -c 'import pathlib,sys; assert pathlib.Path(sys.argv[1]).read_bytes()==pathlib.Path(sys.argv[2]).read_bytes()' \
-            "$RUNNER_TEMP/edg-separate-gcc.out" "$RUNNER_TEMP/edg-separate-expected.out"
-          echo "EDG_RETAINED_TWO_GLOBAL=parsed" >> "$GITHUB_STEP_SUMMARY"
-          grep -E 'file scope init scheduler|EDG_CXX5_SEPARATE_|EDG_CXX5_CLEANUP_CALL_LOCAL' \
-            "$RUNNER_TEMP/separate-two-global.log" | head -n 50 \
-            >> "$GITHUB_STEP_SUMMARY" || true
-      - name: Probe unchanged system GCC iostream source with exact include roots
-        working-directory: edgcpp
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/.cargo/bin:$PATH"
-          source build/gcc-release/environment.sh
-          cat >build/gcc-release/separate-iostream.cpp <<'CPP'
-          #include <iostream>
-          int main() { std::cout << "Hello world\n"; }
-          CPP
-          cd build/gcc-release
-          version="$(g++ -dumpfullversion -dumpversion)"
-          IFS=. read -r major minor patch <<<"$version"
-          gnu_number=$((10#${major}*10000+10#${minor:-0}*100+10#${patch:-0}))
-          mapfile -t dirs < <(g++ -std=c++17 -v -E -x c++ /dev/null 2>&1 |
-            awk '/#include <...> search starts here:/{active=1;next} /^End of search list/{active=0} active && /^ /{sub(/^[[:space:]]+/, "");print}')
-          includes=()
-          for dir in "${dirs[@]}"; do
-            test -d "$dir" && includes+=("-I$dir")
-          done
-          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" \
-            --example parse -- --g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number" \
-            "${includes[@]}" separate-iostream.cpp > "$RUNNER_TEMP/separate-iostream.log" 2>&1 || {
-              tail -n 60 "$RUNNER_TEMP/separate-iostream.log"; exit 1;
-            }
-          grep -Fq 'EDG status: 0' "$RUNNER_TEMP/separate-iostream.log"
-          grep -E 'file scope init scheduler|file scope init root|EDG_CXX5_STARTUP_EVIDENCE|EDG_CXX5_CLEANUP_CALL_LOCAL|EDG_CXX5_CLEANUP_PARTIAL' \
-            "$RUNNER_TEMP/separate-iostream.log" | head -n 40 \
-            | tee -a "$GITHUB_STEP_SUMMARY" || true
-          echo 'EDG_RETAINED_IOSTREAM=parsed_not_executable' >> "$GITHUB_STEP_SUMMARY"
- \
-            build/gcc-release/src/includes/cmake_defines.h
+ build/gcc-release/src/includes/cmake_defines.h
           grep -Eq '^#define GENERATE_EH_TABLES[[:space:]]+0
           # must NEVER be used for this alternate-configuration experiment.
           cmake --build build/gcc-release --target edgcpfe --parallel 4
           test -s build/gcc-release/lib/libedgcpfe.a
-          echo 'EDG_EH_MODE=source preserved-constructs portable=0 tables=0 separate-init=1' >> "$GITHUB_STEP_SUMMARY"
+          echo 'EDG_SEPARATE_INIT_BUILD=source macro=1' >> "$GITHUB_STEP_SUMMARY"
       - name: Install Rust 1.99.1 and build compatible bridge
         run: |
           set -euo pipefail
@@ -183,91 +112,12 @@ jobs:
             startup_provenance::tests:: -- --nocapture
           cargo test --manifest-path edgcpp-rust/Cargo.toml --lib \
             startup_provenance::tests::cleanup_call_requires_exact_direct_child_list -- --nocapture
-      - name: Verify original two-global source and diagnose separate native schedule
-        working-directory: edgcpp
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/.cargo/bin:$PATH"
-          source build/gcc-release/environment.sh
-          cat >build/gcc-release/separate-two-global.cpp <<'CPP'
-          extern "C" int puts(const char*);
-          struct Effectful {
-            int id;
-            explicit Effectful(int i):id(i) { puts(i==1?"first-ctor":"second-ctor"); }
-            ~Effectful() { puts(id==1?"first-dtor":"second-dtor"); }
-          };
-          Effectful first(1);
-          Effectful second(2);
-          int main() { puts("main"); return first.id!=1 || second.id!=2; }
-          CPP
-          cd build/gcc-release
-          version="$(g++ -dumpfullversion -dumpversion)"
-          IFS=. read -r major minor patch <<<"$version"
-          gnu_number=$((10#${major}*10000+10#${minor:-0}*100+10#${patch:-0}))
-          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" \
-            --example parse -- --g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number" \
-            separate-two-global.cpp > "$RUNNER_TEMP/separate-two-global.log" 2>&1 || {
-              tail -n 60 "$RUNNER_TEMP/separate-two-global.log"; exit 1;
-            }
-          grep -Fq 'EDG status: 0' "$RUNNER_TEMP/separate-two-global.log"
-          grep -E 'file scope init scheduler|file scope init root|file scope lowered startup|EDG_CXX5_STARTUP_EVIDENCE|EDG_CXX5_CLEANUP_CALL_LOCAL|EDG_CXX5_CLEANUP_PARTIAL|EDG_CXX5_CLEANUP_TYPED|EDG_CXX5_SEPARATE_INIT|scope dynamic init entries=' \
-            "$RUNNER_TEMP/separate-two-global.log" | head -n 60 \
-            | tee -a "$GITHUB_STEP_SUMMARY" || true
-          g++ -std=c++17 -O0 separate-two-global.cpp -o "$RUNNER_TEMP/edg-separate-gcc"
-          "$RUNNER_TEMP/edg-separate-gcc" > "$RUNNER_TEMP/edg-separate-gcc.out"
-          printf 'first-ctor\nsecond-ctor\nmain\nsecond-dtor\nfirst-dtor\n' \
-            > "$RUNNER_TEMP/edg-separate-expected.out"
-          python3 -c 'import pathlib,sys; assert pathlib.Path(sys.argv[1]).read_bytes()==pathlib.Path(sys.argv[2]).read_bytes()' \
-            "$RUNNER_TEMP/edg-separate-gcc.out" "$RUNNER_TEMP/edg-separate-expected.out"
-          grep -Fq 'EDG_CXX5_SEPARATE_INIT_OWNERS count=2 lifecycle_abi_proven=false' "$RUNNER_TEMP/separate-two-global.log"
-          grep -Fq 'EDG_CXX5_SEPARATE_CHECKED entries=2 lifecycle_abi_proven=false' "$RUNNER_TEMP/separate-two-global.log"
-          grep -Fq 'EDG_CXX5_SEPARATE_CLEANUP entries=2 direct=2 unknown=0 lifecycle_abi_proven=false' "$RUNNER_TEMP/separate-two-global.log"
-          grep -Fq 'EDG_CXX5_SEPARATE_CLEANUP_ENTRY ordinal=0 variable=3 routine=29 destructor=Some(6) dso=Some(32) lifecycle_abi_proven=false' "$RUNNER_TEMP/separate-two-global.log"
-          grep -Fq 'EDG_CXX5_SEPARATE_CLEANUP_ENTRY ordinal=1 variable=5 routine=33 destructor=Some(6) dso=Some(32) lifecycle_abi_proven=false' "$RUNNER_TEMP/separate-two-global.log"
-          grep -Fq 'EDG_CXX5_SEPARATE_CHECKED_ENTRY ordinal=0 variable=3 routine=29 lifecycle_abi_proven=false' "$RUNNER_TEMP/separate-two-global.log"
-          grep -Fq 'EDG_CXX5_SEPARATE_CHECKED_ENTRY ordinal=1 variable=5 routine=33 lifecycle_abi_proven=false' "$RUNNER_TEMP/separate-two-global.log"
-          test "$(grep -Fc 'EDG_CXX5_SEPARATE_INIT_OWNER variable=' "$RUNNER_TEMP/separate-two-global.log")" -eq 2
-          grep -Eq '^EDG_CXX5_SEPARATE_INIT_OWNER variable=[0-9]+ routine=[0-9]+ scheduled_position=Some\(0\)' "$RUNNER_TEMP/separate-two-global.log"
-          grep -Eq '^EDG_CXX5_SEPARATE_INIT_OWNER variable=[0-9]+ routine=[0-9]+ scheduled_position=Some\(1\)' "$RUNNER_TEMP/separate-two-global.log"
-      - name: Probe unchanged system GCC iostream source with exact include roots
-        working-directory: edgcpp
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/.cargo/bin:$PATH"
-          source build/gcc-release/environment.sh
-          cat >build/gcc-release/separate-iostream.cpp <<'CPP'
-          #include <iostream>
-          int main() { std::cout << "Hello world\n"; }
-          CPP
-          cd build/gcc-release
-          version="$(g++ -dumpfullversion -dumpversion)"
-          IFS=. read -r major minor patch <<<"$version"
-          gnu_number=$((10#${major}*10000+10#${minor:-0}*100+10#${patch:-0}))
-          mapfile -t dirs < <(g++ -std=c++17 -v -E -x c++ /dev/null 2>&1 |
-            awk '/#include <...> search starts here:/{active=1;next} /^End of search list/{active=0} active && /^ /{sub(/^[[:space:]]+/, "");print}')
-          includes=()
-          for dir in "${dirs[@]}"; do
-            test -d "$dir" && includes+=("-I$dir")
-          done
-          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" \
-            --example parse -- --g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number" \
-            "${includes[@]}" separate-iostream.cpp > "$RUNNER_TEMP/separate-iostream.log" 2>&1 || {
-              tail -n 60 "$RUNNER_TEMP/separate-iostream.log"; exit 1;
-            }
-          grep -Fq 'EDG status: 0' "$RUNNER_TEMP/separate-iostream.log"
-          grep -E 'file scope init scheduler|file scope init root|EDG_CXX5_STARTUP_EVIDENCE|EDG_CXX5_CLEANUP_CALL_LOCAL|EDG_CXX5_CLEANUP_PARTIAL' \
-            "$RUNNER_TEMP/separate-iostream.log" | head -n 40 \
-            | tee -a "$GITHUB_STEP_SUMMARY" || true
-          grep -Fq 'EDG_CXX5_SEPARATE_CHECKED entries=0 lifecycle_abi_proven=false' "$RUNNER_TEMP/separate-iostream.log"
-          grep -Fq 'EDG_CXX5_SEPARATE_CLEANUP entries=0 direct=0 unknown=0 lifecycle_abi_proven=false' "$RUNNER_TEMP/separate-iostream.log"
-          echo 'EDG_SEPARATE_INIT_ABI_ADMITTED=false' >> "$GITHUB_STEP_SUMMARY"
- \
-            build/gcc-release/src/includes/cmake_defines.h
+ build/gcc-release/src/includes/cmake_defines.h
           # The usual prebuilt archive has a different native IL layout and
           # must NEVER be used for this alternate-configuration experiment.
           cmake --build build/gcc-release --target edgcpfe --parallel 4
           test -s build/gcc-release/lib/libedgcpfe.a
-          echo 'EDG_EH_MODE=source preserved-constructs portable=0 tables=0 separate-init=1' >> "$GITHUB_STEP_SUMMARY"
+          echo 'EDG_SEPARATE_INIT_BUILD=source macro=1' >> "$GITHUB_STEP_SUMMARY"
       - name: Install Rust 1.99.1 and build compatible bridge
         run: |
           set -euo pipefail
@@ -287,123 +137,33 @@ jobs:
             startup_provenance::tests:: -- --nocapture
           cargo test --manifest-path edgcpp-rust/Cargo.toml --lib \
             startup_provenance::tests::cleanup_call_requires_exact_direct_child_list -- --nocapture
-      - name: Verify original two-global source and diagnose separate native schedule
+      - name: Parse original C++ throw catch with destructor using source-built retained mode
         working-directory: edgcpp
         run: |
           set -euo pipefail
           export PATH="$HOME/.cargo/bin:$PATH"
           source build/gcc-release/environment.sh
-          cat >build/gcc-release/separate-two-global.cpp <<'CPP'
-          extern "C" int puts(const char*);
-          struct Effectful {
-            int id;
-            explicit Effectful(int i):id(i) { puts(i==1?"first-ctor":"second-ctor"); }
-            ~Effectful() { puts(id==1?"first-dtor":"second-dtor"); }
-          };
-          Effectful first(1);
-          Effectful second(2);
-          int main() { puts("main"); return first.id!=1 || second.id!=2; }
-          CPP
-          cd build/gcc-release
-          version="$(g++ -dumpfullversion -dumpversion)"
-          IFS=. read -r major minor patch <<<"$version"
-          gnu_number=$((10#${major}*10000+10#${minor:-0}*100+10#${patch:-0}))
-          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" \
-            --example parse -- --g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number" \
-            separate-two-global.cpp > "$RUNNER_TEMP/separate-two-global.log" 2>&1 || {
-              tail -n 60 "$RUNNER_TEMP/separate-two-global.log"; exit 1;
-            }
-          grep -Fq 'EDG status: 0' "$RUNNER_TEMP/separate-two-global.log"
-          grep -E 'file scope init scheduler|file scope init root|file scope lowered startup|EDG_CXX5_STARTUP_EVIDENCE|EDG_CXX5_CLEANUP_CALL_LOCAL|EDG_CXX5_CLEANUP_PARTIAL|EDG_CXX5_CLEANUP_TYPED|EDG_CXX5_SEPARATE_INIT|scope dynamic init entries=' \
-            "$RUNNER_TEMP/separate-two-global.log" | head -n 60 \
-            | tee -a "$GITHUB_STEP_SUMMARY" || true
-          g++ -std=c++17 -O0 separate-two-global.cpp -o "$RUNNER_TEMP/edg-separate-gcc"
-          "$RUNNER_TEMP/edg-separate-gcc" > "$RUNNER_TEMP/edg-separate-gcc.out"
-          printf 'first-ctor\nsecond-ctor\nmain\nsecond-dtor\nfirst-dtor\n' \
-            > "$RUNNER_TEMP/edg-separate-expected.out"
-          python3 -c 'import pathlib,sys; assert pathlib.Path(sys.argv[1]).read_bytes()==pathlib.Path(sys.argv[2]).read_bytes()' \
-            "$RUNNER_TEMP/edg-separate-gcc.out" "$RUNNER_TEMP/edg-separate-expected.out"
-          grep -Fq 'EDG_CXX5_SEPARATE_INIT_OWNERS count=2 lifecycle_abi_proven=false' "$RUNNER_TEMP/separate-two-global.log"
-          grep -Fq 'EDG_CXX5_SEPARATE_CHECKED entries=2 lifecycle_abi_proven=false' "$RUNNER_TEMP/separate-two-global.log"
-          grep -Fq 'EDG_CXX5_SEPARATE_CLEANUP entries=2 direct=2 unknown=0 lifecycle_abi_proven=false' "$RUNNER_TEMP/separate-two-global.log"
-          grep -Fq 'EDG_CXX5_SEPARATE_CLEANUP_ENTRY ordinal=0 variable=3 routine=29 destructor=Some(6) dso=Some(32) lifecycle_abi_proven=false' "$RUNNER_TEMP/separate-two-global.log"
-          grep -Fq 'EDG_CXX5_SEPARATE_CLEANUP_ENTRY ordinal=1 variable=5 routine=33 destructor=Some(6) dso=Some(32) lifecycle_abi_proven=false' "$RUNNER_TEMP/separate-two-global.log"
-          grep -Fq 'EDG_CXX5_SEPARATE_CHECKED_ENTRY ordinal=0 variable=3 routine=29 lifecycle_abi_proven=false' "$RUNNER_TEMP/separate-two-global.log"
-          grep -Fq 'EDG_CXX5_SEPARATE_CHECKED_ENTRY ordinal=1 variable=5 routine=33 lifecycle_abi_proven=false' "$RUNNER_TEMP/separate-two-global.log"
-          test "$(grep -Fc 'EDG_CXX5_SEPARATE_INIT_OWNER variable=' "$RUNNER_TEMP/separate-two-global.log")" -eq 2
-          grep -Eq '^EDG_CXX5_SEPARATE_INIT_OWNER variable=[0-9]+ routine=[0-9]+ scheduled_position=Some\(0\)' "$RUNNER_TEMP/separate-two-global.log"
-          grep -Eq '^EDG_CXX5_SEPARATE_INIT_OWNER variable=[0-9]+ routine=[0-9]+ scheduled_position=Some\(1\)' "$RUNNER_TEMP/separate-two-global.log"
-      - name: Probe unchanged system GCC iostream source with exact include roots
-        working-directory: edgcpp
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/.cargo/bin:$PATH"
-          source build/gcc-release/environment.sh
-          cat >build/gcc-release/separate-iostream.cpp <<'CPP'
-          #include <iostream>
-          int main() { std::cout << "Hello world\n"; }
-          CPP
-          cd build/gcc-release
-          version="$(g++ -dumpfullversion -dumpversion)"
-          IFS=. read -r major minor patch <<<"$version"
-          gnu_number=$((10#${major}*10000+10#${minor:-0}*100+10#${patch:-0}))
-          mapfile -t dirs < <(g++ -std=c++17 -v -E -x c++ /dev/null 2>&1 |
-            awk '/#include <...> search starts here:/{active=1;next} /^End of search list/{active=0} active && /^ /{sub(/^[[:space:]]+/, "");print}')
-          includes=()
-          for dir in "${dirs[@]}"; do
-            test -d "$dir" && includes+=("-I$dir")
-          done
-          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" \
-            --example parse -- --g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number" \
-            "${includes[@]}" separate-iostream.cpp > "$RUNNER_TEMP/separate-iostream.log" 2>&1 || {
-              tail -n 60 "$RUNNER_TEMP/separate-iostream.log"; exit 1;
-            }
-          grep -Fq 'EDG status: 0' "$RUNNER_TEMP/separate-iostream.log"
-          grep -E 'file scope init scheduler|file scope init root|EDG_CXX5_STARTUP_EVIDENCE|EDG_CXX5_CLEANUP_CALL_LOCAL|EDG_CXX5_CLEANUP_PARTIAL' \
-            "$RUNNER_TEMP/separate-iostream.log" | head -n 40 \
-            | tee -a "$GITHUB_STEP_SUMMARY" || true
-          grep -Fq 'EDG_CXX5_SEPARATE_CHECKED entries=0 lifecycle_abi_proven=false' "$RUNNER_TEMP/separate-iostream.log"
-          grep -Fq 'EDG_CXX5_SEPARATE_CLEANUP entries=0 direct=0 unknown=0 lifecycle_abi_proven=false' "$RUNNER_TEMP/separate-iostream.log"
-          echo 'EDG_SEPARATE_INIT_ABI_ADMITTED=false' >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Probe original C++ throw/catch and normal plus exceptional destructor source
-        working-directory: edgcpp
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/.cargo/bin:$PATH"
-          source build/gcc-release/environment.sh
-          cat >build/gcc-release/retained-eh.cpp <<'CPP'
-          extern "C" int puts(const char*);
+          cat >build/gcc-release/eh-probe.cpp <<'CPP'
           int touched=0;
-          struct Effect {
-            ~Effect() noexcept { touched=touched*10+2; }
-          };
-          int f() {
-            try { Effect x; throw 7; }
-            catch (int n) { return touched*10+n; }
-          }
+          struct Effect { ~Effect() noexcept { touched=touched*10+2; } };
+          int f() { try { Effect a; throw 7; } catch(int n) { return touched*10+n; } }
           int main() { return f()!=27; }
           CPP
           cd build/gcc-release
-          version="$(g++ -dumpfullversion -dumpversion)"
-          IFS=. read -r major minor patch <<<"$version"
-          gnu_number=$((10#${major}*10000+10#${minor:-0}*100+10#${patch:-0}))
+          gnu_number="$(g++ -dumpfullversion -dumpversion | awk -F. '{printf "%d%02d%02d",$1,$2,$3}')"
           cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" \
             --example parse -- --g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number" \
-            retained-eh.cpp > "$RUNNER_TEMP/retained-eh.log" 2>&1 || {
-              tail -n 90 "$RUNNER_TEMP/retained-eh.log"; exit 1;
+            eh-probe.cpp > "$RUNNER_TEMP/eh-probe.log" 2>&1 || {
+              tail -n 80 "$RUNNER_TEMP/eh-probe.log"; exit 1;
             }
-          grep -Fq 'EDG status: 0' "$RUNNER_TEMP/retained-eh.log"
-          g++ -std=c++17 -O0 retained-eh.cpp -o "$RUNNER_TEMP/retained-eh-gcc"
-          "$RUNNER_TEMP/retained-eh-gcc"
-          echo 'EDG_RETAINED_EH=parsed GCC_ORACLE=exit0 TYPEID_ABI_ADMITTED=false' >> "$GITHUB_STEP_SUMMARY"
-          for file in "$RUNNER_TEMP/separate-two-global.log" "$RUNNER_TEMP/separate-iostream.log" "$RUNNER_TEMP/retained-eh.log"; do
-            printf '%s : ' "$(basename "$file")" >> "$GITHUB_STEP_SUMMARY"
-            python3 - "$file" <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          grep -Fq 'EDG status: 0' "$RUNNER_TEMP/eh-probe.log"
+          g++ -std=c++17 -O0 eh-probe.cpp -o "$RUNNER_TEMP/eh-gcc"
+          "$RUNNER_TEMP/eh-gcc"
+          python3 - "$RUNNER_TEMP/eh-probe.log" <<'PY' >> "$GITHUB_STEP_SUMMARY"
           import sys
-          t=open(sys.argv[1]).read()
-          print("portable_eh_head_occurrences=",t.count("__curr_eh_stack_entry"),
-                "try_mentions=",t.count("try_block"),
-                "lowered_eh_mentions=",t.count("lowered_eh_construct"))
+          text=open(sys.argv[1]).read()
+          print("EDG_SOURCE_EH=parsed GCC_ORACLE=exit0 TYPEID_ABI_ADMITTED=false")
+          print("portable_head_mentions=",text.count("__curr_eh_stack_entry"),
+                "native_try_mentions=",text.count("try_block"),
+                "lowered_eh_mentions=",text.count("lowered_eh_construct"))
           PY
-          done
