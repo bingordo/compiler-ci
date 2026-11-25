@@ -1,0 +1,138 @@
+name: Candidate EDG aggregate initializer PR 3223
+on:
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/verify-edg-aggregate-init-pr3223.yml']
+permissions:
+  contents: read
+jobs:
+  edg-aggregate-return:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    container:
+      image: ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8
+    defaults:
+      run:
+        shell: edg-container-exec "bash -eo pipefail {0}"
+    env:
+      COMPILER_SHA: fc66447d497e855b6083b96dc037b4fa9957dd4f
+      EDG_SOURCE_SHA: b195677be8b9b56c8337afad6be8064d21a54082
+      EDG_RELEASE_TAG: edgcpfe-v2026.11.14-upstream-177765bb7731
+      EDG_RELEASE_SHA256: 1ce495b629924f31382ecccc891a7a72caae1014ddfa2ba7dd39b44d8b0a9526
+      RUST_TOOLCHAIN_VERSION: 1.99.1
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+      EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+      EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+      EDGCPP_EDG_REVISION: b195677be8b9b56c8337afad6be8064d21a54082
+    steps:
+      - name: Check out shared ABI test harness
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check out exact compiler revision tested by Mini-C
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: fc66447d497e855b6083b96dc037b4fa9957dd4f
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+
+      - name: Check out source headers matching upstream EDG release
+        uses: actions/checkout@v4
+        with:
+          repository: bingundu/edgcpp
+          ref: b195677be8b9b56c8337afad6be8064d21a54082
+          path: edgcpp
+          persist-credentials: false
+
+      - name: Assert source revisions and unmodified Hello World
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          test "$(git -C edgcpp rev-parse HEAD)" = "$EDG_SOURCE_SHA"
+          printf 'Compiler SHA: %s\nEDG package SHA: %s\n' "$COMPILER_SHA" "$EDG_SOURCE_SHA" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Configure EDG header tooling without rebuilding full frontend
+        working-directory: edgcpp
+        env:
+          EDG_BASE: ${{ github.workspace }}/edgcpp/bases/docker/dev-env/gcc
+        run: |
+          set -euo pipefail
+          cmake --preset linux-gcc-release -DEDG_BUILD_LIB=OFF -DEDG_BUILD_CALLABLE_LIBRARY=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          cmake --build build/gcc-release --target error-info --parallel 2
+          test -s build/gcc-release/src/includes/err_codes.h
+          test -s build/gcc-release/src/includes/err_data.h
+
+      - name: Restore checksummed upstream EDG callable release
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          mkdir -p build/gcc-release/lib build/prebuilt-edg
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error --retry 4 --retry-delay 2 \
+            "https://github.com/bingundu/edgcpp/releases/download/$EDG_RELEASE_TAG/edgcpfe-ci-upstream-callable-edg-release-20261114-linux-x86_64.tar.gz" \
+            -o build/prebuilt-edg/archive.tar.gz
+          printf '%s  %s\n' "$EDG_RELEASE_SHA256" build/prebuilt-edg/archive.tar.gz | sha256sum -c -
+          tar -xzf build/prebuilt-edg/archive.tar.gz -C build/prebuilt-edg
+          grep -Fx "commit=$EDG_SOURCE_SHA" build/prebuilt-edg/BUILD-INFO.txt
+          grep -Fx 'platform=linux-x86_64' build/prebuilt-edg/BUILD-INFO.txt
+          test -s build/prebuilt-edg/lib/libedgcpfe.a
+          cp build/prebuilt-edg/lib/libedgcpfe.a build/gcc-release/lib/libedgcpfe.a
+
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          if ! command -v cargo >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN_VERSION"
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install "$RUST_TOOLCHAIN_VERSION" --profile minimal
+          rustup default "$RUST_TOOLCHAIN_VERSION"
+
+      - name: Build EDG native TypeId driver
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo build --manifest-path compiler/tools/edg-driver/Cargo.toml
+          test -x compiler/tools/edg-driver/target/debug/compiler-edg-driver
+      - name: Validate shared backend snapshot unit tests
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test --manifest-path compiler/tools/edg-driver/Cargo.toml --lib
+      - name: Run the same upstream aggregate return corpus with EDG
+        run: |
+          source edgcpp/build/gcc-release/environment.sh
+          checkout="$RUNNER_TEMP/gcc-compat-source"
+          git init "$checkout"
+          git -C "$checkout" remote add origin https://github.com/gcc-mirror/gcc.git
+          git -C "$checkout" sparse-checkout init --cone
+          git -C "$checkout" sparse-checkout set gcc/testsuite/gcc.dg/compat
+          git -C "$checkout" -c protocol.version=2 fetch --depth=1 --filter=blob:none origin 1330eed38849ad186518f609c52bd5651c2bfdc1
+          git -C "$checkout" checkout --detach FETCH_HEAD
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          parts = [int(x) for x in subprocess.check_output(
+              ["gcc", "-dumpfullversion", "-dumpversion"], text=True).strip().split(".")]
+          parts += [0] * (3 - len(parts))
+          version = str(parts[0] * 10000 + parts[1] * 100 + parts[2])
+          Path(os.environ["RUNNER_TEMP"], "edg-return-adapters.json").write_text(json.dumps({
+              "edg": [str(Path("compiler/tools/edg-driver/target/debug/compiler-edg-driver").resolve()),
+                      "{object}", "--gcc", "--c11", "--no_strict_gnu",
+                      "--gnu_version", version, "{original}"]
+          }))
+          PY
+          timeout --signal=TERM --kill-after=10s 8m python3 tools/gcc_compat_runner.py \
+            "$checkout" --adapters "$RUNNER_TEMP/edg-return-adapters.json" \
+            --work-dir "$RUNNER_TEMP/edg-aggregate-returns" --include-return-probes \
+            --compiler-sha "$(git -C compiler rev-parse HEAD)"
+      - name: Preserve EDG aggregate return report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: edg-aggregate-return-coverage
+          path: ${{ runner.temp }}/edg-aggregate-returns/report.json
+          if-no-files-found: ignore
+          retention-days: 14
