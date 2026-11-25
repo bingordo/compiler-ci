@@ -134,3 +134,40 @@ jobs:
                 "native_try_mentions=",text.count("try_block"),
                 "lowered_eh_mentions=",text.count("lowered_eh_construct"))
           PY
+- name: Check out compiler EH TypeId admission candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 63c78adfd9f97c30456b64e9225145eb61c6e749
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+
+      - name: Test TypeId EH ingress fixtures and compile exact EDG adapter
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          test "$(git rev-parse HEAD)" = 63c78adfd9f97c30456b64e9225145eb61c6e749
+          grep -Fq 'rev = "7a8c37e8831db6f6cc941ab5cf11bc008457eb1b"' tools/edg-driver/Cargo.toml
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+          cargo test --manifest-path tools/edg-driver/Cargo.toml retained_eh::tests -- --nocapture
+          cargo build --manifest-path tools/edg-driver/Cargo.toml
+          echo 'EDG_TYPEID_EH_INGRESS=unit_positive_negative_passed' >> "$GITHUB_STEP_SUMMARY"
+      - name: Reject original C++ throw catch through TypeId before native ELF
+        working-directory: edgcpp/build/gcc-release
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source environment.sh
+          driver="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          test -x "$driver"
+          gnu_number="$(g++ -dumpfullversion -dumpversion | awk -F. '{printf "%d%02d%02d",$1,$2,$3}')"
+          ! "$driver" "$RUNNER_TEMP/edg-eh-should-not-exist.o" \
+            --g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number" \
+            eh-probe.cpp > "$RUNNER_TEMP/edg-eh-rejection.log" 2>&1
+          test ! -e "$RUNNER_TEMP/edg-eh-should-not-exist.o"
+          grep -E 'native TypeId EH invoke/unwind and cleanup not implemented: original' "$RUNNER_TEMP/edg-eh-rejection.log" |
+            head -n 2 | tee -a "$GITHUB_STEP_SUMMARY"
+          echo 'EDG_TYPEID_EH_NATIVE_ELF_ADMISSION=false' >> "$GITHUB_STEP_SUMMARY"
