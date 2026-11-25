@@ -51,6 +51,14 @@ class CompatibilityTests(unittest.TestCase):
                          "ABI_MISMATCH")
         self.assertTrue(fatal(record))
 
+    def test_target_only_skip_selector(self):
+        path = self.root / "struct-return-0_main.c"
+        path.write_text('/* { dg-skip-if "limited code space" { pdp11-*-* } } */\n'
+                        + path.read_text())
+        case = self.case()
+        self.assertIsNone(unsupported(case, self.root, "x86_64-linux-gnu"))
+        self.assertIn("target exclusion", unsupported(case, self.root, "pdp11-unknown-none"))
+
     def test_unknown_directive_is_not_executed(self):
         path = self.root / "struct-return-0_main.c"
         path.write_text("/* { dg-require-effective-target unknown_feature } */\n"
