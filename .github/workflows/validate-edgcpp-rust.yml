@@ -37,7 +37,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/edgcpp-rust
-          ref: 7a8c37e8831db6f6cc941ab5cf11bc008457eb1b
+          ref: 82ef53319b0a49b23ea8031cd4140d54d7c93c72
           path: edgcpp-rust
           persist-credentials: false
       - name: Build independent EDG source configuration with separate initializer routines
@@ -138,7 +138,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 63c78adfd9f97c30456b64e9225145eb61c6e749
+          ref: 510636b5003a3759e14405ece703431b114e91f4
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -148,8 +148,8 @@ jobs:
         run: |
           set -euo pipefail
           export PATH="$HOME/.cargo/bin:$PATH"
-          test "$(git rev-parse HEAD)" = 63c78adfd9f97c30456b64e9225145eb61c6e749
-          grep -Fq 'rev = "7a8c37e8831db6f6cc941ab5cf11bc008457eb1b"' tools/edg-driver/Cargo.toml
+          test "$(git rev-parse HEAD)" = 510636b5003a3759e14405ece703431b114e91f4
+          grep -Fq 'rev = "82ef53319b0a49b23ea8031cd4140d54d7c93c72"' tools/edg-driver/Cargo.toml
           git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
           git config --global --add url."https://github.com/".insteadOf "git@github.com:"
           cargo test --manifest-path tools/edg-driver/Cargo.toml retained_eh::tests -- --nocapture
@@ -171,3 +171,47 @@ jobs:
           grep -E 'native TypeId EH invoke/unwind and cleanup not implemented: original' "$RUNNER_TEMP/edg-eh-rejection.log" |
             head -n 2 | tee -a "$GITHUB_STEP_SUMMARY"
           echo 'EDG_TYPEID_EH_NATIVE_ELF_ADMISSION=false' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Execute unchanged C++ scalar free function through retained-EH EDG and TypeId ELF
+        working-directory: edgcpp/build/gcc-release
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source environment.sh
+          gnu_number="$(g++ -dumpfullversion -dumpversion | awk -F. '{printf "%d%02d%02d",$1,$2,$3}')"
+          cat >"$RUNNER_TEMP/eh-safe.cpp" <<'CPP'
+          extern "C" int eh_safe_add(int lhs, int rhs) noexcept {
+            int twice = lhs * 2;
+            return twice + rhs;
+          }
+          CPP
+          cat >"$RUNNER_TEMP/eh-safe-harness.cpp" <<'CPP'
+          #include <cstdio>
+          extern "C" int eh_safe_add(int, int) noexcept;
+          int main() {
+            int vals[3][2]={{2,3},{-4,11},{0,0}};
+            for (auto &v:vals) std::printf("%d\n",eh_safe_add(v[0],v[1]));
+            return 0;
+          }
+          CPP
+          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" \
+            --example parse -- --g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number" \
+            "$RUNNER_TEMP/eh-safe.cpp" >"$RUNNER_TEMP/eh-safe-parse.log" 2>&1
+          grep -Fq 'EDG status: 0' "$RUNNER_TEMP/eh-safe-parse.log"
+          grep -Fxq 'EDG_NATIVE_RETAINED_EH nodes=0 itanium_abi_admitted=false' "$RUNNER_TEMP/eh-safe-parse.log"
+          driver="$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          "$driver" "$RUNNER_TEMP/eh-safe-native.o" \
+            --g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number" \
+            "$RUNNER_TEMP/eh-safe.cpp" >"$RUNNER_TEMP/eh-safe-compiler.log" 2>&1 || {
+              tail -n 90 "$RUNNER_TEMP/eh-safe-compiler.log"; exit 1;
+            }
+          test "$(od -An -tx1 -N4 "$RUNNER_TEMP/eh-safe-native.o" | tr -d '[:space:]')" = 7f454c46
+          g++ -std=c++17 -O0 -c "$RUNNER_TEMP/eh-safe.cpp" -o "$RUNNER_TEMP/eh-safe-gcc.o"
+          g++ -std=c++17 -O0 "$RUNNER_TEMP/eh-safe-harness.cpp" "$RUNNER_TEMP/eh-safe-gcc.o" -o "$RUNNER_TEMP/eh-safe-gcc"
+          g++ -std=c++17 -O0 "$RUNNER_TEMP/eh-safe-harness.cpp" "$RUNNER_TEMP/eh-safe-native.o" -o "$RUNNER_TEMP/eh-safe-native"
+          timeout 15s "$RUNNER_TEMP/eh-safe-gcc" > "$RUNNER_TEMP/eh-safe-gcc.out"
+          timeout 15s "$RUNNER_TEMP/eh-safe-native" > "$RUNNER_TEMP/eh-safe-native.out"
+          cmp "$RUNNER_TEMP/eh-safe-gcc.out" "$RUNNER_TEMP/eh-safe-native.out"
+          printf '7\n3\n0\n' >"$RUNNER_TEMP/eh-safe-expected.out"
+          cmp "$RUNNER_TEMP/eh-safe-native.out" "$RUNNER_TEMP/eh-safe-expected.out"
+          echo 'EDG_RETAINED_EH=zero-effect_free_function TYPEID_ELF_EXECUTED=true GCC_PARITY=true' >> "$GITHUB_STEP_SUMMARY"
