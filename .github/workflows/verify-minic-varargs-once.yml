@@ -1,0 +1,101 @@
+# One-time verification for compiler PR #3137. Remove after validation.
+name: Verify Mini-C GP variadic calls (once)
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/verify-minic-varargs-once.yml'
+
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  gp-varargs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 22
+    steps:
+      - name: Checkout compiler-ci
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d41884d955186ba3e7792fd0ec2ace242d1bfc83
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source revision
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "d41884d955186ba3e7792fd0ec2ace242d1bfc83"
+          test -s compiler/tools/mini-c-driver/tests/differential.py
+          echo "Compiler revision: d41884d955186ba3e7792fd0ec2ace242d1bfc83" >> "$GITHUB_STEP_SUMMARY"
+      - name: Prepare Mini-C public dependency
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("compiler/tools/mini-c-driver/Cargo.toml")
+          s=p.read_text()
+          old="ssh://git@github.com/bingordo/mini-c.git"
+          assert s.count(old)==2, "Mini-C source manifest changed"
+          p.write_text(s.replace(old,"https://github.com/bingordo/mini-c.git"))
+          PY
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: gp-variadic-candidate
+      - name: Build Mini-C driver
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 12m cargo build \
+            --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --bin compiler-mini-c \
+            2>&1 | tee "$RUNNER_TEMP/vararg-build.log"
+      - name: GCC reference and focused mixed-object varargs in both frame modes
+        run: |
+          set -euo pipefail
+          for frame in default rbp; do
+            opts=()
+            if [[ "$frame" == "rbp" ]]; then opts+=(--mixed-frame-pointer); fi
+            timeout --signal=TERM --kill-after=10s 6m python3 \
+              compiler/tools/mini-c-driver/tests/differential.py \
+              --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" \
+              --mixed-only --timeout 15 "${opts[@]}" \
+              --mixed-case mini_calls_gcc_gp_varargs_direct_17 \
+              --mixed-case mini_calls_gcc_gp_varargs_indirect_17 \
+              --mixed-case mini_calls_gcc_gp_varargs_direct_33 \
+              --mixed-case mini_calls_gcc_gp_varargs_indirect_33 \
+              --artifacts "$RUNNER_TEMP/varargs-$frame-cases" \
+              2>&1 | tee "$RUNNER_TEMP/varargs-$frame.log"
+            grep -Fxq "PASS: mixed ABI calls" "$RUNNER_TEMP/varargs-$frame.log"
+            echo "Passed 17/33-argument direct/indirect GCC va_arg ($frame)" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Preserve reproductions on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: varargs-abi-pr3137-reproducers
+          path: |
+            ${{ runner.temp }}/vararg-build.log
+            ${{ runner.temp }}/varargs-*.log
+            ${{ runner.temp }}/varargs-*-cases/
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Publish source-pinned candidate status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [[ "$RESULT" == "success" ]]; then state=success; else state=failure; fi
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$state" -f context="abi/varargs-pr3137" \
+            -f description="Source-pinned GP varargs ABI: $RESULT" \
+            -f target_url="$RUN_URL"
