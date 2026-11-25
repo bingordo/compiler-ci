@@ -51,6 +51,20 @@ class CompatibilityTests(unittest.TestCase):
                          "ABI_MISMATCH")
         self.assertTrue(fatal(record))
 
+    def test_generated_return_controls(self):
+        from gcc_compat_return_probes import generate
+        root = self.root / "generated"
+        generate(root)
+        cases = inventory(root, "probe-return-")
+        self.assertEqual(len(cases), 41)
+        for name in ("bytes-3", "bytes-9", "bytes-17", "gp-sse"):
+            case = next(c for c in cases if c["case"] == "probe-return-" + name)
+            record = run_case(case, root, self.root / name, "gcc", self.flags,
+                              {"control": ["gcc", "-c", "{original}", "-o", "{object}"]})
+            self.assertFalse(fatal(record), record)
+            self.assertTrue(all(d["status"] == "PASS"
+                                for d in record["frontends"]["control"]["directions"].values()))
+
     def test_target_only_skip_selector(self):
         path = self.root / "struct-return-0_main.c"
         path.write_text('/* { dg-skip-if "limited code space" { pdp11-*-* } } */\n'
