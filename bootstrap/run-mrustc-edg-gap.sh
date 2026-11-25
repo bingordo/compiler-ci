@@ -2108,6 +2108,10 @@ schemas={
     "EDG_C_BODY_STMT_SITE":(
         "EDG_C_REAL_BODY_STMT_SITE",
         ("kind","expr","op","children","depth"),1),
+    "EDG_C_BODY_ASSIGN_SITE":(
+        "EDG_C_REAL_BODY_ASSIGN_SITE",
+        ("step","lhs","lhsop","lhstype","lhscan",
+         "rhs","rhsop","rhstype","rhscan"),1),
     "EDG_C_BODY_RESULT_CANON":(
         "EDG_C_REAL_BODY_RESULT_CANON",
         ("root","kind","bytes","align"),1),
