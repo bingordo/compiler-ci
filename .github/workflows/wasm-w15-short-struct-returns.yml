@@ -24,7 +24,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ inputs.compiler_sha || '3c389c4f018ec97253f7cbba823a1133a71ac06c' }}
+          ref: ${{ inputs.compiler_sha || 'd98d8c0478525a066dc5a54cec3ba26b02b54a12' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -47,11 +47,19 @@ jobs:
           path: oberon-pinned
           fetch-depth: 0
           persist-credentials: false
+      - name: Checkout exact upstream baseline for unrelated ASM2 failures
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 80b47764e14b461dd282d04715c5685b9a9ec576
+          path: compiler-baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
       - name: Verify pins and isolate production driver
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C compiler rev-parse HEAD)" = "${{ inputs.compiler_sha || '3c389c4f018ec97253f7cbba823a1133a71ac06c' }}"
+          test "$(git -C compiler rev-parse HEAD)" = "${{ inputs.compiler_sha || 'd98d8c0478525a066dc5a54cec3ba26b02b54a12' }}"
           grep -F '66c599591115e9c17a1d802db3d048cf4f39d294' compiler/crates/driver/Cargo.toml
           grep -F '88979bfeda0ec08f9453010771df70ee5d28169c' compiler/crates/driver/Cargo.toml
           test "$(git -C mini-c-pinned rev-parse HEAD)" = "66c599591115e9c17a1d802db3d048cf4f39d294"
@@ -118,31 +126,50 @@ jobs:
         run: |
           cargo test -p compiler --test wasm32_minic_source -- --nocapture
           cargo test -p compiler --test wasm13_aggregate_returns -- --nocapture
-      # Current main includes unrelated ASM2 frontend admission and GP-clobber
-      # regressions in its pinned Mini-C tree; W13 changes no inline-asm code.
-      # Keep the eight observed failures explicit rather than silently marking
-      # the entire shared Mini-C suite green or dropping all ASM2 coverage.
-      # This is an inherited failure, not a test success claim.
-      - name: Record currently failing pre-existing Mini-C ASM2 checks
-        working-directory: compiler
-        continue-on-error: true
-        run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib
-      - name: Regress every shared Mini-C unit outside eight observed ASM2 failures plus W13 proofs
+      - name: Compare ASM2 unit failures with exact upstream baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler-baseline rev-parse HEAD)" = "80b47764e14b461dd282d04715c5685b9a9ec576"
+          # Keep the nested Mini-C test build isolated in both checkouts.
+          cp compiler/Cargo.toml compiler-baseline/Cargo.toml
+          rm -f compiler-baseline/Cargo.lock
+          mkdir -p compiler/coverage
+          export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/compiler/tools/mini-c-driver/target"
+          set +e
+          cargo test --manifest-path compiler-baseline/tools/mini-c-driver/Cargo.toml --lib asm2_ > compiler/coverage/asm2-baseline.log 2>&1
+          baseline_rc=$?
+          cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib asm2_ > compiler/coverage/asm2-candidate.log 2>&1
+          candidate_rc=$?
+          set -e
+          cat compiler/coverage/asm2-baseline.log
+          cat compiler/coverage/asm2-candidate.log
+          BASELINE_RC="$baseline_rc" CANDIDATE_RC="$candidate_rc" python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          def results(name, rc):
+              log = Path(f"compiler/coverage/asm2-{name}.log").read_text()
+              matches = re.findall(r"^test (\S+) \.\.\. (ok|FAILED|ignored)\s*$", log, re.M)
+              assert matches and "test result:" in log, f"{name}: did not execute ASM2 tests"
+              assert rc == 0 or (rc == 101 and any(v == "FAILED" for _,v in matches)), (name, rc)
+              return dict(matches)
+          base = results("baseline", int(os.environ["BASELINE_RC"]))
+          cand = results("candidate", int(os.environ["CANDIDATE_RC"]))
+          missing = set(base) - set(cand)
+          regressions = {n for n,v in cand.items() if v == "FAILED" and base.get(n) != "FAILED"}
+          ignored = {n for n,v in cand.items() if v == "ignored" and base.get(n) != "ignored"}
+          inherited = sorted(n for n,v in cand.items() if v == base.get(n) == "FAILED")
+          print("Inherited ASM2 failures (also present on exact upstream baseline):", inherited)
+          assert not (missing or regressions or ignored), (missing, regressions, ignored)
+          PY
+      - name: Regress all non-ASM2 Mini-C units and aggregate proofs
         working-directory: compiler
         run: |
           cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib checked_local_memcpy::tests
           python3 tools/wasm-coverage/generate_w13_cases.py
           cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib aggregate_wasm_gp::tests
           cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib wasm_tail_record_result_forwards_hidden_destination_but_not_assignment
-          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib -- \
-            --skip asm2_p12_explicit_gp_clobbers_match_gcc_live_through \
-            --skip asm2_p13b_two_input_gp_unsupported_templates_fail_closed \
-            --skip asm2_p14_generated_gcc_gp_clobber_native_differential \
-            --skip asm2_p15_generated_all_five_operand_roles_gcc_native_differential \
-            --skip asm2_p16_generated_unreviewed_binary_source_templates_fail_closed \
-            --skip asm2_p6_register_templates_reject_unmodeled_operations_and_widths \
-            --skip asm2_p7_rejects_untracked_flags_and_unsafe_arithmetic_templates \
-            --skip asm2_p9_readwrite_and_matching_gp_reject_nonmodeled_templates
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib -- --skip asm2_
       - name: Regress Wasm memory backend and checked pointer implementation
         working-directory: compiler
         run: cargo test -p compiler-backend-wasm --tests
@@ -233,6 +260,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wasm-source-coverage
-          path: compiler/coverage/wasm-source-coverage.json
+          path: |
+            compiler/coverage/wasm-source-coverage.json
+            compiler/coverage/asm2-baseline.log
+            compiler/coverage/asm2-candidate.log
           if-no-files-found: warn
           retention-days: 30
