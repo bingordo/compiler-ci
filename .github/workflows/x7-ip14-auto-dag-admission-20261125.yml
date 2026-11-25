@@ -1,0 +1,59 @@
+name: X7 IP14 auto DAG certificate and actual matcher gate
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/x7-ip14-auto-dag-admission-20261125.yml'
+permissions:
+  contents: read
+jobs:
+  auto-source-match:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d49b30b021a7a8b9aed2872b1f98c5d6d5e2a885
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm exact compiler source and Z3
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = d49b30b021a7a8b9aed2872b1f98c5d6d5e2a885
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+          if ! command -v z3 >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y z3
+          fi
+          z3 --version
+          rustc --version
+      - name: Original Intel exact-source and automatic DAG table certificates
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/x7_ip13_auto_discover_dags.py --check
+          python3 tools/x7_ip14_auto_dag_rules.py --check
+          python3 -m unittest discover -s tools -p 'test_x7_ip13_auto_discover_dags.py' -v
+          python3 -m unittest discover -s tools -p 'test_x7_ip14_auto_dag_rules.py' -v
+          python3 tools/x7_instruction_driven_dag.py --check
+          python3 tools/x86_blanket_instruction_bans.py --check
+          git diff --exit-code
+      - name: Build and run all auto-DAG real matcher tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib --features x7-ip14-auto-dag-probe ip14_auto_dag_tests -- --nocapture
+          echo 'X7_IP14_SOURCE_CERTIFIED_MATCHER=PASS' >> "$GITHUB_STEP_SUMMARY"
+      - name: Existing default, production-logic and driver remain unchanged
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-backend-x86
+          cargo check -p compiler-backend-x86 --features x7-production-generated-logic
+          cargo check -p compiler --bin compiler
