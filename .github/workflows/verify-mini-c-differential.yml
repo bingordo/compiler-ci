@@ -25,6 +25,7 @@ on:
 
 permissions:
   contents: read
+  statuses: write
 
 concurrency:
   group: mini-c-differential-${{ inputs.source_ref || 'main' }}
@@ -124,6 +125,35 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/mini-c-frame-pointer.log"
           grep -Fxq "PASS: mixed ABI calls" "$RUNNER_TEMP/mini-c-frame-pointer.log"
           echo "Passed mixed-object ABI with frame pointers" >> "$GITHUB_STEP_SUMMARY"
+      - name: Reuse native mixed GP/XMM ABI and floating-point GCC oracles
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest=compiler/tools/mini-c-driver/Cargo.toml
+          timeout --signal=TERM --kill-after=10s 7m cargo test \
+            --manifest-path "$manifest" -p compiler-mini-c \
+            --test fp_mixed_abi native_checked_mixed_gp32_xmm_formals_conversions_and_calls \
+            -- --exact --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/mini-c-fp-mixed-abi.log"
+          timeout --signal=TERM --kill-after=10s 7m cargo test \
+            --manifest-path "$manifest" -p compiler-mini-c \
+            --test fp_scalar checked_float_source_gcc_elf_and_gas \
+            -- --exact --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/mini-c-fp-scalar-abi.log"
+          echo "Passed existing Mini-C/GCC floating-point ABI native oracles" >> "$GITHUB_STEP_SUMMARY"
+      - name: Reuse native indirect variadic GCC interoperability oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 5m python3 \
+            compiler/tools/mini-c-driver/tests/p5c_indirect_gp_native.py \
+            --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" \
+            2>&1 | tee "$RUNNER_TEMP/mini-c-indirect-variadic.log"
+          grep -Fq "PASS P5c indirect GP printf obj frameless matches GCC" "$RUNNER_TEMP/mini-c-indirect-variadic.log"
+          grep -Fq "PASS P5c indirect GP printf obj rbp matches GCC" "$RUNNER_TEMP/mini-c-indirect-variadic.log"
+          grep -Fq "PASS P5c indirect GP printf asm frameless matches GCC" "$RUNNER_TEMP/mini-c-indirect-variadic.log"
+          grep -Fq "PASS P5c indirect GP printf asm rbp matches GCC" "$RUNNER_TEMP/mini-c-indirect-variadic.log"
+          echo "Passed existing indirect GP varargs ELF/GAS frame-pointer parity" >> "$GITHUB_STEP_SUMMARY"
       - name: Preserve build logs and failing test cases
         if: failure()
         uses: actions/upload-artifact@v4
@@ -133,7 +163,32 @@ jobs:
             ${{ runner.temp }}/mini-c-build.log
             ${{ runner.temp }}/mini-c-differential.log
             ${{ runner.temp }}/mini-c-frame-pointer.log
+            ${{ runner.temp }}/mini-c-fp-mixed-abi.log
+            ${{ runner.temp }}/mini-c-fp-scalar-abi.log
+            ${{ runner.temp }}/mini-c-indirect-variadic.log
             ${{ runner.temp }}/mini-c-failures/
             ${{ runner.temp }}/mini-c-frame-pointer-failures/
           if-no-files-found: ignore
           retention-days: 14
+      - name: Publish discoverable daily main test result
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          case "$RESULT" in
+            success) state=success ;;
+            *) state=failure ;;
+          esac
+          source_sha=unavailable
+          if [[ -d compiler/.git ]]; then
+            source_sha="$(git -C compiler rev-parse --short=12 HEAD)"
+          fi
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$state" \
+            -f context="mini-c/main-daily" \
+            -f description="Mini-C GCC/ABI daily ($source_sha): $RESULT" \
+            -f target_url="$RUN_URL"
