@@ -13,26 +13,25 @@ on:
         required: false
         default: '6'
         type: string
-      force_recheck:
-        description: 'Repeat previously passing cohort'
-        required: false
-        default: false
-        type: boolean
       abi_only:
         description: 'Run only mixed-object ABI tests (manual validation)'
         required: false
         default: false
         type: boolean
-  schedule:
-    - cron: '4,19,34,49 * * * *'
-  # CI source changes are polled on a schedule; only workflow edits need a
-  # PR-specific trigger. Avoid redundant self-only push event checks.
-  pull_request:
+  # Also exercise this gate once when its own workflow definition changes.
+  # Do not run for routine compiler PRs or compiler-ci source changes.
+  push:
+    branches: [main]
     paths:
       - '.github/workflows/verify-mini-c-differential.yml'
+  # One full run daily on compiler/main, not every 15 minutes or per PR.
+  # GitHub interprets schedule cron in UTC.
+  schedule:
+    - cron: '23 9 * * *'
 
 permissions:
   contents: read
+  statuses: write
 
 concurrency:
   group: mini-c-differential-${{ inputs.source_ref || 'main' }}
@@ -43,6 +42,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
+      - name: Checkout compiler-ci test harness
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Checkout compiler source using existing read-only deploy key
         uses: actions/checkout@v4
         with:
@@ -66,16 +69,7 @@ jobs:
           test -s compiler/tools/mini-c-driver/tests/differential.py
           test -s compiler/tools/mini-c-driver/Cargo.toml
           echo "Compiler revision: $sha" >> "$GITHUB_STEP_SUMMARY"
-      - name: Check for previously successful source and cohort
-        if: ${{ !inputs.abi_only }}
-        id: verified
-        uses: actions/cache/restore@v4
-        with:
-          path: .mini-c-verified
-          key: mini-c-source-v1-${{ hashFiles('.github/workflows/verify-mini-c-differential.yml') }}-${{ steps.source.outputs.sha }}-${{ inputs.seed_count || '6' }}
-          lookup-only: true
       - name: Make public Mini-C dependency accessible without another deploy key
-        if: inputs.abi_only || steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
         shell: bash
         run: |
           set -euo pipefail
@@ -88,14 +82,12 @@ jobs:
           manifest.write_text(text.replace(old,'https://github.com/bingordo/mini-c.git'))
           PY
       - name: Cache Rust objects and dependencies
-        if: inputs.abi_only || steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: compiler/tools/mini-c-driver -> target
           key: mini-c-source-differential-v1
           cache-workspace-crates: 'true'
       - name: Build compiler-mini-c once
-        if: inputs.abi_only || steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
         shell: bash
         run: |
           set -euo pipefail
@@ -105,7 +97,6 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/mini-c-build.log"
           test -x compiler/tools/mini-c-driver/target/debug/compiler-mini-c
       - name: Compare compiled Mini-C against GCC
-        if: inputs.abi_only || steps.verified.outputs.cache-hit != 'true' || inputs.force_recheck
         shell: bash
         env:
           SEED_COUNT: ${{ inputs.seed_count || '6' }}
@@ -127,22 +118,77 @@ jobs:
           else
             grep -Eq "^PASS: [1-9][0-9]* fixtures, $SEED_COUNT seeds, mixed ABI calls and negative cases$" "$RUNNER_TEMP/mini-c-differential.log"
           fi
-          mkdir -p .mini-c-verified
-          printf '%s\n' "${{ steps.source.outputs.sha }}" > .mini-c-verified/source-sha.txt
           if [[ "$ABI_ONLY" == true ]]; then
             echo "Passed focused mixed-object ABI checks" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "Passed fixed, seeded, ABI and negative GCC oracles" >> "$GITHUB_STEP_SUMMARY"
           fi
-      - name: Save successful exact revision evidence
-        if: success() && !inputs.abi_only && steps.verified.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: .mini-c-verified
-          key: mini-c-source-v1-${{ hashFiles('.github/workflows/verify-mini-c-differential.yml') }}-${{ steps.source.outputs.sha }}-${{ inputs.seed_count || '6' }}
-      - name: Report cached result
-        if: !inputs.abi_only && steps.verified.outputs.cache-hit == 'true' && !inputs.force_recheck
-        run: echo "Exact compiler revision and seed cohort previously passed" >> "$GITHUB_STEP_SUMMARY"
+      - name: Check complete mixed-object ABI matrix with frame pointers
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 5m python3 \
+            compiler/tools/mini-c-driver/tests/differential.py \
+            --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" \
+            --mixed-only --mixed-frame-pointer --timeout 15 \
+            --artifacts "$RUNNER_TEMP/mini-c-frame-pointer-failures" \
+            2>&1 | tee "$RUNNER_TEMP/mini-c-frame-pointer.log"
+          grep -Fxq "PASS: mixed ABI calls" "$RUNNER_TEMP/mini-c-frame-pointer.log"
+          echo "Passed mixed-object ABI with frame pointers" >> "$GITHUB_STEP_SUMMARY"
+      - name: Reuse native mixed GP/XMM ABI and floating-point GCC oracles
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest=compiler/tools/mini-c-driver/Cargo.toml
+          timeout --signal=TERM --kill-after=10s 7m cargo test \
+            --manifest-path "$manifest" -p compiler-mini-c \
+            --test fp_mixed_abi native_checked_mixed_gp32_xmm_formals_conversions_and_calls \
+            -- --exact --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/mini-c-fp-mixed-abi.log"
+          timeout --signal=TERM --kill-after=10s 7m cargo test \
+            --manifest-path "$manifest" -p compiler-mini-c \
+            --test fp_scalar checked_float_source_gcc_elf_and_gas \
+            -- --exact --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/mini-c-fp-scalar-abi.log"
+          echo "Passed existing Mini-C/GCC floating-point ABI native oracles" >> "$GITHUB_STEP_SUMMARY"
+      - name: Reuse native indirect variadic GCC interoperability oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 5m python3 \
+            compiler/tools/mini-c-driver/tests/p5c_indirect_gp_native.py \
+            --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" \
+            2>&1 | tee "$RUNNER_TEMP/mini-c-indirect-variadic.log"
+          grep -Fq "PASS P5c indirect GP printf obj frameless matches GCC" "$RUNNER_TEMP/mini-c-indirect-variadic.log"
+          grep -Fq "PASS P5c indirect GP printf obj rbp matches GCC" "$RUNNER_TEMP/mini-c-indirect-variadic.log"
+          grep -Fq "PASS P5c indirect GP printf asm frameless matches GCC" "$RUNNER_TEMP/mini-c-indirect-variadic.log"
+          grep -Fq "PASS P5c indirect GP printf asm rbp matches GCC" "$RUNNER_TEMP/mini-c-indirect-variadic.log"
+          echo "Passed existing indirect GP varargs ELF/GAS frame-pointer parity" >> "$GITHUB_STEP_SUMMARY"
+      - name: Classify pinned upstream GCC compatibility ABI tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Diagnostic coverage admission: a frontend compile rejection is
+          # COVERAGE_MISSING, never counted as an ABI pass. Any admitted
+          # cross-compiler ABI mismatch or GCC/GCC oracle failure is fatal.
+          timeout --signal=TERM --kill-after=10s 4m python3 \
+            tools/gcc_compat_abi_pilot.py \
+            --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" \
+            --work-dir "$RUNNER_TEMP/mini-c-gcc-compat" \
+            2>&1 | tee "$RUNNER_TEMP/mini-c-gcc-compat.log"
+          grep -Fq "GCC_COMPAT_SUMMARY " "$RUNNER_TEMP/mini-c-gcc-compat.log"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          report = json.loads(
+              (Path(os.environ["RUNNER_TEMP"]) / "mini-c-gcc-compat/report.json").read_text())
+          admitted = report["admitted_mixed_directions"]
+          attempted = report["attempted_mixed_directions"]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(f"GCC upstream compatibility pilot: {admitted}/{attempted} "
+                            "mixed directions admitted; compile rejections "
+                            "are unsupported coverage, not passing ABI checks.\n")
+          PY
       - name: Preserve build logs and failing test cases
         if: failure()
         uses: actions/upload-artifact@v4
@@ -151,6 +197,35 @@ jobs:
           path: |
             ${{ runner.temp }}/mini-c-build.log
             ${{ runner.temp }}/mini-c-differential.log
+            ${{ runner.temp }}/mini-c-frame-pointer.log
+            ${{ runner.temp }}/mini-c-fp-mixed-abi.log
+            ${{ runner.temp }}/mini-c-fp-scalar-abi.log
+            ${{ runner.temp }}/mini-c-indirect-variadic.log
+            ${{ runner.temp }}/mini-c-gcc-compat.log
+            ${{ runner.temp }}/mini-c-gcc-compat/report.json
             ${{ runner.temp }}/mini-c-failures/
+            ${{ runner.temp }}/mini-c-frame-pointer-failures/
           if-no-files-found: ignore
           retention-days: 14
+      - name: Publish discoverable daily main test result
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          case "$RESULT" in
+            success) state=success ;;
+            *) state=failure ;;
+          esac
+          source_sha=unavailable
+          if [[ -d compiler/.git ]]; then
+            source_sha="$(git -C compiler rev-parse --short=12 HEAD)"
+          fi
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$state" \
+            -f context="mini-c/main-daily" \
+            -f description="Mini-C GCC/ABI daily ($source_sha): $RESULT" \
+            -f target_url="$RUN_URL"
