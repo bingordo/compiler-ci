@@ -33,6 +33,12 @@ PILOTS = {
     },
 }
 COMMON_FILES = {"compat-common.h": "4b3fb9c14cab4ad96555d85ecdbae68da4a67735"}
+# These unmodified original GCC sources passed as mixed GCC/Mini-C objects
+# on compiler/main in compiler-ci run #45547473336. Enforce that coverage.
+REQUIRED_ADMISSIONS = {
+    ("scalar-by-value-2", "main"),
+    ("scalar-return-1", "main"),
+}
 
 
 def git_blob_id(data: bytes) -> str:
@@ -210,7 +216,23 @@ def main() -> int:
         fatal = True
         records.append({"status": "PILOT_SETUP_FAILED", "error": str(error)})
         print(f"GCC_COMPAT setup failure: {error}", file=sys.stderr)
+    observed = {
+        (record["case"], direction): result["status"]
+        for record in records if "case" in record
+        for direction, result in record["directions"].items()
+    }
+    required_missing = sorted(
+        f"{case}:{direction}"
+        for case, direction in REQUIRED_ADMISSIONS
+        if observed.get((case, direction)) != "PASS"
+    )
+    if required_missing:
+        fatal = True
+        print("GCC_COMPAT_REQUIRED_MISSING " + ", ".join(required_missing),
+              file=sys.stderr)
     summary = {"upstream": f"gcc-mirror/gcc@{GCC_REVISION}",
+               "required_admissions": sorted(f"{c}:{r}" for c, r in REQUIRED_ADMISSIONS),
+               "required_missing": required_missing,
                "admitted_mixed_directions": admitted,
                "attempted_mixed_directions": 3 * len(PILOTS),
                "cases": records}
@@ -220,6 +242,7 @@ def main() -> int:
         "attempted_mixed_directions": 3 * len(PILOTS),
         "reference_cases_passed": sum(
             r.get("gcc_reference") == "PASS" for r in records),
+        "required_missing": required_missing,
         "fatal": fatal,
     }), flush=True)
     if args.require_admitted and not admitted:
