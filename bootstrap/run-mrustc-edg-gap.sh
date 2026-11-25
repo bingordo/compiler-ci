@@ -456,6 +456,94 @@ PY
     fi
   fi
 
+  # Original C record-pointer scalar fields. A source TypeId owns the
+  # pointer ingress and the EDG field byte offsets. Independently compile
+  # the same public C object with GCC, execute a separate GCC harness and
+  # compare exact output; never consume private generated mrustc source.
+  if [[ "${EDG_C_MIXED_GLOBAL_PROBE:-0}" == "1" ]]; then
+    rec_source=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_c_local_typedefs.c
+    rec_harness=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_c_local_typedefs_harness.c
+    test -s "$rec_source" && test -s "$rec_harness"
+    rec_unit_rc=${local_typedef_rc:-11}
+    rec_native_rc=11
+    rec_gcc_rc=11
+    rec_link_rc=11
+    rec_run_rc=11
+    rec_parity_rc=11
+    set +e
+    if (( rec_unit_rc == 0 )); then
+      (
+        cd /workspace/edgcpp/build/gcc-release
+        CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+          timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" run --quiet \
+          --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
+          -- /audit-tmp/edg-c-record-ptr-typeid.o --gcc --c11 --no_strict_gnu \
+          --gnu_version "$gnu_number" "$rec_source"
+      ) > /audit-tmp/edg-c-record-ptr-native.log 2>&1
+      rec_native_rc=$?
+    fi
+    gcc -std=gnu11 -O0 -c "$rec_source" -o /audit-tmp/edg-c-record-ptr-gcc.o
+    rec_gcc_rc=$?
+    if (( rec_native_rc == 0 && rec_gcc_rc == 0 )); then
+      for obj in /audit-tmp/edg-c-record-ptr-typeid.o /audit-tmp/edg-c-record-ptr-gcc.o; do
+        count=$(readelf -Ws "$obj" | awk '$4=="FUNC" && $5=="GLOBAL" &&
+          $8 ~ /^bootstrap_c_(local_aliases|record_pointer_(formal|get|set))$/ {n++}
+          END {print n+0}')
+        if [[ "$count" != 4 ]]; then
+          if [[ "$obj" == *typeid.o ]]; then rec_native_rc=12
+          else rec_gcc_rc=12; fi
+        fi
+      done
+    fi
+    if (( rec_native_rc == 0 && rec_gcc_rc == 0 )); then
+      gcc -std=gnu11 -O0 -fno-pie -no-pie \
+        /audit-tmp/edg-c-record-ptr-gcc.o "$rec_harness" \
+        -o /audit-tmp/edg-c-record-ptr-gcc-exe &&
+      gcc -std=gnu11 -O0 -fno-pie -no-pie \
+        /audit-tmp/edg-c-record-ptr-typeid.o "$rec_harness" \
+        -o /audit-tmp/edg-c-record-ptr-typeid-exe
+      rec_link_rc=$?
+      if (( rec_link_rc == 0 )); then
+        /audit-tmp/edg-c-record-ptr-gcc-exe > /audit-tmp/edg-c-record-ptr-gcc.out &&
+        /audit-tmp/edg-c-record-ptr-typeid-exe > /audit-tmp/edg-c-record-ptr-typeid.out
+        rec_run_rc=$?
+        if (( rec_run_rc == 0 )); then
+          python3 -c 'from pathlib import Path; import sys; sys.exit(
+              0 if Path(sys.argv[1]).read_bytes()==Path(sys.argv[2]).read_bytes()
+              else 1)' \
+            /audit-tmp/edg-c-record-ptr-gcc.out \
+            /audit-tmp/edg-c-record-ptr-typeid.out
+          rec_parity_rc=$?
+        fi
+      fi
+    fi
+    set -e
+    echo "EDG_C_RECORD_PTR_UNIT_EXIT=$rec_unit_rc"
+    echo "EDG_C_RECORD_PTR_ELF_EXIT=$rec_native_rc"
+    echo "EDG_C_RECORD_PTR_GCC_EXIT=$rec_gcc_rc"
+    echo "EDG_C_RECORD_PTR_LINK_EXIT=$rec_link_rc"
+    echo "EDG_C_RECORD_PTR_RUN_EXIT=$rec_run_rc"
+    echo "EDG_C_RECORD_PTR_PARITY_EXIT=$rec_parity_rc"
+    if (( rec_native_rc != 0 || rec_unit_rc != 0 )); then
+      python3 - /audit-tmp/edg-c-record-ptr-native.log \
+        /audit-tmp/edg-c-local-typedef-unit.log <<'PY'
+from pathlib import Path
+import re,sys
+hits=[]
+for path in map(Path,sys.argv[1:]):
+    if not path.is_file():continue
+    for line in path.read_text(errors="replace").splitlines():
+        if any(v in line for v in ("error[E","error:","FAILED","panicked",
+                                   "test result:")):
+            line=re.sub(r"/(?:workspace|audit-tmp)/[^ :]+","public_fixture",line.strip())
+            line=re.sub(r"[^A-Za-z0-9 _.,=:/()><-]","_",line)
+            hits.append(line[:180])
+for i,msg in enumerate(hits[-8:],1):
+    print(f"EDG_C_RECORD_PTR_DIAG_{i}={msg}")
+PY
+    fi
+  fi
+
   # Full public GNU C11 weak data/routine combined proof. The source
   # fixture and harness are both committed with the candidate compiler.
   # Private mrustc generated C is not part of this positive oracle.
