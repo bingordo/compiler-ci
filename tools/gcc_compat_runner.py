@@ -36,12 +36,15 @@ def unsupported(case, root):
 
 def build_native(source, obj, argv, cc, flags, root):
     """Preprocess without rewriting source and invoke a thin frontend adapter."""
+    obj.unlink(missing_ok=True)
     processed = obj.with_suffix(".i.c")
-    pp = command([cc, *flags, "-E", "-P", "-I", str(root),
-                  str(source), "-o", str(processed)])
-    if not succeeds(pp):
-        return "PREPROCESS_FAILED", pp
+    if any("{source}" in arg for arg in argv):
+        pp = command([cc, *flags, "-E", "-P", "-I", str(root),
+                      str(source), "-o", str(processed)])
+        if not succeeds(pp):
+            return "PREPROCESS_FAILED", pp
     result = command([arg.replace("{source}", str(processed))
+                      .replace("{original}", str(source))
                       .replace("{object}", str(obj)) for arg in argv], timeout=60)
     if not succeeds(result):
         status = ("COMPILER_CRASH" if result["exit_code"] is None
@@ -135,7 +138,7 @@ def main():
     p.add_argument("checkout", type=Path)
     p.add_argument("--work-dir", required=True, type=Path)
     p.add_argument("--adapters", required=True, type=Path,
-                   help="JSON mapping frontend names to argv arrays containing {source} and {object}")
+                   help="JSON mapping frontend names to argv arrays containing {source} (preprocessed) or {original}, plus {object}")
     p.add_argument("--prefix", action="append")
     p.add_argument("--cc", default="gcc")
     args = p.parse_args()
@@ -156,8 +159,8 @@ def main():
         if (not re.fullmatch(r"[A-Za-z0-9_-]+", name) or name == "gcc"
                 or not isinstance(argv, list) or not argv
                 or not all(isinstance(arg, str) for arg in argv)
-                or not all(any(key in arg for arg in argv)
-                           for key in ("{source}", "{object}"))):
+                or not any("{object}" in arg for arg in argv)
+                or not any("{source}" in arg or "{original}" in arg for arg in argv)):
             p.error(f"invalid adapter {name}")
     cases = [case for prefix in (args.prefix or ["struct-return-", "union-return-"])
              for case in inventory(root, prefix)]
