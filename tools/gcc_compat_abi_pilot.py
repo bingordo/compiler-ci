@@ -58,6 +58,7 @@ ADDITIONAL_HEADERS = {
 REQUIRED_ADMISSIONS = {
     ("scalar-by-value-2", "main"),
     ("scalar-return-1", "main"),
+    ("sdata-1", "y"),
 }
 
 
