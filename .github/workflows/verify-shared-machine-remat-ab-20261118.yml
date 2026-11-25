@@ -1,113 +1,119 @@
-name: source-pinned generic machine remat x86 and aarch64
+name: native ARM source before after A64 pure remat ELF measurement
 on:
   push:
-    branches: [main]
-    paths: [.github/workflows/verify-shared-machine-remat-ab-20261118.yml]
-  workflow_dispatch:
+    branches: [benchmark/a64-pure-addsub-source-ab-20261124]
+    paths: ['.github/workflows/verify-shared-machine-remat-ab-20261118.yml']
 permissions:
   contents: read
+  statuses: write
 jobs:
-  correctness:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 55
+  source-ab:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 95
     env:
       CARGO_INCREMENTAL: '0'
       CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      BASE_SHA: 'de2411621718803b02a45ac612cb4587d5d7f391'
+      CAND_SHA: 'ac27cbd4b987b1223064132b583134b9248b84e6'
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: e7b79a843fbe6b1d861fa9967c6c279ab97aeba3
+          ref: 'de2411621718803b02a45ac612cb4587d5d7f391'
           path: old
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 192d60ba8888efa5036e897ec3792f3942edc77f
+          ref: 'ac27cbd4b987b1223064132b583134b9248b84e6'
           path: new
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Assert exact source pins
+      - name: Confirm exact source pins and extract an identical C oracle
         run: |
           set -euo pipefail
-          test "$(git -C old rev-parse HEAD)" = "e7b79a843fbe6b1d861fa9967c6c279ab97aeba3"
-          test "$(git -C new rev-parse HEAD)" = "192d60ba8888efa5036e897ec3792f3942edc77f"
-          lscpu | grep -E '^Model name:|^Architecture:' || true
+          test "$(git -C old rev-parse HEAD)" = "$BASE_SHA"
+          test "$(git -C new rev-parse HEAD)" = "$CAND_SHA"
+          uname -m | grep -Eq 'aarch64|arm64'
           git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          mkdir -p bench
+          python3 - <<'PY'
+          from pathlib import Path
+          test=Path('new/crates/driver/tests/aarch64_pure_addsub_remat_native.rs').read_text()
+          for name,output in [('SOURCE','src.c'),('ORACLE','oracle.c')]:
+              token='const '+name+':&str=r#"'
+              assert test.count(token)==1
+              Path('bench/'+output).write_text(test.split(token,1)[1].split('"#;',1)[0])
+          PY
+          echo "A64 before $BASE_SHA after $CAND_SHA" >> "$GITHUB_STEP_SUMMARY"
+          sha256sum bench/src.c bench/oracle.c
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             old -> target
             new -> target
-          key: shared-remat-20261118
-      - name: Generic planner and cross-target correctness and strict Clippy
-        working-directory: new
+          key: a64-pure-remat-native-physical-ab-20261124
+      - name: Build both pinned compilers and validate both native objects against GCC
         run: |
           set -euo pipefail
-          cargo test -p compiler-backend --lib remat::tests -- --nocapture
-          cargo test -p compiler-backend --lib
-          cargo test -p compiler-backend-x86 --lib
-          cargo test -p compiler-backend-aarch64 --lib
-          cargo clippy -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --lib -- -D warnings
-          cargo test -p compiler --test x86_inline_source_ablation -- --nocapture
-          cargo test -p compiler --test x7_s4_rolling_checksum_source -- --nocapture
-      - name: Exact benchmark overlay on both pinned compiler sources
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          path=Path('crates/driver/tests/x86_source_runtime_performance.rs')
-          orig=(Path('old')/path).read_bytes()
-          updated=(Path('new')/path).read_bytes()
-          assert orig==updated, 'benchmark fixture changed between commits'
-          needle=b'REPS=7, ITERS=1800'
-          assert orig.count(needle)==1
-          for root in ('old','new'):
-              (Path(root)/path).write_bytes(orig.replace(needle,b'REPS=7, ITERS=18000'))
-          PY
-          for case in old new; do
-            (cd "$case" && cargo test --release -p compiler --test x86_source_runtime_performance --no-run)
+          for variant in old new; do
+            cargo build -p compiler --bin compiler --manifest-path "$variant/Cargo.toml"
+            "$variant/target/debug/compiler" bench/src.c \
+              --language mini-c --target aarch64 --emit obj \
+              -o "bench/$variant.o"
+            gcc -std=c11 -O2 -Wall -Wextra -Werror bench/oracle.c \
+              "bench/$variant.o" -o "bench/$variant.exe"
+            "bench/$variant.exe"
+            objcopy -O binary --only-section=.text \
+              "bench/$variant.o" "bench/$variant.text"
+            objdump -d --no-show-raw-insn "bench/$variant.o" > "bench/$variant.dis"
           done
-      - name: Source-pinned same-CPU old new new old native and GCC oracle
+      - name: Report observed ARM64 .text bytes and function instruction counts
         run: |
-          set -euo pipefail
-          cpu=$(awk '/^Cpus_allowed_list:/ {split($2,a,/[-,]/); print a[1]}' /proc/self/status)
-          test -n "$cpu"
-          echo "CPU_PIN=$cpu"
-          index=0
-          for case in old new new old; do
-            index=$((index+1))
-            logfile="$RUNNER_TEMP/ab-$index-$case.log"
-            (cd "$case" && taskset -c "$cpu" cargo test --release -p compiler --test x86_source_runtime_performance -- --ignored --nocapture) 2>&1 | tee "$logfile"
-            grep -q 'X86_RUNTIME_FUNCTION mode=mini_default symbol=scan>' "$logfile"
-            grep -q 'X86_SOURCE_RUNTIME mode=mini_default workload=combined ' "$logfile"
-            grep -q 'X86_SOURCE_RUNTIME mode=gcc_O2 workload=combined ' "$logfile"
-          done
-          python3 - "$RUNNER_TEMP" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
           from pathlib import Path
-          import sys,statistics
-          root=Path(sys.argv[1])
-          results=[]
-          for index,case in enumerate(('old','new','new','old'),1):
-              data=(root/f'ab-{index}-{case}.log').read_text(errors='replace')
-              def last(prefix):
-                  lines=[l for l in data.splitlines() if prefix in l]
-                  assert lines,(index,case,prefix)
-                  return dict(token.split('=',1) for token in lines[-1].split() if '=' in token)
-              mini=last('X86_SOURCE_RUNTIME mode=mini_default workload=combined ')
-              gcc=last('X86_SOURCE_RUNTIME mode=gcc_O2 workload=combined ')
-              scan=last('X86_RUNTIME_FUNCTION mode=mini_default symbol=scan>')
-              assert mini['checksum']==gcc['checksum']
-              results.append((case,int(mini['median_ns']),scan))
-              print(f'{index} {case}: native_ns={mini["median_ns"]} gcc_ns={gcc["median_ns"]} scan_instr={scan["instructions"]} moves={scan["moves"]} stack_mem={scan["stack_memory"]}')
-          for case in ('old','new'):
-              medians=[ns for name,ns,_ in results if name==case]
-              print(f'{case} avg_median_ns={statistics.mean(medians):.1f}')
+          import re
+          functions=('mixed_add_sub','mixed_sub_add','mixed_sub_sub','mixed_branch')
+          data={}
+          for variant in ('old','new'):
+              text=Path(f'bench/{variant}.text').read_bytes()
+              counts={};function=None
+              for line in Path(f'bench/{variant}.dis').read_text().splitlines():
+                  header=re.match(r'^[0-9a-f]+ <([^>]+)>:$',line.strip())
+                  if header:
+                      function=header.group(1);counts.setdefault(function,0)
+                      continue
+                  if function and re.match(r'^\s*[0-9a-f]+:\s+[A-Za-z]',line):
+                      counts[function]+=1
+              for f in functions: assert f in counts,(variant,f,counts)
+              data[variant]=(len(text),counts)
+              print(f'{variant} real A64 ELF .text bytes={len(text)}')
+              for f in functions:print(f'{variant} {f} instructions={counts[f]}')
+          print('physical .text delta=',data['new'][0]-data['old'][0])
+          for f in functions:
+              print('instruction delta',f,
+                    data['new'][1][f]-data['old'][1][f])
+          print('No timing or broad performance claims; both objects passed a GCC C11 oracle.')
           PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: source-pinned-generic-remat-ab
-          path: ${{ runner.temp }}/ab-*.log
-          if-no-files-found: ignore
+          name: a64-pure-remat-native-source-ab-objects
+          path: bench/
+      - name: Publish pinned before after result
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUTCOME: ${{ job.status }}
+        run: |
+          case "$OUTCOME" in
+            success) state=success ;;
+            cancelled) state=error ;;
+            *) state=failure ;;
+          esac
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$state" -f context="compiler/a64-pure-remat-source-ab" \
+            -f description="Pinned A64 old ${BASE_SHA:0:12} new ${CAND_SHA:0:12}: $OUTCOME" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
