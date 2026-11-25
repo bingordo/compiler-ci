@@ -111,6 +111,14 @@ def main():
                         before = emit(baseline, source, before_dir, opt, mode, pic, frame)
                         after = emit(candidate, source, after_dir, opt, mode, pic, frame)
                         a, b = function_sizes(before), function_sizes(after)
+                        if opt == "-O2":
+                            for function in ("and32a", "and64a"):
+                                if b[function] >= a[function]:
+                                    raise RuntimeError(
+                                        f"IP11 surviving rule failed to reduce {function} "
+                                        f"physical ELF bytes: {opt}/{mode}/pic={pic}/"
+                                        f"frame={frame} before={a[function]} after={b[function]}"
+                                    )
                         if a["control"] != b["control"]:
                             raise RuntimeError(
                                 f"nonmatching control changed under feature: "
