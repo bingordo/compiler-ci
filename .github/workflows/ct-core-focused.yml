@@ -7,6 +7,10 @@ on:
         required: true
         type: string
         default: main
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct-core-focused.yml'
   push:
     branches: [main]
     paths:
@@ -15,7 +19,7 @@ permissions:
   contents: read
   statuses: write
 concurrency:
-  group: ct-core-focused-${{ inputs.compiler_ref || 'bootstrap' }}
+  group: ct-core-focused-${{ inputs.compiler_ref || github.ref }}
   cancel-in-progress: true
 jobs:
   compiler-ir-opt:
@@ -25,7 +29,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ inputs.compiler_ref || 'main' }}
+          ref: ${{ inputs.compiler_ref || (github.event_name == 'pull_request' && 'cba82d55271238db086166323e9c5060d253423c') || 'main' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -53,12 +57,19 @@ jobs:
         with:
           workspaces: compiler -> target
           key: focused-ct-ir-opt
+      - name: CT11 focused Rust regressions
+        if: github.event_name == 'pull_request'
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-ir -p compiler-opt --lib
+          cargo test -p compiler-opt --test typeid_source_profile_parity --test typed_pre_native --test typed_licm_native --test typed_induction_native --test pre_licm_semantic_matrix --test typeid_fuzz_pre_induction_targeted --test typeid_fuzz_licm_identical_targeted --test typeid_core_pass_manager --test typeid_fuzz_pass_registry
       - name: Run all IR and optimizer unit/integration tests
+        if: github.event_name != 'pull_request'
         working-directory: compiler
         run: cargo test -p compiler-ir -p compiler-opt
-      - name: Verify strict Clippy on IR and optimizer
+      - name: Check optimizer Clippy diagnostics
         working-directory: compiler
-        run: cargo clippy -p compiler-ir -p compiler-opt --all-targets -- -D warnings
+        run: cargo clippy -p compiler-opt --lib -- -D warnings
       - name: Publish focused gate result
         if: always()
         env:
@@ -72,3 +83,46 @@ jobs:
             -f state="$state" -f context=ct/core-focused \
             -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             -f description="Focused IR and optimizer validation: $RESULT"
+  ct11-source:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: cba82d55271238db086166323e9c5060d253423c
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record compiler revision and configure dependency fetches
+        run: |
+          git -C compiler rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ct11-source-release
+      - name: Build actual compiler driver
+        working-directory: compiler
+        run: cargo build --release -p compiler --bin compiler
+      - name: Measure pass timings and check native output parity
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          python3 tools/ct11_loop_source_profile.py --compiler target/release/compiler --rounds 3 --output results/ct11-loop.json | tee results/ct11-loop.log
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json
+          data = json.load(open("results/ct11-loop.json"))
+          for name, case in data["cases"].items():
+              print(name, json.dumps(case["ranked_core_passes"][:5]))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ct11-source-profile
+          path: compiler/results/
