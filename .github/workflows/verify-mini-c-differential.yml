@@ -34,7 +34,7 @@ concurrency:
 jobs:
   differential:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 40
     steps:
       - name: Checkout compiler-ci test harness
         uses: actions/checkout@v4
@@ -188,6 +188,37 @@ jobs:
                             "mixed directions admitted; compile rejections "
                             "are unsupported coverage, not passing ABI checks.\n")
           PY
+      - name: Run upstream aggregate return compatibility subset
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools -p test_gcc_compat_runner.py
+          checkout="$RUNNER_TEMP/gcc-compat-source"
+          git init "$checkout"
+          git -C "$checkout" remote add origin https://github.com/gcc-mirror/gcc.git
+          git -C "$checkout" sparse-checkout init --cone
+          git -C "$checkout" sparse-checkout set gcc/testsuite/gcc.dg/compat
+          git -C "$checkout" -c protocol.version=2 fetch --depth=1 --filter=blob:none origin 1330eed38849ad186518f609c52bd5651c2bfdc1
+          git -C "$checkout" checkout --detach FETCH_HEAD
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          Path(os.environ["RUNNER_TEMP"], "return-adapters.json").write_text(json.dumps({
+              "minic": [str(Path("compiler/tools/mini-c-driver/target/debug/compiler-mini-c").resolve()),
+                        "{source}", "--emit", "obj", "-o", "{object}"]
+          }))
+          PY
+          timeout --signal=TERM --kill-after=10s 8m python3 tools/gcc_compat_runner.py \
+            "$checkout" --adapters "$RUNNER_TEMP/return-adapters.json" \
+            --work-dir "$RUNNER_TEMP/gcc-aggregate-returns"
+      - name: Preserve aggregate return coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gcc-aggregate-return-coverage
+          path: ${{ runner.temp }}/gcc-aggregate-returns/report.json
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Preserve build logs and failing test cases
         if: failure()
         uses: actions/upload-artifact@v4
