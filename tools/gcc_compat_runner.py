@@ -48,7 +48,8 @@ def build_native(source, obj, argv, cc, flags, root):
                       .replace("{object}", str(obj)) for arg in argv], timeout=60)
     if not succeeds(result):
         status = ("COMPILER_CRASH" if result["exit_code"] is None
-                  or result["exit_code"] < 0 else "COMPILE_REJECTED")
+                  or result["exit_code"] < 0 or result["exit_code"] == 101
+                  else "COMPILE_REJECTED")
         return status, result
     if not obj.is_file() or not obj.stat().st_size:
         return "EMPTY_OBJECT", result
