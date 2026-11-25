@@ -1,0 +1,58 @@
+name: Temporary historical SLP retirement acceptance
+on:
+  pull_request:
+    paths: ['.github/workflows/temp-ir-slp-retirement-3190.yml']
+permissions:
+  contents: read
+jobs:
+  slp-retirement:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      SOURCE_SHA: 4c512c450619b4c72f29e27e600bde333d9f054f
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm source, remove private workspace dependency and inventory residual callers
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          if git grep -nE 'legacy-function-slp-oracle|slp::discover_packs|slp::\{[^}]*discover_packs|compiler_opt::slp\b' -- '*.rs' '*.toml'; then
+            echo "Historical SLP callers remain"
+            exit 1
+          fi
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-slp-retirement
+      - name: Native SLP lane identity and dependency coverage
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typed_slp
+      - name: Check ordinary build and all optimizer test targets
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --lib
+          cargo check -p compiler-opt --all-targets
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-backend-x86 vector_match --lib
+      - name: Verify permanent production graph boundary
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: |
+          python3 tools/check_mixed_function_export_boundary.py
