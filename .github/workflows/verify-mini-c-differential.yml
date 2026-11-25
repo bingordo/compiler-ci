@@ -154,6 +154,31 @@ jobs:
           grep -Fq "PASS P5c indirect GP printf asm frameless matches GCC" "$RUNNER_TEMP/mini-c-indirect-variadic.log"
           grep -Fq "PASS P5c indirect GP printf asm rbp matches GCC" "$RUNNER_TEMP/mini-c-indirect-variadic.log"
           echo "Passed existing indirect GP varargs ELF/GAS frame-pointer parity" >> "$GITHUB_STEP_SUMMARY"
+      - name: Classify pinned upstream GCC compatibility ABI tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Diagnostic coverage admission: a frontend compile rejection is
+          # COVERAGE_MISSING, never counted as an ABI pass. Any admitted
+          # cross-compiler ABI mismatch or GCC/GCC oracle failure is fatal.
+          timeout --signal=TERM --kill-after=10s 4m python3 \
+            tools/gcc_compat_abi_pilot.py \
+            --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" \
+            --work-dir "$RUNNER_TEMP/mini-c-gcc-compat" \
+            2>&1 | tee "$RUNNER_TEMP/mini-c-gcc-compat.log"
+          grep -Fq "GCC_COMPAT_SUMMARY " "$RUNNER_TEMP/mini-c-gcc-compat.log"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          report = json.loads(
+              (Path(os.environ["RUNNER_TEMP"]) / "mini-c-gcc-compat/report.json").read_text())
+          admitted = report["admitted_mixed_directions"]
+          attempted = report["attempted_mixed_directions"]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(f"GCC upstream compatibility pilot: {admitted}/{attempted} "
+                            "mixed directions admitted; compile rejections "
+                            "are unsupported coverage, not passing ABI checks.\\n")
+          PY
       - name: Preserve build logs and failing test cases
         if: failure()
         uses: actions/upload-artifact@v4
@@ -166,6 +191,8 @@ jobs:
             ${{ runner.temp }}/mini-c-fp-mixed-abi.log
             ${{ runner.temp }}/mini-c-fp-scalar-abi.log
             ${{ runner.temp }}/mini-c-indirect-variadic.log
+            ${{ runner.temp }}/mini-c-gcc-compat.log
+            ${{ runner.temp }}/mini-c-gcc-compat/report.json
             ${{ runner.temp }}/mini-c-failures/
             ${{ runner.temp }}/mini-c-frame-pointer-failures/
           if-no-files-found: ignore
