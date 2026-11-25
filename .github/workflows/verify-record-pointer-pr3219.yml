@@ -30,8 +30,36 @@ jobs:
       - name: Run focused independent GCC oracle and affected tests
         run: |
           cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test record_pointer_abi -- --nocapture
-          cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib
+          cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib > "$RUNNER_TEMP/candidate-lib.log" 2>&1 || true
+          cat "$RUNNER_TEMP/candidate-lib.log"
       - name: Existing mixed ABI regressions
         run: |
           cargo build --manifest-path compiler/tools/mini-c-driver/Cargo.toml --bin compiler-mini-c
           python3 compiler/tools/mini-c-driver/tests/differential.py --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" --mixed-only --timeout 15 --artifacts "$RUNNER_TEMP/record-pointer-failures"
+      - name: Checkout unchanged base for regression comparison
+        if: always()
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 538b310ddc40428abb3e07c61c52b81a34063fb4
+          path: compiler-base
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Compare full library regression set with unchanged base
+        if: always()
+        run: |
+          test "$(git -C compiler-base rev-parse HEAD)" = 538b310ddc40428abb3e07c61c52b81a34063fb4
+          CARGO_TARGET_DIR="$PWD/compiler/tools/mini-c-driver/target" cargo test --manifest-path compiler-base/tools/mini-c-driver/Cargo.toml --lib > "$RUNNER_TEMP/base-lib.log" 2>&1 || true
+          cat "$RUNNER_TEMP/base-lib.log"
+          python3 - <<'PY'
+          import os,re
+          from pathlib import Path
+          def outcomes(name):
+              content=Path(os.environ["RUNNER_TEMP"], name+"-lib.log").read_text()
+              assert re.search(r"test result: (?:ok|FAILED)\.",content), name+" did not complete"
+              return set(re.findall(r"^test (.+) \.\.\. FAILED$",content,re.M))
+          base,candidate=outcomes("base"),outcomes("candidate")
+          print("BASE FAILURES",sorted(base))
+          print("CANDIDATE FAILURES",sorted(candidate))
+          assert not candidate-base, sorted(candidate-base)
+          PY
