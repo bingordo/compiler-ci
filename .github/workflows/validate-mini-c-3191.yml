@@ -1,0 +1,220 @@
+name: Mini-C PR 3191 canonical ABI candidate
+
+on:
+  push:
+    branches: [validate-mini-c-3191]
+    paths: ['.github/workflows/validate-mini-c-3191.yml']
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: mini-c-differential-73168e219285aa2a585a698eadcc4517b12e7e4e
+  cancel-in-progress: true
+
+jobs:
+  differential:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout compiler-ci test harness
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Checkout compiler source using existing read-only deploy key
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 73168e219285aa2a585a698eadcc4517b12e7e4e
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Identify exact source and validate cohort size
+        id: source
+        shell: bash
+        env:
+          SEED_COUNT: 6
+        run: |
+          set -euo pipefail
+          sha="$(git -C compiler rev-parse HEAD)"
+          [[ "$sha" == 73168e219285aa2a585a698eadcc4517b12e7e4e ]]
+          [[ "$SEED_COUNT" =~ ^[0-9]+$ ]]
+          (( 10#$SEED_COUNT >= 1 && 10#$SEED_COUNT <= 64 ))
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          test -s compiler/tools/mini-c-driver/tests/differential.py
+          test -s compiler/tools/mini-c-driver/Cargo.toml
+          echo "Compiler revision: $sha" >> "$GITHUB_STEP_SUMMARY"
+      - name: Make public Mini-C dependency accessible without another deploy key
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          manifest=Path('compiler/tools/mini-c-driver/Cargo.toml')
+          text=manifest.read_text()
+          old='ssh://git@github.com/bingordo/mini-c.git'
+          assert text.count(old)==2, 'Mini-C dependency declaration changed'
+          manifest.write_text(text.replace(old,'https://github.com/bingordo/mini-c.git'))
+          PY
+      - name: Cache Rust objects and dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: mini-c-source-differential-v1
+          cache-workspace-crates: 'true'
+      - name: Build compiler-mini-c once
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 12m cargo build \
+            --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --bin compiler-mini-c \
+            2>&1 | tee "$RUNNER_TEMP/mini-c-build.log"
+          test -x compiler/tools/mini-c-driver/target/debug/compiler-mini-c
+      - name: Canonical ABI and full native library regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest=compiler/tools/mini-c-driver/Cargo.toml
+          cargo test --manifest-path "$manifest" -p compiler-mini-c --lib canonical_integer_signature_preserves_physical_slots -- --nocapture | tee "$RUNNER_TEMP/canonical-abi.log"
+          grep -Fq '1 passed; 0 failed' "$RUNNER_TEMP/canonical-abi.log"
+          cargo test --manifest-path "$manifest" -p compiler-mini-c --lib
+      - name: Compare compiled Mini-C against GCC
+        shell: bash
+        env:
+          SEED_COUNT: 6
+          ABI_ONLY: false
+        run: |
+          set -euo pipefail
+          args=(--seed-count "$SEED_COUNT" --steps 120 --timeout 15
+                --artifacts "$RUNNER_TEMP/mini-c-failures")
+          if [[ "$ABI_ONLY" == true ]]; then
+            args+=(--mixed-only)
+          fi
+          timeout --signal=TERM --kill-after=10s 10m python3 \
+            compiler/tools/mini-c-driver/tests/differential.py \
+            --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" \
+            "${args[@]}" \
+            2>&1 | tee "$RUNNER_TEMP/mini-c-differential.log"
+          if [[ "$ABI_ONLY" == true ]]; then
+            grep -Fxq "PASS: mixed ABI calls" "$RUNNER_TEMP/mini-c-differential.log"
+          else
+            grep -Eq "^PASS: [1-9][0-9]* fixtures, $SEED_COUNT seeds, mixed ABI calls and negative cases$" "$RUNNER_TEMP/mini-c-differential.log"
+          fi
+          if [[ "$ABI_ONLY" == true ]]; then
+            echo "Passed focused mixed-object ABI checks" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Passed fixed, seeded, ABI and negative GCC oracles" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Check complete mixed-object ABI matrix with frame pointers
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 5m python3 \
+            compiler/tools/mini-c-driver/tests/differential.py \
+            --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" \
+            --mixed-only --mixed-frame-pointer --timeout 15 \
+            --artifacts "$RUNNER_TEMP/mini-c-frame-pointer-failures" \
+            2>&1 | tee "$RUNNER_TEMP/mini-c-frame-pointer.log"
+          grep -Fxq "PASS: mixed ABI calls" "$RUNNER_TEMP/mini-c-frame-pointer.log"
+          echo "Passed mixed-object ABI with frame pointers" >> "$GITHUB_STEP_SUMMARY"
+      - name: Reuse native mixed GP/XMM ABI and floating-point GCC oracles
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest=compiler/tools/mini-c-driver/Cargo.toml
+          timeout --signal=TERM --kill-after=10s 7m cargo test \
+            --manifest-path "$manifest" -p compiler-mini-c \
+            --test fp_mixed_abi native_checked_mixed_gp32_xmm_formals_conversions_and_calls \
+            -- --exact --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/mini-c-fp-mixed-abi.log"
+          timeout --signal=TERM --kill-after=10s 7m cargo test \
+            --manifest-path "$manifest" -p compiler-mini-c \
+            --test fp_scalar checked_float_source_gcc_elf_and_gas \
+            -- --exact --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/mini-c-fp-scalar-abi.log"
+          echo "Passed existing Mini-C/GCC floating-point ABI native oracles" >> "$GITHUB_STEP_SUMMARY"
+      - name: Reuse native indirect variadic GCC interoperability oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 5m python3 \
+            compiler/tools/mini-c-driver/tests/p5c_indirect_gp_native.py \
+            --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" \
+            2>&1 | tee "$RUNNER_TEMP/mini-c-indirect-variadic.log"
+          grep -Fq "PASS P5c indirect GP printf obj frameless matches GCC" "$RUNNER_TEMP/mini-c-indirect-variadic.log"
+          grep -Fq "PASS P5c indirect GP printf obj rbp matches GCC" "$RUNNER_TEMP/mini-c-indirect-variadic.log"
+          grep -Fq "PASS P5c indirect GP printf asm frameless matches GCC" "$RUNNER_TEMP/mini-c-indirect-variadic.log"
+          grep -Fq "PASS P5c indirect GP printf asm rbp matches GCC" "$RUNNER_TEMP/mini-c-indirect-variadic.log"
+          echo "Passed existing indirect GP varargs ELF/GAS frame-pointer parity" >> "$GITHUB_STEP_SUMMARY"
+      - name: Classify pinned upstream GCC compatibility ABI tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Diagnostic coverage admission: a frontend compile rejection is
+          # COVERAGE_MISSING, never counted as an ABI pass. Any admitted
+          # cross-compiler ABI mismatch or GCC/GCC oracle failure is fatal.
+          # Probe original main/x/y without rewriting C; the two proven
+          # Mini-C main-role cross-links are mandatory regression checks.
+          # Require original GCC global record definition and accessor bodies;
+          # C-checked layout is shared across native ELF and GCC linked objects.
+          # Also classify unsupported upstream struct-call and scalar triads.
+          timeout --signal=TERM --kill-after=10s 4m python3 \
+            tools/gcc_compat_abi_pilot.py \
+            --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" \
+            --work-dir "$RUNNER_TEMP/mini-c-gcc-compat" \
+            2>&1 | tee "$RUNNER_TEMP/mini-c-gcc-compat.log"
+          grep -Fq "GCC_COMPAT_SUMMARY " "$RUNNER_TEMP/mini-c-gcc-compat.log"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          report = json.loads(
+              (Path(os.environ["RUNNER_TEMP"]) / "mini-c-gcc-compat/report.json").read_text())
+          admitted = report["admitted_mixed_directions"]
+          attempted = report["attempted_mixed_directions"]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write(f"GCC upstream compatibility pilot: {admitted}/{attempted} "
+                            "mixed directions admitted; compile rejections "
+                            "are unsupported coverage, not passing ABI checks.\n")
+          PY
+      - name: Preserve build logs and failing test cases
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mini-c-source-differential-failures
+          path: |
+            ${{ runner.temp }}/mini-c-build.log
+            ${{ runner.temp }}/mini-c-differential.log
+            ${{ runner.temp }}/mini-c-frame-pointer.log
+            ${{ runner.temp }}/mini-c-fp-mixed-abi.log
+            ${{ runner.temp }}/mini-c-fp-scalar-abi.log
+            ${{ runner.temp }}/mini-c-indirect-variadic.log
+            ${{ runner.temp }}/mini-c-gcc-compat.log
+            ${{ runner.temp }}/mini-c-gcc-compat/report.json
+            ${{ runner.temp }}/mini-c-failures/
+            ${{ runner.temp }}/mini-c-frame-pointer-failures/
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Publish discoverable daily main test result
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          case "$RESULT" in
+            success) state=success ;;
+            *) state=failure ;;
+          esac
+          source_sha=unavailable
+          if [[ -d compiler/.git ]]; then
+            source_sha="$(git -C compiler rev-parse --short=12 HEAD)"
+          fi
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$state" \
+            -f context="mini-c/pr-3191" \
+            -f description="Mini-C PR 3191 ($source_sha): $RESULT" \
+            -f target_url="$RUN_URL"
