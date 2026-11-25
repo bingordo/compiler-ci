@@ -8,6 +8,7 @@ mixed assignments are linked and executed against an independent GCC oracle.
 """
 import argparse
 from itertools import combinations
+from fnmatch import fnmatchcase
 import json
 from pathlib import Path
 import re
@@ -20,7 +21,7 @@ from gcc_compat_inventory import inventory
 ROLES = ("main", "x", "y")
 
 
-def unsupported(case, root):
+def unsupported(case, root, target=None):
     """Reject test semantics that this subset cannot faithfully interpret."""
     if case["missing_roles"]:
         return "missing roles: " + ", ".join(case["missing_roles"])
@@ -28,6 +29,13 @@ def unsupported(case, root):
         return "Tcl sidecar"
     for role in case["roles"].values():
         for line in role["directive_lines"]:
+            # Support simple target-only skip selectors. More complex Tcl
+            # expressions and option conditions remain explicitly unsupported.
+            skip = re.fullmatch(r'\s*/\*\s*\{\s*dg-skip-if\s+"[^"\n]*"\s+\{\s*([A-Za-z0-9_.*?+-]+(?:\s+[A-Za-z0-9_.*?+-]+)*)\s*\}\s*\}\s*\*/\s*', line)
+            if skip and target is not None:
+                if any(fnmatchcase(target, pattern) for pattern in skip[1].split()):
+                    return "target exclusion: " + line
+                continue
             # Only unconditional dg-do run is redundant for compatibility.
             if not re.fullmatch(r"\s*/\*\s*\{\s*dg-do\s+run\s*\}\s*\*/\s*", line):
                 return "unhandled directive: " + line
@@ -72,7 +80,8 @@ def observed(result):
 def run_case(case, root, work, cc, flags, adapters):
     """Compile originals and exercise every nonempty proper role substitution."""
     record = {"case": case["case"], "gcc_flags": flags, "frontends": {}}
-    reason = unsupported(case, root)
+    target = subprocess.check_output([cc, '-dumpmachine'], text=True).strip()
+    reason = unsupported(case, root, target)
     if reason:
         record.update(status="UNSUPPORTED", reason=reason)
         return record
@@ -177,6 +186,9 @@ def main():
                               args.cc, flags, adapters)
             records.append(result)
             print(f"{opt} {case['case']}: {result['status']}", flush=True)
+            for name, entry in result["frontends"].items():
+                print(name, "builds", {k: b["status"] for k, b in entry["builds"].items()},
+                      "directions", {k: d["status"] for k, d in entry["directions"].items()}, flush=True)
             (work / "report.json").write_text(json.dumps({
                 "gcc_revision": revision, "records": records,
                 "planned_records": 2 * len(cases),
