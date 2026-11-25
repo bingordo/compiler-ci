@@ -1,0 +1,59 @@
+name: X7 IP13 automatic ISA-first DAG discovery
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/x7-ip13-auto-dag-source-z3-20261125.yml'
+permissions:
+  contents: read
+jobs:
+  source-semantic-discovery:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b950f467803d67997e8a0b0e627f3cff521321b7
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin exact compiler source and Z3
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = b950f467803d67997e8a0b0e627f3cff521321b7
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+          if ! command -v z3 >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y z3
+          fi
+          z3 --version
+          rustc --version
+      - name: Enumerate automatically from pinned Intel/XED/SMT targets
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/x7_ip13_auto_discover_dags.py --check
+          python3 tools/x7_instruction_driven_dag.py --auto-discover > /tmp/x7-ip13-automatic-receipts.txt
+          grep -F 'X7_IP13_AUTO_DAG_DISCOVERY_Z3_PASS' /tmp/x7-ip13-automatic-receipts.txt
+          python3 -m unittest discover -s tools -p 'test_x7_ip13_auto_discover_dags.py' -v
+          echo 'X7_IP13_AUTODISCOVERY_PROOFS=PASS' >> "$GITHUB_STEP_SUMMARY"
+      - name: Existing generated matcher and proof outputs unchanged
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/x7_instruction_driven_dag.py --check
+          python3 -m unittest discover -s tools -p 'test_x7_instruction_driven_dag.py' -v
+          python3 tools/x86_blanket_instruction_bans.py --check
+          git diff --exit-code
+      - name: Build default and opt-in generated x86 backend
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-backend-x86
+          cargo check -p compiler-backend-x86 --features x7-production-generated-logic
+          cargo check -p compiler --bin compiler
