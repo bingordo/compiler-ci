@@ -1,113 +1,199 @@
-name: source-pinned generic machine remat x86 and aarch64
+name: native A64 source loop and pressure pinned ABBA perf
 on:
   push:
-    branches: [main]
-    paths: [.github/workflows/verify-shared-machine-remat-ab-20261118.yml]
-  workflow_dispatch:
+    branches: [benchmark/a64-loop-pressure-ab-20261125]
+    paths: ['.github/workflows/verify-shared-machine-remat-ab-20261118.yml']
 permissions:
   contents: read
+  statuses: write
 jobs:
-  correctness:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 55
+  perf:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 100
     env:
       CARGO_INCREMENTAL: '0'
       CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      BASE_SHA: 'de2411621718803b02a45ac612cb4587d5d7f391'
+      CAND_SHA: '8fce78afe6fd3d73762504bb4f22229ceb179568'
+      CORPUS_SHA: '37024a3bd30f9ac0dd254c3bd83c23a59b347654'
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: e7b79a843fbe6b1d861fa9967c6c279ab97aeba3
+          ref: 'de2411621718803b02a45ac612cb4587d5d7f391'
           path: old
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 192d60ba8888efa5036e897ec3792f3942edc77f
+          ref: '8fce78afe6fd3d73762504bb4f22229ceb179568'
           path: new
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Assert exact source pins
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: '37024a3bd30f9ac0dd254c3bd83c23a59b347654'
+          path: corpus
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact compiler revisions and identical source corpus
         run: |
           set -euo pipefail
-          test "$(git -C old rev-parse HEAD)" = "e7b79a843fbe6b1d861fa9967c6c279ab97aeba3"
-          test "$(git -C new rev-parse HEAD)" = "192d60ba8888efa5036e897ec3792f3942edc77f"
-          lscpu | grep -E '^Model name:|^Architecture:' || true
+          test "$(git -C old rev-parse HEAD)" = "$BASE_SHA"
+          test "$(git -C new rev-parse HEAD)" = "$CAND_SHA"
+          test "$(git -C corpus rev-parse HEAD)" = "$CORPUS_SHA"
+          uname -m | grep -Eq 'aarch64|arm64'
           git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          mkdir -p bench
+          cp corpus/tests/fixtures/remat/aarch64_loop_pressure.c bench/source.c
+          cp corpus/tests/fixtures/remat/aarch64_loop_pressure_oracle.c bench/oracle.c
+          sha256sum bench/source.c bench/oracle.c
+          echo "Before `$BASE_SHA` after `$CAND_SHA`, shared corpus `$CORPUS_SHA`" >> "$GITHUB_STEP_SUMMARY"
+          lscpu | grep -E '^Architecture:|^Model name:' || true
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             old -> target
             new -> target
-          key: shared-remat-20261118
-      - name: Generic planner and cross-target correctness and strict Clippy
-        working-directory: new
+          key: a64-loop-pressure-native-ab-20261125
+      - name: Build pinned release compilers and validate both C11 executables
         run: |
           set -euo pipefail
-          cargo test -p compiler-backend --lib remat::tests -- --nocapture
-          cargo test -p compiler-backend --lib
-          cargo test -p compiler-backend-x86 --lib
-          cargo test -p compiler-backend-aarch64 --lib
-          cargo clippy -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --lib -- -D warnings
-          cargo test -p compiler --test x86_inline_source_ablation -- --nocapture
-          cargo test -p compiler --test x7_s4_rolling_checksum_source -- --nocapture
-      - name: Exact benchmark overlay on both pinned compiler sources
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          path=Path('crates/driver/tests/x86_source_runtime_performance.rs')
-          orig=(Path('old')/path).read_bytes()
-          updated=(Path('new')/path).read_bytes()
-          assert orig==updated, 'benchmark fixture changed between commits'
-          needle=b'REPS=7, ITERS=1800'
-          assert orig.count(needle)==1
-          for root in ('old','new'):
-              (Path(root)/path).write_bytes(orig.replace(needle,b'REPS=7, ITERS=18000'))
-          PY
-          for case in old new; do
-            (cd "$case" && cargo test --release -p compiler --test x86_source_runtime_performance --no-run)
+          for rev in old new; do
+            cargo build --release -p compiler --bin compiler --manifest-path "$rev/Cargo.toml"
+            "$rev/target/release/compiler" bench/source.c --language mini-c \
+              --target aarch64 --emit obj -o "bench/$rev.o"
+            gcc -std=c11 -O2 -Wall -Wextra -Werror \
+              bench/oracle.c "bench/$rev.o" -o "bench/$rev.oracle"
+            "bench/$rev.oracle" | tee "bench/$rev.oracle.log"
+            objcopy -O binary --only-section=.text \
+              "bench/$rev.o" "bench/$rev.text"
+            objdump -d --no-show-raw-insn "bench/$rev.o" > "bench/$rev.dis"
           done
-      - name: Source-pinned same-CPU old new new old native and GCC oracle
+      - name: Prepare independent timing harness
+        run: |
+          cat > bench/measure.c <<'EOF'
+          #define _POSIX_C_SOURCE 200809L
+          #include <stdio.h>
+          #include <stdint.h>
+          #include <stdlib.h>
+          #include <time.h>
+          #include <string.h>
+          extern unsigned int chain_loop(unsigned int,unsigned int);
+          extern unsigned int branch_loop(unsigned int,unsigned int);
+          extern unsigned int pressure_loop(unsigned int,unsigned int);
+          extern unsigned int call_pressure_loop(unsigned int,unsigned int);
+          __attribute__((noinline))
+          unsigned int external_mix(unsigned int value,unsigned int i) {
+              return (value ^ (i*0x9e3779b9u)) + 37u;
+          }
+          static uint64_t ns(void) {
+              struct timespec t;
+              if(clock_gettime(CLOCK_MONOTONIC,&t)) abort();
+              return (uint64_t)t.tv_sec*1000000000ull+(uint64_t)t.tv_nsec;
+          }
+          int main(int argc,char**argv){
+              if(argc!=2) return 2;
+              const char *m=argv[1];
+              unsigned int (*fn)(unsigned int,unsigned int)=0;
+              unsigned int n=0,reps=0;
+              if(!strcmp(m,"chain")) {
+                  fn=chain_loop;n=200000u;reps=50u;
+              } else if(!strcmp(m,"branch")) {
+                  fn=branch_loop;n=120000u;reps=50u;
+              } else if(!strcmp(m,"pressure")) {
+                  fn=pressure_loop;n=20000u;reps=35u;
+              } else if(!strcmp(m,"call")) {
+                  fn=call_pressure_loop;n=6000u;reps=40u;
+              } else return 2;
+              volatile unsigned int sink=0;
+              uint64_t start=ns();
+              for(unsigned int j=0;j<reps;j++) {
+                  sink=sink+fn(0x12345678u+j*73u,n);
+              }
+              uint64_t elapsed=ns()-start;
+              printf("ABBA %s %llu %u\n",m,(unsigned long long)elapsed,sink);
+              return 0;
+          }
+          EOF
+          for rev in old new; do
+            gcc -std=c11 -O2 -Wall -Wextra -Werror -fno-lto \
+              bench/measure.c "bench/$rev.o" -o "bench/$rev.bench"
+          done
+      - name: Physical code census and alternating pinned-CPU ABBA medians
         run: |
           set -euo pipefail
-          cpu=$(awk '/^Cpus_allowed_list:/ {split($2,a,/[-,]/); print a[1]}' /proc/self/status)
-          test -n "$cpu"
-          echo "CPU_PIN=$cpu"
-          index=0
-          for case in old new new old; do
-            index=$((index+1))
-            logfile="$RUNNER_TEMP/ab-$index-$case.log"
-            (cd "$case" && taskset -c "$cpu" cargo test --release -p compiler --test x86_source_runtime_performance -- --ignored --nocapture) 2>&1 | tee "$logfile"
-            grep -q 'X86_RUNTIME_FUNCTION mode=mini_default symbol=scan>' "$logfile"
-            grep -q 'X86_SOURCE_RUNTIME mode=mini_default workload=combined ' "$logfile"
-            grep -q 'X86_SOURCE_RUNTIME mode=gcc_O2 workload=combined ' "$logfile"
-          done
-          python3 - "$RUNNER_TEMP" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import os,re,statistics,subprocess
           from pathlib import Path
-          import sys,statistics
-          root=Path(sys.argv[1])
-          results=[]
-          for index,case in enumerate(('old','new','new','old'),1):
-              data=(root/f'ab-{index}-{case}.log').read_text(errors='replace')
-              def last(prefix):
-                  lines=[l for l in data.splitlines() if prefix in l]
-                  assert lines,(index,case,prefix)
-                  return dict(token.split('=',1) for token in lines[-1].split() if '=' in token)
-              mini=last('X86_SOURCE_RUNTIME mode=mini_default workload=combined ')
-              gcc=last('X86_SOURCE_RUNTIME mode=gcc_O2 workload=combined ')
-              scan=last('X86_RUNTIME_FUNCTION mode=mini_default symbol=scan>')
-              assert mini['checksum']==gcc['checksum']
-              results.append((case,int(mini['median_ns']),scan))
-              print(f'{index} {case}: native_ns={mini["median_ns"]} gcc_ns={gcc["median_ns"]} scan_instr={scan["instructions"]} moves={scan["moves"]} stack_mem={scan["stack_memory"]}')
-          for case in ('old','new'):
-              medians=[ns for name,ns,_ in results if name==case]
-              print(f'{case} avg_median_ns={statistics.mean(medians):.1f}')
+          allowed=os.sched_getaffinity(0)
+          cpu=min(allowed)
+          os.sched_setaffinity(0,{cpu})
+          print(f'Native A64 CPU affinity: {cpu}')
+          names=('chain_loop','branch_loop','pressure_loop','call_pressure_loop')
+          code={}
+          for rev in ('old','new'):
+              data=Path(f'bench/{rev}.text').read_bytes()
+              assert data and len(data)%4==0
+              counts={};current=None
+              for line in Path(f'bench/{rev}.dis').read_text().splitlines():
+                  m=re.match(r'^[0-9a-f]+ <([^>]+)>:$',line.strip())
+                  if m:
+                      current=m.group(1);counts.setdefault(current,0);continue
+                  if current and re.match(r'^\s*[0-9a-f]+:\s+[A-Za-z]',line):
+                      counts[current]+=1
+              assert all(name in counts for name in names),(rev,counts)
+              code[rev]=(len(data),counts)
+              print(f'{rev} real ELF .text bytes: {len(data)}')
+              for name in names:
+                  print(f'{rev} {name} A64 instructions={counts[name]}')
+          print('physical ELF text delta bytes=',code['new'][0]-code['old'][0])
+          for name in names:
+              print(f'physical {name} instruction delta='+
+                    str(code['new'][1][name]-code['old'][1][name]))
+          for mode in ('chain','branch','pressure','call'):
+              for rev in ('old','new'):
+                  subprocess.run([f'bench/{rev}.bench',mode],check=True,
+                                 capture_output=True,text=True)
+              sequence=('old','new','new','old','old','new','new','old')
+              samples={'old':[],'new':[]}
+              checks={'old':set(),'new':set()}
+              for rev in sequence:
+                  out=subprocess.run([f'bench/{rev}.bench',mode],
+                      check=True,capture_output=True,text=True).stdout
+                  token,m,ns,sink=out.strip().split()
+                  assert token=='ABBA' and m==mode,out
+                  samples[rev].append(int(ns))
+                  checks[rev].add(int(sink))
+              assert len(checks['old'])==len(checks['new'])==1
+              assert checks['old']==checks['new'],(mode,checks)
+              old=statistics.median(samples['old'])
+              new=statistics.median(samples['new'])
+              ratio=100*(new/old-1)
+              print(f'ABBA {mode}: old median={old:.0f} ns new median={new:.0f} ns change={ratio:+.2f}% (4 samples each; no thresholds)')
+              print(f'ABBA {mode} old_samples={samples["old"]} new_samples={samples["new"]}')
+          print('ABBA on shared runner is directional evidence, not a statistically significant speedup.')
           PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: source-pinned-generic-remat-ab
-          path: ${{ runner.temp }}/ab-*.log
-          if-no-files-found: ignore
+          name: a64-remat-loop-pressure-abba
+          path: bench/
+      - name: Publish pinned native result
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUTCOME: ${{ job.status }}
+        run: |
+          case "$OUTCOME" in
+            success) state=success ;;
+            cancelled) state=error ;;
+            *) state=failure ;;
+          esac
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$state" -f context="compiler/a64-loop-pressure-abba" \
+            -f description="Exact pre/post #3168 source and native ABBA $OUTCOME" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
