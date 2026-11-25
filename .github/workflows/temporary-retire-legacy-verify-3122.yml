@@ -1,0 +1,90 @@
+# Temporary exact-source IR legacy annotation codec gate; close unmerged.
+name: Temporary retire production legacy SSA verifier and selector
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temporary-retire-legacy-verify-3122.yml'
+permissions:
+  contents: read
+jobs:
+  ir-legacy-annotation-codecs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: 4f756e78ea1cb76c74b950bc14fd1014b8a1322b
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert source SHA and isolate core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Cache core workspace
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: temporary-retire-legacy-verify-3122
+      - name: Strict production IR and v3 CLI check
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUSTFLAGS="-D warnings" cargo check -p compiler-ir --lib --bin ir-tool --no-default-features
+          RUSTFLAGS="-D warnings" cargo check -p compiler-ir --lib --features verify-counts
+      - name: Check ordinary optimizer and native target libraries
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --lib
+      - name: Check explicitly supported historical annotation codec feature
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-ir --lib --features legacy-ssa-oracle
+      - name: Compile explicit legacy mixed optimizer and IR ABI oracle
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --lib --features legacy-function-mixed-oracle
+          cargo check -p compiler-opt --lib --features legacy-function-cse-oracle
+          cargo check -p compiler-opt --lib --features legacy-function-sccp-oracle
+          cargo check -p compiler-opt --lib --features legacy-function-memory-oracle
+      - name: Verify explicitly selected historical x86 emitter feature
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-backend-x86 --lib --features historical-function-oracle
+          cargo test -p compiler-backend-x86 --test callee_saved_native -- --nocapture
+      - name: Test old annotation readers and native v3 codecs
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test typed_ssa_body --test ssa_typeids --test typed_value_flow --test typed_module_abi --test typed_opcode_types --test module_text --test text_format --test native_module_text_v3 --test native_binary_v1 --test native_binary_v2 --test typed_integer_v2
+          cargo test -p compiler-ir --lib
+          cargo test -p compiler-opt --test typed_core_pipeline
+      - name: Scoped strict Clippy for core library
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir --lib --no-default-features -- -D clippy::all -A clippy::needless_borrows_for_generic_args -A clippy::too_many_arguments -A clippy::needless_range_loop -A clippy::collapsible_if -A clippy::collapsible_match -A clippy::needless_lifetimes -A clippy::type_complexity -A clippy::empty_line_after_doc_comments
