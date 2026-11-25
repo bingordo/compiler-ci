@@ -487,9 +487,9 @@ PY
     if (( rec_native_rc == 0 && rec_gcc_rc == 0 )); then
       for obj in /audit-tmp/edg-c-record-ptr-typeid.o /audit-tmp/edg-c-record-ptr-gcc.o; do
         count=$(readelf -Ws "$obj" | awk '$4=="FUNC" && $5=="GLOBAL" &&
-          $8 ~ /^bootstrap_c_(local_aliases|record_pointer_(formal|get|set|truth|negated|equal|forward|forward_set|address_local|address_truth)|scalar_pointer_(truth|unequal))$/ {n++}
+          $8 ~ /^bootstrap_c_(local_aliases|record_pointer_(formal|get|set|truth|negated|equal|forward|forward_set|address_local|address_truth)|scalar_pointer_(truth|unequal)|pair_(inreg|forward|local|external_forward))$/ {n++}
           END {print n+0}')
-        if [[ "$count" != 13 ]]; then
+        if [[ "$count" != 17 ]]; then
           if [[ "$obj" == *typeid.o ]]; then rec_native_rc=12
           else rec_gcc_rc=12; fi
         fi
