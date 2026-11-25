@@ -1,9 +1,12 @@
-name: x86 real-source generated runtime vs GCC
+name: x86 branch threading physical and runtime PR3164
 on:
   push:
     branches: [main]
     paths: [.github/workflows/verify-x86-source-runtime-performance-20261116.yml]
   workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-x86-source-runtime-performance-20261116.yml'
 permissions:
   contents: read
 jobs:
@@ -17,18 +20,26 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 5209dd4e9cebaad3348cf0b4ed754a729e75f022
+          ref: f1bc16a3829bb97490f738379b1fcb92bf6deb5e
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - name: Verify exact source and configure private frontends
         run: |
-          test "$(git -C compiler rev-parse HEAD)" = "5209dd4e9cebaad3348cf0b4ed754a729e75f022"
+          test "$(git -C compiler rev-parse HEAD)" = "f1bc16a3829bb97490f738379b1fcb92bf6deb5e"
           git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: compiler -> target
-          key: x86-generated-runtime-20261116
+          key: x86-branch-threading-20261124
+      - name: Physical branch threading and native GAS/ELF C oracles
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib branch_threading_tests -- --nocapture
+          cargo test -p compiler-backend-x86 --lib --quiet
+          cargo clippy -p compiler-backend-x86 --lib -- -D warnings
       - name: Native runtime median and GCC independent correctness oracle
         working-directory: compiler
         shell: bash
@@ -44,6 +55,19 @@ jobs:
           grep -q 'X86_SOURCE_RUNTIME mode=mini_default ' "$RUNNER_TEMP/x86-generated-runtime.log"
           grep -q 'X86_SOURCE_RUNTIME mode=mini_noinline ' "$RUNNER_TEMP/x86-generated-runtime.log"
           grep -q 'X86_SOURCE_RUNTIME mode=gcc_Os ' "$RUNNER_TEMP/x86-generated-runtime.log"
+      - name: Summarize source-pinned x86 runtime and physical instruction mix
+        shell: bash
+        if: success()
+        run: |
+          set -euo pipefail
+          {
+            echo "### x86 physical branch-threading run"
+            echo "Source: \`f1bc16a3829bb97490f738379b1fcb92bf6deb5e\`"
+            echo "Comparison is a shared-runner measurement, not a performance acceptance threshold."
+            echo '~~~'
+            grep -E 'X86_(SOURCE_RUNTIME|RUNTIME_FUNCTION) ' "$RUNNER_TEMP/x86-generated-runtime.log"
+            echo '~~~'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Preserve executable runtime and GCC checksums
         uses: actions/upload-artifact@v4
         if: always()
