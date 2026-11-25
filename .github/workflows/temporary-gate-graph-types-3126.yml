@@ -1,0 +1,143 @@
+# Temporary exact-source IR legacy annotation codec gate; close unmerged.
+name: Temporary production graph type exclusion
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temporary-gate-graph-types-3126.yml'
+permissions:
+  contents: read
+jobs:
+  ir-legacy-annotation-codecs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: dbc63d75d7749b3174a549fea631934695469539
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert source SHA and isolate core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm", "crates/lto-plugin-core"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Cache core workspace
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: temporary-gate-graph-types-3126
+      - name: Strict production IR and v3 CLI check
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUSTFLAGS="-D warnings" cargo check -p compiler-ir --lib --bin ir-tool --no-default-features
+      - name: Check ordinary optimizer and native target libraries
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUSTFLAGS="-D warnings" cargo check -p compiler-opt --lib
+          cargo check -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 -p compiler-backend-riscv64 -p compiler-backend-wasm -p compiler-lto-plugin-core --lib
+      - name: Prove legacy graph types are unavailable to default external consumers
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          probe="$(mktemp -d)"
+          mkdir -p "$probe/src"
+          printf '[package]\nname = "ir-api-probe"\nversion = "0.0.0"\nedition = "2021"\n[dependencies]\ncompiler-ir = { path = "%s/crates/ir", default-features = false }\n[features]\noracle = ["compiler-ir/legacy-ssa-oracle"]\n' "$PWD" > "$probe/Cargo.toml"
+          printf 'use compiler_ir::typed_ssa::TypedFunction;\nfn main() { let _ = std::mem::size_of::<TypedFunction>(); }\n' > "$probe/src/main.rs"
+          cargo check --manifest-path "$probe/Cargo.toml"
+          for name in Function Block Instruction Parameter; do
+            printf 'use compiler_ir::%s;\nfn main() { let _ = std::mem::size_of::<%s>(); }\n' "$name" "$name" > "$probe/src/main.rs"
+            if cargo check --manifest-path "$probe/Cargo.toml" > "$probe/error" 2>&1; then
+              echo "Historical type $name leaked into default API" >&2
+              exit 1
+            fi
+            cat "$probe/error"
+            grep -F 'unresolved import' "$probe/error"
+            grep -F "compiler_ir::$name" "$probe/error"
+            cargo check --manifest-path "$probe/Cargo.toml" --features oracle
+          done
+      - name: Check explicitly supported historical annotation codec feature
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-ir --lib --features legacy-ssa-oracle
+      - name: Compile explicit legacy mixed optimizer and IR ABI oracle
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          for feature in legacy-function-mem2reg-oracle legacy-function-memory-oracle legacy-function-algebra-oracle legacy-function-pre-oracle legacy-function-mixed-oracle legacy-function-sccp-oracle experimental-generated-rules; do
+            cargo check -p compiler-opt --lib --features "$feature"
+          done
+          cargo test -p compiler-opt --lib
+      - name: Verify explicitly selected historical x86 emitter feature
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-backend-x86 --lib --features historical-function-oracle
+          cargo test -p compiler-backend-x86 --test callee_saved_native -- --nocapture
+      - name: Test old annotation readers and native v3 codecs
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test typed_ssa_body --test ssa_typeids --test typed_value_flow --test typed_module_abi --test typed_opcode_types --test module_text --test text_format --test native_module_text_v3 --test native_binary_v1 --test native_binary_v2 --test typed_integer_v2
+          cargo test -p compiler-ir --lib
+          cargo test -p compiler-opt --test typed_core_pipeline
+      - name: Scoped strict Clippy for core library
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir --lib --no-default-features -- -D clippy::all -A clippy::needless_borrows_for_generic_args -A clippy::too_many_arguments -A clippy::needless_range_loop -A clippy::collapsible_if -A clippy::collapsible_match -A clippy::needless_lifetimes -A clippy::type_complexity -A clippy::empty_line_after_doc_comments
+  source-drivers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: dbc63d75d7749b3174a549fea631934695469539
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: temporary-graph-types-source
+      - name: Verify source SHA and ordinary unified and standalone drivers
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          cargo check -p compiler --bin compiler
+          cargo check --manifest-path tools/mini-c-driver/Cargo.toml --lib --bin compiler-mini-c
+          cargo test -p compiler --bin compiler
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib
