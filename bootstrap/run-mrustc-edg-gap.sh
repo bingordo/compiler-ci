@@ -1095,9 +1095,9 @@ PY
     if (( byte_result_native_rc == 0 && byte_result_gcc_rc == 0 )); then
       for obj in /audit-tmp/edg-c-byte-result-typeid.o /audit-tmp/edg-c-byte-result-gcc.o; do
         symbols=$(readelf -Ws "$obj" | awk '$4=="FUNC" && $5=="GLOBAL" &&
-          $8 ~ /^bootstrap_byte_(unsigned|signed|boolean|returns_main)$/ {n++}
+          $8 ~ /^bootstrap_byte_(unsigned|signed|boolean|returns_main|formal_(unsigned|signed|boolean))$/ {n++}
           END {print n+0}')
-        if [[ "$symbols" != 4 ]]; then
+        if [[ "$symbols" != 7 ]]; then
           if [[ "$obj" == *typeid.o ]]; then byte_result_native_rc=12
           else byte_result_gcc_rc=12; fi
         fi
