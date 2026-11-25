@@ -1,0 +1,56 @@
+name: Temporary permanent IR boundary acceptance
+on:
+  pull_request:
+    paths: ['.github/workflows/temp-ir-boundary-3189.yml']
+permissions:
+  contents: read
+jobs:
+  graph-boundary:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    env:
+      SOURCE_SHA: f7f7dbc24c6df7d94b9c2e4c901345fe5cc62592
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Run exact recurring boundary checks
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          python3 tools/ir_consumer_inventory.py --check-production
+          PYTHONPATH=tools python3 -m unittest tools.test_ir_consumer_inventory
+          python3 tools/check_mixed_function_export_boundary.py
+      - name: Prove leaked legacy graph types and unrelated build errors reject
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path=Path("crates/ir/src/lib.rs")
+          source=path.read_text()
+          import re
+          pattern=r'#\[cfg\(any\(test, feature = "legacy-ssa-oracle"\)\)\]\n(#\[derive\([^\n]+\)\]\n)(pub struct Parameter\b)'
+          mutated,count=re.subn(pattern,r'\1\2',source)
+          assert count==1, "missing exact Parameter mutation"
+          path.write_text(mutated)
+          PY
+          if python3 tools/check_mixed_function_export_boundary.py > "$RUNNER_TEMP/leak.log" 2>&1; then
+            cat "$RUNNER_TEMP/leak.log"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/leak.log"
+          grep -F 'Legacy graph exclusion failed for Parameter' "$RUNNER_TEMP/leak.log"
+          git restore crates/ir/src/lib.rs
+          printf '\ncompile_error!("boundary unrelated build failure");\n' >> crates/ir/src/lib.rs
+          if python3 tools/check_mixed_function_export_boundary.py > "$RUNNER_TEMP/broken.log" 2>&1; then
+            cat "$RUNNER_TEMP/broken.log"
+            exit 1
+          fi
+          grep -F 'boundary unrelated build failure' "$RUNNER_TEMP/broken.log"
+          git restore crates/ir/src/lib.rs
