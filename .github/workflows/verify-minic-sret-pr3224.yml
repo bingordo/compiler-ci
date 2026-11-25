@@ -1,0 +1,63 @@
+name: Candidate Mini-C SysV MEMORY return PR 3224
+on:
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/verify-minic-sret-pr3224.yml']
+permissions:
+  contents: read
+jobs:
+  candidate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7d166884247d7af43916c8b700fd20a4c89bc0d9
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check out shared test harness
+        uses: actions/checkout@v4
+        with:
+          path: harness
+          persist-credentials: false
+      - name: Verify exact source and prepare public dependencies
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = 7d166884247d7af43916c8b700fd20a4c89bc0d9
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: mini-c-source-differential-v1
+          cache-workspace-crates: 'true'
+      - name: Run native MEMORY result oracle
+        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test sysv_memory_return -- --nocapture
+      - name: Run existing mixed ABI regressions
+        run: |
+          cargo build --manifest-path compiler/tools/mini-c-driver/Cargo.toml --bin compiler-mini-c
+          python3 compiler/tools/mini-c-driver/tests/differential.py --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" --mixed-only --timeout 15 --artifacts "$RUNNER_TEMP/sret-failures"
+      - name: Run shared upstream and generated aggregate return matrix
+        run: |
+          checkout="$RUNNER_TEMP/gcc-compat-source"
+          git init "$checkout"
+          git -C "$checkout" remote add origin https://github.com/gcc-mirror/gcc.git
+          git -C "$checkout" sparse-checkout init --cone
+          git -C "$checkout" sparse-checkout set gcc/testsuite/gcc.dg/compat
+          git -C "$checkout" -c protocol.version=2 fetch --depth=1 --filter=blob:none origin 1330eed38849ad186518f609c52bd5651c2bfdc1
+          git -C "$checkout" checkout --detach FETCH_HEAD
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          Path(os.environ["RUNNER_TEMP"], "adapters.json").write_text(json.dumps({
+              "minic": [str(Path("compiler/tools/mini-c-driver/target/debug/compiler-mini-c").resolve()),
+                        "{source}", "--emit", "obj", "-o", "{object}"]
+          }))
+          PY
+          python3 harness/tools/gcc_compat_runner.py "$checkout" --adapters "$RUNNER_TEMP/adapters.json" --work-dir "$RUNNER_TEMP/sret-matrix" --include-return-probes --compiler-sha "$(git -C compiler rev-parse HEAD)"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: minic-sret-matrix
+          path: ${{ runner.temp }}/sret-matrix/report.json
+          if-no-files-found: ignore
