@@ -1,0 +1,72 @@
+name: X7 permit RFLAGS and 80bit x87 long double
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/x7-allow-flags-x87-long-double-20261125.yml'
+permissions:
+  contents: read
+jobs:
+  validate-blanket-x86-ban:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1f2b0a8f3306781a2e8efb2b6bb054c4e0659707
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin exact compiler and source tools
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 1f2b0a8f3306781a2e8efb2b6bb054c4e0659707
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+          rustc --version
+          python3 --version
+      - name: Enforce uniform all-CPU ISA policy and mutation tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/x86_blanket_instruction_bans.py --check
+          python3 -m unittest discover -s tools -p 'test_x86_blanket_instruction_bans.py' -v
+          python3 tools/regen_x86_forms.py --check
+          python3 tools/regen_x86_gp_recipes.py --check
+          python3 tools/regen_x86_selector_rules.py --check
+      - name: Regenerate-check all SIMD and vector source catalogs
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for gen in \
+            regen_x86_sse_packed_forms \
+            regen_x86_sse_vex_forms \
+            regen_x86_sse_evex_forms \
+            regen_x86_sse_evex_ternlog_forms \
+            regen_x86_sse_evex_mask_compare_forms \
+            regen_x86_sse_move_forms \
+            regen_x86_sse_shift_imm_forms \
+            regen_x86_sse_evex_shift_imm_forms; do
+            python3 "tools/${gen}.py" --check
+          done
+      - name: Verify instruction-first source generation still honors hard ban
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          if ! command -v z3 >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y z3
+          fi
+          python3 tools/x7_instruction_driven_dag.py --check
+          python3 -m unittest discover -s tools -p 'test_x7_instruction_driven_dag.py' -v
+      - name: Compile normal default x86 compiler without research features
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-backend-x86
+          cargo check -p compiler-backend-x86 --features x7-production-generated-logic
+          cargo check -p compiler --bin compiler
