@@ -487,9 +487,9 @@ PY
     if (( rec_native_rc == 0 && rec_gcc_rc == 0 )); then
       for obj in /audit-tmp/edg-c-record-ptr-typeid.o /audit-tmp/edg-c-record-ptr-gcc.o; do
         count=$(readelf -Ws "$obj" | awk '$4=="FUNC" && $5=="GLOBAL" &&
-          $8 ~ /^bootstrap_c_(local_aliases|record_pointer_(formal|get|set|truth|negated|equal|forward|forward_set|address_local|address_truth)|scalar_pointer_(truth|unequal)|pair_(inreg|forward|local|external_forward|copy_ptr|deref_field|deref_forward)|implicit_(scalar_assignment|record_field))$/ {n++}
+          $8 ~ /^bootstrap_c_(local_aliases|record_pointer_(formal|get|set|truth|negated|equal|forward|forward_set|address_local|address_truth)|scalar_pointer_(truth|unequal)|pair_(inreg|forward|local|external_forward|copy_ptr|deref_field|deref_forward)|implicit_(scalar_assignment|record_field)|or_(local_field|gp_field))$/ {n++}
           END {print n+0}')
-        if [[ "$count" != 22 ]]; then
+        if [[ "$count" != 24 ]]; then
           if [[ "$obj" == *typeid.o ]]; then rec_native_rc=12
           else rec_gcc_rc=12; fi
         fi
@@ -2111,6 +2111,7 @@ schemas={
     "EDG_C_BODY_ASSIGN_SITE":(
         "EDG_C_REAL_BODY_ASSIGN_SITE",
         ("step","lhs","lhsop","lhstype","lhscan",
+         "base","baseop","basetype","basescan",
          "rhs","rhsop","rhstype","rhscan"),1),
     "EDG_C_BODY_RESULT_CANON":(
         "EDG_C_REAL_BODY_RESULT_CANON",
