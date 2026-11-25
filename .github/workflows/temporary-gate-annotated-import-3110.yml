@@ -1,0 +1,61 @@
+# Temporary source-pinned IR compatibility gating validation; close unmerged.
+name: Temporary TypeId annotated compatibility importer gate
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temporary-gate-annotated-import-3110.yml'
+permissions:
+  contents: read
+jobs:
+  ir-compat-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: 497675c478e974ac1375fa41c789341be37297ac
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source and isolate production core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Cache core workspace
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: temporary-annotated-compat-import-3110
+      - name: Validate ordinary compiler IR and optimizer/backend libraries
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-ir --lib --no-default-features
+          cargo check -p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --lib
+      - name: Run historical legacy importer and native TypeId IR regressions
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test typed_ssa_body --test ssa_typeids --test typed_value_flow --test typed_module_abi --test typed_opcode_types -- --nocapture
+          cargo test -p compiler-opt --test typed_core_pipeline -- --nocapture
+      - name: Scoped strict Clippy for production IR library
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir --lib --no-default-features -- -D clippy::all -A clippy::needless_borrows_for_generic_args -A clippy::too_many_arguments -A clippy::needless_range_loop -A clippy::collapsible_if -A clippy::collapsible_match -A clippy::needless_lifetimes -A clippy::type_complexity -A clippy::empty_line_after_doc_comments
