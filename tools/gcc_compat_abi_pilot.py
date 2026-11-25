@@ -4,7 +4,7 @@
 Downloads original GPL-licensed GCC test files only into a temporary CI work
 directory. No GPL sources are copied into this repository. Every byte is
 verified against the immutable Git blob IDs recorded below. A Mini-C compile
-rejection is COVERAGE_MISSING, never an ABI pass; accepted objects must link
+rejection is COMPILE_REJECTED, never an ABI pass; accepted objects must link
 and execute identically to an independent GCC/GCC reference.
 """
 
@@ -83,7 +83,7 @@ def succeeds(result: dict) -> bool:
 
 def run_case(name: str, compiler: Path, cc: str, root: Path,
              offline: Path | None) -> dict:
-    """Run GCC/GCC, then try replacing each of x/y with a Mini-C object."""
+    """Run GCC/GCC, then replace each source role with one Mini-C object."""
     base = name + "_"
     home = root / name
     home.mkdir(parents=True, exist_ok=True)
@@ -120,7 +120,7 @@ def run_case(name: str, compiler: Path, cc: str, root: Path,
         "stdout": reference_run["stdout"],
         "stderr": reference_run["stderr"],
     }
-    for replacement in ("x", "y"):
+    for replacement in ("main", "x", "y"):
         entry = {"status": "NOT_RUN"}
         record["directions"][replacement] = entry
         source = home / f"{base}{replacement}.c"
@@ -196,6 +196,11 @@ def main() -> int:
             for direction, value in result["directions"].items():
                 outcome = value["status"]
                 print(f"GCC_COMPAT {name} {direction}=Mini-C: {outcome}", flush=True)
+                if outcome == "COMPILE_REJECTED":
+                    diagnostic = value.get("result", {}).get("stderr", "")
+                    first = diagnostic.strip().splitlines()[:3]
+                    print(f"GCC_COMPAT_DIAGNOSTIC {name} {direction}=Mini-C: "
+                          + " | ".join(first)[:600], flush=True)
                 admitted += int(outcome == "PASS")
                 if outcome in ("ABI_MISMATCH", "MIXED_LINK_FAILED",
                                "COMPILER_CRASH", "EMPTY_OBJECT",
@@ -207,12 +212,12 @@ def main() -> int:
         print(f"GCC_COMPAT setup failure: {error}", file=sys.stderr)
     summary = {"upstream": f"gcc-mirror/gcc@{GCC_REVISION}",
                "admitted_mixed_directions": admitted,
-               "attempted_mixed_directions": 2 * len(PILOTS),
+               "attempted_mixed_directions": 3 * len(PILOTS),
                "cases": records}
     (args.work_dir / "report.json").write_text(json.dumps(summary, indent=2) + "\n")
     print("GCC_COMPAT_SUMMARY " + json.dumps({
         "admitted_mixed_directions": admitted,
-        "attempted_mixed_directions": 2 * len(PILOTS),
+        "attempted_mixed_directions": 3 * len(PILOTS),
         "reference_cases_passed": sum(
             r.get("gcc_reference") == "PASS" for r in records),
         "fatal": fatal,
