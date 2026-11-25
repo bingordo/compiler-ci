@@ -1,0 +1,62 @@
+name: Temporary historical array fold retirement acceptance
+on:
+  pull_request:
+    paths: ['.github/workflows/temp-ir-array-fold-3211.yml']
+permissions:
+  contents: read
+jobs:
+  array-fold-retirement:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SOURCE_SHA: e94c432f5ba52587ed108163d2ccd0b0d6117711
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm source and isolate core workspace
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-array-fold-retirement
+      - name: Audit remaining retired API callers
+        working-directory: compiler
+        run: |
+          if git grep -nE '\bfold_constant_local_array_indices\b' -- '*.rs'; then
+            exit 1
+          fi
+      - name: Verify native bounds, CFG and replay tests
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_array_fold
+          cargo test -p compiler-opt --test typed_array_fold --features verify-counts
+      - name: Verify optimizer library and every test target
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --lib
+          cargo check -p compiler-opt --all-targets
+          cargo test -p compiler-opt --lib
+      - name: Verify permanent graph and removed API guard
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: python3 tools/check_mixed_function_export_boundary.py
