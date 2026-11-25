@@ -2102,6 +2102,9 @@ schemas={
     "EDG_C_BODY_SCALAR_SITE":(
         "EDG_C_REAL_BODY_SCALAR_SITE",
         ("site","root","kind","expr","op"),1),
+    "EDG_C_BODY_CALL_ARG":(
+        "EDG_C_REAL_BODY_CALL_ARG",
+        ("index","root","kind","bytes","align","vararg","class"),1),
     "EDG_C_BODY_RESULT_CANON":(
         "EDG_C_REAL_BODY_RESULT_CANON",
         ("root","kind","bytes","align"),1),
