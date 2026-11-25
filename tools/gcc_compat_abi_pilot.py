@@ -31,8 +31,28 @@ PILOTS = {
         "scalar-return-1_x.c": "5556f9510a3efe9b6eeb908ec6ad3c085a9d13cd",
         "scalar-return-1_y.c": "f913dbbb8917a05f6f155cc743669615e3e45ba7",
     },
+    # Validate original GCC aggregate/global layout and pointer address use.
+    "sdata-1": {
+        "sdata-1_main.c": "68e9f8f09ad3a9c82d0d0fae86f574b516a9d2cf",
+        "sdata-1_x.c": "fc7b8cef333b50df859dc40109e6e1a01a77cca9",
+        "sdata-1_y.c": "8bc878a85d264b98e6e455d6cd47de9a6e1a23b2",
+    },
+    # GCC PR83487: empty/overaligned structs interleaved with GP stack args.
+    "pr83487-1": {
+        "pr83487-1_main.c": "a99519f843346b42bf63cb28ca27c3583a776f48",
+        "pr83487-1_x.c": "22b71cf185629b823cb48c746ba67a2e1d2130bd",
+        "pr83487-1_y.c": "cf275d8f33cf7dc5505d66e2a8c6d2fbe1826efc",
+    },
 }
 COMMON_FILES = {"compat-common.h": "4b3fb9c14cab4ad96555d85ecdbae68da4a67735"}
+ADDITIONAL_HEADERS = {
+    "sdata-1": {
+        "sdata-section.h": "15be8438662afd1738a0a97a472710291f690167",
+    },
+    "pr83487-1": {
+        "pr83487-1.h": "f39d5fd89dd3eb97cb052ed122ad17b6fd1b4998",
+    },
+}
 # These unmodified original GCC sources passed as mixed GCC/Mini-C objects
 # on compiler/main in compiler-ci run #45547473336. Enforce that coverage.
 REQUIRED_ADMISSIONS = {
@@ -93,7 +113,8 @@ def run_case(name: str, compiler: Path, cc: str, root: Path,
     base = name + "_"
     home = root / name
     home.mkdir(parents=True, exist_ok=True)
-    for file, blob in {**COMMON_FILES, **PILOTS[name]}.items():
+    for file, blob in {**COMMON_FILES, **ADDITIONAL_HEADERS.get(name, {}),
+                       **PILOTS[name]}.items():
         download_verified(file, blob, home, offline)
     record = {"case": name, "gcc_revision": GCC_REVISION,
               "directions": {}, "gcc_reference": "NOT_RUN"}
