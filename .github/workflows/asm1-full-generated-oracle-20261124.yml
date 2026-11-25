@@ -1,10 +1,16 @@
-name: ASM1 reviewed shortest GP immediate encoding and fuzz oracle
+name: ASM main regression - reviewed tables, GAS parity and backend unit tests
 on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/asm1-full-generated-oracle-20261124.yml']
   pull_request:
     paths: ['.github/workflows/asm1-full-generated-oracle-20261124.yml']
   workflow_dispatch:
+  schedule:
+    - cron: '21 9 * * *'
 permissions:
   contents: read
+  statuses: write
 jobs:
   generated-oracle:
     runs-on: ubuntu-24.04
@@ -15,15 +21,19 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 11f5e2d77879ab756f5643067378b1f917f60c91
+          ref: main
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
           path: compiler
-      - name: Assert source pinned exactly
+      - name: Record exact tested compiler main SHA
+        id: source
         working-directory: compiler
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = 11f5e2d77879ab756f5643067378b1f917f60c91
+          source_sha="$(git rev-parse HEAD)"
+          echo "ASM_SOURCE_MAIN_SHA=$source_sha"
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+          printf 'compiler/main: `%s`\n' "$source_sha" >> "$GITHUB_STEP_SUMMARY"
       - name: Validate generator source and checked output
         working-directory: compiler
         run: |
@@ -78,6 +88,7 @@ jobs:
           for test in att_sse_packed att_sse_moves att_sse_vex att_sse_evex att_sse_evex_mask_compare att_sse_evex_shift_imm att_sse_evex_ternlog; do
             cargo test -p compiler-backend-x86 --test "$test" -- --nocapture
           done
+          cargo test -p compiler-backend-x86 --lib -- --nocapture
       - name: Upload assembler random-seed reproducer on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -85,3 +96,18 @@ jobs:
           name: asm1-fuzz-reproducer
           path: compiler/asm1-fuzz-repro/
           if-no-files-found: ignore
+      - name: Record main assembler gate status on compiler-ci commit
+        if: always() && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          if [ "$JOB_STATUS" = success ]; then state=success; else state=failure; fi
+          summary="compiler/main ${SOURCE_SHA:-checkout-unavailable} asm suite: $JOB_STATUS"
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$state" \
+            -f context="asm/main-source-regression" \
+            -f description="${summary:0:140}" \
+            -f target_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
