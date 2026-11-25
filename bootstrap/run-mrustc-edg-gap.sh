@@ -2011,6 +2011,9 @@ schemas={
         ("class","prior","locals","statements","expressions","controls"),1),
     "EDG_C_BODY_STAGE":(
         "EDG_C_REAL_BODY_STAGE",("stage","step"),1),
+    "EDG_C_BODY_SCALAR_SITE":(
+        "EDG_C_REAL_BODY_SCALAR_SITE",
+        ("site","root","kind","expr","op"),1),
     "EDG_C_BODY_RESULT_CANON":(
         "EDG_C_REAL_BODY_RESULT_CANON",
         ("root","kind","bytes","align"),1),
