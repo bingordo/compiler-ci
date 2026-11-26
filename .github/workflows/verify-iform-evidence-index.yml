@@ -1,0 +1,63 @@
+name: Intel operand evidence index validation
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-iform-evidence-index.yml']
+permissions:
+  contents: read
+jobs:
+  verify-index:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 8497bbd43c3107da956e9b41cf340f7ccbf275fe
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 75f8d83c31066a0eb9c320e32ab1a5d112a1d9e2
+          path: baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify candidate and run affected suites
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "8497bbd43c3107da956e9b41cf340f7ccbf275fe"
+          python3 -m unittest discover -s tools -p test_x86_g10_catalog_census.py -v
+          python3 -m unittest discover -s tools -p test_x86_g10_source_operand_shapes.py -v
+          python3 -m unittest discover -s tools -p test_x86_iform_batch_worklist.py -v
+      - name: Compare complete reports with previous implementation
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          PYTHONPATH=tools python3 - <<'PY'
+          import importlib.util
+          import json
+          import tempfile
+          from pathlib import Path
+          from test_x86_g10_catalog_census import populated
+          from test_x86_g10_source_operand_shapes import init
+          from x86_g10_source_operand_shapes import generate
+          from x86_iform_batch_worklist import worklist, normalize_source_operand_shapes
+          def old_module(name):
+              spec = importlib.util.spec_from_file_location("old_" + name, "../baseline/tools/" + name + ".py")
+              module = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(module)
+              return module
+          old_shape = old_module("x86_g10_source_operand_shapes")
+          old_worklist = old_module("x86_iform_batch_worklist")
+          with tempfile.TemporaryDirectory() as tmp:
+              report, overlay, src = init(tmp)
+              assert json.dumps(generate(report, overlay, src), sort_keys=True) == json.dumps(old_shape.generate(report, overlay, src), sort_keys=True)
+          for duplicate in (False, True):
+              with tempfile.TemporaryDirectory() as tmp:
+                  src = populated(Path(tmp), duplicate=duplicate)
+                  report = worklist(src)
+                  assert json.dumps(normalize_source_operand_shapes(report, src), sort_keys=True) == json.dumps(old_worklist.normalize_source_operand_shapes(report, src), sort_keys=True)
+          print("EVIDENCE_INDEX_REPORT_BYTE_PARITY_OK")
+          PY
