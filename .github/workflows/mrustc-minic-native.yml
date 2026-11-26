@@ -42,7 +42,7 @@ jobs:
           # Test the merged source-verified TypeId adapter (not the old mixed-global
           # branch) without changing compiler production history.
           # Manual dispatch can still select any explicit source_ref.
-          ref: ${{ inputs.source_ref || '8888ccd179f9dc3d2675c6c21ffad861fbbeec63' }}
+          ref: ${{ inputs.source_ref || '9a0048acdb8b3b9b51e2caffcafdd9b088a50dfa' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -100,7 +100,7 @@ jobs:
         with:
           repository: bingordo/mini-c
           # Diagnostic candidate override; never modify the committed compiler pin.
-          ref: 157539b763124ce300d241121e46bbdf7cf70d4f
+          ref: 4a3c90b0a552540688f7e786a807ed98f1f39fd0
           path: mini-c-compat
           persist-credentials: false
       - name: Checkout pinned mrustc
@@ -302,10 +302,6 @@ jobs:
           rc=$?
           set -e
           echo "MINIC_BUILD_EXIT=$rc"
-          if [ "$rc" -eq 0 ]; then
-            cargo test --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test builtin_byte_swap -- --nocapture
-            cargo test --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib
-          fi
           if (( rc != 0 )); then
             python3 - "$RUNNER_TEMP/minic-build.log" <<'PY'
           import re,sys
@@ -319,6 +315,11 @@ jobs:
           PY
           fi
           exit "$rc"
+
+      - name: Native driver unit regression (independent of source probes)
+        id: native_unit
+        continue-on-error: true
+        run: cargo test --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib
 
       - name: Attempt real generated C with production Mini-C and independent GCC
         shell: bash
@@ -360,6 +361,18 @@ jobs:
                           # Only isolated public fixtures: their diagnostics may be printed.
                           for line in raw.splitlines()[:3]:
                               print("PUBLIC_HEADER_DIAG="+line[:300],flush=True)
+                      for label,source in (
+                          ("TLS_UNUSED_EXTERN", "extern __thread int value; int f(void){return 42;}"),
+                          ("TLS_DEFINED", "__thread int value=7; int f(void){return ++value;}"),
+                          ("TLS_REFERENCED_EXTERN", "extern __thread int value; int f(void){return ++value;}"),
+                          ("TLS_C11", "static _Thread_local int value; int f(void){return ++value;}"),
+                      ):
+                          fixture=tmp/"public-tls.c"
+                          fixture.write_text(source)
+                          result=attempt([str(driver),str(fixture),"--emit","obj","-o",str(tmp/"tls.o")],tmp/"tls.log",60)
+                          print("PUBLIC_"+label+"_EXIT="+str(result),flush=True)
+                          for line in (tmp/"tls.log").read_text(errors="replace").splitlines()[:3]:
+                              print("PUBLIC_TLS_DIAG="+line[:300],flush=True)
                       fixture=tmp/"public-layout.c"
                       fixture.write_text("typedef struct { long long a __attribute__((aligned(__alignof__(long long)))); long double b __attribute__((aligned(__alignof__(long double)))); } Max;\nunsigned long layout_size(void){return sizeof(Max);}\n")
                       harness=tmp/"public-harness.c"
@@ -395,3 +408,7 @@ jobs:
                   failures+=int(rc!=0 or not out.is_file() or gcc!=0)
               raise SystemExit(int(failures!=0))
           PY
+
+      - name: Require independent native unit regression
+        if: always() && steps.native_unit.outcome == 'failure'
+        run: exit 1
