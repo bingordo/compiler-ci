@@ -1,0 +1,59 @@
+# Disposable source-pinned AL-04 memory retirement validation.
+name: IR PR3441 native Alive-lite local memory
+on:
+  push:
+    branches: [verify-ir-alive-local-3441-20261126]
+    paths: ['.github/workflows/ir-pr3441-alive-local.yml']
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      SOURCE_SHA: f0d4a43d2018264ad0e4f4747c895e5565c616e9
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify SHA and isolate optimizer workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-pr3441-alive-local
+      - name: Compile all targets and run nonignored local-memory tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --all-targets
+          cargo test -p compiler-opt --test alive_lite al04_p3
+          cargo test -p compiler-opt --test alive_lite check_memory
+          cargo test -p compiler-opt --test typed_global_memory
+          cargo test -p compiler-opt --test typed_dse
+      - name: Install SMT solver and run representative independent proof
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq z3
+          cd compiler
+          cargo test -p compiler-opt --test alive_lite al04_p3c2_store_to_load_changed_proofs_and_smt_mutants -- --ignored --nocapture
+      - name: Scoped strict lint
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy --no-deps -p compiler-opt --test alive_lite -- -D warnings -A dead_code -A unused_imports -A unused_variables
