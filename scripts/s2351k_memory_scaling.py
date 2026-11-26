@@ -14,7 +14,7 @@ import statistics
 import subprocess
 from pathlib import Path
 
-COUNTS = (96, 384, 768)
+COUNTS = (96, 384, 768, 3072, 6144)
 REPEATS = 4
 TIME_FMT = ("user_s=%U sys_s=%S wall_s=%e maxrss_kb=%M "
             "minor_faults=%R major_faults=%F voluntary_cs=%w "
@@ -149,7 +149,7 @@ def heap_summary(root, before, after):
     """Profile allocation events separately, excluding tracing overhead from RSS."""
     bins = {"before": Path(before).resolve(), "after": Path(after).resolve()}
     records = []
-    for n in (96, 768):
+    for n in (96, 768, 3072):
         source = root / ("cfg_" + str(n) + ".c")
         for revision, binary in bins.items():
             output = root / ("heap_" + str(n) + "_" + revision + ".o")
