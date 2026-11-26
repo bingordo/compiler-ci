@@ -1,0 +1,92 @@
+name: S23.51j real production Mini C driver size versus unchanged main
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-51j-production-footprint.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  production-driver-footprint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 10409cc0913d7b7f9bc6d2c3ce207834fb9c5d7c
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 239a7d946ad24d9a15f6a38a7397372eb15f0333
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler source pins and unchanged generator
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C before rev-parse HEAD)" = 10409cc0913d7b7f9bc6d2c3ce207834fb9c5d7c
+          test "$(git -C after rev-parse HEAD)" = 239a7d946ad24d9a15f6a38a7397372eb15f0333
+          cmp before/tools/typeid-rule-gen/examples.rules after/tools/typeid-rule-gen/examples.rules
+          cmp before/tools/typeid-rule-gen/ssa_codegen.py after/tools/typeid-rule-gen/ssa_codegen.py
+          mkdir -p results
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before/tools/mini-c-driver -> target
+            after/tools/mini-c-driver -> target
+      - name: Build same original TypeId Mini C production driver, baseline then candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          for version in before after; do
+            (cd "$version/tools/mini-c-driver" && cargo build --release --bin compiler-mini-c)
+            test -s "$version/tools/mini-c-driver/target/release/compiler-mini-c"
+          done
+      - name: Measure same-run production release driver executable text and full bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,subprocess
+          from pathlib import Path
+          rows=[]
+          for name in ('before','after'):
+              binary=Path(name)/'tools/mini-c-driver/target/release/compiler-mini-c'
+              assert binary.is_file() and binary.stat().st_size>0
+              sections=subprocess.run(['size','-A',str(binary)],text=True,
+                  capture_output=True,check=True).stdout
+              text_bytes=sum(int(line.split()[1]) for line in sections.splitlines()
+                  if len(line.split())>=2 and line.split()[0].startswith('.text'))
+              assert text_bytes>0
+              row={'revision':name,'driver_bytes':binary.stat().st_size,
+                   'text_section_bytes':text_bytes}
+              rows.append(row)
+              print('S2351J_DRIVER revision='+name+
+                    ' text_bytes='+str(text_bytes)+
+                    ' binary_bytes='+str(row['driver_bytes']))
+          ratio=rows[1]['text_section_bytes']/rows[0]['text_section_bytes']
+          print('S2351J_DRIVER_TEXT_RATIO candidate_over_base='+format(ratio,'.6f'))
+          payload={'schema':'compiler.s2351j.production-driver-footprint.v1',
+                   'base_sha':'10409cc0913d7b7f9bc6d2c3ce207834fb9c5d7c','candidate_sha':'239a7d946ad24d9a15f6a38a7397372eb15f0333',
+                   'rows':rows,'candidate_over_base_text':ratio}
+          Path('results/s2351j-production-driver-footprint.json').write_text(
+              json.dumps(payload,indent=2)+'\n')
+          PY
+      - name: Preserve original production driver footprint comparison
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2351j-actual-release-driver-footprint
+          path: results/
+          retention-days: 28
+          if-no-files-found: warn
