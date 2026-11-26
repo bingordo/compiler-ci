@@ -1,0 +1,66 @@
+name: Temporary historical Function inliner retirement acceptance
+on:
+  pull_request:
+    paths: ['.github/workflows/temp-inline-retire-3479.yml']
+permissions:
+  contents: read
+jobs:
+  inline-retirement:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: 4ee6ba9eb92e52c999de41b9b14c47d456d8d022
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler SHA and optimizer workspace
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-inline-retirement
+      - name: Reject every historical inliner call and feature
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test ! -f crates/opt/src/inline.rs
+          if git grep -nE 'legacy-function-inline-oracle|compiler_opt::inline::|inline_small_calls\(|inline_selected_calls\(' -- '*.rs' '*.toml'; then
+            exit 1
+          fi
+      - name: Native TypeId inliner and C11/ELF regressions
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test inline_practical_native
+          cargo test -p compiler-opt --test typed_inline_cfg_native
+          cargo test -p compiler-opt --test typed_inline_memory_native
+          cargo test -p compiler-opt --test typed_inline_leaf_native
+          cargo test -p compiler-opt --test typed_inline_wide_void_native
+          cargo test -p compiler-opt --test inline_modern_scalar_native
+          cargo test -p compiler-opt --test typed_inline_postopt_native_trial
+          cargo test -p compiler-opt --test typed_core_inline_integration
+      - name: All optimizer targets and strict production Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --all-targets
+          cargo clippy -p compiler-opt --lib -- -D warnings
+      - name: Shared TypeId production graph boundary
+        working-directory: compiler
+        run: python3 tools/check_mixed_function_export_boundary.py
