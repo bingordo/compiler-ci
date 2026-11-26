@@ -39,7 +39,7 @@ with tempfile.TemporaryDirectory() as d:
         out = tmp / f"reference{i}.o"
         log = tmp / "reference.log"
         gcc, _ = attempt(["gcc", "-std=gnu11", "-fsyntax-only", str(src)], tmp/"gcc.log", 180)
-        cmd = ([driver, "--cpp=cc", "--emit-obj", str(out), str(src)] if mode == "minic"
+        cmd = ([driver, *extra, "--cpp=cc", "--emit-obj", str(out), str(src)] if mode == "minic"
                else [driver, str(out), *extra, str(src)])
         rc, elapsed = attempt(cmd, log, 300)
         elf = False
@@ -107,7 +107,7 @@ with tempfile.TemporaryDirectory() as d:
                             cpp = subprocess.run(["cc","-E","-P",str(src)],
                                                  stdout=dst,stderr=err,timeout=180)
                         if cpp.returncode == 0:
-                            rc2,_ = attempt([driver,"--cpp=none","--emit-obj",str(tmp/"private-raw.o"),str(pre)],
+                            rc2,_ = attempt([driver,*extra,"--cpp=none","--emit-obj",str(tmp/"private-raw.o"),str(pre)],
                                             tmp/"private-raw.log",180)
                             raw = (tmp/"private-raw.log").read_text(errors="replace")
                             match = re.search(r":(\d+):(\d+): error\[S[0-9]{4}\]",raw)
