@@ -1,0 +1,76 @@
+name: Verify original Intel X7 corpus iform impact census
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-x7-original-corpus-impact.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  original-corpus-priorities:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 620e3c3b4485e415cb57301f3376d33a99c291ae
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Unit proof gates and 10000-form scalable incidence regression
+        run: |
+          set -euo pipefail
+          echo "X7_CANDIDATE_SOURCE_COMMIT $(git rev-parse HEAD)"
+          python3 -m unittest discover -s tools -p 'test_x86_isl_source_form_impact.py' -v
+          python3 -m unittest discover -s tools -p 'test_x86_isl_operation_model_census.py' -v
+          python3 -m unittest discover -s tools -p 'test_x86_iform_helper_dependencies.py' -v
+          python3 -m py_compile tools/x86_isl_source_form_impact.py tools/x86_isl_operation_model_census.py
+      - name: Fetch all original Intel SDM instruction XML from pinned revision
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --sparse https://github.com/intel/SDM.git /tmp/intel-sdm
+          git -C /tmp/intel-sdm fetch --depth 1 origin 35eface1b7ee003a1cda95005ec5fd83de658a64
+          git -C /tmp/intel-sdm checkout 35eface1b7ee003a1cda95005ec5fd83de658a64
+          git -C /tmp/intel-sdm sparse-checkout set data/instruction
+          test -f /tmp/intel-sdm/data/instruction/POPCNT.xml
+      - name: Rank every Intel iform by actual source blocker/reusable helper reach
+        run: |
+          set -euo pipefail
+          python3 tools/x86_iform_helper_dependencies.py \
+            --xml-dir /tmp/intel-sdm/data/instruction \
+            --out /tmp/x7-full-b2-index.json --shards 8
+          python3 tools/x86_isl_source_form_impact.py \
+            --dependency-index /tmp/x7-full-b2-index.json \
+            --out /tmp/x7-all-original-iform-priorities.json
+          python3 - <<'PY'
+          import json
+          index=json.load(open('/tmp/x7-full-b2-index.json'))
+          report=json.load(open('/tmp/x7-all-original-iform-priorities.json'))
+          s=report['summary']
+          assert s['original_source_operations']==index['operations_indexed']>=1600,s
+          assert s['original_source_iforms']==index['source_iforms']>=1000,s
+          assert s['operations_with_model_results']==0,s
+          assert s['original_iforms_architecturally_proven']==0,s
+          assert s['original_iforms_selection_eligible']==0,s
+          assert len(report['forms'])==s['original_source_iforms'],s
+          assert s['ranked_source_blocker_groups']>0,s
+          assert s['ranked_declared_helper_dependencies']>0,s
+          assert all(row['production_selection_eligible'] is False
+                     for row in report['forms'])
+          print('X7_FULL_ORIGINAL_CORPUS_IFORM_IMPACT_SUCCESS',json.dumps(s,sort_keys=True))
+          for entry in report['ranked_source_blockers'][:20]:
+            print('X7_TOP_SOURCE_BLOCKER',json.dumps({
+              key:entry[key] for key in
+              ('category','key','affected_original_iforms',
+               'affected_distinct_operations')},sort_keys=True))
+          for entry in report['ranked_declared_helper_dependencies'][:20]:
+            print('X7_TOP_DECLARED_HELPER',json.dumps({
+              key:entry[key] for key in
+              ('key','affected_original_iforms','affected_distinct_operations')},
+              sort_keys=True))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-complete-original-Intel-source-iform-blocker-priorities
+          path: /tmp/x7-all-original-iform-priorities.json
+          if-no-files-found: ignore
