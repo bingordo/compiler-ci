@@ -1,0 +1,108 @@
+name: Mini-C GNU NaN builtins PR3381
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-minic-nan-pr3381.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  gnu-nan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 78862268842c41093ba717af0263529754d825ae
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Build candidate production compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 78862268842c41093ba717af0263529754d825ae
+          timeout --signal=TERM --kill-after=10s 14m cargo build --manifest-path compiler/Cargo.toml -p compiler --bin compiler
+          echo "COMPILER_SHA=$(git -C compiler rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Run exact Mini-C checked builtin regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone -q ssh://git@github.com/bingordo/mini-c.git minic
+          git -C minic checkout -q d8158f934ae5c39a82282190b28cc606d642cfda
+          test "$(git -C minic rev-parse HEAD)" = d8158f934ae5c39a82282190b28cc606d642cfda
+          timeout --signal=TERM --kill-after=10s 7m cargo test --manifest-path minic/Cargo.toml -p mini-c-sema gnu_nan_empty_payload_has_checked_float_and_double_type -- --nocapture
+          echo "MINIC_SHA=$(git -C minic rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Compare exact F32 and F64 NaN runtime with independent GCC baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          compiler="$PWD/compiler/target/debug/compiler"
+          d="$(mktemp -d)"
+          trap 'rm -rf "$d"' EXIT
+          cd "$d"
+          cat > nan.c <<'EOF'
+          float f(void) { return __builtin_nanf(""); }
+          double g(void) { return __builtin_nan(""); }
+          int main(void) {
+              float a = f();
+              double b = g();
+              if (a == a || b == b) return 1;
+              if (!(a != a) || !(b != b)) return 2;
+              return 0;
+          }
+          EOF
+          gcc -std=gnu11 -O0 nan.c -o gcc-nan
+          ./gcc-nan
+          "$compiler" --gcc-driver -std=gnu11 nan.c -o native-nan
+          ./native-nan
+          for expression in '__builtin_nanf("payload")' '__builtin_nan("0x123")' '__builtin_nanf()' '__builtin_nan(1)' ; do
+            printf 'float f(void) { return %s; }\n' "$expression" > bad.c
+            if "$compiler" --gcc-driver -c bad.c -o bad.o > bad.log 2>&1; then
+              echo "unsupported NaN builtin admitted: $expression" >&2
+              exit 1
+            fi
+            test ! -e bad.o
+          done
+          echo "GCC_TYPEID_EMPTY_NAN_F32_F64_RUNTIME=PASS" >> "$GITHUB_STEP_SUMMARY"
+      - name: Reprobe unmodified upstream cJSON with independent GCC baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone -q --depth 1 --branch v1.7.19 https://github.com/DaveGamble/cJSON.git cjson
+          test "$(git -C cjson rev-parse HEAD)" = c859b25da02955fef659d658b8f324b5cde87be3
+          cmake -S cjson -B gcc-build -G Ninja -DCMAKE_C_COMPILER=cc -DBUILD_SHARED_LIBS=OFF -DENABLE_CUSTOM_COMPILER_FLAGS=OFF -DENABLE_CJSON_TEST=OFF -DENABLE_CJSON_UTILS=OFF -DENABLE_LOCALES=OFF
+          cmake --build gcc-build
+          test -s gcc-build/libcjson.a
+          compiler="$PWD/compiler/target/debug/compiler"
+          tc="$PWD/compiler/tools/cmake/typeid-gcc-adapter-toolchain.cmake"
+          cmake -S cjson -B native-build -G Ninja -DCMAKE_C_COMPILER="$compiler" -DCMAKE_C_COMPILER_ARG1=--gcc-driver -DCMAKE_TOOLCHAIN_FILE="$tc" -DBUILD_SHARED_LIBS=OFF -DENABLE_CUSTOM_COMPILER_FLAGS=OFF -DENABLE_CJSON_TEST=OFF -DENABLE_CJSON_UTILS=OFF -DENABLE_LOCALES=OFF
+          set +e
+          cmake --build native-build --verbose > native-build.log 2>&1
+          rc=$?
+          set -e
+          if grep -Fq 'unsupported compiler builtin __builtin_nanf' native-build.log; then
+            echo "previous cJSON NaN builtin blocker remains" >&2
+            exit 1
+          fi
+          {
+            echo "GCC_CJSON_STATIC_LIBRARY=PASS"
+            echo "TYPEID_CJSON_BUILD_EXIT=$rc"
+            if test "$rc" -eq 0; then
+              test -s native-build/libcjson.a
+              echo "TYPEID_CJSON_STATIC_LIBRARY=PASS"
+            else
+              echo "TYPEID_CJSON_STATIC_LIBRARY=UNSUPPORTED"
+              echo "First diagnostics:"
+              grep -m 8 -E 'compiler:|error:|unsupported|fatal' native-build.log || true
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: minic-nan-cjson-pr3381
+          path: native-build.log
+          if-no-files-found: ignore
