@@ -263,44 +263,24 @@ jobs:
                             "mixed directions admitted; compile rejections "
                             "are unsupported coverage, not passing ABI checks.\n")
           PY
-      - name: Run upstream aggregate return compatibility subset
+      - name: Validate shared GCC harness controls
+        run: python3 -m unittest discover -s compiler/tests/gcc -p 'test_*.py'
+      - name: Package the already-tested native Mini-C driver
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m unittest discover -s compiler/tests/gcc -p 'test_*.py'
-          checkout="$RUNNER_TEMP/gcc-compat-source"
-          python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          Path(os.environ["RUNNER_TEMP"], "return-adapters.json").write_text(json.dumps({
-              "minic": [str(Path("compiler/tools/mini-c-driver/target/debug/compiler-mini-c").resolve()),
-                        "{source}", "--emit", "obj", "-o", "{object}"]
-          }))
-          PY
-          timeout --signal=TERM --kill-after=10s 45m python3 compiler/tests/gcc/gcc_compat_runner.py \
-            "$checkout" --adapters "$RUNNER_TEMP/return-adapters.json" \
-            --work-dir "$RUNNER_TEMP/gcc-aggregate-returns" --all-compat --include-return-probes --include-all-layout --layout-batches 0 --include-bitfield-execute \
-            --compiler-sha "$(git -C compiler rev-parse HEAD)" \
-            --required compiler/tests/gcc/gcc_compat_required_returns.json
-      - name: Preserve aggregate return coverage report
-        if: always()
+          mkdir -p "$RUNNER_TEMP/native-minic"
+          cp compiler/tools/mini-c-driver/target/debug/compiler-mini-c "$RUNNER_TEMP/native-minic/"
+          git -C compiler rev-parse HEAD > "$RUNNER_TEMP/native-minic/compiler-sha"
+          cd "$RUNNER_TEMP/native-minic"
+          sha256sum compiler-mini-c > SHA256SUMS
+      - name: Transfer Mini-C driver to shared GCC 15 reference job
         uses: actions/upload-artifact@v4
         with:
-          name: gcc-aggregate-return-coverage
-          path: |
-            ${{ runner.temp }}/gcc-aggregate-returns/report.json
-            ${{ runner.temp }}/gcc-aggregate-returns/inventory.json
-          if-no-files-found: ignore
-          retention-days: 14
-      - name: Preserve generated GCC layout reproducer sources on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: gcc-aggregate-returns-generated-sources
-          path: ${{ runner.temp }}/gcc-aggregate-returns/gcc-struct-layout/
-          if-no-files-found: ignore
-          retention-days: 14
-
+          name: native-minic-driver
+          path: ${{ runner.temp }}/native-minic/
+          if-no-files-found: error
+          retention-days: 1
       - name: Preserve build logs and failing test cases
         if: failure()
         uses: actions/upload-artifact@v4
@@ -344,7 +324,7 @@ jobs:
 
   edg-aggregate-return:
     needs: differential
-    if: ${{ always() && needs.differential.outputs.compiler_sha != '' }}
+    if: ${{ needs.differential.result == 'success' && needs.differential.outputs.compiler_sha != '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 100
     container:
@@ -449,7 +429,20 @@ jobs:
         with:
           path: ${{ runner.temp }}/gcc-compat-source
           key: ${{ steps.gcc-source-cache.outputs.cache-primary-key }}
-      - name: Run the same upstream aggregate return corpus with EDG
+      - name: Restore Mini-C binary from this exact workflow run
+        uses: actions/download-artifact@v4
+        with:
+          name: native-minic-driver
+          path: ${{ runner.temp }}/native-minic
+      - name: Verify Mini-C revision and binary integrity
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/native-minic"
+          test "$(cat compiler-sha)" = "$COMPILER_SHA"
+          sha256sum -c SHA256SUMS
+          chmod +x compiler-mini-c
+          ldd compiler-mini-c
+      - name: Run comprehensive GCC 15 interoperability corpus with both frontends
         run: |
           source edgcpp/build/gcc-release/environment.sh
           checkout="$RUNNER_TEMP/gcc-compat-source"
@@ -460,25 +453,36 @@ jobs:
               ["gcc", "-dumpfullversion", "-dumpversion"], text=True).strip().split(".")]
           parts += [0] * (3 - len(parts))
           version = str(parts[0] * 10000 + parts[1] * 100 + parts[2])
-          Path(os.environ["RUNNER_TEMP"], "edg-return-adapters.json").write_text(json.dumps({
+          Path(os.environ["RUNNER_TEMP"], "native-return-adapters.json").write_text(json.dumps({
+              "minic": [str(Path(os.environ["RUNNER_TEMP"], "native-minic/compiler-mini-c")),
+                        "{source}", "--emit", "obj", "-o", "{object}"],
               "edg": [str(Path("compiler/tools/edg-driver/target/debug/compiler-edg-driver").resolve()),
                       "{object}", "--gcc", "--c11", "--no_strict_gnu",
                       "--gnu_version", version, "{original}"]
           }))
           PY
-          timeout --signal=TERM --kill-after=10s 45m python3 compiler/tests/gcc/gcc_compat_runner.py \
-            "$checkout" --adapters "$RUNNER_TEMP/edg-return-adapters.json" \
-            --work-dir "$RUNNER_TEMP/edg-aggregate-returns" --all-compat --include-return-probes --include-all-layout --layout-batches 0 --include-bitfield-execute \
+          timeout --signal=TERM --kill-after=10s 60m python3 compiler/tests/gcc/gcc_compat_runner.py \
+            "$checkout" --adapters "$RUNNER_TEMP/native-return-adapters.json" \
+            --work-dir "$RUNNER_TEMP/gcc-shared-abi" --all-compat --include-return-probes --include-all-layout --layout-batches 0 --include-bitfield-execute \
             --compiler-sha "$(git -C compiler rev-parse HEAD)" \
             --required compiler/tests/gcc/gcc_compat_required_returns.json
-      - name: Preserve EDG aggregate return report
+      - name: Preserve both frontend ABI reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: edg-aggregate-return-coverage
+          name: gcc-shared-abi-coverage
           path: |
-            ${{ runner.temp }}/edg-aggregate-returns/report.json
-            ${{ runner.temp }}/edg-aggregate-returns/inventory.json
+            ${{ runner.temp }}/gcc-shared-abi/report.json
+            ${{ runner.temp }}/gcc-shared-abi/inventory.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Preserve generated GCC layout reproducer sources on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gcc-shared-abi-generated-sources
+          path: ${{ runner.temp }}/gcc-shared-abi/gcc-struct-layout/
           if-no-files-found: ignore
           retention-days: 14
 
@@ -488,15 +492,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: Preserve generated GCC layout reproducer sources on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: edg-aggregate-returns-generated-sources
-          path: ${{ runner.temp }}/edg-aggregate-returns/gcc-struct-layout/
-          if-no-files-found: ignore
-          retention-days: 14
-
       - name: Record successful full run identity
         shell: bash
         env:
