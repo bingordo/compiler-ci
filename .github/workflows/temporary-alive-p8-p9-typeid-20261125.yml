@@ -1,0 +1,68 @@
+# Source-pinned one-off proof gate for compiler PR #3317; close unmerged.
+name: Temporary Alive-lite P8 P9 TypeId proof
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temporary-alive-p8-p9-typeid-20261125.yml'
+permissions:
+  contents: read
+jobs:
+  p8-p9-typeid:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: 9ef31a8a733b7571da31ee013e53ef15447d82d2
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source and isolate optimizer crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "Exact compiler source SHA: $SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - name: Cache Rust compilation
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: temporary-alive-p8-p9-native
+      - name: Run all ordinary Alive-lite tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test alive_lite -- --nocapture
+      - name: Install Z3
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y z3
+          z3 --version
+      - name: Prove real P8 and P9 native graph changes and SAT mutants
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for test in \
+            al05_body_dag_two_forks_changed_cse_and_sat_controls \
+            al05_p9_phi_layouts_trap_sites_changed_cse_and_sat \
+            al05_p9_eight_path_changed_cse_and_mutants; do
+            cargo test -p compiler-opt --test alive_lite "$test" -- --ignored --nocapture --test-threads=1
+          done
+      - name: Focused Alive-lite Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --test alive_lite -- -D clippy::all -A clippy::too_many_arguments -A clippy::needless_lifetimes -A clippy::empty_line_after_doc_comments -A clippy::collapsible_if -A clippy::collapsible_match -A clippy::needless_range_loop -A clippy::needless_borrows_for_generic_args -A clippy::type_complexity
