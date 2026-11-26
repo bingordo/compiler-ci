@@ -1,0 +1,83 @@
+name: S23.51m unmodified upstream C source compatibility census
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-51m-upstream-compatibility.yml'
+      - 'scripts/s2351m_upstream_probe.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  discover-upstream-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 73b92683aa6a52e65d21ab31748fddefdad8a809
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Verify exact merged two-pass producer code and immutable rule DSL
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 73b92683aa6a52e65d21ab31748fddefdad8a809
+          grep -q 'let mut producer_count = 0usize' \
+            compiler/crates/opt/src/generated_typeid_shadow.rs
+          python3 -m py_compile scripts/s2351m_upstream_probe.py
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          mkdir -p results/upstream
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: s2351m-upstream-compatibility
+      - name: Build real release Rust TypeId native C compiler before probing
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 18m \
+            cargo build --release -p compiler --bin compiler --manifest-path compiler/Cargo.toml
+          test -s compiler/target/release/compiler
+          sha256sum compiler/target/release/compiler
+      - name: Checkout five independently maintained upstream codebases at recorded release or branch commits
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch v1.3.1 https://github.com/madler/zlib.git results/upstream/zlib
+          git clone --depth 1 --branch r60 https://github.com/benhoyt/inih.git results/upstream/inih
+          git clone --depth 1 --branch v1.0.0 https://github.com/kokke/tiny-AES-c.git results/upstream/aes
+          git clone --depth 1 --branch master https://github.com/libb64/libb64.git results/upstream/libb64
+          git clone --depth 1 --branch v1.7.19 https://github.com/DaveGamble/cJSON.git results/upstream/cjson
+          for repo in zlib inih aes libb64 cjson; do
+            printf 'S2351M_UPSTREAM name=%s sha=%s\n' "$repo" \
+              "$(git -C "results/upstream/$repo" rev-parse HEAD)"
+          done
+      - name: Run independent GCC baseline and exact TypeId native object attempt on each unchanged source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/s2351m_upstream_probe.py results \
+            --compiler compiler/target/release/compiler | tee results/upstream-discovery.log
+      - name: Archive independent source compatibility, precise failure reasons and original upstream SHA pins
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2351m-upstream-compatibility-and-sources
+          path: |
+            results/source-probe.json
+            results/upstream-revisions.json
+            results/logs/*.json
+            results/upstream-discovery.log
+          retention-days: 28
+          if-no-files-found: warn
