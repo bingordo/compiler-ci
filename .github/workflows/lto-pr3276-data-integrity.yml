@@ -1,0 +1,91 @@
+name: LTO PR3276 Data Import Integrity
+on:
+  push:
+    branches: [validate/lto-pr3276-data-integrity-20261125]
+    paths:
+      - '.github/workflows/lto-pr3276-data-integrity.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  statuses: write
+jobs:
+  comdat-imports:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      SOURCE_SHA: 0204ce0454a3fe319775b112d73191b7092e36a2
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact source compiler SHA
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - name: Verify source and host tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          git -C compiler log -1 --oneline
+          gcc --version | head -n1
+          readelf --version | head -n1
+      - name: Authenticate private frontend dependencies
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: lto-pr3276-data-integrity
+      - name: Native and LTO COMDAT import GCC and ELF oracles
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test lto_cross_partition_relocs -- --nocapture
+          cargo test -p compiler --test lto_cross_tu_external_data -- --nocapture
+          cargo test -p compiler-ir --test lto_comdat_data_import_integrity -- --nocapture
+          cargo test -p compiler --test lto_source_comdat -- --nocapture
+      - name: Existing TypeId LTO and ELF regressions
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test lto_binary_v2_source -- --nocapture
+          cargo test -p compiler --test lto_binary_v2_metadata_source -- --nocapture
+          cargo test -p compiler --test lto_source_sidecar -- --nocapture
+          cargo test -p compiler --test lto_coemit -- --nocapture
+          cargo test -p compiler --test lto_common_elf -- --nocapture
+          cargo test -p compiler --test lto_elf_visibility -- --nocapture
+          cargo test -p compiler-ir --test lto_binary_v2_metadata -- --nocapture
+          cargo test -p compiler-ir --test lto_target_envelope -- --nocapture
+      - name: Driver backend IR build and strict scoped Clippy
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check -p compiler --bin compiler
+          cargo check -p compiler-ir -p compiler-backend -p compiler-backend-x86
+          cargo clippy -p compiler --test lto_cross_partition_relocs --test lto_cross_tu_external_data -- -D clippy::all -A clippy::empty_line_after_doc_comments -A clippy::collapsible_if -A clippy::needless_borrows_for_generic_args -A clippy::too_many_arguments -A clippy::needless_lifetimes -A clippy::type_complexity -A clippy::useless_conversion
+      - name: Publish exact candidate commit status
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_OUTCOME: ${{ job.status }}
+        run: |
+          case "$JOB_OUTCOME" in
+            success) state=success ;;
+            cancelled) state=error ;;
+            *) state=failure ;;
+          esac
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$state" \
+            -f context="candidate/lto-pr3276-data-integrity" \
+            -f description="Exact compiler PR3276 source SHA $SOURCE_SHA" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
