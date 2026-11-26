@@ -1,0 +1,81 @@
+name: uops.info bounded-memory XML import
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-uops-streaming.yml']
+permissions:
+  contents: read
+jobs:
+  indexed-variant-lookup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout immutable compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: caf770b6915214a2f0c13b1052761c2d3257c309
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require exact source SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "caf770b6915214a2f0c13b1052761c2d3257c309"
+      - name: Verify current indexed CPU JSON and Rust bytes exactly
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/tools"
+          python3 -m py_compile tools/import_uops_info.py tools/x86_latency_sources.py tools/regen_x86_indexed_costs.py tools/regen_x86_operand_latencies.py tools/regen_x86_memory_operand_latencies.py tools/test_x86_indexed_variant_lookup.py tools/test_x86_latency_sources.py
+          python3 - <<'PY'
+          import json
+          from regen_x86_indexed_costs import DATA,RUST,dump,render_rust,CPUS,SOURCE_SHA
+          source=json.loads(DATA.read_text())
+          assert source['xml_sha256']==SOURCE_SHA
+          assert DATA.read_text()==dump(source)
+          assert RUST.read_text()==render_rust(source)
+          assert set(source['profiles'])==set(CPUS)
+          print('INDEXED_UOPS_REVIEWED_BYTE_PARITY_OK')
+          PY
+      - name: Run full indexed cost strictness, streaming XML and source provenance mutation suites
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/tools"
+          python3 -m unittest discover -s tools -p test_x86_indexed_variant_lookup.py -v
+          python3 -m unittest discover -s tools -p test_x86_indexed_costs.py -v
+          python3 -m unittest discover -s tools -p test_import_uops_info.py -v
+          python3 -m unittest discover -s tools -p test_x86_operand_latencies.py -v
+          python3 -m unittest discover -s tools -p test_x86_memory_operand_latencies.py -v
+
+          python3 -m unittest discover -s tools -p test_x86_latency_sources.py -v
+  approved-xml-parity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: caf770b6915214a2f0c13b1052761c2d3257c309
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact candidate and approved upstream XML
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "caf770b6915214a2f0c13b1052761c2d3257c309"
+          curl -fL --retry 2 --max-time 300 https://uops.info/instructions.xml -o instructions.xml
+          test "$(sha256sum instructions.xml | cut -d' ' -f1)" = "e5e702caaf04c4fc1f75192a9bbe4d8554b3e174f7933a14d124cc33ca677ab3"
+      - name: Reproduce nominal profiles, report peak RSS and elapsed time
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for cpu in SKL ZEN4; do
+            /usr/bin/time -v python3 tools/import_uops_info.py ../instructions.xml --architecture "$cpu" --mapping data/x86_uops_variant_mapping.json --output "/tmp/cost-$cpu.json"
+            cmp "/tmp/cost-$cpu.json" "data/x86_costs_${cpu,,}.json"
+          done
+      - name: Check indexed and latency tables against approved upstream XML
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v python3 tools/regen_x86_indexed_costs.py --xml ../instructions.xml --check
+          /usr/bin/time -v python3 tools/regen_x86_operand_latencies.py --xml ../instructions.xml --check
+          /usr/bin/time -v python3 tools/regen_x86_memory_operand_latencies.py --xml ../instructions.xml --check
