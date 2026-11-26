@@ -1,0 +1,69 @@
+name: Temporary historical scalar optimizer retirement acceptance
+on:
+  pull_request:
+    paths: ['.github/workflows/temp-ir-scalar-retirement-3467.yml']
+permissions:
+  contents: read
+jobs:
+  native-scalar-retirement:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      SOURCE_SHA: 6fa3ef85fb8129b46423f4ce5bcc09f897a0c16c
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler source and isolate optimizer workspace
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-scalar-retirement
+      - name: Reject historical scalar pass API and feature references
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          if git grep -nE 'legacy-function-scalar-oracle|compiler_opt::fold_constants|compiler_opt::eliminate_dead_code|use compiler_opt::fold_constants' -- '*.rs' '*.toml'; then
+            exit 1
+          fi
+      - name: Optimizer unit and checked native TypeId regressions
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test typed_local
+          cargo test -p compiler-opt --test ctz_total_folding
+          cargo test -p compiler-opt --test ct03_closeout
+      - name: Alive-lite classifier and TypeId replay regression
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test alive_lite behavior_signals_are_distinct_and_conservative
+          cargo test -p compiler-opt --test retired_algebra_api
+      - name: All optimizer target compilation
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --lib
+          cargo check -p compiler-opt --all-targets
+      - name: Strict production optimizer lint
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt --lib -- -D warnings
+      - name: Shared production graph boundary
+        working-directory: compiler
+        run: python3 tools/check_mixed_function_export_boundary.py
