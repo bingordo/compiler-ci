@@ -1,0 +1,119 @@
+# Temporary exact-source acceptance gate for automatic canonical musttail.
+name: Native canonical musttail execution (#545)
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/issue545-native-canonical-tail.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  x86-canonical:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b2a2e7531abc516fd4c6dfb9d9caf991d720ed8b
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin and verify compiler candidate
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "b2a2e7531abc516fd4c6dfb9d9caf991d720ed8b"
+          echo "Compiler: b2a2e7531abc516fd4c6dfb9d9caf991d720ed8b" >> "$GITHUB_STEP_SUMMARY"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Isolate native compiler crates
+        run: |
+          mkdir -p work/crates
+          cp -a compiler/crates/ir compiler/crates/opt compiler/crates/backend \
+            compiler/crates/backend-x86 compiler/crates/backend-aarch64 work/crates/
+          cp -a compiler/tools compiler/examples compiler/tests work/
+          cat > work/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend",
+                     "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: work
+          key: issue545-canonical-x86
+      - name: Strict new source and machine checks
+        working-directory: work
+        run: |
+          RUSTFLAGS="-D warnings" cargo check -p compiler-ir --lib --test musttail_codec
+          cargo check -p compiler-backend-x86 --lib --test musttail_native
+          cargo check -p compiler-opt --lib --test musttail_preservation
+      - name: Canonical copy-on-write ABI and void proof
+        working-directory: work
+        run: |
+          cargo test -p compiler-ir --test musttail_codec -- --nocapture
+          cargo test -p compiler-ir --test musttail_verifier -- --nocapture
+      - name: Native x86 default emitter required tail ELF and GAS
+        working-directory: work
+        run: cargo test -p compiler-backend-x86 --test musttail_native -- --nocapture
+      - name: Existing optional x86 tail recursion baseline
+        working-directory: work
+        run: cargo test -p compiler-backend-x86 --test tailcall_native -- --nocapture
+      - name: Optimizer source musttail preservation
+        working-directory: work
+        run: cargo test -p compiler-opt --test musttail_preservation -- --nocapture
+      - name: Focused correctness and suspicious Clippy
+        working-directory: work
+        run: |
+          cargo clippy -p compiler-ir --lib -- -D clippy::correctness
+          cargo clippy -p compiler-backend-x86 --lib -- -D clippy::correctness
+
+  aarch64-canonical:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b2a2e7531abc516fd4c6dfb9d9caf991d720ed8b
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin and verify compiler candidate
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "b2a2e7531abc516fd4c6dfb9d9caf991d720ed8b"
+          echo "Compiler: b2a2e7531abc516fd4c6dfb9d9caf991d720ed8b" >> "$GITHUB_STEP_SUMMARY"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Isolate native compiler crates
+        run: |
+          mkdir -p work/crates
+          cp -a compiler/crates/ir compiler/crates/opt compiler/crates/backend \
+            compiler/crates/backend-x86 compiler/crates/backend-aarch64 work/crates/
+          cp -a compiler/tools compiler/examples compiler/tests work/
+          cat > work/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend",
+                     "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: work
+          key: issue545-canonical-a64
+      - name: AAPCS64 default emitter typecheck
+        working-directory: work
+        run: cargo check -p compiler-backend-aarch64 --lib --test musttail_native
+      - name: Native AArch64 default ELF and GAS canonical musttail C11
+        working-directory: work
+        run: cargo test -p compiler-backend-aarch64 --test musttail_native -- --nocapture
+      - name: AArch64 existing optional tail and ABI baseline
+        working-directory: work
+        run: |
+          cargo test -p compiler-backend-aarch64 --test tail_call_native -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test direct_calls -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test unwind_cfi -- --nocapture
+      - name: AArch64 Clippy correctness
+        working-directory: work
+        run: cargo clippy -p compiler-backend-aarch64 --lib -- -D clippy::correctness
