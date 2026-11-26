@@ -20,7 +20,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 1716af12d50be5f3902294d4baed822b45cd1a50
+          ref: 51bd647711d490d82da6c12655b375d502e94f7e
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
           path: compiler
@@ -28,7 +28,7 @@ jobs:
         working-directory: compiler
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = 1716af12d50be5f3902294d4baed822b45cd1a50
+          test "$(git rev-parse HEAD)" = 51bd647711d490d82da6c12655b375d502e94f7e
           printf 'Compiler repair candidate: %s\n' "$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
       - name: Isolate public compiler crates from private frontend workspaces
         working-directory: compiler
@@ -44,19 +44,36 @@ jobs:
           workspaces: compiler
           key: main-repair-cross-crate
       - name: Run IR, optimizer, backend and x86 full Rust tests
+        id: core
+        continue-on-error: true
         working-directory: compiler
         run: |
           set -euo pipefail
           cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
       - name: AArch64 reviewed instruction forms and all-target compilation
+        id: arm
+        if: always()
+        continue-on-error: true
         working-directory: compiler
         run: |
           set -euo pipefail
           RUSTFLAGS="-D warnings" cargo check -p compiler-backend-aarch64 --all-targets
           cargo test -p compiler-backend-aarch64 --test generated_scalar_gp_forms
       - name: Check RV64/wasm and strict Rust lint of core/backend
+        id: lint
+        if: always()
+        continue-on-error: true
         working-directory: compiler
         run: |
           set -euo pipefail
           cargo check -p compiler-backend-riscv64 -p compiler-backend-wasm --all-targets
           cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
+      - name: Fail if any compiler main repair suite fails
+        if: always()
+        env:
+          CORE: ${{ steps.core.outcome }}
+          ARM: ${{ steps.arm.outcome }}
+          LINT: ${{ steps.lint.outcome }}
+        run: |
+          printf 'core=%s AArch64=%s lint=%s\n' "$CORE" "$ARM" "$LINT"
+          test "$CORE" = success && test "$ARM" = success && test "$LINT" = success
