@@ -34,11 +34,23 @@ jobs:
         with:
           workspaces: compiler/tools/mini-c-driver -> target
           key: minic-aggregate-places-candidate
+      - name: Isolate backend-only workspace from unrelated frontend dependencies
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("compiler/Cargo.toml")
+          s=p.read_text()
+          assert s.count(', "crates/driver"')==1
+          assert 'exclude = ["tools/mini-c-driver"]' in s
+          p.write_text(s.replace(', "crates/driver"', '').replace('exclude = ["tools/mini-c-driver"]','exclude = ["tools/mini-c-driver", "crates/driver"]'))
+          PY
       - name: Focused x86 scalar compare tests
         run: cargo test -p compiler-backend-x86 --manifest-path compiler/Cargo.toml --lib scalar_cmp_direct_lhs -- --nocapture
       - name: Focused GCC aggregate place test
+        if: success() || failure()
         run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test aggregate_places -- --nocapture
       - name: Focused pointer transport tests
+        if: success() || failure()
         run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test opaque_object_pointer_transport -- --nocapture
       - name: Existing Mini-C adapter unit tests
         if: success() || failure()
@@ -77,6 +89,27 @@ jobs:
             fi
           done
           exit "$failure"
+      - name: Replay original strict observable corpus without body omission
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          header=$(dpkg -L libcsmith-dev | grep '/csmith.h$' | head -n1)
+          test -s "$header"
+          manifest=compiler/tools/mini-c-driver/Cargo.toml
+          compiler_sha=$(git -C compiler rev-parse HEAD)
+          frontend=$(PYTHONPATH=compiler/tools python3 -c 'from csmith_probe import pinned_frontend_revision; import sys; print(pinned_frontend_revision(open(sys.argv[1]).read()))' "$manifest")
+          evidence="$RUNNER_TEMP/struct-evidence/strict-observable"
+          python3 compiler/tools/csmith_probe.py --generate --cases-dir "$evidence/cases" --csmith csmith --seed-base 1 --seed-count 8 --profile restricted-observable
+          rc=0
+          python3 compiler/tools/csmith_probe.py --probe --cases-dir "$evidence/cases" --artifacts-dir "$evidence/results" --include-dir "$(dirname "$header")" --preprocess-c --driver "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" --compiler-sha "$compiler_sha" --frontend-sha "$frontend" --minimum-native 0 --run-timeout 5 --max-wall-seconds 120 || rc=$?
+          python3 - "$evidence/results/results.jsonl" <<'PY'
+          import json,sys
+          for line in open(sys.argv[1]):
+              r=json.loads(line)
+              print("STRICT_RESULT", json.dumps({k:r.get(k) for k in ("seed","classification","compiler","frontend_diagnostic")}))
+          PY
+          exit "$rc"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
