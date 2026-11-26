@@ -39,3 +39,34 @@ jobs:
             crates/backend-aarch64/tests/fixtures/typeid_abi_pressure_v3.ir \
             crates/backend-aarch64/tests/fixtures/direct_calls_sixteen_internal_v3.ir \
             crates/backend-aarch64/tests/fixtures/indexed_scales_v3.ir | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Exact enum variant layout and source consumer inventory
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Diagnostic-only rustc layout dump; no production build flags changed.
+          for package in compiler-ir compiler-backend; do
+            RUSTC_BOOTSTRAP=1 cargo rustc -p "$package" --lib -- -Zprint-type-sizes > "$RUNNER_TEMP/$package-layout.log" 2>&1 || { tail -100 "$RUNNER_TEMP/$package-layout.log"; exit 1; }
+          done
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import os, pathlib, re
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          wanted = {"Op", "ScalarOp", "typed_ssa::TypedInstruction", "native_integer::ScalarInst", "native_integer::ScalarOp"}
+          found = set()
+          for package in ("compiler-ir", "compiler-backend"):
+              active = False
+              for line in (root / (package + "-layout.log")).read_text(errors="replace").splitlines():
+                  match = re.match(r"print-type-size type: `([^`]+)`:", line)
+                  if match:
+                      name = match.group(1)
+                      active = name in wanted or name.rsplit("::", 1)[-1] in {"Op", "ScalarOp"}
+                      if active:
+                          found.add(name.rsplit("::", 1)[-1])
+                  if active and line.startswith(("print-type-size type:", "print-type-size     variant:", "print-type-size     discriminant:")):
+                      print(line)
+          if not {"Op", "ScalarOp"} <= found:
+              raise SystemExit("missing required enum layout")
+          PY
+          echo 'InlineAsmGpGroup consumer files:' | tee -a "$GITHUB_STEP_SUMMARY"
+          git grep -l -F InlineAsmGpGroup -- '*.rs' | tee -a "$GITHUB_STEP_SUMMARY"
+          git grep -n -F InlineAsmGpGroup -- '*.rs'
