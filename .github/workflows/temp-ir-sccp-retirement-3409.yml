@@ -1,0 +1,74 @@
+name: Temporary historical SCCP retirement acceptance
+on:
+  pull_request:
+    paths: ['.github/workflows/temp-ir-sccp-retirement-3409.yml']
+permissions:
+  contents: read
+jobs:
+  sccp-retirement:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      SOURCE_SHA: 13ccca02cbdabcb6802f273455a4815e56ddabb7
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm source and isolate core workspace
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-sccp-retirement
+      - name: Audit historical SCCP callers
+        working-directory: compiler
+        run: |
+          if git grep -nE 'legacy-function-sccp-oracle|(^|[^[:alnum:]_])sccp::|\bsolve_sparse\(' -- '*.rs' '*.toml'; then
+            exit 1
+          fi
+      - name: Native SCCP unit regression and full CFG reference sweep
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo test -p compiler-opt --lib
+      - name: Native SCCP exact expectations and alternative fact storage
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_sccp
+          cargo test -p compiler-opt --test typed_sccp --features experimental-sccp-hash
+      - name: All optimizer targets
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --lib
+          cargo check -p compiler-opt --all-targets
+      - name: Alive-lite native pass observation and SMT checks
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test alive_lite
+          sudo apt-get update -qq
+          sudo apt-get install -y z3
+          cargo test -p compiler-opt --test alive_lite prove_actual_optimizer_passes -- --ignored
+          cargo test -p compiler-opt --test alive_lite prove_seeded_select_against_real_optimizer_passes -- --ignored
+      - name: Production graph boundary
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: python3 tools/check_mixed_function_export_boundary.py
