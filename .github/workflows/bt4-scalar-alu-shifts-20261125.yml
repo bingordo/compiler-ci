@@ -1,0 +1,63 @@
+name: BT4 reviewed scalar ALU shift NOT width and access roles
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/bt4-scalar-alu-shifts-20261125.yml'
+permissions:
+  contents: read
+jobs:
+  x86-abi-regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub for private compiler checkout
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 626bc6bda30cbb60805911a20c17a5887935c7d1
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify candidate source
+        run: test "$(git -C compiler rev-parse HEAD)" = "626bc6bda30cbb60805911a20c17a5887935c7d1"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: bt4-budgeted-abi-runner
+      - name: Build x86 unit test binary and run every refactored ABI oracle
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          for test in \
+            machine_ssa_call_preserves_live_values_and_passes_six_arguments \
+            source_ir_calls_survive_optimization_and_link_to_external_c \
+            machine_ssa_eight_args_call_and_stack_entry_agree_with_c \
+            sixteen_integer_arguments_roundtrip_through_c_with_live_across_call \
+            seven_and_nine_arg_calls_preserve_negative_values_and_outgoing_slots
+          do
+            cargo test -p compiler-backend-x86 --features compiler-opt/legacy-function-cse-oracle --lib "$test" -- --nocapture
+          done
+          cargo test -p compiler-backend-x86 --features compiler-opt/legacy-function-cse-oracle --lib generated_sixteen_arg_abi_permutations_all_budgets -- --nocapture
+          cargo test -p compiler-backend-x86 --features compiler-opt/legacy-function-cse-oracle --lib generated_mixed_seven_nine_abi_permutations_all_budgets -- --nocapture
+          cargo test -p compiler-backend-x86 --features compiler-opt/legacy-function-cse-oracle --lib mixed_sysv_fanout_physical_stack_word_mutants_fail_all_budgets -- --nocapture
+          cargo test -p compiler-backend-x86 --features compiler-opt/legacy-function-cse-oracle --lib generated_sixteen_arg_live_through_pressure_and_slot_mutants -- --nocapture
+          cargo test -p compiler-backend-x86 --features compiler-opt/legacy-function-cse-oracle --lib physical_integer_call_stack_auditor_rejects_malformed_accesses -- --nocapture
+          cargo test -p compiler-backend-x86 --features compiler-opt/legacy-function-cse-oracle --lib reviewed_integer_roles_match_register_scheduler_hazards -- --nocapture
+          cargo test -p compiler-backend-x86 --features compiler-opt/legacy-function-cse-oracle --lib reviewed_bsf_scalar_cmp_roles_and_widths -- --nocapture
+          cargo test -p compiler-backend-x86 --features compiler-opt/legacy-function-cse-oracle --lib reviewed_scalar_alu_shift_not_widths_and_roles -- --nocapture
+          cargo test -p compiler-backend-x86 --features compiler-opt/legacy-function-cse-oracle --lib reviewed_integer_encoder_rejects_invalid_widths_and_memory_roles -- --nocapture
+          cargo test -p compiler-backend-x86 --features compiler-opt/legacy-function-cse-oracle --lib outgoing_sysv_stack_area_never_overlaps_spills_phi_temp_or_locals -- --nocapture
+      - name: Backend Clippy checks (exclude unrelated generated rustc warnings)
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-backend-x86 --lib -- -D clippy::all -A clippy::empty_line_after_doc_comments -A clippy::needless_lifetimes -A clippy::collapsible_match -A clippy::suspicious_assignment_formatting -A clippy::collapsible_if -A clippy::chunks_exact_to_as_chunks
