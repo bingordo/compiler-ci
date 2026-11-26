@@ -1,0 +1,49 @@
+name: x86 shared full-XED exact variant index
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-x86-shared-variant-index.yml']
+permissions:
+  contents: read
+jobs:
+  indexed-variant-lookup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout immutable compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e5f164a6a0cf60bdbab2b1dc346aa58369fffd8a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require exact source SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = "e5f164a6a0cf60bdbab2b1dc346aa58369fffd8a"
+      - name: Verify current indexed CPU JSON and Rust bytes exactly
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/tools"
+          python3 -m py_compile tools/import_uops_info.py tools/x86_latency_sources.py tools/regen_x86_indexed_costs.py tools/regen_x86_operand_latencies.py tools/regen_x86_memory_operand_latencies.py tools/test_x86_indexed_variant_lookup.py tools/test_x86_latency_sources.py
+          python3 - <<'PY'
+          import json
+          from regen_x86_indexed_costs import DATA,RUST,dump,render_rust,CPUS,SOURCE_SHA
+          source=json.loads(DATA.read_text())
+          assert source['xml_sha256']==SOURCE_SHA
+          assert DATA.read_text()==dump(source)
+          assert RUST.read_text()==render_rust(source)
+          assert set(source['profiles'])==set(CPUS)
+          print('INDEXED_UOPS_REVIEWED_BYTE_PARITY_OK')
+          PY
+      - name: Run full indexed cost strictness, streaming XML and source provenance mutation suites
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/tools"
+          python3 -m unittest discover -s tools -p test_x86_indexed_variant_lookup.py -v
+          python3 -m unittest discover -s tools -p test_x86_indexed_costs.py -v
+          python3 -m unittest discover -s tools -p test_import_uops_info.py -v
+          python3 -m unittest discover -s tools -p test_x86_operand_latencies.py -v
+          python3 -m unittest discover -s tools -p test_x86_memory_operand_latencies.py -v
+
+          python3 -m unittest discover -s tools -p test_x86_latency_sources.py -v
