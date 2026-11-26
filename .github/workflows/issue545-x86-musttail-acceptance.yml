@@ -1,0 +1,59 @@
+# Temporary source-pinned compiler-ci acceptance for issue #545 x86 musttail.
+name: X86 required tail branch acceptance (#545)
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/issue545-x86-musttail-acceptance.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  x86-required-tail:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: cf881a077eeea4358b279414bbd318c8c2282b9e
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify actual candidate
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = 'cf881a077eeea4358b279414bbd318c8c2282b9e'
+          echo "Compiler: cf881a077eeea4358b279414bbd318c8c2282b9e" >> "$GITHUB_STEP_SUMMARY"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Isolate tested source without unrelated workspaces
+        run: |
+          mkdir -p work/crates
+          cp -a compiler/crates/ir compiler/crates/opt compiler/crates/backend \
+            compiler/crates/backend-x86 compiler/crates/backend-aarch64 work/crates/
+          cp -a compiler/tools compiler/examples compiler/tests work/
+          cat > work/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend",
+                     "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: work
+          key: issue545-x86-musttail
+      - name: Compile exact x86 required-tail target
+        working-directory: work
+        run: cargo check -p compiler-backend-x86 --lib --test musttail_native
+      - name: Guaranteed physical jump and four C11 ELF ABI modes
+        working-directory: work
+        run: cargo test -p compiler-backend-x86 --test musttail_native -- --nocapture
+      - name: Previously merged optional tail execution baseline
+        working-directory: work
+        run: cargo test -p compiler-backend-x86 --test tailcall_native -- --nocapture
+      - name: Source-level ABI proof
+        working-directory: work
+        run: cargo test -p compiler-ir --test musttail_verifier -- --nocapture
+      - name: Physically verified tail Clippy correctness
+        working-directory: work
+        run: |
+          cargo clippy -p compiler-backend-x86 --lib -- -D clippy::correctness
+          cargo clippy -p compiler-backend-x86 --test musttail_native -- -D clippy::correctness
