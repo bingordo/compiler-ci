@@ -1,0 +1,51 @@
+# Temporary exact-source validation. Do not merge into compiler-ci main.
+name: IR PR3430 native memory semantic oracle
+on:
+  push:
+    branches: [verify-ir-memory-oracle-3430-20261126]
+    paths: ['.github/workflows/ir-pr3430-memory.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      SOURCE_SHA: 30e413c3a03abe43d8585ae93c24fc6dc07f694d
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and isolate core workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-pr3430-memory
+      - name: Compile all opt targets and run independent memory semantic tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --all-targets
+          cargo test -p compiler-opt --test memory_execution_oracle
+          cargo test -p compiler-opt --test typed_global_memory
+          cargo test -p compiler-opt --test typed_dse
+      - name: Strict semantic oracle lint
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy --no-deps -p compiler-opt --test memory_execution_oracle -- -D warnings -A dead_code
