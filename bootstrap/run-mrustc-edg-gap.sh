@@ -544,6 +544,44 @@ PY
     fi
   fi
 
+  # Execute the original public folded global-address fixture against a
+  # GCC-built caller, checking both zero and nonzero relocation addends.
+  if [[ "${EDG_C_MIXED_GLOBAL_PROBE:-0}" == "1" ]]; then
+    folded_src=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_c_folded_record_address.c
+    folded_harness=/audit-tmp/compiler-literal-candidate/tools/edg-driver/tests/fixtures/bootstrap_c_folded_record_address_harness.c
+    folded_gcc=11
+    folded_native=11
+    folded_link=11
+    folded_exec=11
+    set +e
+    gcc -std=gnu11 -O0 -fno-pie -no-pie "$folded_src" "$folded_harness" \
+      -o /audit-tmp/folded-gcc && /audit-tmp/folded-gcc
+    folded_gcc=$?
+    (
+      cd /workspace/edgcpp/build/gcc-release
+      CARGO_TARGET_DIR=/workspace/edgcpp-rust/target \
+        timeout --signal=TERM --kill-after=10s 8m cargo --config "$edg_patch" run --quiet \
+        --manifest-path /audit-tmp/compiler-literal-candidate/tools/edg-driver/Cargo.toml \
+        -- /audit-tmp/folded-native.o --gcc --c11 --no_strict_gnu \
+        --gnu_version "$gnu_number" "$folded_src"
+    ) > /audit-tmp/folded-native.log 2>&1
+    folded_native=$?
+    if (( folded_native == 0 )); then
+      gcc -std=gnu11 -O0 -fno-pie -no-pie /audit-tmp/folded-native.o \
+        "$folded_harness" -o /audit-tmp/folded-native
+      folded_link=$?
+      if (( folded_link == 0 )); then
+        /audit-tmp/folded-native
+        folded_exec=$?
+      fi
+    fi
+    set -e
+    echo "EDG_C_FOLDED_ADDRESS_GCC_EXIT=$folded_gcc"
+    echo "EDG_C_FOLDED_ADDRESS_NATIVE_EXIT=$folded_native"
+    echo "EDG_C_FOLDED_ADDRESS_LINK_EXIT=$folded_link"
+    echo "EDG_C_FOLDED_ADDRESS_EXEC_EXIT=$folded_exec"
+  fi
+
   # Full public GNU C11 weak data/routine combined proof. The source
   # fixture and harness are both committed with the candidate compiler.
   # Private mrustc generated C is not part of this positive oracle.
