@@ -1,0 +1,182 @@
+name: S23.51l source-pinned two-pass original SSA producer builder correctness and memory
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-51l-two-pass-memory.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  two-pass-producer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_BUILD_JOBS: '2'
+      RUST_TEST_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler-ci
+          ref: 343f4250b297d7b431f5f6a7d754b9416053560d
+          path: memory-tools
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 8bbe7d9a19956a280e678f1e1b92918572cc943d
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1a8f494df0f97ac81ce4bcf501ee054f0a953b70
+          fetch-depth: 4
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler code, matched 88-rule DSL and shared stress instrumentation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C before rev-parse HEAD)" = 8bbe7d9a19956a280e678f1e1b92918572cc943d
+          test "$(git -C after rev-parse HEAD)" = 1a8f494df0f97ac81ce4bcf501ee054f0a953b70
+          git -C after merge-base --is-ancestor 8bbe7d9a19956a280e678f1e1b92918572cc943d HEAD
+          git -C after diff --name-only 8bbe7d9a19956a280e678f1e1b92918572cc943d HEAD | tee changed-files.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          expected={'crates/opt/src/generated_typeid_shadow.rs',
+                    'crates/opt/src/generated_typeid_probe_census_tests.rs',
+                    'docs/research/S23_51l_two_pass_producer_build.md'}
+          assert set(Path('changed-files.txt').read_text().splitlines())==expected
+          PY
+          cmp before/tools/typeid-rule-gen/examples.rules after/tools/typeid-rule-gen/examples.rules
+          cmp before/tools/typeid-rule-gen/ssa_codegen.py after/tools/typeid-rule-gen/ssa_codegen.py
+          test "$(git -C memory-tools rev-parse HEAD)" = 343f4250b297d7b431f5f6a7d754b9416053560d
+          python3 -m py_compile memory-tools/scripts/s2351k_memory_scaling.py
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          mkdir -p results
+          printf 'S2351L_PINS before=%s after=%s script=%s\n' 8bbe7d9a19956a280e678f1e1b92918572cc943d 1a8f494df0f97ac81ce4bcf501ee054f0a953b70 343f4250b297d7b431f5f6a7d754b9416053560d
+          rustc --version
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before -> target
+            after -> target
+          key: s2351l-ssa-producer-builder
+      - name: Retrieve original S23.47/48 checked SSA source snapshots
+        uses: actions/download-artifact@v4
+        with:
+          name: s23-48-exact-source-typeid-stage-attribution
+          run-id: 43349934825
+          repository: bingordo/compiler-ci
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: captured
+      - name: Verify source and extreme ValueId tests on exact candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(wc -l < captured/typeid_snapshots/manifest.tsv)" -eq 44
+          (cd after && cargo test --release -p compiler-opt --lib \
+            s2351j_compact_storage_exact_legacy_view_semantics_on_dense_and_sparse_ids \
+            -- --nocapture --test-threads=1) 2>&1 | tee results/dense-sparse-extremes.log
+          (cd after && cargo test --release -p compiler-opt --lib \
+            s2351l_two_pass_builder_preserves_same_kind_duplicate_original_id_behavior \
+            -- --nocapture --test-threads=1) 2>&1 | tee results/duplicate-id.log
+          for rev in before after; do
+            (cd "$rev" && S2351_SNAPSHOT_DIR="$GITHUB_WORKSPACE/captured/typeid_snapshots" \
+              cargo test --release -p compiler-opt --lib \
+              s2351j_compact_original_producer_table_source_cost \
+              -- --nocapture --test-threads=1) \
+              2>&1 | tee "results/original-ssa-$rev.log"
+            grep -q 'S2351J_COVERAGE source_cases=44 stages=88 roots=4613 hits=68 ' \
+              "results/original-ssa-$rev.log"
+          done
+      - name: Build two release production compilers outside time and RSS samples
+        shell: bash
+        run: |
+          set -euo pipefail
+          for rev in before after; do
+            timeout --signal=TERM --kill-after=10s 18m cargo build --release \
+              -p compiler --bin compiler --manifest-path "$rev/Cargo.toml"
+            test -s "$rev/target/release/compiler"
+          done
+      - name: Regenerate same GCC-verified C11 source and 96–6144 function inputs as S23.51k
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/a64_cfg_source_census.py generate results/seed
+          python3 memory-tools/scripts/s2351k_memory_scaling.py generate results
+      - name: Measure complete original compiler time, peak RSS and page faults pre/post two-pass builder
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 memory-tools/scripts/s2351k_memory_scaling.py benchmark results \
+            --baseline before/target/release/compiler \
+            --candidate after/target/release/compiler | tee results/timing.log
+          python3 memory-tools/scripts/s2351k_memory_scaling.py summarize results | tee results/ratio.log
+      - name: Require byte-equal original generated x86 machine code and GCC runtime oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcc -std=c11 -O2 -c results/seed/gcc_reference.c -o results/seed/ref.o
+          for rev in before after; do
+            gcc -std=c11 -O2 results/seed/oracle.c "results/native/$rev"_96.o \
+              results/seed/ref.o -o "results/$rev"_96_oracle
+            "results/$rev"_96_oracle
+          done
+          for n in 96 384 768 3072 6144; do
+            cmp "results/native/before_$n.text" "results/native/after_$n.text"
+          done
+      - name: Install pinned-distro heaptrack allocator instrumentation separate from RSS
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq heaptrack
+      - name: Verify allocator and peak heap results on 96,768,3072 functions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 memory-tools/scripts/s2351k_memory_scaling.py heap results \
+            --baseline before/target/release/compiler \
+            --candidate after/target/release/compiler | tee results/allocator.log
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          root=Path('results')
+          rows=json.loads((root/'whole-process-timings.json').read_text())
+          assert len(rows)==20
+          prof=json.loads((root/'s2351k-heaptrack-summary.json').read_text())
+          assert len(prof)==6
+          assert all(int(x['allocations'])>0 for x in prof)
+          print('S2351L_COMPLETE original_source=44_88 scaled=96_6144 abba=20 alloc=6')
+          PY
+      - name: Compare real release compiler executable text and total file sizes
+        shell: bash
+        run: |
+          set -euo pipefail
+          for rev in before after; do
+            b="$rev/target/release/compiler"
+            size -A "$b" > "results/$rev-compiler-sections.txt"
+            stat -c '%s' "$b" > "results/$rev-executable-size.txt"
+          done
+          grep '^.text ' results/before-compiler-sections.txt
+          grep '^.text ' results/after-compiler-sections.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: s2351l-two-pass-original-producer-costs
+          path: |
+            results/*.json
+            results/*.log
+            results/*.txt
+            changed-files.txt
+          if-no-files-found: warn
+          retention-days: 28
