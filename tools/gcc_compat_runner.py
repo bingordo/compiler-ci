@@ -271,7 +271,7 @@ def main():
                 "compiler_sha": args.compiler_sha,
                 "planned_records": 2 * (len(sources) + len(singles)),
                 "bitfield_layout_inventory": layout_inventory,
-            }, indent=2) + "\\n")
+            }, indent=2) + "\n")
     if args.required:
         required = json.loads(args.required.read_text())
         if required["gcc_revision"] != revision:
