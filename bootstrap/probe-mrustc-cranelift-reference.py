@@ -94,7 +94,7 @@ with tempfile.TemporaryDirectory() as d:
                         with p.open(errors="replace") as stream:
                             window = "".join(itertools.islice(stream, max(0,n-3), n+2))
                         keywords = ("__int128","__uint128_t","__int128_t","__attribute__",
-                                    "__extension__","__typeof__","typeof","__auto_type",
+                                    "__extension__","__typeof__","typeof","__auto_type","__thread","_Thread_local","thread_local",
                                     "_Static_assert","_Alignas","_Alignof","__asm__",
                                     "__builtin_va_list","__float128","_Float128",
                                     "inline","__inline__","__inline","restrict",
