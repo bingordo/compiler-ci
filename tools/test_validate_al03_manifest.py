@@ -67,6 +67,61 @@ class AL03ManifestTests(unittest.TestCase):
         with self.assertRaises(ManifestError):
             self.check(source=self.source + "\n#[test]\nfn al03_new_concrete() {}\n")
 
+    def standalone(self):
+        manifest = dict(self.manifest, standalone_concrete=[{
+            "name": "al03_native_wide_fixtures_match_historical_oracles",
+            "scope": "Independent native TypeId / historical oracle parity and text roundtrip",
+        }])
+        source = self.source + (
+            "#[test]\nfn al03_native_wide_fixtures_match_historical_oracles() {}\n"
+        )
+        concrete = self.concrete.replace(
+            "test result: ok. 1 passed;",
+            "test alive_lite_typeid_wide::"
+            "al03_native_wide_fixtures_match_historical_oracles ... ok\n"
+            "test result: ok. 2 passed;",
+        )
+        return manifest, source, concrete
+
+    def test_explicit_standalone_concrete_requires_execution(self):
+        manifest, source, concrete = self.standalone()
+        report = self.check(manifest=manifest, source=source, concrete=concrete)
+        self.assertEqual(report["suites"], 1)
+        self.assertEqual(report["concrete_tests"], 2)
+        self.assertEqual(report["standalone_concrete_tests"], 1)
+        self.assertEqual(report["external_z3_tests"], 1)
+
+    def test_standalone_missing_log_fails(self):
+        manifest, source, _ = self.standalone()
+        with self.assertRaises(ManifestError):
+            self.check(manifest=manifest, source=source)
+
+    def test_standalone_missing_source_fails(self):
+        manifest, _, concrete = self.standalone()
+        with self.assertRaises(ManifestError):
+            self.check(manifest=manifest, concrete=concrete)
+
+    def test_standalone_misclassified_proof_fails(self):
+        manifest, source, concrete = self.standalone()
+        source = source.replace(
+            "#[test]\nfn al03_native_wide",
+            "#[test]\n#[ignore = \"requires Z3\"]\nfn al03_native_wide",
+        )
+        with self.assertRaises(ManifestError):
+            self.check(manifest=manifest, source=source, concrete=concrete)
+
+    def test_standalone_duplicate_paired_suite_fails(self):
+        manifest, _, _ = self.standalone()
+        manifest["standalone_concrete"][0]["name"] = self.name
+        with self.assertRaises(ManifestError):
+            self.check(manifest=manifest)
+
+    def test_standalone_requires_reviewed_scope(self):
+        manifest, _, _ = self.standalone()
+        manifest["standalone_concrete"][0]["scope"] = ""
+        with self.assertRaises(ManifestError):
+            self.check(manifest=manifest)
+
     def test_missing_source_test_fails_closed(self):
         with self.assertRaises(ManifestError):
             self.check(source=self.source.replace(
