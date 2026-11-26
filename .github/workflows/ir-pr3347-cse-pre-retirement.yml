@@ -1,0 +1,53 @@
+# Temporary source-pinned validation on compiler-ci only; never merge to main.
+name: IR PR3347 CSE PRE retirement
+on:
+  push:
+    branches: [verify-ir-cse-pre-3347-20261126]
+    paths: ['.github/workflows/ir-pr3347-cse-pre-retirement.yml']
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: 60ac93eb021dd9fd54a027abc1209ca7383ad638
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and isolate core workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo 'Remaining direct Function CSE/PRE references (audit):'
+          git -C compiler grep -n 'compiler_opt::cse\|compiler_opt::pre\|crate::cse::\|crate::pre::\|legacy-function-cse-oracle\|legacy-function-pre-oracle' -- crates/opt || :
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-pr3347-cse-pre
+      - name: Compile all optimizer test targets
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --all-targets
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test typed_cse
+          cargo test -p compiler-opt --test typed_pre
+      - name: Lint native optimizer
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --lib -- -D warnings -A dead_code
