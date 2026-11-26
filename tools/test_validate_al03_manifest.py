@@ -73,12 +73,12 @@ class AL03ManifestTests(unittest.TestCase):
             "scope": "Independent native TypeId / historical oracle parity and text roundtrip",
         }])
         source = self.source + (
-            "#[test]\\nfn al03_native_wide_fixtures_match_historical_oracles() {}\\n"
+            "#[test]\nfn al03_native_wide_fixtures_match_historical_oracles() {}\n"
         )
         concrete = self.concrete.replace(
             "test result: ok. 1 passed;",
             "test alive_lite_typeid_wide::"
-            "al03_native_wide_fixtures_match_historical_oracles ... ok\\n"
+            "al03_native_wide_fixtures_match_historical_oracles ... ok\n"
             "test result: ok. 2 passed;",
         )
         return manifest, source, concrete
@@ -104,8 +104,8 @@ class AL03ManifestTests(unittest.TestCase):
     def test_standalone_misclassified_proof_fails(self):
         manifest, source, concrete = self.standalone()
         source = source.replace(
-            "#[test]\\nfn al03_native_wide",
-            "#[test]\\n#[ignore = \\"requires Z3\\"]\\nfn al03_native_wide",
+            "#[test]\nfn al03_native_wide",
+            "#[test]\n#[ignore = \"requires Z3\"]\nfn al03_native_wide",
         )
         with self.assertRaises(ManifestError):
             self.check(manifest=manifest, source=source, concrete=concrete)
