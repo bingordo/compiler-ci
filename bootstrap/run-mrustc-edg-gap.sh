@@ -451,6 +451,10 @@ errors=[line for line in lines if any(k in line for k in
 for i,line in enumerate(errors[-8:],1):
     msg=re.sub(r"/(?:workspace|audit-tmp)/[^ :]+","public_fixture",line.strip())
     msg=re.sub(r"[^A-Za-z0-9 _.,=:/()><-]","_",msg)
+    # Public fixture errors can carry nested phase wrappers; retain the
+    # actual terminal reason instead of truncating it behind those wrappers.
+    if "EDG_PUBLIC_C_FOLDED_ADDRESS_REASON=" in msg:
+        msg="EDG_PUBLIC_C_FOLDED_ADDRESS_REASON="+msg.rsplit(" END ",1)[-1][-130:]
     if msg:print(f"EDG_C_LOCAL_TYPEDEF_DIAG_{i}={msg[:180]}")
 PY
     fi
