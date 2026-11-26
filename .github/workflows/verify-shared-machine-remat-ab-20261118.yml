@@ -1,113 +1,93 @@
-name: source-pinned generic machine remat x86 and aarch64
+name: AArch64 source-CFG 96-function controlled single/dual trace study
 on:
   push:
-    branches: [main]
-    paths: [.github/workflows/verify-shared-machine-remat-ab-20261118.yml]
-  workflow_dispatch:
+    branches: [experiment/a64-source-cfg-census-20261126]
+    paths:
+      - '.github/workflows/verify-shared-machine-remat-ab-20261118.yml'
+      - 'scripts/a64_cfg_source_census.py'
 permissions:
   contents: read
+  statuses: write
 jobs:
-  correctness:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 55
+  native:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 95
     env:
+      CONTROL_SHA: '826bce0faf927f998a3282dcf06742721005d2fa'
+      DUAL_SHA: '41ba00f60b00adc58d969df85c4ac44d34094a1f'
       CARGO_INCREMENTAL: '0'
       CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: e7b79a843fbe6b1d861fa9967c6c279ab97aeba3
-          path: old
+          ref: '826bce0faf927f998a3282dcf06742721005d2fa'
+          path: single
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 192d60ba8888efa5036e897ec3792f3942edc77f
-          path: new
+          ref: '41ba00f60b00adc58d969df85c4ac44d34094a1f'
+          path: dual
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Assert exact source pins
+      - name: Assert same compiler source except deliberately controlled A64 scheduler
         run: |
           set -euo pipefail
-          test "$(git -C old rev-parse HEAD)" = "e7b79a843fbe6b1d861fa9967c6c279ab97aeba3"
-          test "$(git -C new rev-parse HEAD)" = "192d60ba8888efa5036e897ec3792f3942edc77f"
-          lscpu | grep -E '^Model name:|^Architecture:' || true
+          test "$(git -C single rev-parse HEAD)" = "$CONTROL_SHA"
+          test "$(git -C dual rev-parse HEAD)" = "$DUAL_SHA"
+          uname -m | grep -Eq 'aarch64|arm64'
           git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          test "$(git -C single diff "$DUAL_SHA" --name-only | wc -l)" -eq 1
+          test "$(git -C single diff "$DUAL_SHA" --name-only)" = 'crates/backend-aarch64/src/block_layout.rs'
+          echo "C11 source CFG census: control $CONTROL_SHA, dual $DUAL_SHA" >> "$GITHUB_STEP_SUMMARY"
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
-            old -> target
-            new -> target
-          key: shared-remat-20261118
-      - name: Generic planner and cross-target correctness and strict Clippy
-        working-directory: new
+            single -> target
+            dual -> target
+          key: a64-source-cfg-census-control-20261126
+      - name: Generate deterministic shared source and independent GCC reference
         run: |
           set -euo pipefail
-          cargo test -p compiler-backend --lib remat::tests -- --nocapture
-          cargo test -p compiler-backend --lib
-          cargo test -p compiler-backend-x86 --lib
-          cargo test -p compiler-backend-aarch64 --lib
-          cargo clippy -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --lib -- -D warnings
-          cargo test -p compiler --test x86_inline_source_ablation -- --nocapture
-          cargo test -p compiler --test x7_s4_rolling_checksum_source -- --nocapture
-      - name: Exact benchmark overlay on both pinned compiler sources
+          python3 scripts/a64_cfg_source_census.py generate results
+          sha256sum results/generated.c results/gcc_reference.c results/oracle.c
+      - name: Compile both exact revisions through TypeId, verify GAS parity, execute GCC oracle
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          path=Path('crates/driver/tests/x86_source_runtime_performance.rs')
-          orig=(Path('old')/path).read_bytes()
-          updated=(Path('new')/path).read_bytes()
-          assert orig==updated, 'benchmark fixture changed between commits'
-          needle=b'REPS=7, ITERS=1800'
-          assert orig.count(needle)==1
-          for root in ('old','new'):
-              (Path(root)/path).write_bytes(orig.replace(needle,b'REPS=7, ITERS=18000'))
-          PY
-          for case in old new; do
-            (cd "$case" && cargo test --release -p compiler --test x86_source_runtime_performance --no-run)
+          gcc -std=c11 -O2 -Wall -Wextra -Werror -c results/gcc_reference.c -o results/reference.o
+          for rev in single dual; do
+            cargo build --release -p compiler --bin compiler --manifest-path "$rev/Cargo.toml"
+            "$rev/target/release/compiler" results/generated.c --language mini-c --target aarch64 --emit obj -o "results/$rev.o"
+            "$rev/target/release/compiler" results/generated.c --language mini-c --target aarch64 --emit asm -o "results/$rev.s"
+            gcc -c "results/$rev.s" -o "results/$rev-gas.o"
+            objcopy -O binary --only-section=.text "results/$rev.o" "results/$rev.text"
+            objcopy -O binary --only-section=.text "results/$rev-gas.o" "results/$rev-gas.text"
+            cmp "results/$rev.text" "results/$rev-gas.text"
+            readelf -sW "results/$rev.o" > "results/$rev.sym"
+            gcc -std=c11 -O2 -Wall -Wextra -Werror results/oracle.c "results/$rev.o" results/reference.o -o "results/$rev.exe"
+            "results/$rev.exe"
           done
-      - name: Source-pinned same-CPU old new new old native and GCC oracle
+      - name: Count physical instruction bytes and unconditional B by production function
         run: |
           set -euo pipefail
-          cpu=$(awk '/^Cpus_allowed_list:/ {split($2,a,/[-,]/); print a[1]}' /proc/self/status)
-          test -n "$cpu"
-          echo "CPU_PIN=$cpu"
-          index=0
-          for case in old new new old; do
-            index=$((index+1))
-            logfile="$RUNNER_TEMP/ab-$index-$case.log"
-            (cd "$case" && taskset -c "$cpu" cargo test --release -p compiler --test x86_source_runtime_performance -- --ignored --nocapture) 2>&1 | tee "$logfile"
-            grep -q 'X86_RUNTIME_FUNCTION mode=mini_default symbol=scan>' "$logfile"
-            grep -q 'X86_SOURCE_RUNTIME mode=mini_default workload=combined ' "$logfile"
-            grep -q 'X86_SOURCE_RUNTIME mode=gcc_O2 workload=combined ' "$logfile"
-          done
-          python3 - "$RUNNER_TEMP" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
-          from pathlib import Path
-          import sys,statistics
-          root=Path(sys.argv[1])
-          results=[]
-          for index,case in enumerate(('old','new','new','old'),1):
-              data=(root/f'ab-{index}-{case}.log').read_text(errors='replace')
-              def last(prefix):
-                  lines=[l for l in data.splitlines() if prefix in l]
-                  assert lines,(index,case,prefix)
-                  return dict(token.split('=',1) for token in lines[-1].split() if '=' in token)
-              mini=last('X86_SOURCE_RUNTIME mode=mini_default workload=combined ')
-              gcc=last('X86_SOURCE_RUNTIME mode=gcc_O2 workload=combined ')
-              scan=last('X86_RUNTIME_FUNCTION mode=mini_default symbol=scan>')
-              assert mini['checksum']==gcc['checksum']
-              results.append((case,int(mini['median_ns']),scan))
-              print(f'{index} {case}: native_ns={mini["median_ns"]} gcc_ns={gcc["median_ns"]} scan_instr={scan["instructions"]} moves={scan["moves"]} stack_mem={scan["stack_memory"]}')
-          for case in ('old','new'):
-              medians=[ns for name,ns,_ in results if name==case]
-              print(f'{case} avg_median_ns={statistics.mean(medians):.1f}')
-          PY
+          python3 scripts/a64_cfg_source_census.py report results | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: source-pinned-generic-remat-ab
-          path: ${{ runner.temp }}/ab-*.log
-          if-no-files-found: ignore
+          name: a64-96-function-source-cfg-census
+          path: results/
+      - name: Publish exact-source census status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUTCOME: ${{ job.status }}
+        run: |
+          case "$OUTCOME" in success) state=success;; cancelled) state=error;; *) state=failure;; esac
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$state" -f context="compiler/a64-source-cfg-census" \
+            -f description="A64 96-source-functions controlled dual trace: $OUTCOME" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
