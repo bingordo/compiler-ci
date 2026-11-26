@@ -1,0 +1,92 @@
+name: S23.53 pinned guarded expression batch proofs
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-53-guarded-batch-proofs.yml'
+permissions:
+  contents: read
+jobs:
+  prove-all-widths:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c527353e8fdd909358ee929b76b2c64901ff26f7
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 6d616c9daefda90c4225fbad35e2f63354efc3ab
+          path: distribution
+          sparse-checkout: |
+            dist
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify immutable compiler and upstream-expression artifact sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = c527353e8fdd909358ee929b76b2c64901ff26f7
+          test "$(git -C distribution rev-parse HEAD)" = 6d616c9daefda90c4225fbad35e2f63354efc3ab
+          test "$(tr -d '\n' < distribution/dist/source-sha.txt)" = 3a0ebce9a36973cdc9acf833d015b3899f865ffd
+          echo "S2353_COMPILER_SHA=$(git -C compiler rev-parse HEAD)"
+          echo "S2353_DISTRIBUTION_SHA=$(git -C distribution rev-parse HEAD)"
+          echo "S2353_ORIGINAL_GENERATOR_SHA=$(cat distribution/dist/source-sha.txt)"
+      - name: Check strict parser and batch proof tests before launching solver
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler/tools/typeid-rule-gen
+          python3 -m compileall -q guarded_batch_proofs.py test_guarded_batch_proofs.py
+          python3 -m unittest -v test_guarded_batch_proofs test_batch_inventory test_prove test_rules
+      - name: Ensure QF_BV solver is installed exclusively in CI
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v z3 >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq z3
+          fi
+          z3 --version
+      - name: Prove all guarded and fusion candidates independently at five widths
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          arguments=(
+            --source distribution/dist/generated/expr_rules.json
+            --source distribution/dist/generated/expr_fusion.json
+            --generator-sha-file distribution/dist/source-sha.txt
+          )
+          python3 compiler/tools/typeid-rule-gen/guarded_batch_proofs.py "${arguments[@]}" --out results/guarded-batch-proofs.json
+          python3 compiler/tools/typeid-rule-gen/guarded_batch_proofs.py "${arguments[@]}" --out results/guarded-batch-proofs-repeat.json
+          cmp results/guarded-batch-proofs.json results/guarded-batch-proofs-repeat.json
+          python3 - <<'PY'
+          import json
+          p=json.load(open("results/guarded-batch-proofs.json", encoding="utf-8"))
+          assert p["schema"]=="compiler.typeid-source-batch-proofs.v1"
+          assert p["generator_source_sha"]=="3a0ebce9a36973cdc9acf833d015b3899f865ffd"
+          assert [x["count"] for x in p["input_sources"]]==[62,5]
+          assert p["candidate_count"]==67
+          assert p["proof_count"]==335
+          assert p["satisfiable_guard_checks"]==335
+          assert p["false_law_sat_controls"]==5
+          assert p["automatic_ssa_admissions"]==0
+          assert p["ssa_dominance_sharing_cost_verification"]=="not_performed"
+          assert set(x["width"] for x in p["proofs"])=={8,16,32,64,128}
+          assert all(x["counterexample_unsat"] and x["guard_satisfiable"] for x in p["proofs"])
+          print("S2353_ALL_WIDTHS_PROVED",p["candidate_count"],p["proof_count"])
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: s2353-source-pinned-guarded-batch-proofs
+          path: results/
+          retention-days: 21
