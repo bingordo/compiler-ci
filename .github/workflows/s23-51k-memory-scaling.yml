@@ -1,0 +1,148 @@
+name: S23.51k original producer memory and allocations on scaled independent C11 corpus
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-51k-memory-scaling.yml'
+      - 'scripts/s2351k_memory_scaling.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  memory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 95
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 59b052d3f571aeea383dd281e869b07a9bbee106
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2966619e976472aefab0a38553f33330382b1806
+          fetch-depth: 2
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact adjacent pre/post-S23.51j commits and immutable rule source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C before rev-parse HEAD)" = 59b052d3f571aeea383dd281e869b07a9bbee106
+          test "$(git -C after rev-parse HEAD)" = 2966619e976472aefab0a38553f33330382b1806
+          test "$(git -C after rev-parse HEAD^)" = 59b052d3f571aeea383dd281e869b07a9bbee106
+          git -C after diff --name-only HEAD^ HEAD | tee changed-files.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          names=set(Path('changed-files.txt').read_text().splitlines())
+          expect={'crates/opt/src/generated_typeid_shadow.rs',
+                  'crates/opt/src/generated_typeid_probe_census_tests.rs',
+                  'docs/research/S23_51j_compact_producer_table.md'}
+          assert names==expect,(names,expect)
+          PY
+          cmp before/tools/typeid-rule-gen/examples.rules after/tools/typeid-rule-gen/examples.rules
+          cmp before/tools/typeid-rule-gen/ssa_codegen.py after/tools/typeid-rule-gen/ssa_codegen.py
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          python3 -m py_compile scripts/s2351k_memory_scaling.py
+          mkdir -p results
+          rustc --version
+          cargo --version
+          printf 'S2351K_PINS before=%s after=%s\n' 59b052d3f571aeea383dd281e869b07a9bbee106 2966619e976472aefab0a38553f33330382b1806
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before -> target
+            after -> target
+          key: s2351k-producer-memory
+      - name: Build both release Rust TypeId compiler binaries outside all timed samples
+        shell: bash
+        run: |
+          set -euo pipefail
+          for rev in before after; do
+            timeout --signal=TERM --kill-after=10s 18m cargo build --release \
+              -p compiler --bin compiler --manifest-path "$rev/Cargo.toml"
+            test -s "$rev/target/release/compiler"
+          done
+      - name: Generate scaled 96,384,768-function independent portable C11 sources and check with GCC
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/a64_cfg_source_census.py generate results/seed
+          python3 scripts/s2351k_memory_scaling.py generate results
+          test "$(grep -c 'unsigned int bench_' results/cfg_768.c)" -eq 768
+      - name: Compare isolated compiler wall/user/system, peak RSS and page faults in A/B/B/A
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/s2351k_memory_scaling.py benchmark results \
+            --baseline before/target/release/compiler \
+            --candidate after/target/release/compiler | tee results/benchmark.log
+          python3 scripts/s2351k_memory_scaling.py summarize results | tee results/summary.log
+      - name: Validate exact emitted native text and original 96-function GCC execution oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcc -std=c11 -O2 -c results/seed/gcc_reference.c -o results/seed/ref.o
+          for rev in before after; do
+            gcc -std=c11 -O2 results/seed/oracle.c "results/native/$rev"_96.o \
+              results/seed/ref.o -o "results/$rev"_96_oracle
+            "results/$rev"_96_oracle
+          done
+          for n in 96 384 768; do
+            cmp "results/native/before_$n.text" "results/native/after_$n.text"
+          done
+          echo 'S2351K_GCC_ORACLE_OK compiler_versions=2 functions=96' | tee results/oracle.log
+      - name: Install Ubuntu heaptrack allocation profiler for separate instrumented samples
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq heaptrack
+          command -v heaptrack
+          command -v heaptrack_print
+      - name: Count allocator calls and peak heap for source 96 and 768 without distorting uninstrumented RSS
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/s2351k_memory_scaling.py heap results \
+            --baseline before/target/release/compiler \
+            --candidate after/target/release/compiler | tee results/allocations.log
+      - name: Verify coverage and archive precise ratio evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path('results')
+          assert [x['functions'] for x in json.loads((p/'source-manifest.json').read_text())]==[96,384,768]
+          assert len(json.loads((p/'whole-process-timings.json').read_text()))==12
+          h=json.loads((p/'s2351k-heaptrack-summary.json').read_text())
+          assert {(x['functions'],x['revision']) for x in h}=={
+              (96,'before'),(96,'after'),(768,'before'),(768,'after')}
+          assert all(x['allocations']>0 for x in h)
+          print('S2351K_COMPLETE scaled=96,384,768 abba_samples=12 heaptrack_samples=4')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: s2351k-source-producer-memory-and-allocations
+          path: |
+            results/*.json
+            results/*.log
+            results/time_*.txt
+            results/heaptrack_*.txt
+            changed-files.txt
+          retention-days: 28
+          if-no-files-found: warn
