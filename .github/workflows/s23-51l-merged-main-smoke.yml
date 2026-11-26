@@ -1,0 +1,128 @@
+name: S23.51l merged compiler main original SSA compact view smoke
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-51l-merged-main-smoke.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  merged-main-source-and-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      RUST_TEST_THREADS: '1'
+    steps:
+      - name: Checkout exact post-merge main including S23.51l
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 73b92683aa6a52e65d21ab31748fddefdad8a809
+          fetch-depth: 2
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Audit merged commit ancestry and production adaptive view
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 73b92683aa6a52e65d21ab31748fddefdad8a809
+          git -C compiler show -s --format=%s HEAD | grep -F 'S23.51l:'
+          grep -q 'let view = CompactView::new(function)' \
+            compiler/crates/opt/src/generated_typeid_shadow.rs
+          grep -q 'Sparse(FunctionView)' compiler/crates/opt/src/generated_typeid_shadow.rs
+          grep -q 'let mut producer_count = 0usize' compiler/crates/opt/src/generated_typeid_shadow.rs
+          test "$(git -C compiler status --porcelain | wc -l)" -eq 0
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          mkdir -p results
+          rustc --version
+      - name: Retrieve immutable 44-case checked source-stage artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: s23-48-exact-source-typeid-stage-attribution
+          run-id: 43349934825
+          repository: bingordo/compiler-ci
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: captured
+      - name: Check exact accepted original source capture
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(wc -l < captured/typeid_snapshots/manifest.tsv)" -eq 44
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+      - name: Verify merged production original SSA semantics and dense/sparse mismatch behavior
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd compiler && cargo test --release -p compiler-opt --lib \
+            generated_typeid_shadow::tests::real_native_intbin_constbits_valueid_matching_is_read_only \
+            -- --nocapture --test-threads=1) 2>&1 | tee results/native-shadow-smoke.log
+          (cd compiler && cargo test --release -p compiler-opt --lib \
+            s2351j_compact_storage_exact_legacy_view_semantics_on_dense_and_sparse_ids \
+            -- --nocapture --test-threads=1) 2>&1 | tee results/adaptive-storage-smoke.log
+      - name: Verify merged two-pass builder on extreme sparse and duplicate original SSA IDs
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd compiler && cargo test --release -p compiler-opt --lib \
+            s2351l_two_pass_builder_preserves_same_kind_duplicate_original_id_behavior \
+            -- --nocapture --test-threads=1) \
+            2>&1 | tee results/merged-two-pass-extreme-ids.log
+          grep -q 'test result: ok.' results/merged-two-pass-extreme-ids.log
+      - name: Exercise all original 44 source cases through merged compact native matcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd compiler && S2351_SNAPSHOT_DIR="$GITHUB_WORKSPACE/captured/typeid_snapshots" \
+            cargo test --release -p compiler-opt --lib \
+            s2351j_compact_original_producer_table_source_cost \
+            -- --nocapture --test-threads=1) \
+            2>&1 | tee results/original-source-compact-matches.log
+      - name: Verify complete original source-stage retained SSA and optimizer round
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd compiler && S2351_SNAPSHOT_DIR="$GITHUB_WORKSPACE/captured/typeid_snapshots" \
+            cargo test --release -p compiler-opt \
+            --features experimental-typeid-generated-rewrites \
+            --test native_s2351_matcher_cost -- --nocapture --test-threads=1) \
+            2>&1 | tee results/original-source-optimizer-round.log
+      - name: Check all merged main source populations and outcomes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          a=Path('results/original-source-compact-matches.log').read_text()
+          b=Path('results/original-source-optimizer-round.log').read_text()
+          assert 'S2351J_COVERAGE source_cases=44 stages=88 roots=4613 hits=68 ' in a
+          assert 'S2351_SUMMARY cohort=verified_s2347_snapshots cases=44 stages=88' in b
+          rows={}
+          for line in a.splitlines():
+              if 'S2351J_COMPARE id=' not in line:
+                  continue
+              line=line[line.index('S2351J_COMPARE '):]
+              d=dict(p.split('=',1) for p in line.split()[1:])
+              key=(d['id'],d['stage'])
+              assert key not in rows
+              rows[key]=d
+          assert len(rows)==88,len(rows)
+          assert sum(int(x['roots']) for x in rows.values())==4613
+          assert sum(int(x['hits']) for x in rows.values())==68
+          assert sum('S2351_CASE id=' in line for line in b.splitlines())==88
+          print('S2351L_MERGED_MAIN source_cases=44 stages=88 roots=4613 matches=68')
+          print('S2351L_MERGED_MAIN exact_sha=73b92683aa6a52e65d21ab31748fddefdad8a809 native_checks=success')
+          PY
+      - name: Preserve integration snapshot evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2351l-merged-main-original-source-validation
+          path: results/
+          if-no-files-found: warn
+          retention-days: 28
