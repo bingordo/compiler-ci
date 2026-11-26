@@ -133,6 +133,21 @@ with tempfile.TemporaryDirectory() as d:
                                 print("SYNTAX_NEAR="+word, flush=True)
                 except (OSError, ValueError):
                     print("SYNTAX_SOURCE=unavailable", flush=True)
+        # Only public compiler builtin spellings, never arbitrary identifiers
+        # or private generated source. Match the actual error line.
+        builtin_names = {"__builtin_"+n for n in (
+            "add_overflow","sub_overflow","mul_overflow","bswap16","bswap32",
+            "bswap64","bswap128","clz","clzl","clzll","ctz","ctzl","ctzll",
+            "popcount","popcountl","popcountll","unreachable","expect",
+            "memcpy","memmove","memset","memcmp","trap","prefetch",
+            "isnan","isinf","isfinite","signbit","fabs","fabsf","sqrt","sqrtf",
+            "alloca","alloca_with_align","object_size","constant_p","va_start",
+            "va_end","va_copy","va_arg","types_compatible_p","offsetof",
+            "atomic_load_n","atomic_store_n")}
+        for line in msg.splitlines():
+            if re.search(r"error\[T0113\]",line):
+                names = set(re.findall(r"__builtin_[A-Za-z0-9_]+",line))
+                print("UNSUPPORTED_BUILTIN="+",".join(sorted(names & builtin_names)) if names & builtin_names else "UNSUPPORTED_BUILTIN=other",flush=True)
         codes = sorted(set(re.findall(r"error\[([PLST][0-9]{4})\]", msg)))
         print(f"CLIF_MODE={mode} SAMPLE={i} BYTES={src.stat().st_size} GCC_EXIT={gcc} CLIF_EXIT={rc} ELF={int(elf)} SECONDS={elapsed}", flush=True)
         print("CLIF_DIAG_IDS="+",".join(codes), flush=True)
