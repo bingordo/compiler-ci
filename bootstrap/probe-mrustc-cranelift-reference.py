@@ -77,6 +77,34 @@ with tempfile.TemporaryDirectory() as d:
                        "sys/types.h","sys/stat.h","bits/types.h","bits/floatn.h"):
             if re.search(r"(?:/|\\b)"+re.escape(header)+r":\d+", msg):
                 print("PUBLIC_DIAG_HEADER="+header, flush=True)
+        # For Mini-C's first source-location error, privately inspect the
+        # diagnostic line in the original source. Export only counts of
+        # whitelisted C/GNU constructs, never source text or identifiers.
+        if mode == "minic":
+            locations = re.findall(r"(?m)^(.+?):(\d+)(?::\d+)?: error\[S[0-9]{4}\]", msg)
+            if locations:
+                file, line = locations[0]
+                try:
+                    p = Path(file).resolve()
+                    same_source = p == src.resolve()
+                    print("SYNTAX_SOURCE="+("generated" if same_source else "other"), flush=True)
+                    if same_source:
+                        import itertools
+                        n = int(line)
+                        with p.open(errors="replace") as stream:
+                            window = "".join(itertools.islice(stream, max(0,n-3), n+2))
+                        keywords = ("__int128","__uint128_t","__int128_t","__attribute__",
+                                    "__extension__","__typeof__","typeof","__auto_type",
+                                    "_Static_assert","_Alignas","_Alignof","__asm__",
+                                    "__builtin_va_list","__float128","_Float128",
+                                    "inline","__inline__","__inline","restrict",
+                                    "__restrict__","_Atomic","typedef","struct","union",
+                                    "enum","static","extern","register","const","volatile")
+                        for word in keywords:
+                            if re.search(r"\b"+re.escape(word)+r"\b", window):
+                                print("SYNTAX_NEAR="+word, flush=True)
+                except (OSError, ValueError):
+                    print("SYNTAX_SOURCE=unavailable", flush=True)
         codes = sorted(set(re.findall(r"error\[([PLST][0-9]{4})\]", msg)))
         print(f"CLIF_MODE={mode} SAMPLE={i} BYTES={src.stat().st_size} GCC_EXIT={gcc} CLIF_EXIT={rc} ELF={int(elf)} SECONDS={elapsed}", flush=True)
         print("CLIF_DIAG_IDS="+",".join(codes), flush=True)
