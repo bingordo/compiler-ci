@@ -7,32 +7,49 @@ on:
 permissions:
   contents: read
 jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.pin.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: main
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Resolve current main once for both jobs
+        id: pin
+        run: |
+          sha=$(git -C compiler rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Main snapshot: $sha" >> "$GITHUB_STEP_SUMMARY"
   candidate:
+    needs: snapshot
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        source: [869da61b4f776da55002583ce37023e147c02dad, d8f8adca2201042bbf27f960cbb7633f6439d10f, 44ea907b71e2bb788a320650bae0e49fdf989336]
+        variant: [baseline, combined]
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ matrix.source }}
+          ref: ${{ needs.snapshot.outputs.sha }}
           path: compiler
           fetch-depth: 0
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Integrate candidate with pinned current main
-        if: matrix.source != '869da61b4f776da55002583ce37023e147c02dad'
-        env:
-          CANDIDATE: ${{ matrix.source }}
+      - name: Integrate both exact candidates
+        if: matrix.variant == 'combined'
         run: |
           set -euo pipefail
-          git -C compiler cat-file -e 869da61b4f776da55002583ce37023e147c02dad^{commit}
-          git -C compiler checkout --detach 869da61b4f776da55002583ce37023e147c02dad
-          git -C compiler -c user.name=compiler-ci -c user.email=compiler-ci@users.noreply.github.com merge --no-ff --no-edit "$CANDIDATE"
-          git -C compiler log -1 --format='%H parents=%P' | tee -a "$GITHUB_STEP_SUMMARY"
+          for candidate in d8f8adca2201042bbf27f960cbb7633f6439d10f 44ea907b71e2bb788a320650bae0e49fdf989336; do
+            git -C compiler -c user.name=compiler-ci -c user.email=compiler-ci@users.noreply.github.com merge --no-ff --no-edit "$candidate"
+            git -C compiler log -1 --format='%H parents=%P' | tee -a "$GITHUB_STEP_SUMMARY"
+          done
       - name: Record source and frontend pin
         run: |
           set -euo pipefail
@@ -50,16 +67,16 @@ jobs:
           workspaces: compiler/tools/mini-c-driver -> target
           key: minic-aggregate-places-candidate
       - name: Focused GCC aggregate place test
-        if: matrix.source == 'd8f8adca2201042bbf27f960cbb7633f6439d10f'
+        if: matrix.variant == 'combined'
         run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test aggregate_places -- --nocapture
       - name: Focused pointer transport tests
-        if: matrix.source == '44ea907b71e2bb788a320650bae0e49fdf989336'
+        if: matrix.variant == 'combined'
         run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test opaque_object_pointer_transport -- --nocapture
       - name: Existing Mini-C adapter unit tests
         if: success() || failure()
         run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib
-      - name: Replay eight Csmith struct seeds
-        if: (success() || failure()) && matrix.source != '44ea907b71e2bb788a320650bae0e49fdf989336'
+      - name: Replay Csmith structure, array and pointer seeds
+        if: success() || failure()
         shell: bash
         run: |
           set -euo pipefail
@@ -74,23 +91,27 @@ jobs:
           cargo build --manifest-path "$manifest" --bin compiler-mini-c
           mkdir -p "$RUNNER_TEMP/struct-evidence"
           evidence="$RUNNER_TEMP/struct-evidence"
-          python3 compiler/tools/csmith_probe.py --generate --cases-dir "$evidence/cases" --csmith csmith --seed-base 1 --seed-count 8 --profile restricted-structs
-          set +e
-          python3 compiler/tools/csmith_probe.py --probe --cases-dir "$evidence/cases" --artifacts-dir "$evidence/results" --include-dir "$(dirname "$header")" --preprocess-c --driver "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" --compiler-sha "$compiler_sha" --frontend-sha "$frontend" --minimum-native 0 --run-timeout 5 --max-wall-seconds 120 --omit-unreferenced-static-bodies
-          rc=$?
-          set -e
-          if [[ -s "$evidence/results/results.jsonl" ]]; then
-            python3 - "$evidence/results/results.jsonl" <<'PY'
+          failure=0
+          for profile in restricted-structs restricted-arrays restricted-pointers; do
+            cases="$evidence/$profile/cases"
+            results="$evidence/$profile/results"
+            python3 compiler/tools/csmith_probe.py --generate --cases-dir "$cases" --csmith csmith --seed-base 1 --seed-count 8 --profile "$profile"
+            python3 compiler/tools/csmith_probe.py --probe --cases-dir "$cases" --artifacts-dir "$results" --include-dir "$(dirname "$header")" --preprocess-c --driver "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" --compiler-sha "$compiler_sha" --frontend-sha "$frontend" --minimum-native 0 --run-timeout 5 --max-wall-seconds 120 --omit-unreferenced-static-bodies || failure=1
+            if [[ -s "$results/results.jsonl" ]]; then
+              python3 - "$results/results.jsonl" "$profile" <<'PY'
           import json,sys
           for line in open(sys.argv[1]):
               r=json.loads(line)
-              print("STRUCT_RESULT", json.dumps({k:r.get(k) for k in ("seed","classification","compiler","frontend_diagnostic")}))
+              print("STRUCTURAL_RESULT", sys.argv[2], json.dumps({k:r.get(k) for k in ("seed","classification","compiler","frontend_diagnostic")}))
           PY
-          fi
-          exit "$rc"
+            else
+              failure=1
+            fi
+          done
+          exit "$failure"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: struct-evidence-${{ matrix.source }}
+          name: structural-evidence-${{ matrix.variant }}
           path: ${{ runner.temp }}/struct-evidence
           retention-days: 14
