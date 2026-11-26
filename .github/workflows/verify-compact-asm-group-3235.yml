@@ -1,0 +1,96 @@
+name: Candidate compact GP assembly metadata 3235
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-compact-asm-group-3235.yml']
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c3b3df75154ef2dea353239eb5fa1f9a2ecfbb14
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9d283a677628337d100162b25d1976fa0e3971de
+          path: baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1cecb946aa40cd7cee8ee90873da0f9669e1ea39
+          path: census
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: 66c599591115e9c17a1d802db3d048cf4f39d294
+          path: mini-c
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source pins and isolate workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "c3b3df75154ef2dea353239eb5fa1f9a2ecfbb14"
+          test "$(git -C baseline rev-parse HEAD)" = "9d283a677628337d100162b25d1976fa0e3971de"
+          test "$(git -C census rev-parse HEAD)" = "1cecb946aa40cd7cee8ee90873da0f9669e1ea39"
+          test "$(git -C mini-c rev-parse HEAD)" = "66c599591115e9c17a1d802db3d048cf4f39d294"
+          grep -q "66c599591115e9c17a1d802db3d048cf4f39d294" compiler/tools/mini-c-driver/Cargo.toml
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          rustc --version | tee -a "$GITHUB_STEP_SUMMARY"
+          for tree in baseline compiler; do
+            git -C "$tree" rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
+            cat > "$tree/Cargo.toml" <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          exclude = ["tools/mini-c-driver"]
+          EOF
+            rm -f "$tree/Cargo.lock"
+            mkdir -p "$tree/crates/backend/examples"
+            cp census/crates/backend/examples/ir_storage_census.rs "$tree/crates/backend/examples/"
+          done
+      - name: Measure identical diagnostic on baseline and candidate
+        run: |
+          set -euo pipefail
+          for tree in baseline compiler; do
+            (cd "$tree"; cargo run --quiet -p compiler-backend --example ir_storage_census -- crates/backend-aarch64/tests/fixtures/arithmetic_v3.ir) | tee "$RUNNER_TEMP/$tree-layout.tsv"
+          done
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import os, pathlib
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          def read(tree):
+              rows = [line.split("\t") for line in (root / (tree + "-layout.tsv")).read_text().splitlines()]
+              return {row[1]: int(row[2]) for row in rows if row[0] == "layout" and row[1] != "type"}
+          old, new = read("baseline"), read("compiler")
+          print("| Type | Baseline bytes | Candidate bytes |")
+          print("|---|---:|---:|")
+          for name in ("Op", "TypedInstruction", "ScalarOp", "ScalarInst"):
+              print(f"| {name} | {old[name]} | {new[name]} |")
+              assert new[name] < old[name], f"no storage reduction: {name}"
+          PY
+      - name: Shared IR and all backend compilation
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: |
+          cargo check --workspace
+          cargo test -p compiler-ir --test compact_asm_group_storage
+          cargo test -p compiler-ir -p compiler-opt --lib
+      - name: Existing native Mini-C assembly group regression
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: |
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test asm3_p15_gp_group_native -- --nocapture
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test asm3_p14_alternatives_ties_native -- --nocapture
