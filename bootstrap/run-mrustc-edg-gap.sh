@@ -447,7 +447,7 @@ import re,sys
 lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
 errors=[line for line in lines if any(k in line for k in
         ("error[E","error:","panicked","FAILED","test result:",
-         "EDG_PUBLIC_C_BYTE_RETURN_REASON="))]
+         "EDG_PUBLIC_C_BYTE_RETURN_REASON=", "EDG_PUBLIC_C_FOLDED_ADDRESS_REASON="))]
 for i,line in enumerate(errors[-8:],1):
     msg=re.sub(r"/(?:workspace|audit-tmp)/[^ :]+","public_fixture",line.strip())
     msg=re.sub(r"[^A-Za-z0-9 _.,=:/()><-]","_",msg)
