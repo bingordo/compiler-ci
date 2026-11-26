@@ -1,4 +1,4 @@
-name: Mini-C merged x86 comparison regression
+name: Mini-C extended Csmith coverage
 on:
   pull_request:
     paths:
@@ -9,12 +9,12 @@ permissions:
 jobs:
   candidate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 25c55a3ad608289a7475bfe0c2b8714562f6f1ce
+          ref: main
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -34,28 +34,7 @@ jobs:
         with:
           workspaces: compiler/tools/mini-c-driver -> target
           key: minic-aggregate-places-candidate
-      - name: Isolate backend-only workspace from unrelated frontend dependencies
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          p=Path("compiler/Cargo.toml")
-          s=p.read_text()
-          assert s.count(', "crates/driver"')==1
-          assert 'exclude = ["tools/mini-c-driver"]' in s
-          p.write_text(s.replace(', "crates/driver"', '').replace('exclude = ["tools/mini-c-driver"]','exclude = ["tools/mini-c-driver", "crates/driver"]'))
-          PY
-      - name: Focused x86 scalar compare tests
-        run: cargo test -p compiler-backend-x86 --manifest-path compiler/Cargo.toml --lib scalar_cmp_direct_lhs -- --nocapture
-      - name: Focused GCC aggregate place test
-        if: success() || failure()
-        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test aggregate_places -- --nocapture
-      - name: Focused pointer transport tests
-        if: success() || failure()
-        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test opaque_object_pointer_transport -- --nocapture
-      - name: Existing Mini-C adapter unit tests
-        if: success() || failure()
-        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib
-      - name: Replay Csmith structure, array and pointer seeds
+      - name: Replay 128 observable Csmith cases across four profiles
         if: success() || failure()
         shell: bash
         run: |
@@ -72,11 +51,11 @@ jobs:
           mkdir -p "$RUNNER_TEMP/struct-evidence"
           evidence="$RUNNER_TEMP/struct-evidence"
           failure=0
-          for profile in restricted-structs restricted-arrays restricted-pointers; do
+          for profile in restricted-structs restricted-arrays restricted-pointers restricted-compound; do
             cases="$evidence/$profile/cases"
             results="$evidence/$profile/results"
-            python3 compiler/tools/csmith_probe.py --generate --cases-dir "$cases" --csmith csmith --seed-base 1 --seed-count 8 --profile "$profile"
-            python3 compiler/tools/csmith_probe.py --probe --cases-dir "$cases" --artifacts-dir "$results" --include-dir "$(dirname "$header")" --preprocess-c --driver "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" --compiler-sha "$compiler_sha" --frontend-sha "$frontend" --minimum-native 0 --run-timeout 5 --max-wall-seconds 120 --omit-unreferenced-static-bodies || failure=1
+            python3 compiler/tools/csmith_probe.py --generate --cases-dir "$cases" --csmith csmith --seed-base 1 --seed-count 32 --profile "$profile"
+            python3 compiler/tools/csmith_probe.py --probe --cases-dir "$cases" --artifacts-dir "$results" --include-dir "$(dirname "$header")" --preprocess-c --driver "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" --compiler-sha "$compiler_sha" --frontend-sha "$frontend" --minimum-native 32 --run-timeout 5 --max-wall-seconds 300 --omit-unreferenced-static-bodies || failure=1
             if [[ -s "$results/results.jsonl" ]]; then
               python3 - "$results/results.jsonl" "$profile" <<'PY'
           import json,sys
@@ -113,6 +92,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: structural-evidence-merged-main
+          name: extended-csmith-evidence
           path: ${{ runner.temp }}/struct-evidence
           retention-days: 14
