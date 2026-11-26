@@ -1,0 +1,129 @@
+name: Candidate backend streaming RSS comparison 3221
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-streaming-rss-ab-3221.yml']
+permissions:
+  contents: read
+jobs:
+  measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 95d81eca15a1e571cb41f6e5060f0f6fb3cd9e81
+          path: baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 24301ca00d85cc41f6a0fe7548308d16eeb95cdf
+          path: candidate
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: 66c599591115e9c17a1d802db3d048cf4f39d294
+          path: mini-c
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify revisions and build release executables outside measurements
+        run: |
+          set -euo pipefail
+          test "$(git -C baseline rev-parse HEAD)" = "95d81eca15a1e571cb41f6e5060f0f6fb3cd9e81"
+          test "$(git -C candidate rev-parse HEAD)" = "24301ca00d85cc41f6a0fe7548308d16eeb95cdf"
+          test "$(git -C mini-c rev-parse HEAD)" = "66c599591115e9c17a1d802db3d048cf4f39d294"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          rustc --version | tee -a "$GITHUB_STEP_SUMMARY"
+          for tree in baseline candidate; do
+            grep -q "66c599591115e9c17a1d802db3d048cf4f39d294" "$tree/tools/mini-c-driver/Cargo.toml"
+            echo "$tree $(git -C "$tree" rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
+            cat > "$tree/Cargo.toml" <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          exclude = ["tools/mini-c-driver"]
+          EOF
+            rm -f "$tree/Cargo.lock"
+            cargo build --release --manifest-path "$tree/tools/mini-c-driver/Cargo.toml" --bin compiler-mini-c
+          done
+      - name: Generate deterministic multi-function arithmetic and CFG workloads
+        run: |
+          mkdir -p "$RUNNER_TEMP/ir-memory"
+          python3 - <<'PY'
+          import os, pathlib
+          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "ir-memory"
+          for count in (100, 400, 1600):
+              with (root / f"functions-{count}.c").open("w") as f:
+                  for i in range(count):
+                      f.write(f"int func_{i}(int x, int y, int z) {{\n")
+                      for j in range(12):
+                          k = (i * 17 + j * 3) % 127 + 1
+                          f.write(f"  x = x * 3 + y + {k};\n")
+                          f.write("  if (x < z) y = y + x; else y = y - z;\n")
+                          f.write("  z = z + y;\n")
+                      f.write("  return x + y + z;\n}\n")
+          PY
+      - name: Measure compiler processes only, alternating build order
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/ir-memory"
+          printf 'workload\temit\trepeat\trevision\trss_kib\twall_s\tuser_s\tsystem_s\n' > "$root/results.tsv"
+          for count in 100 400 1600; do
+            for emit in obj asm; do
+              for repeat in 1 2 3; do
+                case "$repeat" in
+                  1) order="baseline candidate" ;;
+                  2) order="candidate baseline" ;;
+                  3) order="baseline candidate" ;;
+                esac
+                for tree in $order; do
+                  /usr/bin/time -f '%M\t%e\t%U\t%S' -o "$root/time" \
+                    "$tree/tools/mini-c-driver/target/release/compiler-mini-c" \
+                    "$root/functions-$count.c" --emit "$emit" -o "$root/$count-$emit-$tree-$repeat.out"
+                  printf '%s\t%s\t%s\t%s\t' "$count" "$emit" "$repeat" "$tree" >> "$root/results.tsv"
+                  cat "$root/time" >> "$root/results.tsv"
+                done
+              done
+              for tree in baseline candidate; do
+                for repeat in 2 3; do
+                  cmp "$root/$count-$emit-$tree-1.out" "$root/$count-$emit-$tree-$repeat.out"
+                done
+                sha256sum "$root/$count-$emit-$tree-1.out"
+              done
+            done
+          done
+          cat "$root/results.tsv"
+      - name: Summarize medians and artifact equality
+        if: ${{ !cancelled() }}
+        run: |
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import csv, hashlib, os, pathlib, statistics
+          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "ir-memory"
+          rows = list(csv.DictReader((root / "results.tsv").open(), delimiter="\t"))
+          print("| Functions | Emit | Revision | Median peak RSS KiB | Median wall s | Same output as baseline |")
+          print("|---:|---|---|---:|---:|---|")
+          for count in (100, 400, 1600):
+              for emit in ("obj", "asm"):
+                  baseline = root / f"{count}-{emit}-baseline-1.out"
+                  for tree in ("baseline", "candidate"):
+                      group = [r for r in rows if (r["workload"], r["emit"], r["revision"]) == (str(count), emit, tree)]
+                      if len(group) != 3:
+                          print(f"| {count} | {emit} | {tree} | incomplete | incomplete | unknown |")
+                          continue
+                      rss = statistics.median(int(r["rss_kib"]) for r in group)
+                      wall = statistics.median(float(r["wall_s"]) for r in group)
+                      out = root / f"{count}-{emit}-{tree}-1.out"
+                      equal = out.read_bytes() == baseline.read_bytes()
+                      assert equal, "output differs from exact parent"
+                      print(f"| {count} | {emit} | {tree} | {rss} | {wall:.2f} | {equal} |")
+          assert len(rows) == 36, "incomplete measurements"
+          print("\nGNU time measures compiler-process peak RSS, not Rust build memory. Identical generated workloads on exact current parent and reconciled streaming candidate.")
+          PY
