@@ -1,0 +1,52 @@
+name: Intel census opcode candidate cache
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-intel-census-candidate-cache.yml']
+permissions:
+  contents: read
+jobs:
+  verify-census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e6ff1593fcba0c8ebcec5892e791a241923ab4ee
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2b8a53603802c10ea00ec8ac9a134c42cc9a285b
+          path: baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify candidate and run affected suites
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "e6ff1593fcba0c8ebcec5892e791a241923ab4ee"
+          python3 -m unittest discover -s tools -p test_x86_g10_catalog_census.py -v
+          python3 -m unittest discover -s tools -p test_x86_iform_batch_worklist.py -v
+      - name: Compare complete synthetic-corpus reports with previous implementation
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          PYTHONPATH=tools python3 - <<'PY'
+          import importlib.util
+          import json
+          import tempfile
+          from pathlib import Path
+          from test_x86_g10_catalog_census import populated, ROOT
+          from x86_g10_catalog_census import census
+          spec = importlib.util.spec_from_file_location("old_census", "../baseline/tools/x86_g10_catalog_census.py")
+          old = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(old)
+          for duplicate in (False, True):
+              with tempfile.TemporaryDirectory() as tmp:
+                  src = populated(Path(tmp), duplicate=duplicate)
+                  assert json.dumps(census(ROOT, src), sort_keys=True) == json.dumps(old.census(ROOT, src), sort_keys=True)
+          print("CENSUS_COMPLETE_REPORT_BYTE_PARITY_OK")
+          PY
