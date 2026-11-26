@@ -1,0 +1,76 @@
+name: Temporary Mini-C C99 block static 296
+on:
+  pull_request:
+    paths: ['.github/workflows/temp-mini-c-c99-block-static-296.yml']
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: d00515564361f4b1c5a9893269b3e565d4337a09
+          persist-credentials: false
+      - run: git rev-parse HEAD
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/debug
+          key: mini-c-native-ubuntu-block-static-296
+          restore-keys: |
+            mini-c-native-
+      - run: cargo test -p mini-c-syntax -p mini-c-sema -p mini-c-cranelift
+      - run: cargo clippy -p mini-c-sema -p mini-c-cranelift --all-targets -- -D warnings
+      - name: GCC differential runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/static.c" <<'EOF'
+          int *counter(void) {
+              static int n=3;
+              ++n;
+              return &n;
+          }
+          int recursive(int n) {
+              static int sum;
+              sum+=n;
+              if(n) return recursive(n-1);
+              return sum;
+          }
+          int *skipped(void) {
+              goto use;
+              static int a[3]={2,4,6};
+              static int *p=a+1;
+          use:
+              return p;
+          }
+          int distinct(int which) {
+              static int n=10;
+              if(which) { static int n=20; return ++n; }
+              return ++n;
+          }
+          void *self(void) { static void *p=&p; return p; }
+          const char *fname(void) { static const char *p=__func__; return p; }
+          int main(void) {
+              int *p=counter();
+              if(*p!=4 || counter()!=p || *p!=5) return 1;
+              if(recursive(3)!=6 || recursive(2)!=9) return 2;
+              if(*skipped()!=4 || skipped()!=skipped()) return 3;
+              *skipped()=9;
+              if(*skipped()!=9) return 4;
+              if(distinct(0)!=11 || distinct(1)!=21 || distinct(0)!=12 || distinct(1)!=22) return 5;
+              if(self()!=self() || *(void**)self()!=self() || fname()[0]!='f') return 6;
+              return 0;
+          }
+          EOF
+          gcc -std=c99 -pedantic-errors "$RUNNER_TEMP/static.c" -o "$RUNNER_TEMP/gcc-static"
+          "$RUNNER_TEMP/gcc-static"
+          cargo run -q -p mini-c-cranelift -- --cpp=none --emit-obj "$RUNNER_TEMP/static.o" "$RUNNER_TEMP/static.c"
+          gcc "$RUNNER_TEMP/static.o" -o "$RUNNER_TEMP/mini-static"
+          "$RUNNER_TEMP/mini-static"
+          readelf -r "$RUNNER_TEMP/static.o"
