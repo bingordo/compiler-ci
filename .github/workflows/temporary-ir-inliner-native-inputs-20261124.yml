@@ -1,0 +1,55 @@
+# Temporary exact-source TypeId fixture acceptance; close unmerged.
+name: Temporary native TypeId inliner input cutover
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temporary-ir-inliner-native-inputs-20261124.yml'
+permissions:
+  contents: read
+jobs:
+  inliner-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: d7a72ecfd2f5b594531edf46deca1d6139269acc
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and isolate core workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - name: Cache workspace
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: temporary-native-inliner-acceptance
+      - name: Run leaf and CFG native TypeId integration suites
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typed_inline_leaf_native -- --nocapture
+          cargo test -p compiler-opt --test typed_inline_cfg_native -- --nocapture
+      - name: Check scoped Clippy (known unrelated baseline lints excluded)
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --test typed_inline_leaf_native --test typed_inline_cfg_native -- -D clippy::all -A clippy::needless_range_loop -A clippy::empty_line_after_doc_comments -A clippy::collapsible_match -A clippy::collapsible_if
