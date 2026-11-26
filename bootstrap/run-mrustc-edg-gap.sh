@@ -2264,6 +2264,9 @@ schemas={
     "EDG_C_BODY_CALL_ARG":(
         "EDG_C_REAL_BODY_CALL_ARG",
         ("index","root","kind","bytes","align","vararg","class"),1),
+    "EDG_C_BODY_SNAPSHOT_SITE":(
+        "EDG_C_REAL_BODY_SNAPSHOT_SITE",
+        ("expr","op","expected_bytes","expected_align"),1),
     "EDG_C_BODY_STMT_SITE":(
         "EDG_C_REAL_BODY_STMT_SITE",
         ("kind","expr","op","children","depth"),1),
