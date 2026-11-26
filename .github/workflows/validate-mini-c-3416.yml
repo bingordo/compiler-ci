@@ -1,0 +1,130 @@
+name: Mini-C PR 3416 canonical ABI candidate
+
+on:
+  push:
+    branches: [validate-mini-c-3416]
+    paths: ['.github/workflows/validate-mini-c-3416.yml']
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: mini-c-differential-b78607ab9571508ed3eb85e7fef21ea4a9b74048
+  cancel-in-progress: true
+
+jobs:
+  differential:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout compiler-ci test harness
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Checkout compiler source using existing read-only deploy key
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b78607ab9571508ed3eb85e7fef21ea4a9b74048
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Identify exact source and validate cohort size
+        id: source
+        shell: bash
+        env:
+          SEED_COUNT: 6
+        run: |
+          set -euo pipefail
+          sha="$(git -C compiler rev-parse HEAD)"
+          [[ "$sha" == b78607ab9571508ed3eb85e7fef21ea4a9b74048 ]]
+          [[ "$SEED_COUNT" =~ ^[0-9]+$ ]]
+          (( 10#$SEED_COUNT >= 1 && 10#$SEED_COUNT <= 64 ))
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          test -s compiler/tools/mini-c-driver/tests/differential.py
+          test -s compiler/tools/mini-c-driver/Cargo.toml
+          echo "Compiler revision: $sha" >> "$GITHUB_STEP_SUMMARY"
+      - name: Make public Mini-C dependency accessible without another deploy key
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          manifest=Path('compiler/tools/mini-c-driver/Cargo.toml')
+          text=manifest.read_text()
+          old='ssh://git@github.com/bingordo/mini-c.git'
+          assert text.count(old)==2, 'Mini-C dependency declaration changed'
+          manifest.write_text(text.replace(old,'https://github.com/bingordo/mini-c.git'))
+          PY
+      - name: Cache Rust objects and dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: mini-c-source-differential-v1
+          cache-workspace-crates: 'true'
+      - name: Build compiler-mini-c once
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 12m cargo build \
+            --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --bin compiler-mini-c \
+            2>&1 | tee "$RUNNER_TEMP/mini-c-build.log"
+          test -x compiler/tools/mini-c-driver/target/debug/compiler-mini-c
+      - name: Focused aggregate and declaration regression checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest=compiler/tools/mini-c-driver/Cargo.toml
+          for filter in aggregate_result_uses_canonical_two_word_product source_checked_aggregate_result_call_uses_canonical_product source_typeid_redeclarations_produce_metadata_not_implicit_common_binding; do
+            cargo test --manifest-path "$manifest" -p compiler-mini-c --lib "$filter" 2>&1 | tee "$RUNNER_TEMP/$filter.log"
+            grep -Fq '1 passed; 0 failed' "$RUNNER_TEMP/$filter.log"
+          done
+      - name: Full Mini-C library and integration regression on unchanged main
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/mini-c-main-library.log"
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$RUNNER_TEMP/mini-c-main-library.log"
+      - name: Preserve build logs and failing test cases
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mini-c-source-differential-failures
+          path: |
+            ${{ runner.temp }}/mini-c-main-library.log
+            ${{ runner.temp }}/mini-c-build.log
+            ${{ runner.temp }}/mini-c-differential.log
+            ${{ runner.temp }}/mini-c-frame-pointer.log
+            ${{ runner.temp }}/mini-c-fp-mixed-abi.log
+            ${{ runner.temp }}/mini-c-fp-scalar-abi.log
+            ${{ runner.temp }}/mini-c-indirect-variadic.log
+            ${{ runner.temp }}/mini-c-gcc-compat.log
+            ${{ runner.temp }}/mini-c-gcc-compat/report.json
+            ${{ runner.temp }}/mini-c-failures/
+            ${{ runner.temp }}/mini-c-frame-pointer-failures/
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Publish discoverable daily main test result
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          case "$RESULT" in
+            success) state=success ;;
+            *) state=failure ;;
+          esac
+          source_sha=unavailable
+          if [[ -d compiler/.git ]]; then
+            source_sha="$(git -C compiler rev-parse --short=12 HEAD)"
+          fi
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$state" \
+            -f context="mini-c/pr-3416" \
+            -f description="Mini-C PR 3416 ($source_sha): $RESULT" \
+            -f target_url="$RUN_URL"
