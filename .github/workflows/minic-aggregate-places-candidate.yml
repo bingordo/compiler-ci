@@ -1,4 +1,4 @@
-name: Mini-C discarded aggregate result candidate
+name: Mini-C merged aggregate and FP regression
 on:
   pull_request:
     paths:
@@ -7,51 +7,17 @@ on:
 permissions:
   contents: read
 jobs:
-  snapshot:
-    runs-on: ubuntu-24.04
-    outputs:
-      sha: ${{ steps.source.outputs.sha }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: bingordo/compiler
-          ref: main
-          path: compiler
-          ssh-key: ${{ secrets.CI_KEY }}
-          persist-credentials: false
-      - name: Resolve main
-        id: source
-        run: echo "sha=$(git -C compiler rev-parse HEAD)" >> "$GITHUB_OUTPUT"
   candidate:
-    needs: snapshot
-    strategy:
-      fail-fast: false
-      matrix:
-        variant: [baseline, integrated, combined]
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ needs.snapshot.outputs.sha }}
-          fetch-depth: 0
+          ref: 110ccf9793844d40948fd00e5594f94938f9414f
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Integrate exact candidate with current main
-        if: matrix.variant != 'baseline'
-        run: |
-          set -euo pipefail
-          git -C compiler rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
-          git -C compiler -c user.name=compiler-ci -c user.email=compiler-ci@users.noreply.github.com merge --no-ff --no-edit 424c1ab05ad6dc1c9e0ab7b157c755cebc8566eb
-          git -C compiler log -1 --format='%H parents=%P' | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: Integrate shared native literal candidate
-        if: matrix.variant == 'combined'
-        run: |
-          set -euo pipefail
-          git -C compiler -c user.name=compiler-ci -c user.email=compiler-ci@users.noreply.github.com merge --no-ff --no-edit 56e19801dd41011039d38b7ec8ddf3fe951c3c17
-          git -C compiler log -1 --format='%H parents=%P' | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Record source and frontend pin
         run: |
           set -euo pipefail
@@ -69,15 +35,13 @@ jobs:
           workspaces: compiler/tools/mini-c-driver -> target
           key: minic-aggregate-places-candidate
       - name: GCC aggregate place and discarded call regression
-        if: matrix.variant != 'baseline'
         run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test aggregate_places -- --nocapture
       - name: Native literal GCC ELF and GAS regression
-        if: matrix.variant == 'combined'
         run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test native_float_literals -- --nocapture
       - name: Adapter unit tests on all variants
         if: success() || failure()
         run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib
-      - name: Replay 32 structure seeds
+      - name: Replay 128 structural and compound Csmith seeds
         if: success() || failure()
         shell: bash
         run: |
@@ -94,7 +58,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/struct-evidence"
           evidence="$RUNNER_TEMP/struct-evidence"
           failure=0
-          for profile in restricted-structs; do
+          for profile in restricted-structs restricted-arrays restricted-pointers restricted-compound; do
             cases="$evidence/$profile/cases"
             results="$evidence/$profile/results"
             python3 compiler/tools/csmith_probe.py --generate --cases-dir "$cases" --csmith csmith --seed-base 1 --seed-count 32 --profile "$profile"
@@ -114,6 +78,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: discarded-aggregate-csmith-evidence-${{ matrix.variant }}
+          name: merged-aggregate-and-fp-evidence
           path: ${{ runner.temp }}/struct-evidence
           retention-days: 14
