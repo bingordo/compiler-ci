@@ -60,6 +60,27 @@ def validate(
         for marker in markers
     ):
         raise ManifestError("Missing or invalid AL-03 formal evidence marker")
+    # Standalone historical-oracle parity tests cannot manufacture a paired
+    # SMT theorem. Record their exact names and review scope explicitly,
+    # keeping the source/log inventory fail-closed for every concrete test.
+    standalone = manifest.get("standalone_concrete", [])
+    if not isinstance(standalone, list):
+        raise ManifestError("Invalid standalone concrete inventory")
+    standalone_names = []
+    for entry in standalone:
+        if not isinstance(entry, dict) or set(entry) != {"name", "scope"}:
+            raise ManifestError("Malformed standalone concrete entry")
+        name, scope = entry["name"], entry["scope"]
+        if not isinstance(name, str) or not re.fullmatch(r"al03_[a-z0-9_]+", name):
+            raise ManifestError("Invalid standalone concrete test name")
+        if not isinstance(scope, str) or len(scope.strip()) < 12:
+            raise ManifestError("Standalone concrete test needs a reviewed scope")
+        standalone_names.append(name)
+    _unique(standalone_names, "standalone concrete regression")
+    if set(standalone_names) & (set(ordinary) | set(proofs)):
+        raise ManifestError("Standalone concrete test duplicates a paired suite")
+    required_concrete = set(ordinary) | set(standalone_names)
+
     _unique(ordinary, "concrete regression")
     _unique(proofs, "formal proof regression")
     _unique(markers, "formal proof marker")
@@ -72,11 +93,11 @@ def validate(
     _unique([name for name, _ in actual], "source AL-03 test")
     actual_ordinary = {name for name, ignored in actual if not ignored}
     actual_proofs = {name for name, ignored in actual if ignored}
-    if actual_ordinary != set(ordinary) or actual_proofs != set(proofs):
+    if actual_ordinary != required_concrete or actual_proofs != set(proofs):
         raise ManifestError(
             "AL-03 source/manifest test drift: "
-            f"new_concrete={sorted(actual_ordinary - set(ordinary))}, "
-            f"missing_concrete={sorted(set(ordinary) - actual_ordinary)}, "
+            f"new_concrete={sorted(actual_ordinary - required_concrete)}, "
+            f"missing_concrete={sorted(required_concrete - actual_ordinary)}, "
             f"new_proofs={sorted(actual_proofs - set(proofs))}, "
             f"missing_proofs={sorted(set(proofs) - actual_proofs)}"
         )
@@ -88,11 +109,11 @@ def validate(
 
     passed_concrete = _CONCRETE_SUCCESS.findall(concrete_log)
     _unique(passed_concrete, "executed concrete AL-03 test")
-    if set(passed_concrete) != set(ordinary):
+    if set(passed_concrete) != required_concrete:
         raise ManifestError(
             f"Concrete AL-03 coverage mismatch: missing="
-            f"{sorted(set(ordinary)-set(passed_concrete))}, "
-            f"unmanifested={sorted(set(passed_concrete)-set(ordinary))}"
+            f"{sorted(required_concrete-set(passed_concrete))}, "
+            f"unmanifested={sorted(set(passed_concrete)-required_concrete)}"
         )
 
     seen_proofs = _PROOF_RECORD.findall(proof_log)
@@ -136,7 +157,8 @@ def validate(
         "scope": "AL-03 exact-width TypeId",
         "source_sha": source_sha,
         "suites": len(suites),
-        "concrete_tests": len(ordinary),
+        "concrete_tests": len(required_concrete),
+        "standalone_concrete_tests": len(standalone_names),
         "external_z3_tests": len(proofs),
         "real_unsat_witnesses": sum(x["real_unsat"] for x in measured),
         "sat_negative_controls": sum(x["sat_negatives"] for x in measured),
