@@ -95,13 +95,12 @@ jobs:
           ref: ${{ steps.frontend-pins.outputs.mini_c_preprocess_sha }}
           path: mini-c
           persist-credentials: false
-      - name: Checkout compiler-pinned Mini-C for generated-C compatibility audit
+      - name: Checkout exact Mini-C natural alignment candidate
         uses: actions/checkout@v4
         with:
           repository: bingordo/mini-c
-          # Use precisely the grammar and checker revision required by the
-          # bootstrapped driver rather than a historical parser snapshot.
-          ref: ${{ steps.frontend-pins.outputs.mini_c_frontend_sha }}
+          # Diagnostic candidate override; never modify the committed compiler pin.
+          ref: f6344789facdbad80219e83ae592e91d665b3c80
           path: mini-c-compat
           persist-credentials: false
       - name: Checkout pinned mrustc
@@ -350,6 +349,25 @@ jobs:
                           result=attempt([str(driver),str(fixture),"--emit","obj","-o",str(tmp/"header.o")],tmp/"header.log",60)
                           raw=(tmp/"header.log").read_text(errors="replace").split("\nusage:",1)[0]
                           print("PUBLIC_HEADER="+header+" EXIT="+str(result)+" DIAG_IDS="+",".join(sorted(set(re.findall(r'\b[PLST][0-9]{4}\b',raw)))))
+                          # Only isolated public fixtures: their diagnostics may be printed.
+                          for line in raw.splitlines()[:3]:
+                              print("PUBLIC_HEADER_DIAG="+line[:300],flush=True)
+                      fixture=tmp/"public-layout.c"
+                      fixture.write_text("typedef struct { long long a __attribute__((aligned(__alignof__(long long)))); long double b __attribute__((aligned(__alignof__(long double)))); } Max;\nunsigned long layout_size(void){return sizeof(Max);}\n")
+                      harness=tmp/"public-harness.c"
+                      harness.write_text("extern unsigned long layout_size(void); int main(void){return layout_size()!=32;}\n")
+                      for name,cmd in [("gcc",["gcc","-c",str(fixture),"-o",str(tmp/"layout.o")]),("native",[str(driver),str(fixture),"--emit","obj","-o",str(tmp/"layout.o")])]:
+                          (tmp/"layout.o").unlink(missing_ok=True)
+                          result=attempt(cmd,tmp/"layout.log",60)
+                          print("PUBLIC_LAYOUT_"+name.upper()+"_COMPILE_EXIT="+str(result),flush=True)
+                          if result==0:
+                              link=attempt(["gcc",str(harness),str(tmp/"layout.o"),"-o",str(tmp/"layout")],tmp/"layout-link.log",60)
+                              print("PUBLIC_LAYOUT_"+name.upper()+"_LINK_EXIT="+str(link),flush=True)
+                              if link==0:
+                                  print("PUBLIC_LAYOUT_"+name.upper()+"_EXEC_EXIT="+str(attempt([str(tmp/"layout")],tmp/"layout-exec.log",10)),flush=True)
+                          else:
+                              for line in (tmp/"layout.log").read_text(errors="replace").splitlines()[:3]:
+                                  print("PUBLIC_LAYOUT_DIAG="+line[:300],flush=True)
                   # Emit only enumerated syntax tokens, never source identifiers or literals.
                   allowed = {";",",","(",")","{","}","[","]","*","=","...",":","__attribute__","__aligned__","__alignof__","__extension__","__asm__","__typeof__","typeof","_Atomic","_Alignas","_Alignof","_Static_assert","__atomic_load_n","__atomic_store_n","__int128","__float128","__builtin_va_list","__restrict","__restrict__","volatile","const","struct","union","enum","typedef","inline","int","char","void","long","short","unsigned","signed","float","double"}
                   m = re.search(r"expected '([^'\n]*)', found '([^'\n]*)'", msg)
