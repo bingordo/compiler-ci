@@ -1,0 +1,60 @@
+# Disposable acceptance gate. Do not merge onto compiler-ci main.
+name: IR PR3340 legacy CFG adapter retirement
+on:
+  push:
+    branches: [verify-ir-legacy-cfg-3340-20261126]
+    paths: ['.github/workflows/ir-pr3340-cfg-retirement.yml']
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: 2e04e482876e684cd257f74d8ab41e985bd0f8a5
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and isolate core workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          if git -C compiler grep -n 'compiler_opt::cfg\|crate::cfg::\|legacy-function-cfg-oracle' -- '*.rs' '*.toml'; then
+            echo "Found stale historical CFG callers or features" >&2
+            exit 1
+          fi
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-pr3340-cfg-retirement
+      - name: Build native optimizer and execute CFG tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --all-targets
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test typed_cfg
+          cargo test -p compiler-opt --test typed_phi_cfg
+          cargo test -p compiler-opt --test typed_phi_dead_linear
+          cargo test -p compiler-opt --test ir_opt_native_v3_only
+      - name: Strict optimizer Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --lib -- -D warnings
+          cargo clippy -p compiler-opt --all-targets -- -D warnings
