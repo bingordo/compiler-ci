@@ -1,0 +1,73 @@
+name: Mini-C shared float literal candidate
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/minic-hexfloat-candidate.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  candidate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d06a608a118be567d0cefea0b7a481496c2b6a9e
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: 87e5e393ff2a2ff6f9602d214136617da8ae17ef
+          path: mini-c
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mini-c -> target
+          key: minic-hexfloat-candidate
+      - name: Record source and test exact rounding
+        run: |
+          git -C compiler rev-parse HEAD
+          git -C mini-c rev-parse HEAD
+          cargo test --manifest-path mini-c/Cargo.toml -p mini-c-sema --test float_literal
+      - name: Build and test Cranelift
+        run: |
+          cargo test --manifest-path mini-c/Cargo.toml -p mini-c-cranelift --lib
+          cargo build --manifest-path mini-c/Cargo.toml -p mini-c-cranelift
+      - name: Replay strict observable Csmith
+        if: success() || failure()
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y --no-install-recommends csmith libcsmith-dev gcc clang
+          [[ $(dpkg-query -W -f='${Version}' csmith) == 2.3.0-* ]]
+          header=$(dpkg -L libcsmith-dev | grep '/csmith.h$' | head -n1)
+          export CRANELIFT_BIN="$PWD/mini-c/target/debug/mini-c-cranelift"
+          test -x "$CRANELIFT_BIN"
+          cat > "$RUNNER_TEMP/cranelift-adapter" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          [[ $# == 5 && "$2" == -o && "$4" == --emit && "$5" == obj ]]
+          exec "$CRANELIFT_BIN" --cpp=none --emit-obj "$3" "$1"
+          SH
+          chmod +x "$RUNNER_TEMP/cranelift-adapter"
+          evidence="$RUNNER_TEMP/csmith-evidence"
+          python3 compiler/tools/csmith_probe.py --generate --cases-dir "$evidence/cases" --csmith csmith --seed-base 1 --seed-count 8 --profile restricted-observable
+          rc=0
+          python3 compiler/tools/csmith_probe.py --probe --cases-dir "$evidence/cases" --artifacts-dir "$evidence/results" --include-dir "$(dirname "$header")" --preprocess-c --driver "$RUNNER_TEMP/cranelift-adapter" --compiler-sha "$(git -C compiler rev-parse HEAD)" --frontend-sha "$(git -C mini-c rev-parse HEAD)" --minimum-native 8 --run-timeout 5 --max-wall-seconds 120 || rc=$?
+          python3 - "$evidence/results/results.jsonl" <<'PY'
+          import json,sys
+          for line in open(sys.argv[1]):
+              r=json.loads(line)
+              print("STRICT_RESULT", json.dumps({k:r.get(k) for k in ("seed","classification","compiler","frontend_diagnostic")}))
+          PY
+          exit "$rc"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cranelift-hexfloat-evidence
+          path: ${{ runner.temp }}/csmith-evidence
+          retention-days: 14
