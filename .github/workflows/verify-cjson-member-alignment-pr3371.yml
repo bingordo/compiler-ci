@@ -1,0 +1,77 @@
+name: cJSON GNU natural field alignment PR3371
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-cjson-member-alignment-pr3371.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  cjson-alignment:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 24
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ed234183a945d1015e9998fd0c5df40e6b44a62c
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Build exact candidate production Rust GCC driver
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = ed234183a945d1015e9998fd0c5df40e6b44a62c
+          timeout --signal=TERM --kill-after=10s 12m cargo build -p compiler --bin compiler --manifest-path compiler/Cargo.toml
+          echo "COMPILER_SHA=$(git -C compiler rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Run exact pinned Mini-C GNU alignment semantic tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone -q ssh://git@github.com/bingordo/mini-c.git minic
+          git -C minic checkout -q ef0d13a0f8df27d00774b9e2ed7c7be1de85286d
+          test "$(git -C minic rev-parse HEAD)" = ef0d13a0f8df27d00774b9e2ed7c7be1de85286d
+          timeout --signal=TERM --kill-after=10s 6m cargo test --manifest-path minic/Cargo.toml -p mini-c-sema gnu_member_alignment_checks_natural_target_layout -- --nocapture
+          echo "MINIC_SHA=$(git -C minic rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Independent GCC baseline and unmodified TypeId cJSON build classification
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone -q --depth 1 --branch v1.7.19 https://github.com/DaveGamble/cJSON.git cjson
+          test "$(git -C cjson rev-parse HEAD)" = c859b25da02955fef659d658b8f324b5cde87be3
+          cmake -S cjson -B gcc-build -G Ninja -DCMAKE_C_COMPILER=cc -DBUILD_SHARED_LIBS=OFF -DENABLE_CUSTOM_COMPILER_FLAGS=OFF -DENABLE_CJSON_TEST=OFF -DENABLE_CJSON_UTILS=OFF -DENABLE_LOCALES=OFF
+          cmake --build gcc-build
+          test -s gcc-build/libcjson.a
+          compiler="$PWD/compiler/target/debug/compiler"
+          toolchain="$PWD/compiler/tools/cmake/typeid-gcc-adapter-toolchain.cmake"
+          cmake -S cjson -B typeid-build -G Ninja -DCMAKE_C_COMPILER="$compiler" -DCMAKE_C_COMPILER_ARG1=--gcc-driver -DCMAKE_TOOLCHAIN_FILE="$toolchain" -DBUILD_SHARED_LIBS=OFF -DENABLE_CUSTOM_COMPILER_FLAGS=OFF -DENABLE_CJSON_TEST=OFF -DENABLE_CJSON_UTILS=OFF -DENABLE_LOCALES=OFF
+          set +e
+          cmake --build typeid-build --verbose > typeid-build.log 2>&1
+          result=$?
+          set -e
+          if grep -Fq "expected ';', found '__attribute__'" typeid-build.log; then
+            echo "GNU aligned member parser still fails the original cJSON case" >&2
+            grep -m 5 "expected ';', found '__attribute__'" typeid-build.log >&2
+            exit 1
+          fi
+          {
+            echo 'GCC_CJSON_STATIC_LIBRARY=PASS'
+            echo "TYPEID_CJSON_BUILD_EXIT=$result"
+            if test "$result" -eq 0; then
+              test -s typeid-build/libcjson.a
+              echo 'TYPEID_CJSON_STATIC_LIBRARY=PASS'
+            else
+              echo 'TYPEID_CJSON_STATIC_LIBRARY=UNSUPPORTED'
+              echo 'First new diagnostics:'
+              grep -m 8 -E 'compiler:|error:|unsupported|fatal' typeid-build.log || true
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cjson-natural-alignment-repro-PR3371
+          path: typeid-build.log
+          if-no-files-found: ignore
