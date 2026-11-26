@@ -1,0 +1,52 @@
+# Disposable exact-source optimizer check; never merge this workflow into compiler-ci main.
+name: IR PR3428 native memory stress bounds
+on:
+  push:
+    branches: [verify-ir-bounds-3428-20261126]
+    paths: ['.github/workflows/ir-pr3428-memory-bounds.yml']
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: 26bc269c0ca2b7dcea211afb117254b3a97539f6
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source and isolate optimizer workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-pr3428-memory-bounds
+      - name: Compile all optimizer targets, large memory matrix, core tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --all-targets
+          cargo test -p compiler-opt --test memory_analysis_bounds
+          cargo test -p compiler-opt --test typed_dse
+          cargo test -p compiler-opt --test typed_global_memory
+          cargo test -p compiler-opt --test memory_native
+      - name: Strict affected-target lint
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy --no-deps -p compiler-opt --test memory_analysis_bounds -- -D warnings -A dead_code
