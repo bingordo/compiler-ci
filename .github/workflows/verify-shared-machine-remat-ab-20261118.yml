@@ -1,113 +1,193 @@
-name: source-pinned generic machine remat x86 and aarch64
+name: Pinned AArch64 dual-trace real-source ELF/GAS and seven alignments
 on:
   push:
-    branches: [main]
-    paths: [.github/workflows/verify-shared-machine-remat-ab-20261118.yml]
-  workflow_dispatch:
+    branches: [benchmark/a64-dual-trace-20261126]
+    paths: ['.github/workflows/verify-shared-machine-remat-ab-20261118.yml']
 permissions:
   contents: read
+  statuses: write
 jobs:
-  correctness:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 55
+  native:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 95
     env:
+      OLD_SHA: '891472a323ff66b3ba47bd979efcc7f6f52dc04d'
+      NEW_SHA: 'a8d71f42b4df6a67085e5ad2d7fc1e5aec974fb1'
       CARGO_INCREMENTAL: '0'
       CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: e7b79a843fbe6b1d861fa9967c6c279ab97aeba3
+          ref: '891472a323ff66b3ba47bd979efcc7f6f52dc04d'
           path: old
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 192d60ba8888efa5036e897ec3792f3942edc77f
+          ref: 'a8d71f42b4df6a67085e5ad2d7fc1e5aec974fb1'
           path: new
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Assert exact source pins
+      - name: Verify pinned code and independently identical test source
         run: |
           set -euo pipefail
-          test "$(git -C old rev-parse HEAD)" = "e7b79a843fbe6b1d861fa9967c6c279ab97aeba3"
-          test "$(git -C new rev-parse HEAD)" = "192d60ba8888efa5036e897ec3792f3942edc77f"
-          lscpu | grep -E '^Model name:|^Architecture:' || true
+          test "$(git -C old rev-parse HEAD)" = "$OLD_SHA"
+          test "$(git -C new rev-parse HEAD)" = "$NEW_SHA"
+          uname -m | grep -Eq 'aarch64|arm64'
           git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          cmp old/tests/fixtures/remat/aarch64_loop_pressure.c new/tests/fixtures/remat/aarch64_loop_pressure.c
+          cmp old/tests/fixtures/remat/aarch64_loop_pressure_oracle.c new/tests/fixtures/remat/aarch64_loop_pressure_oracle.c
+          mkdir -p results
+          cp new/tests/fixtures/remat/aarch64_loop_pressure.c results/loops.c
+          cp new/tests/fixtures/remat/aarch64_loop_pressure_oracle.c results/loops_oracle.c
+          cp new/tests/fixtures/remat/aarch64_nested_control_flow.c results/nested.c
+          cp new/tests/fixtures/remat/aarch64_nested_control_flow_oracle.c results/nested_oracle.c
+          sha256sum results/loops.c results/loops_oracle.c results/nested.c results/nested_oracle.c
+          printf 'A64 physical CFG layout: baseline `%s`, candidate `%s`\n' "$OLD_SHA" "$NEW_SHA" >> "$GITHUB_STEP_SUMMARY"
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             old -> target
             new -> target
-          key: shared-remat-20261118
-      - name: Generic planner and cross-target correctness and strict Clippy
-        working-directory: new
+          key: a64-dual-cfg-loop-abba-20261126
+      - name: Build exact production compiler revisions and native C11 differential for both sources
         run: |
           set -euo pipefail
-          cargo test -p compiler-backend --lib remat::tests -- --nocapture
-          cargo test -p compiler-backend --lib
-          cargo test -p compiler-backend-x86 --lib
-          cargo test -p compiler-backend-aarch64 --lib
-          cargo clippy -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --lib -- -D warnings
-          cargo test -p compiler --test x86_inline_source_ablation -- --nocapture
-          cargo test -p compiler --test x7_s4_rolling_checksum_source -- --nocapture
-      - name: Exact benchmark overlay on both pinned compiler sources
+          for rev in old new; do
+            cargo build -p compiler --bin compiler --manifest-path "$rev/Cargo.toml"
+            for fixture in loops nested; do
+              "$rev/target/debug/compiler" "results/$fixture.c" --language mini-c --target aarch64 --emit obj -o "results/$rev-$fixture.o"
+              "$rev/target/debug/compiler" "results/$fixture.c" --language mini-c --target aarch64 --emit asm -o "results/$rev-$fixture.s"
+              gcc -c "results/$rev-$fixture.s" -o "results/$rev-$fixture-gas.o"
+              for variant in "$rev-$fixture" "$rev-$fixture-gas"; do
+                gcc -std=c11 -O2 -Wall -Wextra -Werror "results/${fixture}_oracle.c" "results/$variant.o" -o "results/$variant.exe"
+                "results/$variant.exe"
+              done
+              objcopy -O binary --only-section=.text "results/$rev-$fixture.o" "results/$rev-$fixture.text"
+              objcopy -O binary --only-section=.text "results/$rev-$fixture-gas.o" "results/$rev-$fixture-gas.text"
+              cmp "results/$rev-$fixture.text" "results/$rev-$fixture-gas.text"
+              objdump -d --no-show-raw-insn "results/$rev-$fixture.o" > "results/$rev-$fixture.dis"
+            done
+          done
+      - name: Independent physical code size and branch counts for loops and nested control flow
         run: |
-          set -euo pipefail
-          python3 - <<'PY'
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import re
           from pathlib import Path
-          path=Path('crates/driver/tests/x86_source_runtime_performance.rs')
-          orig=(Path('old')/path).read_bytes()
-          updated=(Path('new')/path).read_bytes()
-          assert orig==updated, 'benchmark fixture changed between commits'
-          needle=b'REPS=7, ITERS=1800'
-          assert orig.count(needle)==1
-          for root in ('old','new'):
-              (Path(root)/path).write_bytes(orig.replace(needle,b'REPS=7, ITERS=18000'))
+          for fixture,names in (
+              ('loops',('chain_loop','branch_loop','pressure_loop','call_pressure_loop')),
+              ('nested',('nested_loops','interleaved_loops','guarded_loop'))):
+              data={}
+              for rev in ('old','new'):
+                  code=Path(f'results/{rev}-{fixture}.text').read_bytes()
+                  assert code and len(code)%4==0
+                  words=[int.from_bytes(code[i:i+4],'little') for i in range(0,len(code),4)]
+                  b=sum((w&0xfc000000)==0x14000000 for w in words)
+                  counts={};fn=None
+                  for line in Path(f'results/{rev}-{fixture}.dis').read_text().splitlines():
+                      m=re.match(r'^\s*[0-9a-f]+ <([^>]+)>:$',line)
+                      if m:
+                          fn=m.group(1);counts[fn]=0
+                      elif fn and re.match(r'^\s*[0-9a-f]+:\s+[A-Za-z]',line):
+                          counts[fn]+=1
+                  assert all(n in counts for n in names),counts
+                  data[rev]=(len(code),b,counts)
+                  print(f'{fixture} {rev} .text={len(code)} words={len(words)} unconditional_B={b}')
+                  for fn in names:
+                      print(f'{fixture} {rev} {fn} instructions={counts[fn]}')
+              old,new=data['old'],data['new']
+              print(f'{fixture} DELTA text={new[0]-old[0]} B={new[1]-old[1]}')
+              for fn in names:
+                  print(f'{fixture} DELTA {fn} instructions={new[2][fn]-old[2][fn]}')
+              assert new[1]<=old[1],f'Unexpected extra B for {fixture}'
+          print('Both independent native C11 sources pass exact ELF and GAS oracle for both compiler revisions.')
           PY
-          for case in old new; do
-            (cd "$case" && cargo test --release -p compiler --test x86_source_runtime_performance --no-run)
-          done
-      - name: Source-pinned same-CPU old new new old native and GCC oracle
+      - name: Native 7-layout ABBA study for nested loop variants, without performance pins
         run: |
           set -euo pipefail
-          cpu=$(awk '/^Cpus_allowed_list:/ {split($2,a,/[-,]/); print a[1]}' /proc/self/status)
-          test -n "$cpu"
-          echo "CPU_PIN=$cpu"
-          index=0
-          for case in old new new old; do
-            index=$((index+1))
-            logfile="$RUNNER_TEMP/ab-$index-$case.log"
-            (cd "$case" && taskset -c "$cpu" cargo test --release -p compiler --test x86_source_runtime_performance -- --ignored --nocapture) 2>&1 | tee "$logfile"
-            grep -q 'X86_RUNTIME_FUNCTION mode=mini_default symbol=scan>' "$logfile"
-            grep -q 'X86_SOURCE_RUNTIME mode=mini_default workload=combined ' "$logfile"
-            grep -q 'X86_SOURCE_RUNTIME mode=gcc_O2 workload=combined ' "$logfile"
-          done
-          python3 - "$RUNNER_TEMP" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          cat > results/timing.c <<'EOF'
+          #define _POSIX_C_SOURCE 200809L
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <time.h>
+          extern unsigned int nested_loops(unsigned int,unsigned int,unsigned int);
+          extern unsigned int interleaved_loops(unsigned int,unsigned int);
+          extern unsigned int guarded_loop(unsigned int,unsigned int);
+          int main(void){
+              struct timespec t;
+              volatile unsigned int check=0;
+              clock_gettime(CLOCK_MONOTONIC_RAW,&t);
+              unsigned long long start=(unsigned long long)t.tv_sec*1000000000ull+t.tv_nsec;
+              for(unsigned int i=0;i<12000u;i++){
+                  check=check+nested_loops(0x12345678u+i*7u,16u,13u);
+                  check=check+interleaved_loops(i^0x123u,19u);
+                  check=check+guarded_loop(i*13u,23u);
+              }
+              clock_gettime(CLOCK_MONOTONIC_RAW,&t);
+              unsigned long long end=(unsigned long long)t.tv_sec*1000000000ull+t.tv_nsec;
+              printf("%llu %u\n",end-start,check);
+              return 0;
+          }
+          EOF
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import os,statistics,subprocess
           from pathlib import Path
-          import sys,statistics
-          root=Path(sys.argv[1])
-          results=[]
-          for index,case in enumerate(('old','new','new','old'),1):
-              data=(root/f'ab-{index}-{case}.log').read_text(errors='replace')
-              def last(prefix):
-                  lines=[l for l in data.splitlines() if prefix in l]
-                  assert lines,(index,case,prefix)
-                  return dict(token.split('=',1) for token in lines[-1].split() if '=' in token)
-              mini=last('X86_SOURCE_RUNTIME mode=mini_default workload=combined ')
-              gcc=last('X86_SOURCE_RUNTIME mode=gcc_O2 workload=combined ')
-              scan=last('X86_RUNTIME_FUNCTION mode=mini_default symbol=scan>')
-              assert mini['checksum']==gcc['checksum']
-              results.append((case,int(mini['median_ns']),scan))
-              print(f'{index} {case}: native_ns={mini["median_ns"]} gcc_ns={gcc["median_ns"]} scan_instr={scan["instructions"]} moves={scan["moves"]} stack_mem={scan["stack_memory"]}')
-          for case in ('old','new'):
-              medians=[ns for name,ns,_ in results if name==case]
-              print(f'{case} avg_median_ns={statistics.mean(medians):.1f}')
+          cpu=min(os.sched_getaffinity(0));os.sched_setaffinity(0,{cpu})
+          print('AArch64 native pinned CPU:',cpu)
+          for rev in ('old','new'):
+              source=Path(f'results/{rev}-nested.s').read_text()
+              anchor='nested_loops:\n'
+              assert source.count(anchor)==1
+              for pad in (0,4,8,16,24,32,48):
+                  # Align only the entire function, not its internal .inst
+                  # branch offsets; unchanged relative A64 displacements.
+                  padded=source.replace(anchor,
+                      '.p2align 6\n'+('    nop\n'*(pad//4))+anchor)
+                  Path(f'results/{rev}-{pad}.s').write_text(padded)
+                  obj=f'results/{rev}-{pad}.o'
+                  subprocess.run(['gcc','-c',f'results/{rev}-{pad}.s','-o',obj],check=True)
+                  oracle=f'results/{rev}-{pad}.oracle'
+                  subprocess.run(['gcc','-std=c11','-O2','-Wall','-Wextra',
+                      '-Werror','results/nested_oracle.c',obj,'-o',oracle],check=True)
+                  out=subprocess.run([oracle],capture_output=True,text=True,check=True)
+                  assert 'A64_NESTED_CONTROL_FLOW_C11_ORACLE_OK' in out.stdout
+                  subprocess.run(['gcc','-std=c11','-O2','-Wall','-Wextra',
+                      '-Werror','results/timing.c',obj,
+                      '-o',f'results/{rev}-{pad}.bench'],check=True)
+          for pad in (0,4,8,16,24,32,48):
+              times={'old':[],'new':[]}
+              checks={'old':set(),'new':set()}
+              for rev in ('old','new'):
+                  subprocess.run([f'results/{rev}-{pad}.bench'],
+                      capture_output=True,check=True)
+              for rev in ('old','new','new','old')*3:
+                  line=subprocess.run([f'results/{rev}-{pad}.bench'],
+                      check=True,capture_output=True,text=True).stdout.split()
+                  assert len(line)==2
+                  times[rev].append(int(line[0]));checks[rev].add(int(line[1]))
+              assert len(checks['old'])==len(checks['new'])==1
+              assert checks['old']==checks['new'],(pad,checks)
+              a=statistics.median(times['old']);b=statistics.median(times['new'])
+              print(f'ABBA layout={pad} old_ns={a:.0f} new_ns={b:.0f} delta={100*(b/a-1):+.2f}%')
+              print(f'ABBA layout={pad} raw_old={times["old"]} raw_new={times["new"]}')
+          print('All 14 alignment-variant native GCC oracles pass. Timings are directional, not CI regressions.')
           PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: source-pinned-generic-remat-ab
-          path: ${{ runner.temp }}/ab-*.log
-          if-no-files-found: ignore
+          name: a64-dual-trace-source-layout-abba
+          path: results/
+      - name: Publish pinned A64 source AB status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUTCOME: ${{ job.status }}
+        run: |
+          case "$OUTCOME" in success) state=success;; cancelled) state=error;; *) state=failure;; esac
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$state" -f context="compiler/a64-dual-trace-source-ab" \
+            -f description="Pinned source ABI/CFG text A/B $OUTCOME" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
