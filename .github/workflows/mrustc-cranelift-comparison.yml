@@ -299,6 +299,51 @@ jobs:
           fi
           python3 bootstrap/probe-mrustc-cranelift-reference.py minic "$PWD/mini-c-compat/target/release/mini-c-cranelift" "$PWD/mrustc/output-compiler-bootstrap"
 
+
+      - name: Checkout current Mini-C main independently of compiler pin
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: fa4ef7db838bf01e531e59eeab0fdd3113f97c9d
+          path: mini-c-current
+          persist-credentials: false
+
+      - name: Compare current Mini-C parser and Cranelift against real C and public headers
+        id: minic-current
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +1.99.1 build --release --manifest-path mini-c-current/Cargo.toml -p mini-c-cranelift -p mini-c --no-default-features > "$RUNNER_TEMP/minic-current-build.log" 2>&1 || {
+            echo "MINIC_CURRENT_BUILD_EXIT=1"
+            grep -oE 'error\[E[0-9]{4}\]' "$RUNNER_TEMP/minic-current-build.log" | sort -u || true
+            exit 1
+          }
+          echo "MINIC_CURRENT_BUILD_EXIT=0"
+          python3 - <<'PY'
+          import subprocess,tempfile
+          from pathlib import Path
+          driver=Path("mini-c-current/target/release/mini-c-cranelift").resolve()
+          cases={
+              "stddef":"#include <stddef.h>\nint test(void){return 42;}\n",
+              "stdint":"#include <stdint.h>\nint test(void){return 42;}\n",
+              "stdatomic":"#include <stdatomic.h>\nint test(void){return 42;}\n",
+              "stdlib":"#include <stdlib.h>\nint test(void){return 42;}\n",
+              "aligned_member":"struct X { char a; long b __attribute__((__aligned__(16))); };\nint test(void){return sizeof(struct X)==32;}\n",
+              "alignof_member":"struct X { char a; long b __attribute__((__aligned__(__alignof__(long)))); };\nint test(void){return sizeof(struct X)==16;}\n",
+          }
+          with tempfile.TemporaryDirectory() as d:
+              for name,source in cases.items():
+                  p=Path(d)/"probe.c"; p.write_text(source)
+                  out=Path(d)/"probe.o";out.unlink(missing_ok=True)
+                  r=subprocess.run([str(driver),"--cpp=cc","--emit-obj",str(out),str(p)],capture_output=True,text=True,timeout=60)
+                  print(f"PUBLIC_CURRENT_{name.upper()}_EXIT={r.returncode}",flush=True)
+                  # Public, synthetic inputs only; no private C diagnostics.
+                  for line in r.stderr.splitlines()[:3]:
+                      print(f"PUBLIC_CURRENT_{name.upper()}_DIAG={line[:300]}",flush=True)
+          PY
+          python3 bootstrap/probe-mrustc-cranelift-reference.py minic "$PWD/mini-c-current/target/release/mini-c-cranelift" "$PWD/mrustc/output-compiler-bootstrap"
+
       - name: Checkout exact EDG callable source
         uses: actions/checkout@v4
         with:
