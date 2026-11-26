@@ -131,6 +131,19 @@ class CompatibilityTests(unittest.TestCase):
                          "ABI_MISMATCH")
         self.assertTrue(fatal(changed))
 
+    def test_standalone_bitfield_execution_accounting(self):
+        from gcc_bitfield_execute import run_single
+        from gcc_compat_runner import build_native, link_run, observed, command, succeeds
+        src = self.root / "single.c"
+        src.write_text("int main(void) { struct { signed a:1; unsigned b:3; } v; "
+                       "v.a=-1; v.b=7; return v.a!=-1 || v.b!=7; }\n")
+        record = run_single(src, None, self.root / "single", "gcc", self.flags,
+                            {"control": ["gcc", "-c", "{original}", "-o", "{object}"]},
+                            build_native, link_run, observed, command, succeeds)
+        self.assertFalse(fatal(record), record)
+        self.assertEqual(record["frontends"]["control"]["directions"]["whole-tu"]["status"], "PASS")
+        self.assertEqual(record["origin"], "upstream-bitfield-execute")
+
     def test_unknown_directive_is_not_executed(self):
         path = self.root / "struct-return-0_main.c"
         path.write_text("/* { dg-require-effective-target unknown_feature } */\n"
