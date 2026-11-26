@@ -1,0 +1,59 @@
+name: Validate x86 zero bulk PR 3251
+on:
+  push:
+    branches: [ci-bulk-zero-pr3251]
+    paths: ['.github/workflows/ci-bulk-zero-pr3251.yml']
+  pull_request:
+    paths: ['.github/workflows/ci-bulk-zero-pr3251.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-memmove:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1961f20b76238e54ad014ad1b3a9e56770fdf29a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source commit
+        run: test "$(git -C compiler rev-parse HEAD)" = 1961f20b76238e54ad014ad1b3a9e56770fdf29a
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x86-memmove-pr2956
+      - name: Verify generated physical x86 instruction catalog
+        working-directory: compiler
+        run: python3 tools/regen_x86_forms.py --check
+      - name: Verify Rust formatter in new implementation and tests
+        working-directory: compiler
+        run: rustfmt --check --edition 2021 crates/backend-x86/src/bulk_copy.rs crates/backend-x86/src/bulk_move.rs crates/backend-x86/src/bulk_fill.rs crates/backend-x86/src/bulk_zero_tests.rs
+      - name: Selected machine and independent GCC GAS/direct-ELF overlap oracle
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --lib bulk_move_tests -- --nocapture
+      - name: Existing machine memcpy regression
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --lib bulk_copy -- --nocapture
+      - name: Existing selected memset regression
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --lib bulk_fill_tests -- --nocapture
+      - name: Shared bulk-memory contract
+        working-directory: compiler
+        run: cargo test -p compiler-backend --lib bulk_memory -- --nocapture
+      - name: Full x86 library tests
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --lib
+      - name: Strict Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-x86 --all-targets -- -D warnings
