@@ -1,0 +1,111 @@
+name: S23.54 proof-pinned batch SSA shadow matcher
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-54-guarded-ssa-shadow.yml'
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: e1523c56df9202f1bb22f3c95e7d34e0049e0524
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 6d616c9daefda90c4225fbad35e2f63354efc3ab
+          path: distribution
+          sparse-checkout: |
+            dist
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify compiler, distribution, and generator source pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = e1523c56df9202f1bb22f3c95e7d34e0049e0524
+          test "$(git -C distribution rev-parse HEAD)" = 6d616c9daefda90c4225fbad35e2f63354efc3ab
+          test "$(tr -d '\n' < distribution/dist/source-sha.txt)" = 3a0ebce9a36973cdc9acf833d015b3899f865ffd
+          echo "S2354_COMPILER_SHA=$(git -C compiler rev-parse HEAD)"
+          echo "S2354_DIST_SHA=$(git -C distribution rev-parse HEAD)"
+      - name: Run existing and new offline matcher generator tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler/tools/typeid-rule-gen
+          python3 -m compileall -q guarded_ssa_codegen.py test_guarded_ssa_codegen.py
+          python3 -m unittest -v test_guarded_ssa_codegen test_guarded_batch_proofs test_batch_inventory test_ssa_codegen test_rules
+      - name: Install solver exclusively in compiler-ci
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v z3 >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq z3
+          fi
+          z3 --version
+      - name: Reprove all 67 source rules and produce authenticated width manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          python3 compiler/tools/typeid-rule-gen/guarded_batch_proofs.py \
+            --source distribution/dist/generated/expr_rules.json \
+            --source distribution/dist/generated/expr_fusion.json \
+            --generator-sha-file distribution/dist/source-sha.txt \
+            --out results/proofs.json
+          python3 - <<'PY'
+          import json
+          j=json.load(open('results/proofs.json'))
+          assert j['proof_count']==335 and j['false_law_sat_controls']==5
+          assert j['automatic_ssa_admissions']==0
+          PY
+      - name: Generate same read-only matcher twice and check byte stability
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--source distribution/dist/generated/expr_rules.json
+                --source distribution/dist/generated/expr_fusion.json
+                --proof-manifest results/proofs.json)
+          python3 compiler/tools/typeid-rule-gen/guarded_ssa_codegen.py "${args[@]}" --out results/guarded-shadow.rs
+          python3 compiler/tools/typeid-rule-gen/guarded_ssa_codegen.py "${args[@]}" --out results/guarded-shadow-repeat.rs
+          cmp results/guarded-shadow.rs results/guarded-shadow-repeat.rs
+          grep -Fq 'pub fn shadow_guarded_match' results/guarded-shadow.rs
+          grep -Fq 'pub enum GuardedProposal' results/guarded-shadow.rs
+          python3 - <<'PY'
+          import pathlib
+          s=pathlib.Path('results/guarded-shadow.rs').read_text()
+          assert s.count('return Some((')==67
+          assert 'pub enum GuardedProposal' in s
+          assert 'wrapping_add' in s or 'wrapping_sub' in s
+          print('S2354_MATCHER_67_SHAPES_OK')
+          PY
+      - name: Compile and execute generated SSA candidate semantics on five widths
+        shell: bash
+        env:
+          S2354_SOURCE_RULES: distribution/dist/generated/expr_rules.json
+          S2354_SOURCE_FUSION: distribution/dist/generated/expr_fusion.json
+          S2354_PROOF_MANIFEST: results/proofs.json
+        run: |
+          set -euo pipefail
+          cd compiler/tools/typeid-rule-gen
+          export S2354_SOURCE_RULES="../../../$S2354_SOURCE_RULES"
+          export S2354_SOURCE_FUSION="../../../$S2354_SOURCE_FUSION"
+          export S2354_PROOF_MANIFEST="../../../$S2354_PROOF_MANIFEST"
+          python3 -m unittest -v test_guarded_ssa_codegen
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: s2354-proven-read-only-ssa-shadow
+          path: results/
+          retention-days: 21
