@@ -1,0 +1,59 @@
+name: Repair compiler main - focused cross-crate build and regression
+on:
+  pull_request:
+    paths: ['.github/workflows/main-build-repair-20261125.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_INCREMENTAL: '0'
+      RUST_BACKTRACE: '1'
+    steps:
+      - name: Checkout exact compiler repair candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1716af12d50be5f3902294d4baed822b45cd1a50
+          ssh-key: \${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - name: Assert tested source SHA
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 1716af12d50be5f3902294d4baed822b45cd1a50
+          printf 'Compiler repair candidate: %s\n' "$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Isolate public compiler crates from private frontend workspaces
+        working-directory: compiler
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: main-repair-cross-crate
+      - name: Run IR, optimizer, backend and x86 full Rust tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86
+      - name: AArch64 reviewed instruction forms and all-target compilation
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          RUSTFLAGS="-D warnings" cargo check -p compiler-backend-aarch64 --all-targets
+          cargo test -p compiler-backend-aarch64 --test generated_scalar_gp_forms
+      - name: Check RV64/wasm and strict Rust lint of core/backend
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-backend-riscv64 -p compiler-backend-wasm --all-targets
+          cargo clippy -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 --all-targets -- -D warnings
