@@ -1,0 +1,101 @@
+name: RV64 R26 generic CFG candidate
+on:
+  workflow_dispatch:
+  push:
+    branches: ['ci/rv64-r26-main-integration']
+    paths: ['.github/workflows/verify-rv64-r26-main-integration.yml']
+permissions:
+  contents: read
+  statuses: write
+jobs:
+  rv64-cfg:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 55b84a44f48cf4f5b692dfbdab36d62d466d2394
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - run: test "$(git -C compiler rev-parse HEAD)" = 55b84a44f48cf4f5b692dfbdab36d62d466d2394
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install RV64 toolchain
+        run: sudo apt-get install -y --no-install-recommends gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu qemu-user
+      - name: Check backend and source regressions
+        working-directory: compiler
+        run: |
+          RV64_CFG_FIXTURE_DIR=/tmp/rv64-cfg cargo test -p compiler --test riscv64_generic_cfg
+          cargo test -p compiler-backend-riscv64 --lib --tests
+          cargo test -p compiler --test riscv64_load_ir --test riscv64_source_preview
+          cargo clippy -p compiler-backend-riscv64 --tests -- -D warnings
+      - name: Compare real CFG execution against independent GCC under QEMU
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/rv64-cfg
+          ls -l
+          for name in wide many nested; do
+            for isa in rv64i rv64izmmul rv64im; do
+              test -s "$name-$isa.obj" && test -s "$name-$isa.asm"
+            done
+          done
+          cat > harness.c <<'EOF'
+          extern long wide(long, long), many(long), nested(long, long);
+          extern long ref_wide(long, long), ref_many(long), ref_nested(long, long);
+          long step(long x) { return x + 1; }
+          static void finish(long code) {
+              register long a0 asm("a0") = code;
+              register long a7 asm("a7") = 93;
+              asm volatile("ecall" : : "r"(a0), "r"(a7) : "memory");
+              __builtin_unreachable();
+          }
+          void _start(void) {
+              for (long n = -1; n <= 8; ++n)
+                  for (long x = -40; x <= 40; x += 5) {
+                      if (wide(n, x) != ref_wide(n, x)) finish(1);
+                      if (many(x) != ref_many(x)) finish(2);
+                      if (nested(n, x) != ref_nested(n, x)) finish(3);
+                  }
+              finish(0);
+          }
+          EOF
+          cc=riscv64-linux-gnu-gcc
+          for name in wide many nested; do
+            "$cc" -march=rv64im -mabi=lp64 -O2 -ffreestanding -fno-builtin -fno-pie -fno-stack-protector -D"$name=ref_$name" -c "$name.c" -o "ref_$name.o"
+          done
+          "$cc" -march=rv64im -mabi=lp64 -O2 -ffreestanding -fno-builtin -fno-pie -fno-stack-protector -c harness.c -o harness.o
+          for isa in rv64i rv64izmmul rv64im; do
+            march="$isa"
+            if [ "$isa" = rv64izmmul ]; then march=rv64i_zmmul; fi
+            for name in wide many nested; do
+              riscv64-linux-gnu-as -march="$march" -mabi=lp64 "$name-$isa.asm" -o "$name-$isa-gas.o"
+              riscv64-linux-gnu-objcopy -O binary -j .text "$name-$isa.obj" native.bin
+              riscv64-linux-gnu-objcopy -O binary -j .text "$name-$isa-gas.o" gas.bin
+              cmp native.bin gas.bin
+            done
+            for suffix in .obj -gas.o; do
+              riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax -e _start harness.o ref_wide.o ref_many.o ref_nested.o "wide-$isa$suffix" "many-$isa$suffix" "nested-$isa$suffix" -o check.elf
+              timeout 20s qemu-riscv64 check.elf
+              echo "$isa$suffix: 510 source CFG comparisons passed"
+            done
+          done
+      - name: Publish candidate status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          state=failure
+          if [ "$JOB_STATUS" = success ]; then state=success; fi
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$state" -f context=rv64-r26-main-integration \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            -f description="Compiler 55b84a44f48cf4f5b692dfbdab36d62d466d2394"
