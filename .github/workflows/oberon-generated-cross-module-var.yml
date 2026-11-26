@@ -76,7 +76,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/oberon
-          ref: e40986eb946346d72446324d852d235f151ade27
+          ref: c61ff11137db3982f6c114222ca38d3e8f21f02d
           path: oberon-generator
           persist-credentials: false
       - name: Build and unit-test the pinned typed import generator
@@ -118,8 +118,49 @@ jobs:
               grep -q 'PROC Change' "$build/FuzzOps.sym"
               grep -q 'PROC FlipFlag' "$build/FuzzOps.sym"
               grep -q 'PROC Twist' "$build/FuzzOps.sym"
+              grep -q 'PROC Forward' "$build/FuzzOps.sym"
               if ! cc -std=c11 -O2 -fwrapv -Wall -Wextra -Werror -fPIE -pie \
                     "$root/reference.c" "$build/FuzzOps.$suffix" "$build/Fuzz.$suffix" \
+                    -o "$build/check" > "$build/link.log" 2>&1; then
+                cat "$build/link.log" >&2
+                exit 1
+              fi
+              "$build/check"
+            done
+          done
+      - name: Native three-module forwarded VAR differential (GAS and direct ELF)
+        shell: bash
+        run: |
+          set -euo pipefail
+          obgen="$PWD/oberon-generator/oberon/target/debug/obgen"
+          compiler="$PWD/compiler/target/debug/compiler"
+          for ((offset=0; offset<OBERON_MODULE_SEEDS; offset++)); do
+            seed=$((OBERON_MODULE_BASE_SEED + offset))
+            root="/tmp/oberon-typed-relay-$seed"
+            mkdir -p "$root"
+            "$obgen" --base "$seed" --compiler-subset=typed-import-provider > "$root/FuzzOps.mod"
+            "$obgen" --base "$seed" --compiler-subset=typed-relay-provider > "$root/FuzzRelay.mod"
+            "$obgen" --base "$seed" --compiler-subset=typed-relay-source > "$root/Fuzz.mod"
+            "$obgen" --base "$seed" --compiler-subset=typed-relay-harness > "$root/reference.c"
+            for format in asm obj; do
+              build="$root/$format"
+              compile_log="$root/$format.compile.log"
+              if ! "$compiler" "$root/Fuzz.mod" --language oberon \
+                  --build-modules "$build" --module-path "$root" --emit "$format" \
+                  > "$compile_log" 2>&1; then
+                cat "$compile_log" >&2
+                exit 1
+              fi
+              if [[ "$format" == asm ]]; then suffix=s; else suffix=o; fi
+              for module in FuzzOps FuzzRelay Fuzz; do
+                grep -qx "$module.$suffix" "$build/objects.list"
+              done
+              grep -q 'PROC Forward' "$build/FuzzRelay.sym"
+              grep -q 'PROC Forward' "$build/FuzzOps.sym"
+              grep -q 'PROC Twist' "$build/FuzzOps.sym"
+              if ! cc -std=c11 -O2 -fwrapv -Wall -Wextra -Werror -fPIE -pie \
+                    "$root/reference.c" "$build/FuzzOps.$suffix" \
+                    "$build/FuzzRelay.$suffix" "$build/Fuzz.$suffix" \
                     -o "$build/check" > "$build/link.log" 2>&1; then
                 cat "$build/link.log" >&2
                 exit 1
@@ -156,6 +197,7 @@ jobs:
           name: oberon-generated-cross-module-failures
           path: |
             /tmp/oberon-typed-import-*
+            /tmp/oberon-typed-relay-*
             /tmp/oberon-module-generated-*
             /tmp/oberon-module-negative-*
             /tmp/oberon-module-dag-*
