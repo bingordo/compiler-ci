@@ -2,6 +2,9 @@ name: X7 batched compiler candidate validation
 # Reusable manual gate: supply the exact compiler commit SHA on dispatch.
 # This workflow never enables its experimental feature in default codegen.
 on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-x7-batch.yml'
   workflow_dispatch:
     inputs:
       source_ref:
@@ -11,7 +14,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: x7-batch-${{ inputs.source_ref }}
+  group: x7-batch-${{ inputs.source_ref || 'fe65d1d24740a99a0a1d17c513762ad137623877' }}
   cancel-in-progress: true
 jobs:
   physical-ctz:
@@ -25,7 +28,7 @@ jobs:
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
       CARGO_INCREMENTAL: "0"
-      SOURCE_REF: "${{ inputs.source_ref }}"
+      SOURCE_REF: "${{ inputs.source_ref || 'fe65d1d24740a99a0a1d17c513762ad137623877' }}"
     steps:
       - name: Validate source-ref shape
         shell: bash
@@ -61,6 +64,18 @@ jobs:
         with:
           workspaces: compiler -> target
           key: x7-batch-${{ matrix.variant }}
+      - name: Generated x86 forms and feature-safe GP bit count oracles
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/regen_x86_forms.py --check
+          cargo test -p compiler-backend-x86 --test x86_bitcount_physical_native -- --nocapture
+          if test "${{ matrix.variant }}" = probe; then
+            cargo test -p compiler-backend-x86 --test x86_tzcnt_typeid_native --features x7-tzcnt-native-probe,x7-bsf-zeroing-probe -- --nocapture
+          else
+            cargo test -p compiler-backend-x86 --test x86_tzcnt_typeid_native -- --nocapture
+          fi
       - name: Native TypeId CTZ independent C11 GAS/ELF oracle
         shell: bash
         working-directory: compiler
@@ -77,8 +92,8 @@ jobs:
         run: |
           set -euo pipefail
           if test "${{ matrix.variant }}" = probe; then
-            cargo test -p compiler-backend-x86 --test review_narrow_compare_ctz_oracle --features x7-bsf-zeroing-probe
-            cargo test -p compiler-backend-x86 --test x7_measured_bsf_dependencies --features x7-bsf-zeroing-probe
+            cargo test -p compiler-backend-x86 --test review_narrow_compare_ctz_oracle --features x7-bsf-zeroing-probe,x7-tzcnt-native-probe
+            cargo test -p compiler-backend-x86 --test x7_measured_bsf_dependencies --features x7-bsf-zeroing-probe,x7-tzcnt-native-probe
           else
             cargo test -p compiler-backend-x86 --test review_narrow_compare_ctz_oracle
             cargo test -p compiler-backend-x86 --test x7_measured_bsf_dependencies
@@ -89,8 +104,8 @@ jobs:
         run: |
           set -euo pipefail
           if test "${{ matrix.variant }}" = probe; then
-            cargo check -p compiler-backend-x86 --features x7-bsf-zeroing-probe
-            cargo check -p compiler-backend-x86 --no-default-features --features x7-bsf-zeroing-probe
+            cargo check -p compiler-backend-x86 --features x7-bsf-zeroing-probe,x7-tzcnt-native-probe
+            cargo check -p compiler-backend-x86 --no-default-features --features x7-bsf-zeroing-probe,x7-tzcnt-native-probe
           else
             cargo check -p compiler-backend-x86
             cargo check -p compiler-backend-x86 --no-default-features
