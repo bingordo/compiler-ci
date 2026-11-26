@@ -1,56 +1,31 @@
-name: X7 batched compiler candidate validation
-# Reusable manual gate: supply the exact compiler commit SHA on dispatch.
-# This workflow never enables its experimental feature in default codegen.
+name: X7 explicit target feature validation
 on:
-  workflow_dispatch:
-    inputs:
-      source_ref:
-        description: "Exact compiler candidate SHA (40 hex digits)"
-        required: true
-        type: string
+  pull_request:
+    paths: ['.github/workflows/verify-x7-batch.yml']
 permissions:
   contents: read
-concurrency:
-  group: x7-batch-${{ inputs.source_ref }}
-  cancel-in-progress: true
 jobs:
-  physical-ctz:
-    name: Physical CTZ ${{ matrix.variant }}
+  target-ctz:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         variant: [baseline, probe]
-    env:
-      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-      CARGO_INCREMENTAL: "0"
-      SOURCE_REF: "${{ inputs.source_ref }}"
     steps:
-      - name: Validate source-ref shape
-        shell: bash
-        run: |
-          set -euo pipefail
-          [[ "$SOURCE_REF" =~ ^[0-9a-f]{40}$ ]] || { echo "Full exact SHA required" >&2; exit 1; }
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ env.SOURCE_REF }}
+          ref: d2008f1effce37aebc8e1132afdeb1c9b8a43582
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Verify exact candidate and configure public git dependencies
-        shell: bash
+      - name: Verify exact source and restrict workspace
         run: |
           set -euo pipefail
-          sha="$(git -C compiler rev-parse HEAD)"
-          test "$sha" = "$SOURCE_REF"
-          echo "X7 tested compiler SHA: $sha, mode: ${{ matrix.variant }}" >> "$GITHUB_STEP_SUMMARY"
+          test "$(git -C compiler rev-parse HEAD)" = d2008f1effce37aebc8e1132afdeb1c9b8a43582
           git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
           git config --global --add url."https://github.com/".insteadOf "git@github.com:"
-      - name: Restrict workspace to core source crates
-        shell: bash
-        run: |
           cat > compiler/Cargo.toml <<'EOF'
           [workspace]
           resolver = "2"
@@ -61,37 +36,13 @@ jobs:
         with:
           workspaces: compiler -> target
           key: x7-batch-${{ matrix.variant }}
-      - name: Native TypeId CTZ independent C11 GAS/ELF oracle
-        shell: bash
+      - name: Explicit target TypeId GAS/ELF and narrow fallback oracles
         working-directory: compiler
         run: |
           set -euo pipefail
+          args=()
           if test "${{ matrix.variant }}" = probe; then
-            cargo test -p compiler-backend-x86 --test x7_ctz_bsf_zeroing_probe --features x7-bsf-zeroing-probe -- --nocapture
-          else
-            cargo test -p compiler-backend-x86 --test x7_ctz_bsf_zeroing_probe -- --nocapture
+            args+=(--features x7-tzcnt-native-probe)
           fi
-      - name: Existing narrow CTZ regression and measured dependency tests
-        shell: bash
-        working-directory: compiler
-        run: |
-          set -euo pipefail
-          if test "${{ matrix.variant }}" = probe; then
-            cargo test -p compiler-backend-x86 --test review_narrow_compare_ctz_oracle --features x7-bsf-zeroing-probe
-            cargo test -p compiler-backend-x86 --test x7_measured_bsf_dependencies --features x7-bsf-zeroing-probe
-          else
-            cargo test -p compiler-backend-x86 --test review_narrow_compare_ctz_oracle
-            cargo test -p compiler-backend-x86 --test x7_measured_bsf_dependencies
-          fi
-      - name: Backend normal and no-default build checks
-        shell: bash
-        working-directory: compiler
-        run: |
-          set -euo pipefail
-          if test "${{ matrix.variant }}" = probe; then
-            cargo check -p compiler-backend-x86 --features x7-bsf-zeroing-probe
-            cargo check -p compiler-backend-x86 --no-default-features --features x7-bsf-zeroing-probe
-          else
-            cargo check -p compiler-backend-x86
-            cargo check -p compiler-backend-x86 --no-default-features
-          fi
+          cargo test -p compiler-backend-x86 "${args[@]}" --test x86_tzcnt_typeid_native --test review_narrow_compare_ctz_oracle -- --nocapture
+          cargo check -p compiler-backend-x86 --no-default-features "${args[@]}"
