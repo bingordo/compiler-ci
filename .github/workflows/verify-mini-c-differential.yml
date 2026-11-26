@@ -32,11 +32,66 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      compiler_sha: ${{ steps.identity.outputs.sha }}
+      success_key: ${{ steps.identity.outputs.key }}
+      run: ${{ steps.decision.outputs.run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Resolve compiler revision once
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || 'main' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Identify all pinned suite inputs
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git -C compiler rev-parse HEAD)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          workflow="$(sha256sum .github/workflows/verify-mini-c-differential.yml | cut -d ' ' -f1)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "key=gcc-comprehensive-success-v1-$sha-$workflow" >> "$GITHUB_OUTPUT"
+      - name: Find exact successful comprehensive run
+        if: github.event_name == 'schedule'
+        id: previous
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/gcc-comprehensive-success
+          key: ${{ steps.identity.outputs.key }}
+      - name: Decide whether to run expensive tests
+        id: decision
+        shell: bash
+        env:
+          KEY: ${{ steps.identity.outputs.key }}
+          HIT: ${{ steps.previous.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          marker="$RUNNER_TEMP/gcc-comprehensive-success/key"
+          if [[ "$GITHUB_EVENT_NAME" == schedule && "$HIT" == true && -f "$marker" ]] && [[ "$(cat "$marker")" == "$KEY" ]]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Unchanged compiler and pinned suite inputs; both frontends previously passed the full corpus." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "New inputs, no successful full run, or manual/candidate validation." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   differential:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     outputs:
       compiler_sha: ${{ steps.source.outputs.sha }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 90
     steps:
       - name: Checkout compiler-ci test harness
         uses: actions/checkout@v4
@@ -46,7 +101,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ inputs.source_ref || 'main' }}
+          ref: ${{ needs.changes.outputs.compiler_sha }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -58,7 +113,7 @@ jobs:
         run: |
           set -euo pipefail
           sha="$(git -C compiler rev-parse HEAD)"
-          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$sha" == '${{ needs.changes.outputs.compiler_sha }}' ]]
           [[ "$SEED_COUNT" =~ ^[0-9]+$ ]]
           (( 10#$SEED_COUNT >= 1 && 10#$SEED_COUNT <= 64 ))
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
@@ -92,6 +147,12 @@ jobs:
             -p compiler-mini-c --bin compiler-mini-c \
             2>&1 | tee "$RUNNER_TEMP/mini-c-build.log"
           test -x compiler/tools/mini-c-driver/target/debug/compiler-mini-c
+      - name: Native bitfield and record-pointer ABI regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --test bitfield_pointer_abi --test record_pointer_abi
       - name: Compare compiled Mini-C against GCC
         shell: bash
         env:
@@ -160,6 +221,20 @@ jobs:
           grep -Fq "PASS P5c indirect GP printf asm frameless matches GCC" "$RUNNER_TEMP/mini-c-indirect-variadic.log"
           grep -Fq "PASS P5c indirect GP printf asm rbp matches GCC" "$RUNNER_TEMP/mini-c-indirect-variadic.log"
           echo "Passed existing indirect GP varargs ELF/GAS frame-pointer parity" >> "$GITHUB_STEP_SUMMARY"
+      - name: Restore pinned GCC source cache
+        id: gcc-source-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/gcc-compat-source
+          key: gcc-tests-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('compiler/tests/gcc/gcc_compat_abi_pilot.py', 'compiler/tests/gcc/fetch_gcc.py', 'compiler/tests/gcc/gcc_bitfield_execute.py') }}
+      - name: Fetch or validate pinned GCC sources
+        run: python3 compiler/tests/gcc/fetch_gcc.py "$RUNNER_TEMP/gcc-compat-source"
+      - name: Save verified GCC source cache
+        if: steps.gcc-source-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/gcc-compat-source
+          key: ${{ steps.gcc-source-cache.outputs.cache-primary-key }}
       - name: Classify pinned upstream GCC compatibility ABI tests
         shell: bash
         run: |
@@ -173,9 +248,10 @@ jobs:
           # C-checked layout is shared across native ELF and GCC linked objects.
           # Also classify unsupported upstream struct-call and scalar triads.
           timeout --signal=TERM --kill-after=10s 4m python3 \
-            tools/gcc_compat_abi_pilot.py \
+            compiler/tests/gcc/gcc_compat_abi_pilot.py \
             --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" \
             --work-dir "$RUNNER_TEMP/mini-c-gcc-compat" \
+            --offline-source-dir "$RUNNER_TEMP/gcc-compat-source/gcc/testsuite/gcc.dg/compat" \
             2>&1 | tee "$RUNNER_TEMP/mini-c-gcc-compat.log"
           grep -Fq "GCC_COMPAT_SUMMARY " "$RUNNER_TEMP/mini-c-gcc-compat.log"
           python3 - <<'PY'
@@ -190,39 +266,24 @@ jobs:
                             "mixed directions admitted; compile rejections "
                             "are unsupported coverage, not passing ABI checks.\n")
           PY
-      - name: Run upstream aggregate return compatibility subset
+      - name: Validate shared GCC harness controls
+        run: python3 -m unittest discover -s compiler/tests/gcc -p 'test_*.py'
+      - name: Package the already-tested native Mini-C driver
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m unittest discover -s tools -p test_gcc_compat_runner.py
-          checkout="$RUNNER_TEMP/gcc-compat-source"
-          git init "$checkout"
-          git -C "$checkout" remote add origin https://github.com/gcc-mirror/gcc.git
-          git -C "$checkout" sparse-checkout init --cone
-          git -C "$checkout" sparse-checkout set gcc/testsuite/gcc.dg/compat gcc/testsuite/gcc.c-torture/execute
-          git -C "$checkout" -c protocol.version=2 fetch --depth=1 --filter=blob:none origin 1330eed38849ad186518f609c52bd5651c2bfdc1
-          git -C "$checkout" checkout --detach FETCH_HEAD
-          python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          Path(os.environ["RUNNER_TEMP"], "return-adapters.json").write_text(json.dumps({
-              "minic": [str(Path("compiler/tools/mini-c-driver/target/debug/compiler-mini-c").resolve()),
-                        "{source}", "--emit", "obj", "-o", "{object}"]
-          }))
-          PY
-          timeout --signal=TERM --kill-after=10s 8m python3 tools/gcc_compat_runner.py \
-            "$checkout" --adapters "$RUNNER_TEMP/return-adapters.json" \
-            --work-dir "$RUNNER_TEMP/gcc-aggregate-returns" --include-return-probes --include-bitfield-layout --layout-batches 6 --include-bitfield-execute \
-            --compiler-sha "$(git -C compiler rev-parse HEAD)" \
-            --required tools/gcc_compat_required_returns.json
-      - name: Preserve aggregate return coverage report
-        if: always()
+          mkdir -p "$RUNNER_TEMP/native-minic"
+          cp compiler/tools/mini-c-driver/target/debug/compiler-mini-c "$RUNNER_TEMP/native-minic/"
+          git -C compiler rev-parse HEAD > "$RUNNER_TEMP/native-minic/compiler-sha"
+          cd "$RUNNER_TEMP/native-minic"
+          sha256sum compiler-mini-c > SHA256SUMS
+      - name: Transfer Mini-C driver to shared GCC 15 reference job
         uses: actions/upload-artifact@v4
         with:
-          name: gcc-aggregate-return-coverage
-          path: ${{ runner.temp }}/gcc-aggregate-returns/report.json
-          if-no-files-found: ignore
-          retention-days: 14
+          name: native-minic-driver
+          path: ${{ runner.temp }}/native-minic/
+          if-no-files-found: error
+          retention-days: 1
       - name: Preserve build logs and failing test cases
         if: failure()
         uses: actions/upload-artifact@v4
@@ -266,9 +327,9 @@ jobs:
 
   edg-aggregate-return:
     needs: differential
-    if: ${{ always() && needs.differential.outputs.compiler_sha != '' }}
+    if: ${{ needs.differential.result == 'success' && needs.differential.outputs.compiler_sha != '' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 50
+    timeout-minutes: 100
     container:
       image: ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8
     defaults:
@@ -357,16 +418,37 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           cargo build --manifest-path compiler/tools/edg-driver/Cargo.toml
           test -x compiler/tools/edg-driver/target/debug/compiler-edg-driver
-      - name: Run the same upstream aggregate return corpus with EDG
+      - name: Restore pinned GCC source cache
+        id: gcc-source-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/gcc-compat-source
+          key: gcc-tests-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('compiler/tests/gcc/gcc_compat_abi_pilot.py', 'compiler/tests/gcc/fetch_gcc.py', 'compiler/tests/gcc/gcc_bitfield_execute.py') }}
+      - name: Fetch or validate pinned GCC sources
+        run: python3 compiler/tests/gcc/fetch_gcc.py "$RUNNER_TEMP/gcc-compat-source"
+      - name: Save verified GCC source cache
+        if: steps.gcc-source-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/gcc-compat-source
+          key: ${{ steps.gcc-source-cache.outputs.cache-primary-key }}
+      - name: Restore Mini-C binary from this exact workflow run
+        uses: actions/download-artifact@v4
+        with:
+          name: native-minic-driver
+          path: ${{ runner.temp }}/native-minic
+      - name: Verify Mini-C revision and binary integrity
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/native-minic"
+          test "$(cat compiler-sha)" = "$COMPILER_SHA"
+          sha256sum -c SHA256SUMS
+          chmod +x compiler-mini-c
+          ldd compiler-mini-c
+      - name: Run comprehensive GCC 15 interoperability corpus with both frontends
         run: |
           source edgcpp/build/gcc-release/environment.sh
           checkout="$RUNNER_TEMP/gcc-compat-source"
-          git init "$checkout"
-          git -C "$checkout" remote add origin https://github.com/gcc-mirror/gcc.git
-          git -C "$checkout" sparse-checkout init --cone
-          git -C "$checkout" sparse-checkout set gcc/testsuite/gcc.dg/compat gcc/testsuite/gcc.c-torture/execute
-          git -C "$checkout" -c protocol.version=2 fetch --depth=1 --filter=blob:none origin 1330eed38849ad186518f609c52bd5651c2bfdc1
-          git -C "$checkout" checkout --detach FETCH_HEAD
           python3 - <<'PY'
           import json, os, subprocess
           from pathlib import Path
@@ -374,22 +456,93 @@ jobs:
               ["gcc", "-dumpfullversion", "-dumpversion"], text=True).strip().split(".")]
           parts += [0] * (3 - len(parts))
           version = str(parts[0] * 10000 + parts[1] * 100 + parts[2])
-          Path(os.environ["RUNNER_TEMP"], "edg-return-adapters.json").write_text(json.dumps({
+          Path(os.environ["RUNNER_TEMP"], "native-return-adapters.json").write_text(json.dumps({
+              "minic": [str(Path(os.environ["RUNNER_TEMP"], "native-minic/compiler-mini-c")),
+                        "{source}", "--emit", "obj", "-o", "{object}"],
               "edg": [str(Path("compiler/tools/edg-driver/target/debug/compiler-edg-driver").resolve()),
                       "{object}", "--gcc", "--c11", "--no_strict_gnu",
                       "--gnu_version", version, "{original}"]
           }))
           PY
-          timeout --signal=TERM --kill-after=10s 8m python3 tools/gcc_compat_runner.py \
-            "$checkout" --adapters "$RUNNER_TEMP/edg-return-adapters.json" \
-            --work-dir "$RUNNER_TEMP/edg-aggregate-returns" --include-return-probes --include-bitfield-layout --layout-batches 6 --include-bitfield-execute \
+          timeout --signal=TERM --kill-after=10s 60m python3 compiler/tests/gcc/gcc_compat_runner.py \
+            "$checkout" --adapters "$RUNNER_TEMP/native-return-adapters.json" \
+            --work-dir "$RUNNER_TEMP/gcc-shared-abi" --all-compat --include-return-probes --include-argument-probes --include-all-layout --extended-layout --layout-batches 0 --include-bitfield-execute \
             --compiler-sha "$(git -C compiler rev-parse HEAD)" \
-            --required tools/gcc_compat_required_returns.json
-      - name: Preserve EDG aggregate return report
+            --required compiler/tests/gcc/gcc_compat_required_returns.json
+      - name: Preserve both frontend ABI reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: edg-aggregate-return-coverage
-          path: ${{ runner.temp }}/edg-aggregate-returns/report.json
+          name: gcc-shared-abi-coverage
+          path: |
+            ${{ runner.temp }}/gcc-shared-abi/report.json
+            ${{ runner.temp }}/gcc-shared-abi/coverage-summary.json
+            ${{ runner.temp }}/gcc-shared-abi/inventory.json
           if-no-files-found: ignore
           retention-days: 14
+
+      - name: Preserve generated GCC layout reproducer sources on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gcc-shared-abi-generated-sources
+          path: ${{ runner.temp }}/gcc-shared-abi/gcc-struct-layout/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  record-comprehensive-success:
+    needs: [changes, differential, edg-aggregate-return]
+    if: github.event_name == 'schedule' && needs.changes.outputs.run == 'true' && needs.differential.result == 'success' && needs.edg-aggregate-return.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Record successful full run identity
+        shell: bash
+        env:
+          KEY: ${{ needs.changes.outputs.success_key }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gcc-comprehensive-success"
+          printf '%s\n' "$KEY" > "$RUNNER_TEMP/gcc-comprehensive-success/key"
+      - name: Save exact successful input identity
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/gcc-comprehensive-success
+          key: ${{ needs.changes.outputs.success_key }}
+
+  publish-comprehensive-result:
+    needs: [changes, differential, edg-aggregate-return, record-comprehensive-success]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Publish overall GCC ABI outcome
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SOURCE_SHA: ${{ needs.changes.outputs.compiler_sha }}
+          PRECHECK: ${{ needs.changes.result }}
+          SHOULD_RUN: ${{ needs.changes.outputs.run }}
+          MINIC: ${{ needs.differential.result }}
+          EDG: ${{ needs.edg-aggregate-return.result }}
+          MARKER: ${{ needs.record-comprehensive-success.result }}
+        run: |
+          set -euo pipefail
+          state=failure
+          description="GCC ABI incomplete or failed"
+          if [[ "$PRECHECK" == success && "$SHOULD_RUN" == false ]]; then
+            state=success
+            description="GCC ABI unchanged: cached successful run"
+          elif [[ "$PRECHECK" == success && "$MINIC" == success && "$EDG" == success ]]; then
+            if [[ "$GITHUB_EVENT_NAME" != schedule || "$MARKER" == success ]]; then
+              state=success
+              description="GCC ABI both frontends passed"
+            fi
+          fi
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$state" \
+            -f context="mini-c/gcc-comprehensive" \
+            -f description="$description (${SOURCE_SHA:0:12})" \
+            -f target_url="$RUN_URL"
+          [[ "$state" == success ]]
