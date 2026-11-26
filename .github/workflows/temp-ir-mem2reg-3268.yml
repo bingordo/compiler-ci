@@ -1,0 +1,48 @@
+name: Temporary native mem2reg expectation acceptance
+on:
+  pull_request:
+    paths: ['.github/workflows/temp-ir-mem2reg-3268.yml']
+permissions:
+  contents: read
+jobs:
+  native-mem2reg:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      SOURCE_SHA: 28f2435563fc71f74fbce29d684749ad030b74bb
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm source and isolate core workspace
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-native-mem2reg-expectations
+      - name: Native expected rewrites and independent execution
+        working-directory: compiler
+        run: cargo test --no-fail-fast -p compiler-opt --test typed_mem2reg --test mem2reg_native --test mem2reg_profile
+      - name: Existing per-slot reference and optimizer unit tests
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo test -p compiler-opt --lib
+      - name: Production graph boundary
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: python3 tools/check_mixed_function_export_boundary.py
