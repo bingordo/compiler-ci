@@ -2,6 +2,9 @@ name: X7 batched compiler candidate validation
 # Reusable manual gate: supply the exact compiler commit SHA on dispatch.
 # This workflow never enables its experimental feature in default codegen.
 on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-x7-batch.yml'
   workflow_dispatch:
     inputs:
       source_ref:
@@ -11,7 +14,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: x7-batch-${{ inputs.source_ref }}
+  group: x7-batch-${{ inputs.source_ref || '7f34fd32fdabb6043eb97a79de90655db55140dd' }}
   cancel-in-progress: true
 jobs:
   physical-ctz:
@@ -25,7 +28,7 @@ jobs:
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
       CARGO_INCREMENTAL: "0"
-      SOURCE_REF: "${{ inputs.source_ref }}"
+      SOURCE_REF: "${{ inputs.source_ref || '7f34fd32fdabb6043eb97a79de90655db55140dd' }}"
     steps:
       - name: Validate source-ref shape
         shell: bash
@@ -83,6 +86,44 @@ jobs:
             cargo test -p compiler-backend-x86 --test review_narrow_compare_ctz_oracle
             cargo test -p compiler-backend-x86 --test x7_measured_bsf_dependencies
           fi
+      - name: Bind real pinned Intel bit-count iforms to generic B2/B3 proof work
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools -p 'test_x86_isl_source_form_cohort.py' -v
+          python3 -m unittest discover -s tools -p 'test_x86_iform_helper_dependencies.py' -v
+          python3 -m unittest discover -s tools -p 'test_x86_iform_proof_work_dag.py' -v
+          mkdir -p /tmp/intel-x7-source-cohort
+          intel_rev=35eface1b7ee003a1cda95005ec5fd83de658a64
+          for instruction in POPCNT LZCNT TZCNT; do
+            curl --fail --silent --show-error --location --retry 3 --max-time 40 \
+              "https://raw.githubusercontent.com/intel/SDM/${intel_rev}/data/instruction/${instruction}.xml" \
+              --output "/tmp/intel-x7-source-cohort/${instruction}.xml"
+          done
+          python3 tools/x86_iform_helper_dependencies.py \
+            --xml-dir /tmp/intel-x7-source-cohort \
+            --out /tmp/x7-bitcount-b2-index.json --shards 4
+          python3 tools/x86_iform_proof_work_dag.py \
+            --dependency-index /tmp/x7-bitcount-b2-index.json \
+            --out /tmp/x7-bitcount-b3-queue.json --shards 4
+          python3 tools/x86_isl_source_form_cohort.py \
+            --dependency-index /tmp/x7-bitcount-b2-index.json \
+            --proof-work-queue /tmp/x7-bitcount-b3-queue.json \
+            --out /tmp/x7-bitcount-original-source-cohort.json
+          python3 - <<'PY'
+          import json
+          p=json.load(open("/tmp/x7-bitcount-original-source-cohort.json"))
+          assert p["physical_variants"] == 12, p["summary"]
+          assert p["original_source_iform_candidates"] == 12, p["summary"]
+          assert p["summary"]["newly_selection_eligible_forms"] == 0
+          assert p["summary"]["original_semantic_proofs_completed"] == 0
+          assert all(r["status"].startswith("matched_original_source")
+                     for r in p["records"]), p["summary"]
+          assert all(not r["selection_eligible"]
+                     for r in p["records"])
+          print("X7_REAL_BITCOUNT_ISL_COHORT_MATCH_PASS",p["summary"])
+          PY
       - name: Backend normal and no-default build checks
         shell: bash
         working-directory: compiler
