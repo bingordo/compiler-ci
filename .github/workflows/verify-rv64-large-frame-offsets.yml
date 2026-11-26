@@ -19,11 +19,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: f75bf59563216a36b00d709112da1a5975e1ec55
+          ref: d9f9db1ea13a8fe9dd2d07c32016633963d4588e
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - run: test "$(git -C compiler rev-parse HEAD)" = f75bf59563216a36b00d709112da1a5975e1ec55
+      - run: test "$(git -C compiler rev-parse HEAD)" = d9f9db1ea13a8fe9dd2d07c32016633963d4588e
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -33,7 +33,7 @@ jobs:
         working-directory: compiler
         run: |
           RV64_CFG_FIXTURE_DIR=/tmp/rv64-cfg cargo test -p compiler --test riscv64_generic_cfg
-          cargo test -p compiler-backend-riscv64 --lib --tests
+          RV64_LARGE_FRAME_FIXTURE_DIR=/tmp/rv64-large cargo test -p compiler-backend-riscv64 --lib --tests
           cargo test -p compiler --test riscv64_load_ir --test riscv64_source_preview
           cargo clippy -p compiler-backend-riscv64 --tests -- -D warnings
       - name: Compare real CFG execution against independent GCC under QEMU
@@ -87,6 +87,54 @@ jobs:
               echo "$isa$suffix: 510 source CFG comparisons passed"
             done
           done
+      - name: Execute wide-frame leaf and nonleaf fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/rv64-cfg
+          cat > large-harness.c <<'EOF'
+          extern long rv64_spill_sum(void);
+          extern long large(long,long,long,long,long,long,long,long,long,long,long,long);
+          extern long ref_large(long,long,long,long,long,long,long,long,long,long,long,long);
+          long step(long x) { return x + 1; }
+          static void finish(long code) {
+              register long a0 asm("a0") = code;
+              register long a7 asm("a7") = 93;
+              asm volatile("ecall" : : "r"(a0), "r"(a7) : "memory");
+              __builtin_unreachable();
+          }
+          void _start(void) {
+              if (rv64_spill_sum() != 80200) finish(1);
+              for (long x = -40; x <= 40; x += 5) {
+                  long actual = large(x,x+1,x+2,x+3,x+4,x+5,x+6,x+7,x+8,x+9,x+10,x+11);
+                  long expected = ref_large(x,x+1,x+2,x+3,x+4,x+5,x+6,x+7,x+8,x+9,x+10,x+11);
+                  if (actual != expected) finish(2);
+              }
+              finish(0);
+          }
+          EOF
+          cc=riscv64-linux-gnu-gcc
+          "$cc" -march=rv64im -mabi=lp64 -O2 -ffreestanding -fno-builtin -fno-pie -fno-stack-protector -Dlarge=ref_large -c large.c -o ref_large.o
+          "$cc" -march=rv64im -mabi=lp64 -O2 -ffreestanding -fno-builtin -fno-pie -fno-stack-protector -c large-harness.c -o large-harness.o
+          for isa in rv64i rv64izmmul rv64im; do
+            march="$isa"
+            if [ "$isa" = rv64izmmul ]; then march=rv64i_zmmul; fi
+            riscv64-linux-gnu-as -march="$march" -mabi=lp64 "/tmp/rv64-large/large-$isa.s" -o leaf-gas.o
+            riscv64-linux-gnu-as -march="$march" -mabi=lp64 "large-$isa.asm" -o nonleaf-gas.o
+            for pair in "/tmp/rv64-large/large-$isa.o:leaf-gas.o" "large-$isa.obj:nonleaf-gas.o"; do
+              riscv64-linux-gnu-objcopy -O binary -j .text "${pair%:*}" native.bin
+              riscv64-linux-gnu-objcopy -O binary -j .text "${pair#*:}" gas.bin
+              cmp native.bin gas.bin
+            done
+            for mode in native gas; do
+              leaf="/tmp/rv64-large/large-$isa.o"
+              nonleaf="large-$isa.obj"
+              if [ "$mode" = gas ]; then leaf=leaf-gas.o; nonleaf=nonleaf-gas.o; fi
+              riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax -e _start large-harness.o ref_large.o "$leaf" "$nonleaf" -o large-check.elf
+              timeout 30s qemu-riscv64 large-check.elf
+              echo "$isa/$mode: large-frame leaf and 17 nonleaf GCC comparisons passed"
+            done
+          done
       - name: Publish candidate status
         if: always()
         env:
@@ -98,4 +146,4 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
             -f state="$state" -f context=rv64-large-frame-offsets \
             -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            -f description="Compiler f75bf59563216a36b00d709112da1a5975e1ec55"
+            -f description="Compiler d9f9db1ea13a8fe9dd2d07c32016633963d4588e"
