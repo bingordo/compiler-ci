@@ -1,0 +1,72 @@
+# Temporary source-pinned verification; do not merge this workflow to compiler-ci main.
+name: IR PR3455 retire Function memory
+on:
+  push:
+    branches: [verify-ir-memory-final-3455-20261126]
+    paths: ['.github/workflows/ir-pr3455-memory-retirement.yml']
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      SOURCE_SHA: a17e7ee6bd6bb9f2d6d121d475dd67ba59bffa80
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source, isolate core workspace and audit removed memory refs
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          if git -C compiler grep -n -E 'legacy-function-memory-oracle|compiler_opt::dse::|compiler_opt::global_memory::' -- crates/opt; then
+            echo 'ERROR: obsolete Function memory pass reference remains'
+            exit 1
+          fi
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-pr3455-retired-memory
+      - name: Compile all optimizer targets and test native memory functionality
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --all-targets
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test typed_dse
+          cargo test -p compiler-opt --test typed_global_memory
+          cargo test -p compiler-opt --test memory_analysis_bounds
+          cargo test -p compiler-opt --test memory_execution_oracle
+          cargo test -p compiler-opt --test alias_phi_exhaustive
+          cargo test -p compiler-opt --test alias_phis
+          cargo test -p compiler-opt --test alive_lite al04_p3c
+          cargo test -p compiler-opt --test alive_lite al04_p4
+      - name: Independent sampled local/global/trap Z3 proof regression
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq z3
+          cd compiler
+          cargo test -p compiler-opt --test alive_lite al04_p3c2_store_to_load_changed_proofs_and_smt_mutants -- --ignored --nocapture
+          cargo test -p compiler-opt --test alive_lite al04_p4a_ordered_call_trace_actual_pass_proofs_and_negative_controls -- --ignored --nocapture
+          cargo test -p compiler-opt --test alive_lite al04_p4b2 -- --ignored --nocapture
+          cargo test -p compiler-opt --test alive_lite al04_p4b3 -- --ignored --nocapture
+      - name: Strict scoped lint
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --lib -- -D warnings -A dead_code
+          cargo clippy --no-deps -p compiler-opt --test alive_lite -- -D warnings -A dead_code -A unused_imports -A unused_variables -A clippy::too_many_arguments
