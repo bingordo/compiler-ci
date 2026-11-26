@@ -1,4 +1,4 @@
-name: TEMP combined aggregate ABI 3440
+name: TEMP EDG shared aggregate ABI 3399
 on:
   pull_request:
     branches: [main]
@@ -6,83 +6,6 @@ on:
 permissions:
   contents: read
 jobs:
-  combined:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 35
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: bingordo/compiler
-          ref: 506024758894b170313756e0ba8db0ca59e1c8e9
-          path: compiler
-          ssh-key: ${{ secrets.CI_KEY }}
-          persist-credentials: false
-      - name: Verify exact source and prepare Mini-C dependency
-        run: |
-          set -euxo pipefail
-          test "$(git -C compiler rev-parse HEAD)" = 506024758894b170313756e0ba8db0ca59e1c8e9
-          python3 - <<'PY'
-          from pathlib import Path
-          p=Path('compiler/tools/mini-c-driver/Cargo.toml')
-          s=p.read_text()
-          old='ssh://git@github.com/bingordo/mini-c.git'
-          assert s.count(old)==2
-          p.write_text(s.replace(old,'https://github.com/bingordo/mini-c.git'))
-          PY
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: compiler/tools/mini-c-driver -> target
-          key: mini-c-source-differential-v1
-      - name: Build native driver
-        run: cargo build --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
-      - name: Run harness unit controls
-        run: python3 -m unittest discover -s compiler/tests/gcc -p 'test_*.py'
-      - name: Run all combined aggregate probes at GCC O0 and O2
-        run: |
-          set -euo pipefail
-          PYTHONPATH="$PWD/compiler/tests/gcc" python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          from gcc_compat_argument_probes import generate_combined
-          from gcc_compat_inventory import inventory
-          from gcc_compat_runner import run_case, fatal, missing_required
-          from gcc_compat_coverage import summarize
-          work = Path(os.environ["RUNNER_TEMP"]) / "combined-abi"
-          root = work / "sources"
-          root.mkdir(parents=True)
-          generate_combined(root)
-          cases = inventory(root, "probe-arg-combined-")
-          assert len(cases) == 100
-          adapters = {"minic": [str(Path("compiler/tools/mini-c-driver/target/debug/compiler-mini-c").resolve()), "{source}", "--emit", "obj", "-o", "{object}"]}
-          records = []
-          for opt in ("-O0", "-O2"):
-              for case in cases:
-                  record = run_case(case, root, work / opt[1:] / case["case"], "gcc", ["-std=gnu11", opt, "-w", "-fno-pie"], adapters)
-                  record["origin"] = "generated-argument-probe"
-                  records.append(record)
-                  (work / "report.json").write_text(json.dumps({"compiler_sha": "506024758894b170313756e0ba8db0ca59e1c8e9", "records": records, "planned_records": 200}, indent=2))
-                  print(opt, case["case"], record["status"], {k: v["status"] for k,v in record["frontends"].get("minic", {}).get("directions", {}).items()}, flush=True)
-          summary = summarize(records, adapters, 200)
-          (work / "coverage-summary.json").write_text(json.dumps(summary, indent=2))
-          print(json.dumps(summary), flush=True)
-          assert len(records) == 200 and all(r["status"] == "REFERENCE_PASS" and not fatal(r) for r in records)
-          manifest = json.loads(Path("compiler/tests/gcc/gcc_compat_required_returns.json").read_text())
-          requirements = [r for r in manifest["requirements"] if r.get("source_run") == 45893187759]
-          assert len(requirements) == 1 and len(requirements[0]["cases"]) == 100
-          missing = missing_required(records, requirements, adapters)
-          print("COMBINED_REQUIRED_MISSING", missing, flush=True)
-          assert not missing
-          PY
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: combined-aggregate-abi
-          path: |
-            ${{ runner.temp }}/combined-abi/report.json
-            ${{ runner.temp }}/combined-abi/coverage-summary.json
-            ${{ runner.temp }}/combined-abi/sources
-          if-no-files-found: warn
-
   edg-combined:
     runs-on: ubuntu-24.04
     timeout-minutes: 35
@@ -92,7 +15,7 @@ jobs:
       run:
         shell: edg-container-exec "bash -eo pipefail {0}"
     env:
-      COMPILER_SHA: 506024758894b170313756e0ba8db0ca59e1c8e9
+      COMPILER_SHA: 176838abc152b85d03fda45fed8b0d3b34dcff3b
       EDG_SOURCE_SHA: b195677be8b9b56c8337afad6be8064d21a54082
       EDG_RELEASE_TAG: edgcpfe-v2026.11.14-upstream-177765bb7731
       EDG_RELEASE_SHA256: 1ce495b629924f31382ecccc891a7a72caae1014ddfa2ba7dd39b44d8b0a9526
@@ -112,8 +35,17 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 506024758894b170313756e0ba8db0ca59e1c8e9
+          ref: 176838abc152b85d03fda45fed8b0d3b34dcff3b
           path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+
+      - name: Check out merged GCC test harness independently of candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 4aa6012d43568d7b8304c7d8a58c34feec218aa4
+          path: harness
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
 
@@ -129,6 +61,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          test "$(git -C harness rev-parse HEAD)" = "4aa6012d43568d7b8304c7d8a58c34feec218aa4"
           test "$(git -C edgcpp rev-parse HEAD)" = "$EDG_SOURCE_SHA"
           printf 'Compiler SHA: %s\nEDG package SHA: %s\n' "$COMPILER_SHA" "$EDG_SOURCE_SHA" >>"$GITHUB_STEP_SUMMARY"
 
@@ -178,8 +111,9 @@ jobs:
         run: |
           set -euo pipefail
           source edgcpp/build/gcc-release/environment.sh
-          PYTHONPATH="$PWD/compiler/tests/gcc" python3 - <<'PY'
+          PYTHONPATH="$PWD/harness/tests/gcc" python3 - <<'PY'
           import json, os, subprocess
+          from collections import Counter
           from pathlib import Path
           from gcc_compat_argument_probes import generate_combined
           from gcc_compat_inventory import inventory
@@ -201,13 +135,19 @@ jobs:
                   record = run_case(case, root, work / opt[1:] / case["case"], "gcc", ["-std=gnu11", opt, "-w", "-fno-pie"], adapters)
                   record["origin"] = "generated-argument-probe"
                   records.append(record)
-                  (work / "report.json").write_text(json.dumps({"compiler_sha": "506024758894b170313756e0ba8db0ca59e1c8e9", "records": records, "planned_records": 200}, indent=2))
+                  (work / "report.json").write_text(json.dumps({"compiler_sha": "176838abc152b85d03fda45fed8b0d3b34dcff3b", "harness_sha": "4aa6012d43568d7b8304c7d8a58c34feec218aa4", "records": records, "planned_records": 200}, indent=2))
                   print(opt, case["case"], record["status"], {k: v["status"] for k,v in record["frontends"].get("edg", {}).get("directions", {}).items()}, flush=True)
           summary = summarize(records, adapters, 200)
           (work / "coverage-summary.json").write_text(json.dumps(summary, indent=2))
           print(json.dumps(summary), flush=True)
+          rejected = Counter()
+          for record in records:
+              for role, build in record["frontends"]["edg"]["builds"].items():
+                  if build["status"] != "PASS":
+                      rejected[role] += 1
+          print("EDG_REJECTED_BY_ROLE", dict(rejected), flush=True)
           assert len(records) == 200 and all(r["status"] == "REFERENCE_PASS" and not fatal(r) for r in records)
-          manifest = json.loads(Path("compiler/tests/gcc/gcc_compat_required_returns.json").read_text())
+          manifest = json.loads(Path("harness/tests/gcc/gcc_compat_required_returns.json").read_text())
           requirements = [r for r in manifest["requirements"] if r.get("source_run") == 45898268606 and r["frontend"] == "edg"]
           assert len(requirements) == 2 and sum(len(r["cases"]) for r in requirements) == 10
           missing = missing_required(records, requirements, adapters)
