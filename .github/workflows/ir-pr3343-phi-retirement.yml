@@ -1,0 +1,60 @@
+# Temporary exact-source PR validation. Do not merge to compiler-ci main.
+name: IR PR3343 TypeId phi retirement
+on:
+  push:
+    branches: [verify-ir-phi-3343-20261126]
+    paths: ['.github/workflows/ir-pr3343-phi-retirement.yml']
+permissions:
+  contents: read
+jobs:
+  check-phi:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: d33a2c05393c63653482027bec4bcfd0c259fbe1
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin source, isolate workspace, audit obsolete phi API
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          if git -C compiler grep -n 'legacy-function-phi-oracle\|compiler_opt::phi\|crate::phi::' -- crates/opt; then
+            echo 'Obsolete historical phi references remain' >&2
+            exit 1
+          fi
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-pr3343-phi
+      - name: Compile entire optimizer, run native phi and CFG suites
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --all-targets
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test typed_phi_cfg
+          cargo test -p compiler-opt --test typed_phi_dead_linear
+          cargo test -p compiler-opt --test typed_transitive_phi
+          cargo test -p compiler-opt --test alias_phi_exhaustive
+          cargo test -p compiler-opt --test typed_cfg_validation
+          cargo test -p compiler-opt --test ct03_closeout
+      - name: Strict optimizer library and focused test Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --lib -- -D warnings
+          cargo clippy --no-deps -p compiler-opt --test typed_phi_cfg --test typed_phi_dead_linear --test typed_transitive_phi --test alias_phi_exhaustive --test ct03_closeout -- -D warnings
