@@ -1,0 +1,72 @@
+name: Candidate IR storage census 3234
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-ir-storage-census-3234.yml'
+permissions:
+  contents: read
+jobs:
+  census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1cecb946aa40cd7cee8ee90873da0f9669e1ea39
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify candidate and restrict workspace
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "1cecb946aa40cd7cee8ee90873da0f9669e1ea39"
+          git -C compiler rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
+          rustc --version | tee -a "$GITHUB_STEP_SUMMARY"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/backend"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - name: Run storage census
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p compiler-backend --release --example ir_storage_census
+          target/release/examples/ir_storage_census \
+            crates/backend-aarch64/tests/fixtures/arithmetic_v3.ir \
+            crates/backend-aarch64/tests/fixtures/typeid_abi_pressure_v3.ir \
+            crates/backend-aarch64/tests/fixtures/direct_calls_sixteen_internal_v3.ir \
+            crates/backend-aarch64/tests/fixtures/indexed_scales_v3.ir | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Exact enum variant layout and source consumer inventory
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Diagnostic-only rustc layout dump; no production build flags changed.
+          for package in compiler-ir compiler-backend; do
+            RUSTC_BOOTSTRAP=1 cargo rustc -p "$package" --lib -- -Zprint-type-sizes > "$RUNNER_TEMP/$package-layout.log" 2>&1 || { tail -100 "$RUNNER_TEMP/$package-layout.log"; exit 1; }
+          done
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import os, pathlib, re
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          wanted = {"Op", "ScalarOp", "typed_ssa::TypedInstruction", "native_integer::ScalarInst", "native_integer::ScalarOp"}
+          found = set()
+          for package in ("compiler-ir", "compiler-backend"):
+              active = False
+              for line in (root / (package + "-layout.log")).read_text(errors="replace").splitlines():
+                  match = re.match(r"print-type-size type: `([^`]+)`:", line)
+                  if match:
+                      name = match.group(1)
+                      active = name in wanted or name.rsplit("::", 1)[-1] in {"Op", "ScalarOp"}
+                      if active:
+                          found.add(name.rsplit("::", 1)[-1])
+                  if active and line.startswith(("print-type-size type:", "print-type-size     variant:", "print-type-size     discriminant:")):
+                      print(line)
+          if not {"Op", "ScalarOp"} <= found:
+              raise SystemExit("missing required enum layout")
+          PY
+          echo 'InlineAsmGpGroup consumer files:' | tee -a "$GITHUB_STEP_SUMMARY"
+          git grep -l -F InlineAsmGpGroup -- '*.rs' | tee -a "$GITHUB_STEP_SUMMARY"
+          git grep -n -F InlineAsmGpGroup -- '*.rs'
