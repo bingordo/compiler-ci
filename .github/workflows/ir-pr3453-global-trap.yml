@@ -1,0 +1,64 @@
+# Disposable source-pinned AL04 P4 SMT migration verification.
+name: IR PR3453 TypeId global trap memory
+on:
+  push:
+    branches: [verify-ir-p4-global-trap-3453-20261126]
+    paths: ['.github/workflows/ir-pr3453-global-trap.yml']
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      SOURCE_SHA: d614afb653ab1f57a60eedb69d6bed2864e97488
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned source and isolate optimizer workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-pr3453-global-trap
+      - name: Compile all optimizer targets and run P4b native fixtures
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --all-targets
+          cargo test -p compiler-opt --test alive_lite al04_p4b2_
+          cargo test -p compiler-opt --test alive_lite al04_p4b3_
+          cargo test -p compiler-opt --test alive_lite al04_p4b4_
+          cargo test -p compiler-opt --test alive_lite al04_p4b5_
+          cargo test -p compiler-opt --test alive_lite al04_p4b6_
+      - name: Install Z3 and prove global/trap/narrow/derived-index SMT cases
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq z3
+          cd compiler
+          cargo test -p compiler-opt --test alive_lite al04_p4b2 -- --ignored --nocapture
+          cargo test -p compiler-opt --test alive_lite al04_p4b3 -- --ignored --nocapture
+          cargo test -p compiler-opt --test alive_lite al04_p4b4 -- --ignored --nocapture
+          cargo test -p compiler-opt --test alive_lite al04_p4b5 -- --ignored --nocapture
+          cargo test -p compiler-opt --test alive_lite al04_p4b6 -- --ignored --nocapture
+      - name: Scoped strict optimizer Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy --no-deps -p compiler-opt --test alive_lite -- -D warnings -A dead_code -A unused_imports -A unused_variables -A clippy::too_many_arguments
