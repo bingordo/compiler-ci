@@ -2020,6 +2020,11 @@ for side in caller callee; do
   ) > "$probe/$side.log" 2>&1
   rc=$?
   echo "EDG_C_MEMORY_ARG_${side^^}_COMPILE_EXIT=$rc"
+  if (( rc != 0 )); then
+    # This probe is public source, not the real private generated C.
+    grep -m 1 'rejected source:' "$probe/$side.log" | cut -c 1-500 |
+      sed "s/^/EDG_C_MEMORY_ARG_${side^^}_REJECTION=/" || true
+  fi
   if (( rc == 0 )); then
     other=caller
     if [[ "$side" == caller ]]; then other=callee; fi
