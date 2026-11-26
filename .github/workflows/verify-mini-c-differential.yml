@@ -35,11 +35,66 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      compiler_sha: ${{ steps.identity.outputs.sha }}
+      success_key: ${{ steps.identity.outputs.key }}
+      run: ${{ steps.decision.outputs.run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Resolve compiler revision once
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || 'ffd01e5555d30bbb630dfeeafdc9584bc45fd586' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Identify all pinned suite inputs
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git -C compiler rev-parse HEAD)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          workflow="$(sha256sum .github/workflows/verify-mini-c-differential.yml | cut -d ' ' -f1)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "key=gcc-comprehensive-success-v1-$sha-$workflow" >> "$GITHUB_OUTPUT"
+      - name: Find exact successful comprehensive run
+        if: github.event_name == 'schedule'
+        id: previous
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/gcc-comprehensive-success
+          key: ${{ steps.identity.outputs.key }}
+      - name: Decide whether to run expensive tests
+        id: decision
+        shell: bash
+        env:
+          KEY: ${{ steps.identity.outputs.key }}
+          HIT: ${{ steps.previous.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          marker="$RUNNER_TEMP/gcc-comprehensive-success/key"
+          if [[ "$GITHUB_EVENT_NAME" == schedule && "$HIT" == true && -f "$marker" ]] && [[ "$(cat "$marker")" == "$KEY" ]]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Unchanged compiler and pinned suite inputs; both frontends previously passed the full corpus." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "New inputs, no successful full run, or manual/candidate validation." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   differential:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     outputs:
       compiler_sha: ${{ steps.source.outputs.sha }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 90
     steps:
       - name: Checkout compiler-ci test harness
         uses: actions/checkout@v4
@@ -49,7 +104,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ inputs.source_ref || 'ffd01e5555d30bbb630dfeeafdc9584bc45fd586' }}
+          ref: ${{ needs.changes.outputs.compiler_sha }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -61,7 +116,7 @@ jobs:
         run: |
           set -euo pipefail
           sha="$(git -C compiler rev-parse HEAD)"
-          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$sha" == '${{ needs.changes.outputs.compiler_sha }}' ]]
           [[ "$SEED_COUNT" =~ ^[0-9]+$ ]]
           (( 10#$SEED_COUNT >= 1 && 10#$SEED_COUNT <= 64 ))
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
@@ -222,9 +277,9 @@ jobs:
                         "{source}", "--emit", "obj", "-o", "{object}"]
           }))
           PY
-          timeout --signal=TERM --kill-after=10s 8m python3 compiler/tests/gcc/gcc_compat_runner.py \
+          timeout --signal=TERM --kill-after=10s 45m python3 compiler/tests/gcc/gcc_compat_runner.py \
             "$checkout" --adapters "$RUNNER_TEMP/return-adapters.json" \
-            --work-dir "$RUNNER_TEMP/gcc-aggregate-returns" --include-return-probes --include-bitfield-layout --layout-batches 6 --include-bitfield-execute \
+            --work-dir "$RUNNER_TEMP/gcc-aggregate-returns" --include-return-probes --include-bitfield-layout --layout-batches 0 --include-bitfield-execute \
             --compiler-sha "$(git -C compiler rev-parse HEAD)" \
             --required compiler/tests/gcc/gcc_compat_required_returns.json
       - name: Preserve aggregate return coverage report
@@ -280,7 +335,7 @@ jobs:
     needs: differential
     if: ${{ always() && needs.differential.outputs.compiler_sha != '' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 50
+    timeout-minutes: 100
     container:
       image: ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8
     defaults:
@@ -400,9 +455,9 @@ jobs:
                       "--gnu_version", version, "{original}"]
           }))
           PY
-          timeout --signal=TERM --kill-after=10s 8m python3 compiler/tests/gcc/gcc_compat_runner.py \
+          timeout --signal=TERM --kill-after=10s 45m python3 compiler/tests/gcc/gcc_compat_runner.py \
             "$checkout" --adapters "$RUNNER_TEMP/edg-return-adapters.json" \
-            --work-dir "$RUNNER_TEMP/edg-aggregate-returns" --include-return-probes --include-bitfield-layout --layout-batches 6 --include-bitfield-execute \
+            --work-dir "$RUNNER_TEMP/edg-aggregate-returns" --include-return-probes --include-bitfield-layout --layout-batches 0 --include-bitfield-execute \
             --compiler-sha "$(git -C compiler rev-parse HEAD)" \
             --required compiler/tests/gcc/gcc_compat_required_returns.json
       - name: Preserve EDG aggregate return report
@@ -413,3 +468,23 @@ jobs:
           path: ${{ runner.temp }}/edg-aggregate-returns/report.json
           if-no-files-found: ignore
           retention-days: 14
+
+  record-comprehensive-success:
+    needs: [changes, differential, edg-aggregate-return]
+    if: github.event_name == 'schedule' && needs.changes.outputs.run == 'true' && needs.differential.result == 'success' && needs.edg-aggregate-return.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Record successful full run identity
+        shell: bash
+        env:
+          KEY: ${{ needs.changes.outputs.success_key }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gcc-comprehensive-success"
+          printf '%s\n' "$KEY" > "$RUNNER_TEMP/gcc-comprehensive-success/key"
+      - name: Save exact successful input identity
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/gcc-comprehensive-success
+          key: ${{ needs.changes.outputs.success_key }}
