@@ -21,14 +21,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: main
+          ref: 1b3a00336b6fad5d2f4d7257e188ffb1acf64f41
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
           repository: bingordo/mini-c
-          ref: main
+          ref: e8c8a00e6a40729e691c1887835256d25fd994ca
           path: mini-c
           persist-credentials: false
       - name: Record exact source and build configuration
@@ -107,21 +107,27 @@ jobs:
           evidence="$RUNNER_TEMP/csmith-evidence"
           harness=compiler/tools/csmith_probe.py
           failure=0
-          for profile in baseline restricted-observable restricted-pointers restricted-arrays restricted-structs; do
+          for variant in baseline restricted-observable restricted-observable-omit restricted-pointers restricted-pointers-omit restricted-arrays restricted-arrays-omit restricted-structs restricted-structs-omit; do
+            if [[ "$DRIVER_KIND" == cranelift-latest && "$variant" == *-omit ]]; then continue; fi
+            profile="${variant%-omit}"
             cases="$evidence/cases-$profile"
-            timeout 90s python3 "$harness" --generate --cases-dir "$cases" --csmith csmith --seed-base 1 --seed-count 8 --profile "$profile"
-            flags=()
-            # Keep strict baseline and observable separate from historical omission mode.
-            if [[ "$DRIVER_KIND" != cranelift-latest ]]; then
-              case "$profile" in restricted-pointers|restricted-arrays|restricted-structs) flags=(--omit-unreferenced-static-bodies);; esac
+            if [[ ! -s "$cases/manifest.json" ]]; then
+              timeout 90s python3 "$harness" --generate --cases-dir "$cases" --csmith csmith --seed-base 1 --seed-count 8 --profile "$profile"
             fi
-            if ! timeout --kill-after=5s 150s python3 "$harness" --probe --cases-dir "$cases" --artifacts-dir "$evidence/results-$profile" --include-dir "$CSMITH_INCLUDE" --preprocess-c --driver "$DRIVER" --compiler-sha "$COMPILER_SHA" --frontend-sha "$FRONTEND_SHA" --minimum-native 0 --max-wall-seconds 120 "${flags[@]}" 2>&1 | tee "$evidence/$profile.log"; then
+            flags=()
+            if [[ "$variant" == *-omit ]]; then flags=(--omit-unreferenced-static-bodies); fi
+            if ! timeout --kill-after=5s 150s python3 "$harness" --probe --cases-dir "$cases" --artifacts-dir "$evidence/results-$variant" --include-dir "$CSMITH_INCLUDE" --preprocess-c --driver "$DRIVER" --compiler-sha "$COMPILER_SHA" --frontend-sha "$FRONTEND_SHA" --minimum-native 0 --run-timeout 5 --max-wall-seconds 120 "${flags[@]}" 2>&1 | tee "$evidence/$variant.log"; then
               failure=1
             fi
-            if [[ -s "$evidence/results-$profile/summary.json" ]]; then
-              python3 - "$evidence/results-$profile/summary.json" <<'PY'
-          import json,os,sys
-          d=json.load(open(sys.argv[1]))
+            if [[ -s "$evidence/results-$variant/summary.json" ]]; then
+              python3 - "$evidence/results-$variant/summary.json" <<'PY'
+          import json,os,sys,pathlib
+          summary=pathlib.Path(sys.argv[1])
+          d=json.load(summary.open())
+          for line in summary.with_name("results.jsonl").read_text().splitlines():
+              row=json.loads(line)
+              if row["classification"] != "passed":
+                  print("CSMITH_FIRST_FAILURE", summary.parent.name, json.dumps({k:row.get(k) for k in ("seed","classification","compiler","frontend_diagnostic","frontend_location","compiler_link")}))
           with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
               print(f"{d['generator_profile']}: {d['passed']}/{d['total_seeds']} matching executions; {d['native_accepted']} accepted; {d['status']}; omit unused static bodies={d['omit_unreferenced_static_bodies']}",file=f)
           PY
