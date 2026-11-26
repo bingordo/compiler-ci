@@ -1,0 +1,77 @@
+# Source-pinned regression of compiler PR #3333; run only on compiler-ci.
+name: GNU word mode bridge regression (compiler PR3333)
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-gcc-mode-word-pr3333.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  mode-word:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 24
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ffccf5e88c4fc5f8799b5b7368e00c7acef15580
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Build production driver and run checked Mini-C GNU bridge regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = ffccf5e88c4fc5f8799b5b7368e00c7acef15580
+          timeout --signal=TERM --kill-after=10s 14m cargo build -p compiler --bin compiler --manifest-path compiler/Cargo.toml
+          timeout --signal=TERM --kill-after=10s 8m cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib m48_source::tests:: -- --nocapture
+      - name: Reprobe unmodified cJSON with GCC baseline and new Rust mode bridge
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch v1.7.19 https://github.com/DaveGamble/cJSON.git cjson
+          test "$(git -C cjson rev-parse HEAD)" = c859b25da02955fef659d658b8f324b5cde87be3
+          cmake -S cjson -B gcc-build -G Ninja -DCMAKE_C_COMPILER=cc \
+            -DBUILD_SHARED_LIBS=OFF -DENABLE_CUSTOM_COMPILER_FLAGS=OFF \
+            -DENABLE_CJSON_TEST=OFF -DENABLE_CJSON_UTILS=OFF -DENABLE_LOCALES=OFF
+          cmake --build gcc-build
+          test -s gcc-build/libcjson.a
+          c="$PWD/compiler/target/debug/compiler"
+          tc="$PWD/compiler/tools/cmake/typeid-gcc-adapter-toolchain.cmake"
+          cmake -S cjson -B rust-build -G Ninja \
+            -DCMAKE_C_COMPILER="$c" \
+            -DCMAKE_C_COMPILER_ARG1=--gcc-driver \
+            -DCMAKE_TOOLCHAIN_FILE="$tc" \
+            -DBUILD_SHARED_LIBS=OFF -DENABLE_CUSTOM_COMPILER_FLAGS=OFF \
+            -DENABLE_CJSON_TEST=OFF -DENABLE_CJSON_UTILS=OFF -DENABLE_LOCALES=OFF
+          set +e
+          cmake --build rust-build --verbose > rust-build.log 2>&1
+          build_rc=$?
+          set -e
+          if grep -F "unsupported GNU symbol attribute '__mode__'" rust-build.log; then
+            echo "bridge still rejects GNU mode before checked parser" >&2
+            cat rust-build.log
+            exit 1
+          fi
+          {
+            echo "COMPILER_SHA=$(git -C compiler rev-parse HEAD)"
+            echo "GCC_CJSON_STATIC_LIBRARY=PASS"
+            echo "RUST_CJSON_BUILD_EXIT=$build_rc"
+            if test "$build_rc" -eq 0; then
+              test -s rust-build/libcjson.a
+              echo "RUST_CJSON_STATIC_LIBRARY=PASS"
+            else
+              echo "RUST_CJSON_STATIC_LIBRARY=UNSUPPORTED"
+              echo 'First compiler diagnostic:'
+              grep -m 5 -E 'error:|unsupported|failed|fatal' rust-build.log || true
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gcc-word-mode-cjson-source-pinned
+          path: rust-build.log
+          if-no-files-found: ignore
