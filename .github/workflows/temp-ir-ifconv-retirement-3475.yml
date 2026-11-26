@@ -1,0 +1,65 @@
+name: Temporary historical if-conversion retirement acceptance
+on:
+  pull_request:
+    paths: ['.github/workflows/temp-ir-ifconv-retirement-3475.yml']
+permissions:
+  contents: read
+jobs:
+  ifconv-retirement:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: d2369d26da5d003d53fefedc51fd06ee9c90dd1e
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source and isolate core workspace
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-ifconv-retirement
+      - name: Retired Function if-conversion caller audit
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test ! -f crates/opt/src/if_conversion.rs
+          if git grep -nE 'legacy-function-ifconv-oracle|compiler_opt::if_conversion|crate::if_conversion::|super::super::if_conversion' -- '*.rs' '*.toml'; then
+            exit 1
+          fi
+      - name: Native optimizer library, TypeId CFG and C11 integration
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test typed_if_conversion_native
+          cargo test -p compiler-opt --test typed_if_conversion_pure
+          cargo test -p compiler-opt --test typed_identical_merges
+          cargo test -p compiler-opt --test ct05_identical_native
+          cargo test -p compiler-opt --test if_conversion_typeid_x86
+          cargo test -p compiler-opt --test if_conversion_typeid_multimerge
+          cargo test -p compiler-opt --test if_conversion_typeid_remaining
+      - name: All optimizer targets and strict production Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --all-targets
+          cargo clippy -p compiler-opt --lib -- -D warnings
+      - name: TypeId graph boundary
+        working-directory: compiler
+        run: python3 tools/check_mixed_function_export_boundary.py
