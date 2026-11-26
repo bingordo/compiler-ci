@@ -1,0 +1,58 @@
+name: Validate Mini-C native bitfield pointer access
+on:
+  pull_request:
+    paths: [.github/workflows/verify-minic-native-bitfield-pointer.yml]
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact compiler revision
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || 'c2e6512883de3f0d34c8c59730ccaf2246ac9474' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Identify exact compiler source
+        run: |
+          set -euo pipefail
+          actual="$(git -C compiler rev-parse HEAD)"
+          echo "Compiler SHA: $actual" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            test "$actual" = 'c2e6512883de3f0d34c8c59730ccaf2246ac9474'
+          fi
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: mini-c-source-differential-v1
+          cache-workspace-crates: 'true'
+      - name: Native bitfield and existing record pointer ABI regression
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c \
+            --test bitfield_pointer_abi --test record_pointer_abi -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/bitfield-native.log"
+      - name: Preserve failures
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: minic-native-bitfield-failures
+          path: |
+            ${{ runner.temp }}/bitfield-native.log
+            /tmp/native-bitfield-*/
+          if-no-files-found: ignore
+          retention-days: 7
