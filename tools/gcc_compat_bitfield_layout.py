@@ -22,6 +22,7 @@ def layout_directive(line, source_dir, target):
     if not re.fullmatch(r"x86_64-[A-Za-z0-9_-]*linux[A-Za-z0-9_-]*", target):
         return False
     if line in (
+        '/* { dg-options "-w" } */',
         '/* { dg-require-effective-target int32plus } */',
         '/* { dg-prune-output ".*-Wno-abi.*" } */',
         '/* { dg-prune-output ".*Offset of packed bit-field.*" } */',
