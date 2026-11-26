@@ -18,6 +18,7 @@ import sys
 from gcc_compat_abi_pilot import GCC_REVISION, GCC_COMPAT_DIR, command, succeeds
 from gcc_compat_inventory import inventory
 from gcc_compat_return_probes import generate
+from gcc_compat_bitfield_layout import generate_layout, layout_directive
 
 ROLES = ("main", "x", "y")
 
@@ -30,6 +31,9 @@ def unsupported(case, root, target=None):
         return "Tcl sidecar"
     for role in case["roles"].values():
         for line in role["directive_lines"]:
+            if case.get("layout_directive_source") and layout_directive(
+                    line, Path(case["layout_directive_source"]), target or ""):
+                continue
             # Support simple target-only skip selectors. More complex Tcl
             # expressions and option conditions remain explicitly unsupported.
             skip = re.fullmatch(r'\s*/\*\s*\{\s*dg-skip-if\s+"[^"\n]*"\s+\{\s*([A-Za-z0-9_.*?+-]+(?:\s+[A-Za-z0-9_.*?+-]+)*)\s*\}\s*\}\s*\*/\s*', line)
@@ -171,6 +175,10 @@ def main():
     p.add_argument("--prefix", action="append")
     p.add_argument("--cc", default="gcc")
     p.add_argument("--include-return-probes", action="store_true")
+    p.add_argument("--include-bitfield-layout", action="store_true",
+                   help="include original GCC struct-layout-1 bit-field interoperability tests")
+    p.add_argument("--layout-batches", type=int, default=6,
+                   help="number of deterministic bit-field batches (0 = all)")
     p.add_argument("--compiler-sha", help="exact tested source revision")
     p.add_argument("--required", type=Path, help="verified mixed-direction regression manifest")
     args = p.parse_args()
@@ -206,12 +214,26 @@ def main():
         generate(probe_root)
         sources.extend((probe_root, case, "generated-return-probe")
                        for case in inventory(probe_root, "probe-return-"))
+    layout_inventory = None
+    if args.include_bitfield_layout:
+        # Original checked-in one-bitfield layout test and full upstream
+        # generated batches. Keep their source origin separate from probes.
+        fixed = inventory(root, "struct-layout-1")
+        for case in fixed:
+            case["layout_directive_source"] = str(root)
+        sources.extend((root, case, "upstream-bitfield-layout") for case in fixed)
+        layout_root, layout_cases, layout_inventory = generate_layout(
+            root, work, args.cc, args.layout_batches)
+        sources.extend((layout_root, case, "upstream-generated-bitfield-layout")
+                       for case in layout_cases)
     records = []
     for opt in ("-O0", "-O2"):
         flags = ["-std=gnu11", opt, "-w", "-fno-pie"]
         for case_root, case, origin in sources:
+            case_flags = flags + (["-Wno-abi", "-mno-mmx"]
+                                  if case.get("layout_directive_source") else [])
             result = run_case(case, case_root, work / opt[1:] / case["case"],
-                              args.cc, flags, adapters)
+                              args.cc, case_flags, adapters)
             result["origin"] = origin
             records.append(result)
             print(f"{opt} {case['case']}: {result['status']}", flush=True)
@@ -222,6 +244,7 @@ def main():
                 "gcc_revision": revision, "records": records,
                 "compiler_sha": args.compiler_sha,
                 "planned_records": 2 * len(sources),
+                "bitfield_layout_inventory": layout_inventory,
             }, indent=2) + "\n")
     if args.required:
         required = json.loads(args.required.read_text())
