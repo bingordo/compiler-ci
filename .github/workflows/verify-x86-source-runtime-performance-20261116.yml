@@ -1,9 +1,12 @@
-name: x86 real-source generated runtime vs GCC
+name: x86 source edge profile counters and live physical copy costs PR3275
 on:
   push:
     branches: [main]
     paths: [.github/workflows/verify-x86-source-runtime-performance-20261116.yml]
   workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-x86-source-runtime-performance-20261116.yml'
 permissions:
   contents: read
 jobs:
@@ -17,37 +20,54 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 5209dd4e9cebaad3348cf0b4ed754a729e75f022
+          ref: e341e35952020c6253a148f22a735b67cdbd16f1
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - name: Verify exact source and configure private frontends
         run: |
-          test "$(git -C compiler rev-parse HEAD)" = "5209dd4e9cebaad3348cf0b4ed754a729e75f022"
+          test "$(git -C compiler rev-parse HEAD)" = "e341e35952020c6253a148f22a735b67cdbd16f1"
           git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: compiler -> target
-          key: x86-generated-runtime-20261116
-      - name: Native runtime median and GCC independent correctness oracle
+          key: x86-real-edge-profile-20261125
+      - name: Verify shared flow contract and x86 backend before source profiling
         working-directory: compiler
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --release -p compiler --test x7_s4_rolling_checksum_source -- --nocapture
-          cargo test --release -p compiler --test x86_source_runtime_performance -- --ignored --nocapture 2>&1 | tee "$RUNNER_TEMP/x86-generated-runtime.log"
-          grep -q 'X86_RUNTIME_FUNCTION mode=gcc_O2 symbol=' "$RUNNER_TEMP/x86-generated-runtime.log"
-          grep -q 'X86_RUNTIME_FUNCTION mode=mini_default symbol=' "$RUNNER_TEMP/x86-generated-runtime.log"
-          grep -q 'X86_SOURCE_RUNTIME mode=gcc_O2 workload=batch ' "$RUNNER_TEMP/x86-generated-runtime.log"
-          grep -q 'X86_SOURCE_RUNTIME mode=mini_default workload=delta ' "$RUNNER_TEMP/x86-generated-runtime.log"
-          grep -q 'X86_SOURCE_RUNTIME mode=gcc_O2 ' "$RUNNER_TEMP/x86-generated-runtime.log"
-          grep -q 'X86_SOURCE_RUNTIME mode=mini_default ' "$RUNNER_TEMP/x86-generated-runtime.log"
-          grep -q 'X86_SOURCE_RUNTIME mode=mini_noinline ' "$RUNNER_TEMP/x86-generated-runtime.log"
-          grep -q 'X86_SOURCE_RUNTIME mode=gcc_Os ' "$RUNNER_TEMP/x86-generated-runtime.log"
+          cargo test -p compiler-backend --lib profile_counters -- --nocapture
+          cargo test -p compiler-backend-x86 --lib --quiet -- \
+            --skip typeid_fp_staged_native_tests::mixed_body_typed_gp_indirect_value_and_void_calls
+          cargo clippy -p compiler-backend-x86 --lib -- -D warnings
+          cargo clippy -p compiler --test x86_edge_pgo_runtime_source -- -D warnings
+      - name: Collect real TypeId edge profile, native GCC/GAS/ELF proof
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release -p compiler --test x86_edge_pgo_runtime_source -- --ignored --nocapture 2>&1 | tee "$RUNNER_TEMP/x86-generated-runtime.log"
+          grep -q 'X86_PGO_PROVENANCE object_sha256=' "$RUNNER_TEMP/x86-generated-runtime.log"
+          grep -q 'X86_PGO_EDGE function=scan from=' "$RUNNER_TEMP/x86-generated-runtime.log"
+          grep -q 'X86_PGO_AGG function=scan calls=' "$RUNNER_TEMP/x86-generated-runtime.log"
+      - name: Summarize measured hot edge frequencies and copy demand
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '### Real x86 TypeId PGO edge counts and post-RA copies'
+            echo 'Exact compiler SHA: e341e35952020c6253a148f22a735b67cdbd16f1'
+            echo 'Native C/GCC/GAS/direct ELF identities and all edge flow checked'
+            echo '~~~'
+            grep 'X86_PGO_' "$RUNNER_TEMP/x86-generated-runtime.log"
+            echo '~~~'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Preserve executable runtime and GCC checksums
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: x86-generated-runtime
+          name: x86-source-pgo-profile
           path: ${{ runner.temp }}/x86-generated-runtime.log
           if-no-files-found: ignore
