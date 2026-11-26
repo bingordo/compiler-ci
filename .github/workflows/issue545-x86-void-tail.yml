@@ -1,0 +1,66 @@
+# Temporary source-pinned native SysV void required tail calls.
+name: Native x86 void musttail execution (#545)
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/issue545-x86-void-tail.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  x86-void-tail:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: cf56c90b4a2ad2fba262f319612aba1c3c68e828
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Prove exact candidate source checkout
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = "cf56c90b4a2ad2fba262f319612aba1c3c68e828"
+          echo "compiler cf56c90b4a2ad2fba262f319612aba1c3c68e828" >> "$GITHUB_STEP_SUMMARY"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Isolate native GP compiler workspace
+        run: |
+          mkdir -p work/crates
+          cp -a compiler/crates/ir compiler/crates/opt compiler/crates/backend \
+            compiler/crates/backend-x86 compiler/crates/backend-aarch64 work/crates/
+          cp -a compiler/tools work/
+          cat > work/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend",
+                     "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: work
+          key: issue545-x86-void-direct-tail
+      - name: Strict backend and tests typecheck
+        working-directory: work
+        run: RUSTFLAGS="-D warnings" cargo check -p compiler-backend-x86 --lib --test musttail_native --test tailcall_native
+      - name: Canonical void GP required tail native C11 (ELF/GAS PIC framed)
+        working-directory: work
+        run: cargo test -p compiler-backend-x86 --test musttail_native -- --nocapture
+      - name: Existing optional TCO and frame ABI
+        working-directory: work
+        run: cargo test -p compiler-backend-x86 --test tailcall_native -- --nocapture
+      - name: Physical x86 required tail receipt index
+        working-directory: work
+        run: cargo test -p compiler-backend-x86 --lib musttail::tests -- --nocapture
+      - name: Source TypeId ABI and codec tests
+        working-directory: work
+        run: |
+          cargo test -p compiler-ir --test musttail_codec -- --nocapture
+          cargo test -p compiler-ir --test musttail_verifier -- --nocapture
+      - name: Clippy correctness and suspiciousness
+        working-directory: work
+        run: |
+          cargo clippy -p compiler-backend-x86 --lib -- -D clippy::correctness
+          cargo clippy -p compiler-backend-x86 --test musttail_native -- -D clippy::correctness
