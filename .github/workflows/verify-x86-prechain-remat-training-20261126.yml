@@ -1,0 +1,84 @@
+name: Exact pre-chain x86 rematerialization PGO training and replay
+on:
+  push:
+    branches: [verify/x86-prechain-training-20261126]
+    paths: [.github/workflows/verify-x86-prechain-remat-training-20261126.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+  statuses: write
+jobs:
+  source-pinned:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    env:
+      COMPILER_SHA: 45da062b8a6f5ca925a53b4d839f8fb1ba78e8f7
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.COMPILER_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler source
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          echo "Checked compiler source: $COMPILER_SHA" >> "$GITHUB_STEP_SUMMARY"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: remat-prechain-source-training-20261126
+      - name: Existing shared planner and x86 pure-chain regressions
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib remat::
+          cargo test -p compiler-backend-x86 --lib machine::profiled_remat_tests
+          cargo test -p compiler-backend-x86 --lib machine::pure_immediate_chain_tests
+      - name: Run isolated REAL C11 PGO training and certified pre-chain replay
+        working-directory: compiler
+        env:
+          COMPILER_X86_REMAT_PGO_EDGE_COUNTERS: '1'
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib             remat_prechain_training_native_tests::real_training_counters_replay_on_original_prechain_ssa             -- --ignored --exact --nocapture
+      - name: Cross-target and C11 native parity
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-aarch64 --lib
+          cargo test -p compiler-backend-riscv64 --lib
+          cargo test -p compiler-backend-x86 --lib pure_immediate_chain_native_tests -- --nocapture
+      - name: X86 Clippy and actual production source oracle
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          # Two Clippy warnings already exist in unchanged upstream
+          # aligned_relaxation.rs / legalize.rs on compiler main.
+          cargo clippy -p compiler-backend-x86 --lib -- --no-deps -D warnings             -A dead_code -A clippy::too_many_arguments             -A clippy::unnecessary_lazy_evaluations
+          cargo test -p compiler --test x7_s4_rolling_checksum_source -- --nocapture
+      - name: Publish source-pinned validation
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          case "$JOB_STATUS" in
+            success) state=success ;;
+            cancelled) state=error ;;
+            *) state=failure ;;
+          esac
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$state" \
+            -f context="compiler/x86-prechain-remat-training" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            -f description="Exact x86 remat prechain PGO training + ELF/GAS C11 oracle"
