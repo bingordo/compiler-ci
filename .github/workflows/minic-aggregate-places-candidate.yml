@@ -7,19 +7,40 @@ on:
 permissions:
   contents: read
 jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: main
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Resolve main
+        id: source
+        run: echo "sha=$(git -C compiler rev-parse HEAD)" >> "$GITHUB_OUTPUT"
   candidate:
+    needs: snapshot
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline, integrated]
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: main
+          ref: ${{ needs.snapshot.outputs.sha }}
           fetch-depth: 0
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - name: Integrate exact candidate with current main
+        if: matrix.variant == 'integrated'
         run: |
           set -euo pipefail
           git -C compiler rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
@@ -42,6 +63,7 @@ jobs:
           workspaces: compiler/tools/mini-c-driver -> target
           key: minic-aggregate-places-candidate
       - name: GCC aggregate place and discarded call regression
+        if: matrix.variant == 'integrated'
         run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test aggregate_places -- --nocapture
       - name: Replay 32 structure seeds
         if: success() || failure()
@@ -80,6 +102,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: discarded-aggregate-csmith-evidence
+          name: discarded-aggregate-csmith-evidence-${{ matrix.variant }}
           path: ${{ runner.temp }}/struct-evidence
           retention-days: 14
