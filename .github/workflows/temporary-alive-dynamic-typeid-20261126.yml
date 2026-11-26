@@ -1,0 +1,80 @@
+# Source-pinned temporary AL01-AL02 dynamic native TypeId cutover; do not merge.
+name: Temporary Alive dynamic TypeId
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temporary-alive-dynamic-typeid-20261126.yml'
+permissions:
+  contents: read
+jobs:
+  dynamic-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      SOURCE_SHA: 172c993c8db441b7a9d8f9585f415bc1722c7334
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler commit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source SHA and isolate optimizer workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "Exact compiler source SHA: $SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - name: Cache Rust compilation
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: temporary-alive-dynamic-native
+      - name: Ordinary Alive-lite suite, native seed regression and fixture coverage
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test alive_lite -- --nocapture
+      - name: Install Z3
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y z3
+          z3 --version
+      - name: Dynamic seeded production optimizer proofs and negative controls
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for test in \
+            prove_actual_optimizer_passes \
+            prove_seeded_mutations_against_actual_passes \
+            prove_seeded_select_against_real_optimizer_passes \
+            prove_select_phi_traps_against_real_passes \
+            prove_cfg_phi_and_real_pre_transforms; do
+            cargo test -p compiler-opt --test alive_lite "$test" -- --ignored --nocapture --test-threads=1
+          done
+      - name: AL01 AL02 baseline native proofs
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for test in \
+            al01_direct_typeid_proves_changed_cse_and_finds_phi_trap_mutants \
+            al02_typeid_stage_proof_ledger \
+            al02_source_pipeline_composed_z3_proofs; do
+            cargo test -p compiler-opt --test alive_lite "$test" -- --ignored --nocapture --test-threads=1
+          done
+      - name: Focused Alive-lite Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --test alive_lite -- -D clippy::all -A clippy::too_many_arguments -A clippy::needless_lifetimes -A clippy::empty_line_after_doc_comments -A clippy::collapsible_if -A clippy::collapsible_match -A clippy::needless_range_loop -A clippy::needless_borrows_for_generic_args -A clippy::type_complexity
