@@ -1982,6 +1982,57 @@ if [[ "${EDG_TYPEID_UNIT_REGRESSION:-0}" == "1" ]]; then
 fi
 native=/workspace/compiler/tools/edg-driver/target/debug/compiler-edg-driver
 test -x "$native"
+# Public, independently compiled SysV MEMORY argument reproducer.
+# Keep the call and definition separate to detect one-sided ABI mistakes.
+probe=/audit-tmp/edg-memory-arg
+mkdir -p "$probe"
+cat > "$probe/caller.c" <<'C'
+struct words { unsigned long a,b,c,d; };
+extern unsigned long take_words(struct words x, unsigned long tail);
+unsigned long call_words(unsigned long n) {
+    struct words x;
+    x.a=n; x.b=n+1; x.c=n+2; x.d=n+3;
+    return take_words(x, 13);
+}
+C
+cat > "$probe/callee.c" <<'C'
+struct words { unsigned long a,b,c,d; };
+unsigned long take_words(struct words x, unsigned long tail) {
+    x.a += 1;
+    return x.a+2*x.b+3*x.c+4*x.d+tail;
+}
+C
+cat > "$probe/main.c" <<'C'
+extern unsigned long call_words(unsigned long);
+int main(void) { return call_words(5)!=84; }
+C
+# 6 + 2*6 + 3*7 + 4*8 + 13 = 84.
+gcc -std=c11 -c "$probe/caller.c" -o "$probe/gcc-caller.o"
+gcc -std=c11 -c "$probe/callee.c" -o "$probe/gcc-callee.o"
+gcc -std=c11 "$probe/main.c" "$probe/gcc-caller.o" "$probe/gcc-callee.o" -o "$probe/gcc-only"
+set +e
+"$probe/gcc-only"
+echo "EDG_C_MEMORY_ARG_GCC_EXIT=$?"
+for side in caller callee; do
+  (
+    cd /workspace/edgcpp/build/gcc-release
+    timeout --signal=TERM --kill-after=10s 90s "$native" "$probe/native-$side.o" --gcc --c11 --no_strict_gnu --gnu_version "$gnu_number" "$probe/$side.c"
+  ) > "$probe/$side.log" 2>&1
+  rc=$?
+  echo "EDG_C_MEMORY_ARG_${side^^}_COMPILE_EXIT=$rc"
+  if (( rc == 0 )); then
+    other=caller
+    if [[ "$side" == caller ]]; then other=callee; fi
+    gcc -std=c11 "$probe/main.c" "$probe/native-$side.o" "$probe/gcc-$other.o" -o "$probe/mixed-$side" > "$probe/link-$side.log" 2>&1
+    link_rc=$?
+    echo "EDG_C_MEMORY_ARG_${side^^}_LINK_EXIT=$link_rc"
+    if (( link_rc == 0 )); then
+      "$probe/mixed-$side"
+      echo "EDG_C_MEMORY_ARG_${side^^}_EXEC_EXIT=$?"
+    fi
+  fi
+done
+set -e
 for kind in alignment linkage abi naked control_globals weak_function section_function control_asm aligned_global scalar_global weak_scalar_global; do
   fixture="/workspace/bootstrap/fixtures/edg-gnu-attributes/${kind}.c"
   output="/audit-tmp/edg-gnu-${kind}.o"
