@@ -1,0 +1,105 @@
+# Current-main acceptance is source-pinned to a concrete compiler revision.
+# This workflow does not use the historical Python GCC adapter.
+name: Rust GCC current-main direct CMake acceptance
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-rust-gcc-current-main-20261125.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  rust-gcc-current-main:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 22
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c61494c8213bb40625fdc39ef0f7644750d46da6
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Build exact current-main production Rust compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "c61494c8213bb40625fdc39ef0f7644750d46da6"
+          echo "COMPILER_SOURCE_SHA=$(git -C compiler rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          timeout --signal=TERM --kill-after=10s 14m cargo build -p compiler --bin compiler --manifest-path compiler/Cargo.toml
+      - name: Rust GCC isolated planner tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          d="$(mktemp -d)"
+          trap 'rm -rf "$d"' EXIT
+          root="$PWD/compiler"
+          printf '#[path="%s/crates/driver/src/gcc_driver.rs"]\nmod gcc_driver;\n#[path="%s/crates/driver/tests/unit/gcc_driver_cases.rs"]\nmod gcc_driver_cases;\n' \
+            "$root" "$root" > "$d/harness.rs"
+          rustc --edition=2021 --test "$d/harness.rs" -o "$d/gcc_planner_tests"
+          "$d/gcc_planner_tests" --nocapture
+      - name: Direct Rust GCC CMake Ninja and Makefiles with header invalidation
+        shell: bash
+        run: |
+          set -euo pipefail
+          compiler="$PWD/compiler/target/debug/compiler"
+          tc="$PWD/compiler/tools/cmake/typeid-gcc-adapter-toolchain.cmake"
+          d="$(mktemp -d)"
+          trap 'rm -rf "$d"' EXIT
+          mkdir -p "$d/src"
+          cat > "$d/src/CMakeLists.txt" <<'EOF'
+          cmake_minimum_required(VERSION 3.20)
+          project(typeid_direct_rust C)
+          if(NOT CMAKE_C_COMPILER_ID STREQUAL "TypeId")
+            message(FATAL_ERROR "Expected TypeId compiler identity, got: ${CMAKE_C_COMPILER_ID}")
+          endif()
+          add_executable(probe main.c)
+          target_compile_options(probe PRIVATE -std=c11 -g0)
+          EOF
+          printf '#include "answer.h"\nint main(void) { return ANSWER == 42 ? 0 : 1; }\n' > "$d/src/main.c"
+          for generator in Ninja "Unix Makefiles"; do
+            printf '#define ANSWER 42\n' > "$d/src/answer.h"
+            suffix=ninja
+            test "$generator" = Ninja || suffix=make
+            cmake -S "$d/src" -B "$d/$suffix" -G "$generator" \
+              -DCMAKE_C_COMPILER="$compiler" \
+              -DCMAKE_C_COMPILER_ARG1=--gcc-driver \
+              -DCMAKE_TOOLCHAIN_FILE="$tc"
+            cmake --build "$d/$suffix"
+            "$d/$suffix/probe"
+            obj="$d/$suffix/CMakeFiles/probe.dir/main.c.o"
+            before="$(stat -c %Y "$obj")"
+            sleep 1
+            cmake --build "$d/$suffix"
+            test "$(stat -c %Y "$obj")" = "$before"
+            sleep 1
+            printf '#define ANSWER 43\n' > "$d/src/answer.h"
+            cmake --build "$d/$suffix"
+            test "$(stat -c %Y "$obj")" -gt "$before"
+            if "$d/$suffix/probe"; then
+              echo "header edit did not affect $generator executable" >&2
+              exit 1
+            else
+              test "$?" -eq 1
+            fi
+          done
+          echo "RUST_GCC_CURRENT_MAIN_CMAKE_NINJA_MAKE=PASS" >> "$GITHUB_STEP_SUMMARY"
+      - name: Check invalid option fails closed without output
+        shell: bash
+        run: |
+          set -euo pipefail
+          c="$PWD/compiler/target/debug/compiler"
+          d="$(mktemp -d)"
+          trap 'rm -rf "$d"' EXIT
+          cd "$d"
+          printf 'int main(void) { return 0; }\n' > source.c
+          for opt in -O2 -Werror -pthread -shared -std=c17; do
+            if "$c" --gcc-driver "$opt" source.c -o rejected; then
+              echo "unexpectedly accepted $opt" >&2
+              exit 1
+            fi
+            test ! -e rejected
+          done
+          echo "RUST_GCC_CURRENT_MAIN_NEGATIVE_OPTIONS=PASS" >> "$GITHUB_STEP_SUMMARY"
