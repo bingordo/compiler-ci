@@ -1,0 +1,81 @@
+name: S23.51n source-pinned generated factoring metadata regression
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-51n-lazy-factoring.yml'
+permissions:
+  contents: read
+jobs:
+  generated-rewrite-parity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_BUILD_JOBS: '2'
+      RUST_TEST_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 8ffddbe631e2dedcfb0c315a3d64ff7c6c587c33
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 73b7341ef9c96243900d5d3c4563abeff7302a76
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source pins and strictly limited diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C before rev-parse HEAD)" = 8ffddbe631e2dedcfb0c315a3d64ff7c6c587c33
+          test "$(git -C after rev-parse HEAD)" = 73b7341ef9c96243900d5d3c4563abeff7302a76
+          git -C after merge-base --is-ancestor 8ffddbe631e2dedcfb0c315a3d64ff7c6c587c33 HEAD
+          git -C after diff --name-only 8ffddbe631e2dedcfb0c315a3d64ff7c6c587c33 HEAD | sort > changed.txt
+          printf '%s\n' crates/opt/src/generated_typeid_shadow.rs crates/opt/tests/native_s2350_two_op_factoring.rs | sort | diff -u - changed.txt
+          cmp before/tools/typeid-rule-gen/examples.rules after/tools/typeid-rule-gen/examples.rules
+          cmp before/tools/typeid-rule-gen/ssa_codegen.py after/tools/typeid-rule-gen/ssa_codegen.py
+          echo "S2351N_COMPILER_BASE_SHA=$(git -C before rev-parse HEAD)"
+          echo "S2351N_COMPILER_CANDIDATE_SHA=$(git -C after rev-parse HEAD)"
+      - name: Configure existing checkout dependency transport and compiler cache
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before -> target
+            after -> target
+          key: s2351n-root-only-and-mixed-factoring
+      - name: Test original and candidate generated rewrite legality on every width
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          for rev in before after; do
+            for test in native_s2350_two_op_factoring native_s2350_shadow_parity native_s2350_constructed_binary_batch native_s2350_gcc_boolean_batch; do
+              (cd "$rev" && cargo test --release -p compiler-opt --test "$test" -- --nocapture) 2>&1 | tee "results/$rev-$test.log"
+            done
+            (cd "$rev" && cargo test --release -p compiler-opt --lib generated_typeid_shadow -- --nocapture) 2>&1 | tee "results/$rev-shadow-lib.log"
+          done
+          grep -q "root_only_rewrites_skip_factoring_metadata_but_mixed_rewrites_still_factor" results/after-native_s2350_two_op_factoring.log
+      - name: Candidate strict Clippy on changed optimizer crate
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd after && cargo clippy -p compiler-opt --lib --tests -- -D warnings) 2>&1 | tee results/clippy.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: s2351n-pinned-regression-results
+          path: |
+            results/
+            changed.txt
+          retention-days: 21
