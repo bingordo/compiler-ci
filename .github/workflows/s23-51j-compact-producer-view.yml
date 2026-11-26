@@ -1,0 +1,180 @@
+name: S23.51j compact producer view compared to legacy source snapshots
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-51j-compact-producer-view.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  original-source-compact-producer-cost:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      RUST_TEST_THREADS: '1'
+    steps:
+      - name: Checkout exact test-only compact producer view candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2ec3f667964ba6b0b11f9553907ff91c703878a8
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Audit immutable rule DSL and candidate scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = '2ec3f667964ba6b0b11f9553907ff91c703878a8'
+          grep -q 's2351j_compact_original_producer_table_source_cost' \
+            compiler/crates/opt/src/generated_typeid_probe_census_tests.rs
+          grep -q 's2351j_compact_storage_exact_legacy_view_semantics_on_dense_and_sparse_ids' \
+            compiler/crates/opt/src/generated_typeid_probe_census_tests.rs
+          grep -q 'struct CompactView' compiler/crates/opt/src/generated_typeid_probe_census_tests.rs
+          test "$(git -C compiler status --porcelain | wc -l)" -eq 0
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          mkdir -p results
+          rustc --version
+          cargo --version
+      - name: Download the immutable original source snapshot artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: s23-48-exact-source-typeid-stage-attribution
+          run-id: 43349934825
+          repository: bingordo/compiler-ci
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: captured
+      - name: Check original verified source manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s captured/typeid_snapshots/manifest.tsv
+          test "$(wc -l < captured/typeid_snapshots/manifest.tsv)" -eq 44
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          source=json.loads(Path("captured/s23-47-source-capture.json").read_text())
+          assert (source['attempted'],source['accepted'],source['rejected'])==(46,44,2)
+          print("S2351J_ORIGINAL_SOURCE accepted=44 stages=88")
+          PY
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+      - name: Build the compiled source-view comparator before timing
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler
+          cargo test --release -p compiler-opt --lib \
+            --features experimental-typeid-generated-rewrites \
+            s2351j_ --no-run
+      - name: Test dense and sparse ValueId lookup equivalence and synthetic fallback
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd compiler && cargo test --release -p compiler-opt --lib \
+            --features experimental-typeid-generated-rewrites \
+            s2351j_ -- --nocapture --test-threads=1) \
+            2>&1 | tee results/s2351j-synthetic-and-lookup-tests.log
+          grep -q 'S2351J_COVERAGE source_cases=0 stages=1' \
+            results/s2351j-synthetic-and-lookup-tests.log
+      - name: Repeated same-compiled-binary original SSA compact versus legacy matcher and view build timings
+        shell: bash
+        run: |
+          set -euo pipefail
+          for pass in 1 2; do
+            echo "S2351J_PASS_BEGIN pass=$pass"
+            (cd compiler && S2351_SNAPSHOT_DIR="$GITHUB_WORKSPACE/captured/typeid_snapshots" \
+              cargo test --release -p compiler-opt --lib \
+              --features experimental-typeid-generated-rewrites \
+              s2351j_ -- --nocapture --test-threads=1) \
+              2>&1 | tee "results/s2351j-source-pass-$pass.log"
+          done
+      - name: Check complete source parity and summarize matcher/view construction costs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          from statistics import median
+          rows=[]
+          for pass_id in (1,2):
+              data=Path(f'results/s2351j-source-pass-{pass_id}.log').read_text()
+              assert 'S2351J_COVERAGE source_cases=44 stages=88 roots=4613 hits=68 ' in data,pass_id
+              entries={}
+              for text in data.splitlines():
+                  if 'S2351J_COMPARE id=' not in text:
+                      continue
+                  text=text[text.index('S2351J_COMPARE '):]
+                  item=dict(token.split('=',1) for token in text.split()[1:])
+                  key=(item['id'],item['stage'])
+                  assert key not in entries,(pass_id,key)
+                  assert int(item['match_repeats'])==128
+                  assert int(item['build_repeats'])==16
+                  assert int(item['samples'])==9
+                  for name in ('old_matcher_ns','new_matcher_ns','old_build_ns','new_build_ns'):
+                      assert int(item[name])>0,(pass_id,key,name)
+                  entries[key]=item
+              assert len(entries)==88,(pass_id,len(entries))
+              assert sum(int(v['roots']) for v in entries.values())==4613
+              assert sum(int(v['hits']) for v in entries.values())==68
+              rows.append(entries)
+          assert set(rows[0])==set(rows[1])
+          for key in rows[0]:
+              for field in ('id','cohort','stage','roots','hits','functions',
+                            'dense','sparse','compact_slots','scope'):
+                  assert rows[0][key][field]==rows[1][key][field],(key,field)
+          keys=sorted(rows[0])
+          groups={'all':keys,
+                  'matched':[k for k in keys if int(rows[0][k]['hits'])>0],
+                  'missed':[k for k in keys if int(rows[0][k]['hits'])==0],
+                  'dense_only':[k for k in keys if int(rows[0][k]['sparse'])==0],
+                  'has_sparse':[k for k in keys if int(rows[0][k]['sparse'])>0]}
+          assert (len(groups['matched']),len(groups['missed']))==(3,85)
+          report={'schema':'compiler.s2351j.compact-source-compare.v1',
+                  'compiled_sha':'2ec3f667964ba6b0b11f9553907ff91c703878a8','source_capture_run':43349934825,
+                  'source_cases':44,'source_stages':88,'roots':4613,'matches':68,
+                  'scope':'compiled generated matcher on two original producer view types',
+                  'samples':9,'ABBA_within_each_sample':True,'runs':2,
+                  'groups':{}}
+          for name,subset in groups.items():
+              if not subset:continue
+              out={'stages':len(subset)}
+              for first,last,tag in [('old_matcher_ns','new_matcher_ns','direct_matcher'),
+                                     ('old_build_ns','new_build_ns','view_build')]:
+                  ratios=[]
+                  oldsum=newsum=0
+                  for k in subset:
+                      old=median(int(r[k][first]) for r in rows)
+                      new=median(int(r[k][last]) for r in rows)
+                      ratios.append(new/max(1,old))
+                      oldsum+=old;newsum+=new
+                  out[tag+'_stage_median_new_over_old']=median(ratios)
+                  out[tag+'_sum_new_over_old']=newsum/max(1,oldsum)
+              report['groups'][name]=out
+              print('S2351J_SOURCE group='+name+' stages='+str(len(subset))+
+                    ' matcher_ratio='+format(out['direct_matcher_stage_median_new_over_old'],'.4f')+
+                    ' matcher_sum_ratio='+format(out['direct_matcher_sum_new_over_old'],'.4f')+
+                    ' view_build_ratio='+format(out['view_build_stage_median_new_over_old'],'.4f')+
+                    ' view_sum_ratio='+format(out['view_build_sum_new_over_old'],'.4f'))
+          report['functions_dense']=sum(int(r['dense']) for r in rows[0].values())
+          report['functions_sparse']=sum(int(r['sparse']) for r in rows[0].values())
+          report['total_compact_slots']=sum(int(r['compact_slots']) for r in rows[0].values())
+          print('S2351J_STORAGE dense='+str(report['functions_dense'])+
+                ' sparse='+str(report['functions_sparse'])+
+                ' slots='+str(report['total_compact_slots']))
+          Path('results/s2351j-compact-source-results.json').write_text(
+              json.dumps(report,indent=2)+'\n')
+          PY
+      - name: Archive complete compact view performance and SSA equivalence evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2351j-compact-original-producer-view-results
+          path: results/
+          if-no-files-found: warn
+          retention-days: 28
