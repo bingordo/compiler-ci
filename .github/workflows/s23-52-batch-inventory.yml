@@ -1,0 +1,86 @@
+name: S23.52 pinned batch TypeId rule import inventory
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-52-batch-inventory.yml'
+permissions:
+  contents: read
+jobs:
+  inventory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a0e6231fdadcb828d55e1ae827ee49527ff451e4
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 6d616c9daefda90c4225fbad35e2f63354efc3ab
+          path: distribution
+          sparse-checkout: |
+            dist
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact snapshots and source schema
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = a0e6231fdadcb828d55e1ae827ee49527ff451e4
+          test "$(git -C distribution rev-parse HEAD)" = 6d616c9daefda90c4225fbad35e2f63354efc3ab
+          test "$(tr -d '\n' < distribution/dist/source-sha.txt)" = 3a0ebce9a36973cdc9acf833d015b3899f865ffd
+          test -s distribution/dist/generated/expr_rules.json
+          test -s distribution/dist/generated/expr_fusion.json
+          echo "S2352_COMPILER_SHA=$(git -C compiler rev-parse HEAD)"
+          echo "S2352_EXPRESSION_DIST_SHA=$(git -C distribution rev-parse HEAD)"
+          cat distribution/dist/source-sha.txt
+      - name: Run canonical TypeId DSL and bulk inventory unit suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler/tools/typeid-rule-gen
+          python3 -m compileall -q batch_inventory.py test_batch_inventory.py
+          python3 -m unittest -v test_batch_inventory test_rules test_rule_interactions
+      - name: Compare both original SMT-proven artifact batches against TypeId rules
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          base=(python3 compiler/tools/typeid-rule-gen/batch_inventory.py
+            --admitted compiler/tools/typeid-rule-gen/examples.rules
+            --source distribution/dist/generated/expr_rules.json
+            --source distribution/dist/generated/expr_fusion.json
+            --generator-sha-file distribution/dist/source-sha.txt)
+          "${base[@]}" --out results/inventory.json
+          "${base[@]}" --out results/inventory-repeat.json
+          cmp results/inventory.json results/inventory-repeat.json
+          python3 - <<'PY'
+          import json
+          data=json.load(open("results/inventory.json", encoding="utf-8"))
+          assert data["schema"]=="compiler.typeid-import-inventory.v1"
+          assert data["source_generator_commit"]=="3a0ebce9a36973cdc9acf833d015b3899f865ffd"
+          assert data["admitted_typeid_rule_families"]==88
+          assert data["candidate_count"]==67
+          assert data["auto_admitted"]==0
+          assert data["widths_proven_by_this_tool"]==[]
+          assert sum(data["status_counts"].values())==67
+          assert len(data["inputs"])==2
+          assert [s["family_count"] for s in data["inputs"]]==[62,5]
+          assert all(r["source_proof"]=="generator_reported_qfbv32" for r in data["candidates"])
+          assert any(r["status"]=="guarded_requires_predicate_adapter" for r in data["candidates"])
+          assert any(r["status"]=="constant_fusion_requires_adapter" for r in data["candidates"])
+          print("S2352_INVENTORY_GREEN", json.dumps(data["status_counts"],sort_keys=True))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: s2352-pinned-batch-inventory
+          path: results/
+          retention-days: 21
