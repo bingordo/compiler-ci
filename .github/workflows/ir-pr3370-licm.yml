@@ -1,0 +1,56 @@
+# Temporary source-pinned validation. Do not merge onto compiler-ci main.
+name: IR PR3370 retire Function LICM
+on:
+  push:
+    branches: [verify-ir-licm-3370-20261126]
+    paths: ['.github/workflows/ir-pr3370-licm.yml']
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: 9bbebca7ffd3240ad545eb0b3b3eee44670fd463
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source and isolate optimizer workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo 'Historical LICM symbol audit:'
+          git -C compiler grep -n -E 'legacy-function-licm-oracle|compiler_opt::licm::|licm::hoist\(|licm::canonicalize_preheaders\(' -- crates/opt || :
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-pr3370-licm
+      - name: Compile all optimizer targets and execute native LICM, loop semantics
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --all-targets
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test typed_licm_native
+          cargo test -p compiler-opt --test licm_native
+          cargo test -p compiler-opt --test licm_preheaders
+          cargo test -p compiler-opt --test loop_trap_semantics
+          cargo test -p compiler-opt --test pre_licm_semantic_matrix
+      - name: Strict optimizer library lint excluding baseline generated dead code
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --lib -- -D warnings -A dead_code
