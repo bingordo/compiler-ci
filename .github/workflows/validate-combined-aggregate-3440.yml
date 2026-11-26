@@ -1,0 +1,78 @@
+name: TEMP combined aggregate ABI 3440
+on:
+  pull_request:
+    branches: [main]
+    paths: [.github/workflows/validate-combined-aggregate-3440.yml]
+permissions:
+  contents: read
+jobs:
+  combined:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9543a3303a2040aa0cd33c8ce40af45525625c30
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source and prepare Mini-C dependency
+        run: |
+          set -euxo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 9543a3303a2040aa0cd33c8ce40af45525625c30
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('compiler/tools/mini-c-driver/Cargo.toml')
+          s=p.read_text()
+          old='ssh://git@github.com/bingordo/mini-c.git'
+          assert s.count(old)==2
+          p.write_text(s.replace(old,'https://github.com/bingordo/mini-c.git'))
+          PY
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: mini-c-source-differential-v1
+      - name: Build native driver
+        run: cargo build --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+      - name: Run harness unit controls
+        run: python3 -m unittest discover -s compiler/tests/gcc -p 'test_*.py'
+      - name: Run all combined aggregate probes at GCC O0 and O2
+        run: |
+          set -euo pipefail
+          PYTHONPATH="$PWD/compiler/tests/gcc" python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          from gcc_compat_argument_probes import generate_combined
+          from gcc_compat_inventory import inventory
+          from gcc_compat_runner import run_case, fatal
+          from gcc_compat_coverage import summarize
+          work = Path(os.environ["RUNNER_TEMP"]) / "combined-abi"
+          root = work / "sources"
+          root.mkdir(parents=True)
+          generate_combined(root)
+          cases = inventory(root, "probe-arg-combined-")
+          assert len(cases) == 100
+          adapters = {"minic": [str(Path("compiler/tools/mini-c-driver/target/debug/compiler-mini-c").resolve()), "{source}", "--emit", "obj", "-o", "{object}"]}
+          records = []
+          for opt in ("-O0", "-O2"):
+              for case in cases:
+                  record = run_case(case, root, work / opt[1:] / case["case"], "gcc", ["-std=gnu11", opt, "-w", "-fno-pie"], adapters)
+                  record["origin"] = "generated-argument-probe"
+                  records.append(record)
+                  (work / "report.json").write_text(json.dumps({"compiler_sha": "9543a3303a2040aa0cd33c8ce40af45525625c30", "records": records, "planned_records": 200}, indent=2))
+                  print(opt, case["case"], record["status"], {k: v["status"] for k,v in record["frontends"].get("minic", {}).get("directions", {}).items()}, flush=True)
+          summary = summarize(records, adapters, 200)
+          (work / "coverage-summary.json").write_text(json.dumps(summary, indent=2))
+          print(json.dumps(summary), flush=True)
+          assert len(records) == 200 and all(r["status"] == "REFERENCE_PASS" and not fatal(r) for r in records)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: combined-aggregate-abi
+          path: |
+            ${{ runner.temp }}/combined-abi/report.json
+            ${{ runner.temp }}/combined-abi/coverage-summary.json
+            ${{ runner.temp }}/combined-abi/sources
+          if-no-files-found: warn
