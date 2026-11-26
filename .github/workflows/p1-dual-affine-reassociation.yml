@@ -1,0 +1,110 @@
+name: P1 dual-arm affine SSA reassociation regression
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/p1-dual-affine-reassociation.yml'
+permissions:
+  contents: read
+jobs:
+  generated-rewrite-parity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_BUILD_JOBS: '2'
+      RUST_TEST_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2a5c9325a682a236a699a72bd5f235c13f870651
+          path: before
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5c0f3774bdf0766ea62ac00d8959d086a89e2b78
+          fetch-depth: 7
+          path: after
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source pins and strictly limited diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C before rev-parse HEAD)" = 2a5c9325a682a236a699a72bd5f235c13f870651
+          test "$(git -C after rev-parse HEAD)" = 5c0f3774bdf0766ea62ac00d8959d086a89e2b78
+          git -C after merge-base --is-ancestor 2a5c9325a682a236a699a72bd5f235c13f870651 HEAD
+          git -C after diff --name-only 2a5c9325a682a236a699a72bd5f235c13f870651 HEAD | sort > changed.txt
+          printf '%s\n' crates/opt/src/native_integer_algebra.rs crates/opt/tests/native_p1_dual_affine_reassociation.rs | sort | diff -u - changed.txt
+          cmp before/tools/typeid-rule-gen/examples.rules after/tools/typeid-rule-gen/examples.rules
+          cmp before/tools/typeid-rule-gen/ssa_codegen.py after/tools/typeid-rule-gen/ssa_codegen.py
+          echo "P1_DUAL_AFFINE_COMPILER_BASE_SHA=$(git -C before rev-parse HEAD)"
+          echo "P1_DUAL_AFFINE_COMPILER_CANDIDATE_SHA=$(git -C after rev-parse HEAD)"
+      - name: Configure existing checkout dependency transport and compiler cache
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            before -> target
+            after -> target
+          key: p1-dual-affine-reassociation
+      - name: Compare baseline and candidate native algebra regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          for rev in before after; do
+            for test in generated_native_shift_affine generated_native_integer_algebra generated_native_dual_arithmetic_cancellation_s2333; do
+              (cd "$rev" && cargo test --release -p compiler-opt --test "$test" -- --nocapture) 2>&1 | tee "results/$rev-$test.log"
+            done
+          done
+          (cd after && cargo test --release -p compiler-opt --test native_p1_dual_affine_reassociation -- --nocapture) 2>&1 | tee results/after-new-affine.log
+          grep -q "dual_affine_reassociation_widths_sharing_edges_and_oracle" results/after-new-affine.log
+          grep -q "dual_affine_exhaustive_i8_modular_identity" results/after-new-affine.log
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9a0048acdb8b3b9b51e2caffcafdd9b088a50dfa
+          fetch-depth: 0
+          path: integration
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Test clean integration with exact current-main source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C integration rev-parse HEAD)" = 9a0048acdb8b3b9b51e2caffcafdd9b088a50dfa
+          git -C integration fetch --no-tags origin 5c0f3774bdf0766ea62ac00d8959d086a89e2b78
+          git -C integration -c user.name=CI -c user.email=ci@example.invalid merge --no-commit --no-ff FETCH_HEAD
+          git -C integration diff --cached --name-only | sort > integration-files.txt
+          printf '%s\n' crates/opt/src/native_integer_algebra.rs crates/opt/tests/native_p1_dual_affine_reassociation.rs | sort | diff -u - integration-files.txt
+          echo "P1_DUAL_AFFINE_INTEGRATION_MAIN=9a0048acdb8b3b9b51e2caffcafdd9b088a50dfa CANDIDATE=5c0f3774bdf0766ea62ac00d8959d086a89e2b78"
+          (cd integration && cargo test --release -p compiler-opt --test native_p1_dual_affine_reassociation -- --nocapture) 2>&1 | tee results/integration-dual-affine.log
+          (cd integration && cargo test --release -p compiler-opt --test generated_native_shift_affine -- --nocapture) 2>&1 | tee results/integration-shift-affine.log
+      - name: Strict Clippy on original and candidate native algebra and new tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Existing test-only helper methods cause dead_code warnings when
+          # built as a standalone non-test library. Keep other lint policy strict.
+          for rev in before after; do
+            (cd "$rev" && cargo clippy -p compiler-opt --lib -- -D warnings -A dead_code) \
+              2>&1 | tee "results/$rev-clippy.log"
+          done
+          (cd after && cargo clippy -p compiler-opt --test native_p1_dual_affine_reassociation -- -D warnings -A dead_code) 2>&1 | tee results/new-test-clippy.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: p1-dual-affine-regression-results
+          path: |
+            results/
+            changed.txt
+            integration-files.txt
+          retention-days: 21
