@@ -19,6 +19,7 @@ from gcc_compat_abi_pilot import GCC_REVISION, GCC_COMPAT_DIR, command, succeeds
 from gcc_compat_inventory import inventory
 from gcc_compat_return_probes import generate
 from gcc_compat_bitfield_layout import generate_layout, layout_directive
+from gcc_bitfield_execute import EXECUTE_DIR, discover, run_single
 
 ROLES = ("main", "x", "y")
 
@@ -177,6 +178,8 @@ def main():
     p.add_argument("--include-return-probes", action="store_true")
     p.add_argument("--include-bitfield-layout", action="store_true",
                    help="include original GCC struct-layout-1 bit-field interoperability tests")
+    p.add_argument("--include-bitfield-execute", action="store_true",
+                   help="run original GCC standalone bit-field execution tests")
     p.add_argument("--layout-batches", type=int, default=6,
                    help="number of deterministic bit-field batches (0 = all)")
     p.add_argument("--compiler-sha", help="exact tested source revision")
@@ -226,6 +229,14 @@ def main():
             root, work, args.cc, args.layout_batches)
         sources.extend((layout_root, case, "upstream-generated-bitfield-layout")
                        for case in layout_cases)
+    singles = []
+    if args.include_bitfield_execute:
+        execute_root = checkout / EXECUTE_DIR
+        if subprocess.check_output(["git", "-C", str(checkout), "status", "--porcelain",
+                                    "--untracked-files=all", "--", EXECUTE_DIR], text=True):
+            p.error("GCC bitfield execute directory is dirty")
+        target = subprocess.check_output([args.cc, "-dumpmachine"], text=True).strip()
+        singles = discover(execute_root, target)
     records = []
     for opt in ("-O0", "-O2"):
         flags = ["-std=gnu11", opt, "-w", "-fno-pie"]
@@ -243,9 +254,24 @@ def main():
             (work / "report.json").write_text(json.dumps({
                 "gcc_revision": revision, "records": records,
                 "compiler_sha": args.compiler_sha,
-                "planned_records": 2 * len(sources),
+                "planned_records": 2 * (len(sources) + len(singles)),
                 "bitfield_layout_inventory": layout_inventory,
             }, indent=2) + "\n")
+        for source, reason in singles:
+            result = run_single(source, reason, work / opt[1:] / source.stem,
+                                args.cc, flags, adapters, build_native, link_run,
+                                observed, command, succeeds)
+            records.append(result)
+            print(f"{opt} {source.stem}: {result['status']}", flush=True)
+            for name, entry in result["frontends"].items():
+                print(name, "builds", {k: b["status"] for k, b in entry["builds"].items()},
+                      "directions", {k: d["status"] for k, d in entry["directions"].items()}, flush=True)
+            (work / "report.json").write_text(json.dumps({
+                "gcc_revision": revision, "records": records,
+                "compiler_sha": args.compiler_sha,
+                "planned_records": 2 * (len(sources) + len(singles)),
+                "bitfield_layout_inventory": layout_inventory,
+            }, indent=2) + "\\n")
     if args.required:
         required = json.loads(args.required.read_text())
         if required["gcc_revision"] != revision:
