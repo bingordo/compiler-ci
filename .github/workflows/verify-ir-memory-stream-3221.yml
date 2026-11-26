@@ -1,98 +1,92 @@
 name: Candidate IR memory stream 3221 baseline comparison
 on:
   pull_request:
-    paths:
-      - '.github/workflows/verify-ir-memory-stream-3221.yml'
+    paths: ['.github/workflows/verify-ir-memory-stream-3221.yml']
 permissions:
   contents: read
 jobs:
-  baseline:
+  compare:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 538b310ddc40428abb3e07c61c52b81a34063fb4
-          path: compiler
+          ref: 95d81eca15a1e571cb41f6e5060f0f6fb3cd9e81
+          path: baseline
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: e8b0b74317d36f96ec0917c9dd36086bc5357e44
+          ref: 24301ca00d85cc41f6a0fe7548308d16eeb95cdf
           path: candidate
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Confirm exact revisions and overlay only the two test compilation repairs
+      - name: Verify exact revisions and isolate workspace
         run: |
           set -euo pipefail
-          test "$(git -C compiler rev-parse HEAD)" = "538b310ddc40428abb3e07c61c52b81a34063fb4"
-          test "$(git -C candidate rev-parse HEAD)" = "e8b0b74317d36f96ec0917c9dd36086bc5357e44"
-          printf 'Baseline production source: %s\nCandidate: %s\n' "538b310ddc40428abb3e07c61c52b81a34063fb4" "e8b0b74317d36f96ec0917c9dd36086bc5357e44" | tee -a "$GITHUB_STEP_SUMMARY"
-          for file in crates/backend-aarch64/tests/generated_scalar_gp_forms.rs crates/backend/tests/typeid_integer_result_transport.rs; do
-            cp "candidate/$file" "compiler/$file"
-          done
-          test "$(git -C compiler diff --name-only | wc -l)" -eq 2
-          git -C compiler diff --stat | tee -a "$GITHUB_STEP_SUMMARY"
-          rustc --version
-      - name: Restrict workspace as in candidate run
-        run: |
-          cat > compiler/Cargo.toml <<'EOF'
+          test "$(git -C baseline rev-parse HEAD)" = "95d81eca15a1e571cb41f6e5060f0f6fb3cd9e81"
+          test "$(git -C candidate rev-parse HEAD)" = "24301ca00d85cc41f6a0fe7548308d16eeb95cdf"
+          for tree in baseline candidate; do
+            git -C "$tree" rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
+            cat > "$tree/Cargo.toml" <<'EOF'
           [workspace]
           resolver = "2"
           members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          exclude = ["tools/mini-c-driver"]
           EOF
-          rm -f compiler/Cargo.lock
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: compiler -> target
-          key: ir-memory-stream-baseline
-      - name: Reproduce failures from candidate run 45720299887
-        working-directory: compiler
+            rm -f "$tree/Cargo.lock"
+          done
+      - name: New streaming regression and alternate selector features
+        working-directory: candidate
+        run: |
+          cargo test -p compiler-backend --test stream_scalar_legalization
+          cargo check -p compiler-backend-x86 --no-default-features
+          cargo check -p compiler-backend-x86 --no-default-features --features x7-production-generated-add
+          cargo check -p compiler-backend-x86 --features x7-typeid-source-dag-optin
+      - name: Full backend tests on both unmodified revisions
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -euo pipefail
-          for package in compiler-backend compiler-backend-x86 compiler-backend-aarch64 compiler-backend-riscv64 compiler-backend-wasm; do
-            set +e
-            cargo test -p "$package" --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/$package.log"
-            result=${PIPESTATUS[0]}
-            set -e
-            echo "$result" > "$RUNNER_TEMP/$package.status"
+          for tree in baseline candidate; do
+            for package in compiler-backend compiler-backend-x86 compiler-backend-aarch64 compiler-backend-riscv64 compiler-backend-wasm; do
+              set +e
+              (cd "$tree"; cargo test -p "$package" --no-fail-fast) 2>&1 | tee "$RUNNER_TEMP/$tree-$package.log"
+              result=${PIPESTATUS[0]}
+              set -e
+              echo "$result" > "$RUNNER_TEMP/$tree-$package.status"
+            done
           done
-      - name: Compare exact failed test names against the recorded candidate
-        working-directory: compiler
-        shell: bash
+      - name: Compare failed names, distinguishing doctest failures from build errors
+        if: ${{ !cancelled() }}
         run: |
-          python3 - <<'PY'
-          import os, pathlib, re, sys
-          expected = {"compiler-backend":["gdb_resolves_real_line_breakpoints_and_backtraces_generated_pie"],"compiler-backend-x86":["indirect_ssa_calls_real_c_callbacks_elf_and_gas_all_frame_modes","native_s2314_matchpd_factor_gas_elf_per_family","production_c_defined_add_is_selected_by_both_normal_emitters_and_matches_c_oracle","source_linked_bitwise_three_form_native_gas_and_elf_differential"],"compiler-backend-aarch64":["source_owned_aarch64_full_selector_census_on_real_elf","native_typeid_arithmetic_machine_spill_elf_and_original_c11","direct_typeid_cmp_imm_native_quality_and_original_c11","native_typeid_ctz_select_calls_preserve_original_c_and_spill_pressure","selector_rejects_unsupported_direct_call_signatures","native_typeid_double_indexed_store_machine_spills_and_original_c11_oracle","production_ctz_and_binary_rule_hits_are_measured_on_actual_elf","direct_typeid_native_indexed_machine_shape_matches_original_quality_oracle","aarch64_machine_dump_is_observed_from_same_production_emitter_instance","aarch64_machine_cli_selection_and_elf_emission_is_replayable_on_disk","aarch64_widths_are_lossless_for_native_typeid_and_elf_byte_identical","aarch64_v2_strictly_rejects_missing_conflicting_unsorted_and_extra_widths","native_typeid_mixed_index_displacement_machine_spills_and_original_16_c11","migrated_native_aarch64_fixtures_are_canonical","direct_typeid_subs_imm_native_quality_and_original_c11","original_direct_elf_branch_bytes_now_use_native_typeid","original_four_control_flow_oracles_now_execute_on_native_typeid","native_both_return_paths_restore_callee_saved_frame_bytes","native_register_pressure_emits_exact_callee_saved_frame_bytes","native_spilled_ssa_values_get_exact_stack_loads_and_stores","original_five_pressure_and_abi_c_oracles_now_execute_on_native_typeid","direct_typeid_zero_branch_elf_gas_pic_and_original_c11"],"compiler-backend-riscv64":["crates/backend-riscv64/src/selector.rs - selector::fold_two_arm_trees (line 469)"],"compiler-backend-wasm":[]}
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import os, pathlib, re
           root = pathlib.Path(os.environ["RUNNER_TEMP"])
-          rows = ["| Crate | Candidate failures | Baseline failures | Candidate-only failures |", "|---|---:|---:|---:|"]
           problems = []
-          for package, names in expected.items():
-              log = (root / (package + ".log")).read_text(errors="replace")
-              status = int((root / (package + ".status")).read_text())
-              failed = set(re.findall(r"^test (.*?) \.\.\. FAILED\s*$", log, re.M))
-              candidate = set(names)
-              missing = candidate - failed
-              rows.append(f"| {package} | {len(candidate)} | {len(failed)} | {len(missing)} |")
-              if missing:
-                  problems.append(f"{package}: not reproduced on baseline: {sorted(missing)}")
-              if re.search(r"(?m)^error(?:\[E\d+\]:|: could not compile)", log) or (status != 0 and not failed) or (status == 0 and failed):
-                  problems.append(f"{package}: baseline test execution incomplete or inconsistent (exit {status})")
-              if not re.search(r"(?m)^test result: ", log):
-                  problems.append(f"{package}: missing test result")
-              if failed - candidate:
-                  print(f"{package}: additional baseline failures: {sorted(failed - candidate)}")
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as out:
-              out.write("\n".join(rows) + "\n")
-              out.write("\nCandidate run: https://github.com/bingordo/compiler-ci/actions/runs/45720299887\n")
-              out.write("\nBaseline uses only the two test compilation repairs; production code is unmodified. This comparison does not certify a green full test suite.\n")
-              if problems:
-                  out.write("\n".join(problems) + "\n")
-          print("\n".join(rows))
-          for problem in problems:
-              print(problem)
-          sys.exit(bool(problems))
+          print("| Crate | Baseline failed | Candidate failed | New failures |")
+          print("|---|---:|---:|---:|")
+          for package in ("compiler-backend", "compiler-backend-x86", "compiler-backend-aarch64", "compiler-backend-riscv64", "compiler-backend-wasm"):
+              failures = {}
+              for tree in ("baseline", "candidate"):
+                  log = (root / f"{tree}-{package}.log").read_text(errors="replace")
+                  status = int((root / f"{tree}-{package}.status").read_text())
+                  failed = set(re.findall(r"^test (.*?) \.\.\. FAILED\s*$", log, re.M))
+                  failures[tree] = failed
+                  # Rustdoc prints compiler diagnostics for failed examples;
+                  # only Cargo's build-failure marker is a build error.
+                  if re.search(r"(?m)^error: could not compile", log) or (status != 0 and not failed) or (status == 0 and failed) or not re.search(r"(?m)^test result: ", log):
+                      problems.append(f"{tree} {package}: incomplete or inconsistent test execution (exit {status})")
+              new = failures["candidate"] - failures["baseline"]
+              print(f"| {package} | {len(failures['baseline'])} | {len(failures['candidate'])} | {len(new)} |")
+              if new:
+                  problems.append(f"{package}: new failures: {sorted(new)}")
+              print(f"Baseline failures: {sorted(failures['baseline'])}")
+              print(f"Candidate failures: {sorted(failures['candidate'])}")
+          for problem in problems: print(problem)
+          assert not problems, "new failures or incomplete tests"
           PY
