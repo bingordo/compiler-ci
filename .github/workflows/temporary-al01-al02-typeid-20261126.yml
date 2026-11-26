@@ -1,0 +1,68 @@
+# Temporary exact-source AL01/AL02 TypeId fixture migration gate. Do not merge.
+name: Temporary AL01 AL02 native TypeId
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temporary-al01-al02-typeid-20261126.yml'
+permissions:
+  contents: read
+jobs:
+  al01-al02:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      SOURCE_SHA: 3d492c8d26dd5729880733264814faa2d3d62dc5
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler SHA and isolate optimizer workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "Exact compiler source SHA: $SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - name: Cache Rust compilation
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: temporary-al01-al02-typeid
+      - name: Run ordinary Alive-lite and fixture tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test alive_lite -- --nocapture
+      - name: Install Z3
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y z3
+          z3 --version
+      - name: AL01 changed CSE and AL02 stages and default pipeline proofs
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for test in \
+            al01_direct_typeid_proves_changed_cse_and_finds_phi_trap_mutants \
+            al02_typeid_stage_proof_ledger \
+            al02_source_pipeline_composed_z3_proofs; do
+            cargo test -p compiler-opt --test alive_lite "$test" -- --ignored --nocapture --test-threads=1
+          done
+      - name: Focused Alive-lite Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --test alive_lite -- -D clippy::all -A clippy::too_many_arguments -A clippy::needless_lifetimes -A clippy::empty_line_after_doc_comments -A clippy::collapsible_if -A clippy::collapsible_match -A clippy::needless_range_loop -A clippy::needless_borrows_for_generic_args -A clippy::type_complexity
