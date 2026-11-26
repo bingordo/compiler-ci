@@ -7,17 +7,47 @@ on:
 permissions:
   contents: read
 jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: main
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Resolve main snapshot
+        id: source
+        run: |
+          sha=$(git -C compiler rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Main snapshot: $sha" >> "$GITHUB_STEP_SUMMARY"
   candidate:
+    needs: snapshot
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline, integrated]
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: f414488afbcef625e720023a4975bc4a00ab53e5
+          ref: ${{ needs.snapshot.outputs.sha }}
+          fetch-depth: 0
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
+      - name: Integrate exact compare candidate
+        if: matrix.variant == 'integrated'
+        run: |
+          set -euo pipefail
+          git -C compiler -c user.name=compiler-ci -c user.email=compiler-ci@users.noreply.github.com merge --no-ff --no-edit f414488afbcef625e720023a4975bc4a00ab53e5
+          git -C compiler log -1 --format='%H parents=%P' | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Record source and frontend pin
         run: |
           set -euo pipefail
@@ -113,6 +143,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: structural-evidence-x86-compare-candidate
+          name: structural-evidence-${{ matrix.variant }}
           path: ${{ runner.temp }}/struct-evidence
           retention-days: 14
