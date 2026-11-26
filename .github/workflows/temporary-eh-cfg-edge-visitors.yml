@@ -1,0 +1,50 @@
+# Temporary candidate validation; close unmerged.
+name: EH CFG edge traversal candidate
+on:
+  pull_request:
+    paths: ['.github/workflows/temporary-eh-cfg-edge-visitors.yml']
+permissions:
+  contents: read
+jobs:
+  cfg:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: 959b2bc7926d14c10bf2a71e0ea200b839266b86
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source and isolate native core workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: temporary-native-inliner-acceptance
+      - name: IR and native optimizer regressions
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --lib --test terminator_edge_visitors
+          cargo test -p compiler-opt --lib --test typed_inline_leaf_native --test typed_inline_cfg_native
+      - name: Production core build and scoped lint
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-ir -p compiler-opt --lib
+          cargo clippy -p compiler-ir --test terminator_edge_visitors -- -D clippy::all -A clippy::needless_range_loop -A clippy::empty_line_after_doc_comments -A clippy::collapsible_match -A clippy::collapsible_if
