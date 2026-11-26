@@ -1,0 +1,66 @@
+# Temporary source-pinned #545 canonical required-tail opcode validation.
+name: TypeId persistent musttail opcode acceptance (#545)
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/issue545-canonical-musttail.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  canonical-musttail:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7f84bef948d8a488324dd906912d0a99f27fc139
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check exact compiler candidate
+        run: |
+          test "$(git -C compiler rev-parse HEAD)" = '7f84bef948d8a488324dd906912d0a99f27fc139'
+          echo "Compiler 7f84bef948d8a488324dd906912d0a99f27fc139" >> "$GITHUB_STEP_SUMMARY"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Isolated TypeId and native backend workspace
+        run: |
+          mkdir -p work/crates
+          cp -a compiler/crates/ir compiler/crates/opt compiler/crates/backend \
+            compiler/crates/backend-x86 compiler/crates/backend-aarch64 work/crates/
+          cp -a compiler/tools work/
+          cat > work/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend",
+                     "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: work
+          key: issue545-canonical-musttail
+      - name: Strict canonical IR and musttail test typecheck
+        working-directory: work
+        run: RUSTFLAGS="-D warnings" cargo check -p compiler-ir --lib --test musttail_codec
+      - name: Canonical text/v1/v2 replay and negative verifier
+        working-directory: work
+        run: cargo test -p compiler-ir --test musttail_codec -- --nocapture
+      - name: Existing musttail source-level ABI verifier
+        working-directory: work
+        run: cargo test -p compiler-ir --test musttail_verifier -- --nocapture
+      - name: Native GP backend and optimizer consumer audit
+        working-directory: work
+        run: |
+          cargo check -p compiler-backend --lib
+          cargo check -p compiler-backend-x86 --lib
+          cargo check -p compiler-backend-aarch64 --lib
+          cargo check -p compiler-opt --lib
+      - name: Canonical IR library regression
+        working-directory: work
+        run: cargo test -p compiler-ir --lib -- --test-threads=2
+      - name: New opcode Clippy correctness
+        working-directory: work
+        run: |
+          cargo clippy -p compiler-ir --lib -- -D clippy::correctness
+          cargo clippy -p compiler-ir --test musttail_codec -- -D clippy::correctness
