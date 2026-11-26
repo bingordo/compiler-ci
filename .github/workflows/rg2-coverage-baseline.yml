@@ -19,6 +19,7 @@ on:
           - smoke
           - core-full
           - gcc
+          - minic
           - oberon
           - edg
           - all
@@ -49,7 +50,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ github.event_name == 'pull_request' && 'a6f7f28f9a3541d6b91445954f5ba3d3d49b3955' || inputs.source_ref || 'main' }}
+          ref: ${{ github.event_name == 'pull_request' && 'd8b3448e9629616535a0f062c7ba2cdc0a0492d5' || inputs.source_ref || 'main' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -110,6 +111,18 @@ jobs:
           assert tally['counts'].get('shared/reference-passed', 0) == expected
           PY
           exit "$status"
+      - name: Validate pinned musl and hosted glibc references without native frontend builds
+        working-directory: compiler
+        run: |
+          python3 tools/mini-c-driver/tests/s9_native.py --reference-only --artifacts target/regression-musl-reference --report target/regression-musl-reference.json >target/musl-reference.log 2>&1
+          python3 tools/mini-c-driver/tests/s12_p4_native.py --reference-only --artifacts target/regression-glibc-reference >target/glibc-reference.log 2>&1
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path('target/regression-musl-reference.json').read_text())
+          assert report['passed'] == report['total'] == 12
+          print('Pinned musl S9 reference: 12/12; hosted glibc S12 reference: passed')
+          PY
       - name: Provision native, solver and cross-target tools
         run: |
           sudo apt-get update -qq
@@ -232,14 +245,14 @@ jobs:
           key: ${{ steps.public-registry.outputs.cache-primary-key }}
 
   gcc-smoke:
-    if: inputs.lane == 'gcc' || inputs.lane == 'all' || github.event.label.name == 'rg-gcc' || github.event.label.name == 'rg-all'
+    if: inputs.lane == 'gcc' || inputs.lane == 'minic' || inputs.lane == 'all' || github.event.label.name == 'rg-gcc' || github.event.label.name == 'rg-minic' || github.event.label.name == 'rg-all'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ github.event_name == 'pull_request' && 'a6f7f28f9a3541d6b91445954f5ba3d3d49b3955' || inputs.source_ref || 'main' }}
+          ref: ${{ github.event_name == 'pull_request' && 'd8b3448e9629616535a0f062c7ba2cdc0a0492d5' || inputs.source_ref || 'main' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -247,6 +260,7 @@ jobs:
         with:
           ssh-private-key: ${{ secrets.CI_KEY }}
       - uses: actions/cache@v4
+        if: inputs.lane != 'minic' && github.event.label.name != 'rg-minic'
         with:
           path: compiler/target/gcc-source
           key: gcc-corpus-1330eed38849ad186518f609c52bd5651c2bfdc1
@@ -261,6 +275,7 @@ jobs:
           restore-keys: |
             rg-public-registry-v2-${{ runner.os }}-${{ runner.arch }}-
       - name: Run one original upstream ABI case with automatic adapter
+        if: inputs.lane != 'minic' && github.event.label.name != 'rg-minic'
         working-directory: compiler
         run: |
           python3 tools/regression.py --gcc-abi quick --gcc-prefix scalar-by-value-2 --output target/regression-gcc-smoke
@@ -276,6 +291,11 @@ jobs:
           print('GCC smoke: previously admitted mixed main directions passed at O0/O2')
           PY
 
+      - name: Run shared C and libc through the standalone Mini-C driver
+        if: always() && (inputs.lane == 'minic' || inputs.lane == 'all' || github.event.label.name == 'rg-minic' || github.event.label.name == 'rg-all')
+        working-directory: compiler
+        run: |
+          python3 tools/regression.py --frontend-suite c --frontend-suite libc --c-frontend minic --seed-count 1 --output target/regression-minic-c
       - name: Save public Cargo registry archives
         if: always() && steps.public-registry.outcome == 'success' && steps.public-registry.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
@@ -293,7 +313,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ github.event_name == 'pull_request' && 'a6f7f28f9a3541d6b91445954f5ba3d3d49b3955' || inputs.source_ref || 'main' }}
+          ref: ${{ github.event_name == 'pull_request' && 'd8b3448e9629616535a0f062c7ba2cdc0a0492d5' || inputs.source_ref || 'main' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -366,7 +386,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ github.event_name == 'pull_request' && 'a6f7f28f9a3541d6b91445954f5ba3d3d49b3955' || inputs.source_ref || 'main' }}
+          ref: ${{ github.event_name == 'pull_request' && 'd8b3448e9629616535a0f062c7ba2cdc0a0492d5' || inputs.source_ref || 'main' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -441,7 +461,7 @@ jobs:
         working-directory: compiler
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
-          python3 tools/regression.py --frontend-suite c --c-frontend edg --edg-driver "$RUNNER_TEMP/edg-launcher" --seed-count 1 --output target/regression-edg-c
+          python3 tools/regression.py --frontend-suite c --frontend-suite libc --c-frontend edg --edg-driver "$RUNNER_TEMP/edg-launcher" --seed-count 1 --output target/regression-edg-c
       - name: Provision existing Csmith and verified YARPGen
         id: generators
         if: always() && steps.edg-build.outcome == 'success'
