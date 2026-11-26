@@ -1,0 +1,145 @@
+# Source-pinned, independent GCC differential for compiler #3362.
+name: Mini-C bswap native and unmodified cJSON
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-minic-bswap-pr3362.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-bswap:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 26
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b27280a2ac813c7aaaea1896c6f8bb2c7e0420da
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Build and test the exact production compiler and Mini-C
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "b27280a2ac813c7aaaea1896c6f8bb2c7e0420da"
+          timeout --signal=TERM --kill-after=10s 14m cargo build -p compiler --bin compiler --manifest-path compiler/Cargo.toml
+          set +e
+          timeout --signal=TERM --kill-after=10s 8m cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib -- --nocapture > "$RUNNER_TEMP/candidate-tests.log" 2>&1
+          test_rc=$?
+          set -e
+          grep -E '^test .* \.\.\. FAILED$' "$RUNNER_TEMP/candidate-tests.log" | sed 's/^test //;s/ \.\.\. FAILED$//' | sort -u > "$RUNNER_TEMP/candidate-failures" || true
+          if test "$test_rc" -ne 0 && ! test -s "$RUNNER_TEMP/candidate-failures"; then
+            tail -n 100 "$RUNNER_TEMP/candidate-tests.log"
+            echo 'candidate tests failed without classified failing test names' >&2
+            exit 1
+          fi
+          echo "CANDIDATE_MINIC_FAILURES=$(wc -l < "$RUNNER_TEMP/candidate-failures")" >> "$GITHUB_STEP_SUMMARY"
+      - name: Check out and compare exact pre-change Mini-C test baseline
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d8d046d907461cef20bce02224b39584c674f46a
+          path: compiler-baseline
+          ssh-key: \${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Require candidate Mini-C failures match pre-change baseline exactly
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler-baseline rev-parse HEAD)" = d8d046d907461cef20bce02224b39584c674f46a
+          set +e
+          timeout --signal=TERM --kill-after=10s 8m cargo test --manifest-path compiler-baseline/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib -- --nocapture > "$RUNNER_TEMP/baseline-tests.log" 2>&1
+          baseline_rc=$?
+          set -e
+          grep -E '^test .* \.\.\. FAILED$' "$RUNNER_TEMP/baseline-tests.log" | sed 's/^test //;s/ \.\.\. FAILED$//' | sort -u > "$RUNNER_TEMP/baseline-failures" || true
+          if test "$baseline_rc" -ne 0 && ! test -s "$RUNNER_TEMP/baseline-failures"; then
+            tail -n 100 "$RUNNER_TEMP/baseline-tests.log"
+            echo 'baseline test invocation failed without classified tests' >&2
+            exit 1
+          fi
+          if ! diff -u "$RUNNER_TEMP/baseline-failures" "$RUNNER_TEMP/candidate-failures"; then
+            echo 'candidate changes the existing Mini-C failure set' >&2
+            exit 1
+          fi
+          echo "MINIC_FAILURE_SET_MATCHES_PRE_CHANGE_BASELINE=YES" >> "$GITHUB_STEP_SUMMARY"
+          echo "PREEXISTING_MINIC_FAILURE_COUNT=$(wc -l < "$RUNNER_TEMP/baseline-failures")" >> "$GITHUB_STEP_SUMMARY"
+      - name: Native vs GCC byte-swap runtime and invalid input rejection
+        shell: bash
+        run: |
+          set -euo pipefail
+          c="$PWD/compiler/target/debug/compiler"
+          d="$(mktemp -d)"
+          trap 'rm -rf "$d"' EXIT
+          cd "$d"
+          cat > bswap.c <<'EOF'
+          unsigned short swap16(unsigned short x) { return __builtin_bswap16(x); }
+          unsigned int swap32(unsigned int x) { return __builtin_bswap32(x); }
+          unsigned long swap64(unsigned long x) { return __builtin_bswap64(x); }
+          int main(void) {
+              if (swap16(0x1234) != 0x3412) return 1;
+              if (swap16(0x00ff) != 0xff00) return 2;
+              if (swap16(0xffff) != 0xffff) return 3;
+              if (swap32(0x12345678U) != 0x78563412U) return 4;
+              if (swap32(0x000000ffU) != 0xff000000U) return 5;
+              if (swap32(0xffffffffU) != 0xffffffffU) return 6;
+              if (swap64(0x0123456789abcdefUL) != 0xefcdab8967452301UL) return 7;
+              if (swap64(0x00000000000000ffUL) != 0xff00000000000000UL) return 8;
+              if (swap64(~0UL) != ~0UL) return 9;
+              return 0;
+          }
+          EOF
+          gcc -std=gnu11 -O0 bswap.c -o oracle
+          ./oracle
+          "$c" --gcc-driver -std=gnu11 bswap.c -o native
+          ./native
+          for source in               'int x(void) { return __builtin_bswap16(); }'               'int x(void) { return __builtin_bswap32(1,2); }'               'int x(void) { return __builtin_bswap64((void*)0); }' ; do
+            printf '%s\n' "$source" > invalid.c
+            if "$c" --gcc-driver -c invalid.c -o invalid.o >negative.log 2>&1; then
+              echo 'invalid byte-swap builtin unexpectedly accepted' >&2
+              exit 1
+            fi
+            test ! -e invalid.o
+          done
+          echo 'NATIVE_BSWAP16_32_64_GCC_RUNTIME=PASS' >> "$GITHUB_STEP_SUMMARY"
+      - name: Probe unchanged cJSON and explicitly identify any remaining gap
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch v1.7.19 https://github.com/DaveGamble/cJSON.git cjson
+          test "$(git -C cjson rev-parse HEAD)" = c859b25da02955fef659d658b8f324b5cde87be3
+          cmake -S cjson -B gcc-build -G Ninja -DCMAKE_C_COMPILER=cc             -DBUILD_SHARED_LIBS=OFF -DENABLE_CUSTOM_COMPILER_FLAGS=OFF             -DENABLE_CJSON_TEST=OFF -DENABLE_CJSON_UTILS=OFF -DENABLE_LOCALES=OFF
+          cmake --build gcc-build
+          test -s gcc-build/libcjson.a
+          native="$PWD/compiler/target/debug/compiler"
+          tc="$PWD/compiler/tools/cmake/typeid-gcc-adapter-toolchain.cmake"
+          cmake -S cjson -B native-build -G Ninja             -DCMAKE_C_COMPILER="$native" -DCMAKE_C_COMPILER_ARG1=--gcc-driver             -DCMAKE_TOOLCHAIN_FILE="$tc"             -DBUILD_SHARED_LIBS=OFF -DENABLE_CUSTOM_COMPILER_FLAGS=OFF             -DENABLE_CJSON_TEST=OFF -DENABLE_CJSON_UTILS=OFF -DENABLE_LOCALES=OFF
+          set +e
+          cmake --build native-build --verbose > native-build.log 2>&1
+          result=$?
+          set -e
+          if grep -E 'unsupported compiler builtin __builtin_bswap(16|32|64)' native-build.log; then
+            echo 'byte-swap builtin still unsupported in native cJSON build' >&2
+            exit 1
+          fi
+          {
+            echo 'GCC_CJSON_STATIC_LIBRARY=PASS'
+            echo "TYPEID_CJSON_BUILD_EXIT=$result"
+            if test "$result" -eq 0; then
+              test -s native-build/libcjson.a
+              echo 'TYPEID_CJSON_STATIC_LIBRARY=PASS'
+            else
+              echo 'TYPEID_CJSON_STATIC_LIBRARY=UNSUPPORTED'
+              echo 'First remaining compiler diagnostics:'
+              grep -m 8 -E 'compiler:|error:|unsupported|fatal' native-build.log || true
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-bswap-cjson-logs
+          path: native-build.log
+          if-no-files-found: ignore
