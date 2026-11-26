@@ -107,10 +107,12 @@ with tempfile.TemporaryDirectory() as d:
                             cpp = subprocess.run(["cc","-E","-P",str(src)],
                                                  stdout=dst,stderr=err,timeout=180)
                         if cpp.returncode == 0:
-                            rc2,_ = attempt([driver,"--emit-obj",str(tmp/"private-raw.o"),str(pre)],
+                            rc2,_ = attempt([driver,"--cpp=none","--emit-obj",str(tmp/"private-raw.o"),str(pre)],
                                             tmp/"private-raw.log",180)
                             raw = (tmp/"private-raw.log").read_text(errors="replace")
                             match = re.search(r":(\d+):(\d+): error\[S[0-9]{4}\]",raw)
+                            print("RAW_REPLAY_EXIT="+str(rc2),flush=True)
+                            print("RAW_REPLAY_LOCATED="+str(int(match is not None)),flush=True)
                             if match:
                                 line2,col2 = map(int,match.groups())
                                 with pre.open(errors="replace") as stream:
