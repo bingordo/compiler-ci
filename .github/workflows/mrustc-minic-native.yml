@@ -1,0 +1,351 @@
+name: Mini-C native mrustc generated-C probe
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/mrustc-minic-native.yml'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Compiler source branch, tag, or SHA'
+        required: false
+        default: main
+        type: string
+      edg_creduce:
+        description: 'Enable C-Reduce on exact generated C'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mrustc-minic-native-${{ github.head_ref || inputs.source_ref || 'main' }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    steps:
+      - name: Checkout compiler-ci smoke fixtures
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout compiler using existing read-only deploy key
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          # Test the merged source-verified TypeId adapter (not the old mixed-global
+          # branch) without changing compiler production history.
+          # Manual dispatch can still select any explicit source_ref.
+          ref: ${{ inputs.source_ref || 'b3489a796bd13b788930703787718ed9952855d6' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+
+      - name: Resolve exact frontend source pins from checked-out compiler
+        id: frontend-pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          from pathlib import Path
+          import re
+          import tomllib
+
+          with Path("compiler/crates/driver/Cargo.toml").open("rb") as f:
+              driver = tomllib.load(f)["dependencies"]
+          with Path("compiler/tools/mini-c-driver/Cargo.toml").open("rb") as f:
+              mini = tomllib.load(f)["dependencies"]
+          # The Mini-C syntax/sema crates moved into a separate workspace.
+          # The main driver preprocessor may use a DIFFERENT pinned revision.
+          def pin(deps, crate, repo):
+              dep = deps[crate]
+              assert dep["git"] == f"ssh://git@github.com/bingordo/{repo}.git"
+              sha = dep["rev"]
+              assert re.fullmatch(r"[0-9a-f]{40}", sha), (crate, sha)
+              return sha
+          oberon = pin(driver, "oberon-front-ir", "oberon")
+          preprocessor = pin(driver, "mini-c-preprocess", "mini-c")
+          syntax = pin(mini, "mini-c-syntax", "mini-c")
+          sema = pin(mini, "mini-c-sema", "mini-c")
+          assert syntax == sema, "Mini-C syntax/sema must use one source revision"
+          assert driver["mini-c-preprocess"]["features"] == ["internal-rcc"]
+          print(f"oberon_sha={oberon}")
+          print(f"mini_c_frontend_sha={syntax}")
+          print(f"mini_c_preprocess_sha={preprocessor}")
+          PY
+
+      - name: Checkout pinned Oberon frontend source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/oberon
+          ref: ${{ steps.frontend-pins.outputs.oberon_sha }}
+          path: oberon
+          persist-credentials: false
+
+      - name: Checkout pinned Mini-C frontend source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: ${{ steps.frontend-pins.outputs.mini_c_preprocess_sha }}
+          path: mini-c
+          persist-credentials: false
+      - name: Checkout compiler-pinned Mini-C for generated-C compatibility audit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          # Use precisely the grammar and checker revision required by the
+          # bootstrapped driver rather than a historical parser snapshot.
+          ref: ${{ steps.frontend-pins.outputs.mini_c_frontend_sha }}
+          path: mini-c-compat
+          persist-credentials: false
+      - name: Checkout pinned mrustc
+        uses: actions/checkout@v4
+        with:
+          repository: thepowersgang/mrustc
+          ref: master
+          path: mrustc
+          persist-credentials: false
+
+      - name: Identify mrustc cache revision
+        id: mrustc-revision
+        shell: bash
+        run: echo "sha=$(git -C mrustc rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore prebuilt mrustc and Rust 1.90 libraries
+        id: mrustc-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            mrustc/bin
+            mrustc/output-1.90.0
+          key: mrustc-bootstrap-v1-${{ runner.os }}-ubuntu2404-rust190-${{ steps.mrustc-revision.outputs.sha }}
+
+      - name: Install mrustc build dependencies when the toolchain needs building
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.mrustc-cache.outputs.cache-hit }}" == "true" ]] &&
+             [[ -x mrustc/bin/mrustc ]] &&
+             [[ -x mrustc/bin/minicargo ]] &&
+             [[ -f mrustc/output-1.90.0/libcore.rlib ]]; then
+            echo "Cached mrustc is complete; skipping apt install." >> "$GITHUB_STEP_SUMMARY"
+          else
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends build-essential zlib1g-dev pkg-config cmake curl python3 libssl-dev
+          fi
+          # GCC and Cargo are required even when mrustc itself came from cache.
+          command -v gcc
+          command -v cargo
+          command -v python3
+
+      - name: Record reproducibility inputs and target crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Compiler SHA: $(git -C compiler rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          echo "mrustc SHA: $(git -C mrustc rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Host: $(uname -m) / $(lsb_release -rs)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Rust crate editions:" >> "$GITHUB_STEP_SUMMARY"
+          grep -Rh '^edition[[:space:]]*=' compiler/crates/*/Cargo.toml | sort | uniq -c >> "$GITHUB_STEP_SUMMARY"
+          echo "First target: compiler-ir (no frontend dependency); then compiler-opt, backend, driver." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build mrustc and matching Rust 1.90 libraries
+        id: toolchain
+        shell: bash
+        working-directory: mrustc
+        env:
+          RUSTC_VERSION: '1.90.0'
+          MRUSTC_TARGET_VER: '1.90'
+          OUTDIR_SUF: '-1.90.0'
+          PARLEVEL: '2'
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.mrustc-cache.outputs.cache-hit }}" == "true" ]] && \
+             [[ -x bin/mrustc ]] && [[ -x bin/minicargo ]] && \
+             [[ -f output-1.90.0/libcore.rlib ]]; then
+            echo "Using cached mrustc toolchain and Rust libraries" >> "$GITHUB_STEP_SUMMARY"
+          else
+            # Missing/incomplete caches rebuild in this runner.
+            timeout --signal=TERM --kill-after=10s 20m make -j2
+            timeout --signal=TERM --kill-after=10s 10m make RUSTCSRC
+            timeout --signal=TERM --kill-after=10s 55m make -f minicargo.mk LIBS
+          fi
+          test -x bin/mrustc
+          test -x bin/minicargo
+          test -f output-1.90.0/libcore.rlib
+
+      - name: Cache validated mrustc toolchain
+        if: success() && steps.mrustc-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            mrustc/bin
+            mrustc/output-1.90.0
+          key: mrustc-bootstrap-v1-${{ runner.os }}-ubuntu2404-rust190-${{ steps.mrustc-revision.outputs.sha }}
+
+      - name: Snapshot C files before translation
+        shell: bash
+        run: |
+          find mrustc -type f -name '*.c' -printf '%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/mrustc-c-before.txt"
+
+      - name: Attempt compiler-ir Rust-to-C emission
+        id: translate
+        shell: bash
+        working-directory: mrustc
+        env:
+          RUSTC_VERSION: '1.90.0'
+          MRUSTC_TARGET_VER: '1.90'
+          OUTDIR_SUF: '-1.90.0'
+          PARLEVEL: '2'
+          CC: gcc
+        run: |
+          set -euo pipefail
+          # This is deliberately a bounded first-crate feasibility probe, not
+          # an assertion that the full Cargo workspace is supported.
+          set +e
+          # minicargo's positional argument is the crate DIRECTORY, not Cargo.toml.
+          # Share one fresh per-run directory across all compiler crate probes.
+          # minicargo can now reuse compiler-ir and other completed dependencies.
+          # Do not persist private generated C/rlibs in public Actions caches.
+          timeout --signal=TERM --kill-after=10s 20m bin/minicargo \
+            -L output-1.90.0 -o output-compiler-bootstrap \
+            ../compiler/crates/ir > "$RUNNER_TEMP/mrustc-probe.log" 2>&1
+          rc=$?
+          set -e
+          echo "mrustc/minicargo exit code: $rc" >> "$GITHUB_STEP_SUMMARY"
+          find . -type f -name '*.c' -printf '%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/mrustc-c-after.txt"
+          # Before-snapshot is relative to mrustc/; after-snapshot is also
+          # relative to mrustc/, avoiding false differences from prefix changes.
+          comm -13 "$RUNNER_TEMP/mrustc-c-before.txt" "$RUNNER_TEMP/mrustc-c-after.txt" > "$RUNNER_TEMP/mrustc-c-new.txt"
+          echo "New C files from attempted translation: $(wc -l < "$RUNNER_TEMP/mrustc-c-new.txt")" >> "$GITHUB_STEP_SUMMARY"
+          echo "All C files (includes prebuilt Rust stdlib): $(wc -l < "$RUNNER_TEMP/mrustc-c-after.txt")" >> "$GITHUB_STEP_SUMMARY"
+          # Do not print private compiler source or raw diagnostics into public CI.
+          python3 - "$RUNNER_TEMP/mrustc-probe.log" "$GITHUB_STEP_SUMMARY" <<'PY'
+          import pathlib, re, sys
+          log = pathlib.Path(sys.argv[1]).read_text(errors="replace")
+          categories = {
+              "manifest or dependency resolution": r"failed to (load|parse|select|resolve)|dependency|manifest",
+              "missing files or paths": r"No such file|not found|cannot open",
+              "unsupported Rust feature": r"unsupported|not implemented|unimplemented|TODO",
+              "type or parsing error": r"parse error|type error|error:|ERROR:",
+              "compiler crash": r"SIGSEGV|segmentation fault|panic|assertion failed",
+              "GCC diagnostic": r"gcc: error|fatal error:|compilation terminated",
+          }
+          print("Diagnostic categories (counts; non-exclusive):", file=open(sys.argv[2], "a"))
+          with open(sys.argv[2], "a") as out:
+              for name, pattern in categories.items():
+                  print(f"- {name}: {len(re.findall(pattern, log, re.I))}", file=out)
+          PY
+          echo "Target translation must succeed before GCC syntax and object tests run." >> "$GITHUB_STEP_SUMMARY"
+          if (( rc != 0 )); then
+            # Only show a bounded, non-source-bearing summary here. Private
+            # diagnostics remain in the runner temp log.
+            echo "minicargo failed; inspect diagnostic categories above." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "probe_exit=$rc" >> "$GITHUB_OUTPUT"
+          # A nonzero exit is a real failed acceptance gate, not a green probe.
+          exit "$rc"
+
+      - name: Generate small real mrustc compiler-ir executable C as reduction seed
+        if: always() && steps.translate.outcome == 'success'
+        shell: bash
+        working-directory: mrustc
+        env:
+          RUSTC_VERSION: '1.90.0'
+          MRUSTC_TARGET_VER: '1.90'
+          OUTDIR_SUF: '-1.90.0'
+          PARLEVEL: '2'
+          CC: gcc
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 15m bin/minicargo \
+            -L output-1.90.0 -o output-compiler-bootstrap \
+            ../bootstrap/mrustc-gcc-smoke > "$RUNNER_TEMP/mrustc-small-smoke.log" 2>&1
+          # The compiler-ir library alone emits a 65+ MB file. This
+          # source-owned public executable smoke emits a much smaller C unit
+          # without compiling the unrelated optimizer, backends, or driver.
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          from pathlib import Path
+          units=[p.stat().st_size for p in Path("output-compiler-bootstrap").rglob("*.c") if p.is_file() and p.stat().st_size]
+          assert len(units) >= 2, "expected library C plus executable C"
+          print("Generated-C unit count:", len(units))
+          print("Smallest generated-C bytes:", min(units))
+          assert min(units) < 1024*1024, "missing <1MiB executable seed"
+          PY
+
+
+      - name: Build production Mini-C TypeId driver
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Resolve exact syntax/sema checkout locally without changing production manifests.
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          p=Path("compiler/tools/mini-c-driver/Cargo.toml")
+          s=p.read_text()
+          for name,crate in [("mini-c-syntax","syntax"),("mini-c-sema","sema")]:
+              pattern=rf'(?m)^{name} = \{{[^\n]+\}}$'
+              path=(Path("mini-c-compat/crates")/crate).resolve()
+              assert (path/"Cargo.toml").is_file()
+              s,n=re.subn(pattern,f'{name} = {{ path = "{path}" }}',s)
+              assert n==1
+          p.write_text(s)
+          PY
+          set +e
+          cargo build --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml > "$RUNNER_TEMP/minic-build.log" 2>&1
+          rc=$?
+          set -e
+          echo "MINIC_BUILD_EXIT=$rc"
+          if (( rc != 0 )); then
+            python3 - "$RUNNER_TEMP/minic-build.log" <<'PY'
+          import re,sys
+          from pathlib import Path
+          s=Path(sys.argv[1]).read_text(errors="replace")
+          for code in sorted(set(re.findall(r'error\[(E[0-9]{4})\]',s))):print("MINIC_RUST_ERROR="+code)
+          PY
+          fi
+          exit "$rc"
+
+      - name: Attempt real generated C with production Mini-C and independent GCC
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os,re,subprocess,tempfile
+          from pathlib import Path
+          root=Path("mrustc/output-compiler-bootstrap").resolve()
+          driver=Path("compiler/tools/mini-c-driver/target/release/compiler-mini-c").resolve()
+          assert driver.is_file()
+          units=sorted((p for p in root.rglob("*.c") if p.is_file() and p.stat().st_size),key=lambda p:p.stat().st_size)
+          assert units
+          def attempt(cmd, log, seconds):
+              with log.open("wb") as f:
+                  try:return subprocess.run(cmd,stdout=f,stderr=subprocess.STDOUT,timeout=seconds).returncode
+                  except subprocess.TimeoutExpired:return 124
+          with tempfile.TemporaryDirectory() as d:
+              tmp=Path(d)
+              # Small actual executable seed first; also try the largest generated library.
+              selected=list(dict.fromkeys([units[0],units[-1]]))
+              failures=0
+              for i,src in enumerate(selected):
+                  print(f"MINIC_SAMPLE={i} BYTES={src.stat().st_size}",flush=True)
+                  gcc=attempt(["gcc","-std=gnu11","-fsyntax-only",str(src)],tmp/"gcc.log",180)
+                  out=tmp/f"native{i}.o"
+                  rc=attempt([str(driver),str(src),"--emit","obj","-o",str(out)],tmp/"native.log",300)
+                  # Only compiler-owned diagnostic IDs and fixed categories leave the runner.
+                  msg=(tmp/"native.log").read_text(errors="replace")
+                  codes=sorted(set(re.findall(r'\b[PLS][0-9]{4}\b',msg)))
+                  cats={"preprocessor":r"preprocess", "atomic":r"atomic", "syntax":r"syntax|parse|unexpected token", "type":r"type|semantic", "unsupported":r"unsupported|not implemented", "abi":r"abi|calling convention", "panic":r"panicked|segmentation fault"}
+                  print(f"MINIC_SAMPLE={i} GCC_EXIT={gcc} NATIVE_EXIT={rc} ELF={int(out.is_file() and out.open('rb').read(4)==bytes([127,69,76,70]))}")
+                  print("MINIC_DIAG_IDS="+",".join(codes))
+                  print("MINIC_DIAG_CATEGORIES="+",".join(k for k,v in cats.items() if re.search(v,msg,re.I)))
+                  failures+=int(rc!=0 or not out.is_file() or gcc!=0)
+              raise SystemExit(int(failures!=0))
+          PY
