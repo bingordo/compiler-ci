@@ -173,8 +173,13 @@ def parse_symbol_text(symbol_file: Path, rawtext: Path) -> dict:
 
 
 def report(output: Path) -> None:
-    old = parse_symbol_text(output / "single.sym", output / "single.text")
-    new = parse_symbol_text(output / "dual.sym", output / "dual.text")
+    # The controlled historical study used single/dual filenames. The
+    # reusable two-revision workflow names them control/candidate.
+    before, after = (("control", "candidate")
+                     if (output / "control.sym").exists()
+                     else ("single", "dual"))
+    old = parse_symbol_text(output / f"{before}.sym", output / f"{before}.text")
+    new = parse_symbol_text(output / f"{after}.sym", output / f"{after}.text")
     changed, saved, added, total_bytes, total_b = [], 0, 0, 0, 0
     for name in sorted(old):
         a, b = old[name], new[name]
@@ -197,7 +202,7 @@ def report(output: Path) -> None:
         for name, delta, bd, old_b, new_b in changed
     ) + "\n")
     if added:
-        raise RuntimeError("Dual trace increases actual unconditional B on source corpus")
+        raise RuntimeError("Candidate increases actual unconditional B on source corpus")
 
 
 if __name__ == "__main__":
