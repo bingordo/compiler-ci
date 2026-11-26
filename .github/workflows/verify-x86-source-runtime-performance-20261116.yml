@@ -1,9 +1,12 @@
-name: x86 real-source generated runtime vs GCC
+name: x86 phi-first soft affinity native A/B PR3266
 on:
   push:
     branches: [main]
     paths: [.github/workflows/verify-x86-source-runtime-performance-20261116.yml]
   workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-x86-source-runtime-performance-20261116.yml'
 permissions:
   contents: read
 jobs:
@@ -17,18 +20,29 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 5209dd4e9cebaad3348cf0b4ed754a729e75f022
+          ref: 47c7fb4d952435379a1f563c64ae5da80c27ea49
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - name: Verify exact source and configure private frontends
         run: |
-          test "$(git -C compiler rev-parse HEAD)" = "5209dd4e9cebaad3348cf0b4ed754a729e75f022"
+          test "$(git -C compiler rev-parse HEAD)" = "47c7fb4d952435379a1f563c64ae5da80c27ea49"
           git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: compiler -> target
-          key: x86-generated-runtime-20261116
+          key: x86-phi-first-alu-20261125
+      - name: Shared backend PHI-first soft affinity and x86 native correctness
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib --quiet
+          cargo test -p compiler-backend-x86 --lib soft_scalar_affinity_tests -- --nocapture
+          # Historical LP64 indirect call oracle is tracked after #3145.
+          cargo test -p compiler-backend-x86 --lib --quiet -- \
+            --skip typeid_fp_staged_native_tests::mixed_body_typed_gp_indirect_value_and_void_calls
+          cargo clippy -p compiler-backend -p compiler-backend-x86 --lib -- -D warnings
       - name: Native runtime median and GCC independent correctness oracle
         working-directory: compiler
         shell: bash
@@ -44,10 +58,46 @@ jobs:
           grep -q 'X86_SOURCE_RUNTIME mode=mini_default ' "$RUNNER_TEMP/x86-generated-runtime.log"
           grep -q 'X86_SOURCE_RUNTIME mode=mini_noinline ' "$RUNNER_TEMP/x86-generated-runtime.log"
           grep -q 'X86_SOURCE_RUNTIME mode=gcc_Os ' "$RUNNER_TEMP/x86-generated-runtime.log"
+      - name: Checkout identical pre-priority main for same-runner GCC A/B
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 95d81eca15a1e571cb41f6e5060f0f6fb3cd9e81
+          path: compiler-baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Native exact baseline code quality and independent GCC checksums
+        working-directory: compiler-baseline
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/compiler/target
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "95d81eca15a1e571cb41f6e5060f0f6fb3cd9e81"
+          cargo test --release -p compiler --test x86_source_runtime_performance -- --ignored --nocapture 2>&1 | tee "$RUNNER_TEMP/x86-baseline-runtime.log"
+          grep -F 'X86_RUNTIME_FUNCTION mode=mini_default symbol=scan>' "$RUNNER_TEMP/x86-baseline-runtime.log"
+      - name: Source-bound comparison of x86 machine instructions and runtime
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '### PHI-first soft affinity, production x86 same-runner A/B'
+            echo 'Candidate source: 47c7fb4d952435379a1f563c64ae5da80c27ea49'
+            echo 'Baseline source: 95d81eca15a1e571cb41f6e5060f0f6fb3cd9e81'
+            echo '~~~'
+            echo 'Prior main:'
+            grep -E 'X86_(RUNTIME_FUNCTION|SOURCE_RUNTIME) ' "$RUNNER_TEMP/x86-baseline-runtime.log" | grep -E 'symbol=(scan>|BenchBatch>|BenchDelta>)|workload=combined'
+            echo 'PHI-first candidate:'
+            grep -E 'X86_(RUNTIME_FUNCTION|SOURCE_RUNTIME) ' "$RUNNER_TEMP/x86-generated-runtime.log" | grep -E 'symbol=(scan>|BenchBatch>|BenchDelta>)|workload=combined'
+            echo '~~~'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Preserve executable runtime and GCC checksums
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: x86-generated-runtime
-          path: ${{ runner.temp }}/x86-generated-runtime.log
+          path: |
+            ${{ runner.temp }}/x86-generated-runtime.log
+            ${{ runner.temp }}/x86-baseline-runtime.log
           if-no-files-found: ignore
