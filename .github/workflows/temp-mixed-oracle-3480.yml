@@ -1,0 +1,64 @@
+name: Temporary mixed Function optimizer retirement acceptance
+on:
+  pull_request:
+    paths: ['.github/workflows/temp-mixed-oracle-3480.yml']
+permissions:
+  contents: read
+jobs:
+  mixed-oracle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: 1fe1d44681b1ced61b4a9d6e3384b5c454388e22
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler SHA and isolate core workspace
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-mixed-oracle-retirement
+      - name: Retired Function optimizer API audit
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          if git grep -nE 'legacy-function-mixed-oracle|fold_constant_calls\(\&mut|prune_unreachable_internal\(|prune_unreachable_module\(' -- '*.rs' '*.toml'; then
+            exit 1
+          fi
+      - name: Native CTFE and reachability tests plus C11 ELF/GAS regression
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test ctfe
+          cargo test -p compiler-opt --test typed_ctfe
+          cargo test -p compiler-opt --test dead_functions_reachability
+          cargo test -p compiler-opt --test linkage_native
+          cargo test -p compiler-opt --test typed_array_fold
+          cargo test -p compiler-opt --test array_fold_native
+          cargo test -p compiler-opt --test inline_private_decision_oracle
+      - name: All optimizer targets and strict Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --all-targets
+          cargo clippy -p compiler-opt --lib -- -D warnings
+      - name: Native graph and mixed export boundary
+        working-directory: compiler
+        run: python3 tools/check_mixed_function_export_boundary.py
