@@ -1,0 +1,57 @@
+name: Temporary native inliner decision oracle retirement
+on:
+  pull_request:
+    paths: ['.github/workflows/temp-inline-retire-oracles-3478.yml']
+permissions:
+  contents: read
+jobs:
+  native-inline-oracles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      SOURCE_SHA: b525e736e88287441373c12643a96dc5cb8d0d2f
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source and core workspace
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-inline-retire-oracle
+      - name: Verify migrated suites have no historical inliner calls
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          if git grep -nE 'compiler_opt::inline::|inline_selected_calls\(|inline_small_calls\(|to_legacy\(' -- crates/opt/tests/inline_modern_scalar_native.rs crates/opt/tests/inline_decision_oracle.rs crates/opt/tests/inline_private_decision_oracle.rs; then
+            exit 1
+          fi
+      - name: Checked TypeId inlining and direct C11/ELF decision oracles
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test inline_modern_scalar_native
+          cargo test -p compiler-opt --test inline_decision_oracle
+          cargo test -p compiler-opt --test inline_private_decision_oracle
+          cargo test -p compiler-opt --test typed_inline_postopt_native_trial
+      - name: All optimizer target compilation and strict production lint
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --all-targets
+          cargo clippy -p compiler-opt --lib -- -D warnings
