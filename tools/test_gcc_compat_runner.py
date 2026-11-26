@@ -109,7 +109,8 @@ class CompatibilityTests(unittest.TestCase):
         (root / "bitfield_main.c").write_text(
             "int check(void); int main(void) { return check(); }\n")
         (root / "bitfield.h").write_text(
-            "struct B { unsigned a:3; signed b:5; unsigned :0; unsigned c:9; };\n"
+            "#ifndef WIDTH\n#define WIDTH 3\n#endif\n"
+            "struct B { unsigned a:WIDTH; signed b:5; unsigned :0; unsigned c:9; };\n"
             "struct B make(void);\n")
         (root / "bitfield_x.c").write_text(
             '#include "bitfield.h"\nint check(void) { struct B b=make(); '
@@ -123,6 +124,12 @@ class CompatibilityTests(unittest.TestCase):
         self.assertFalse(fatal(record), record)
         self.assertTrue(all(d["status"] == "PASS"
                             for d in record["frontends"]["control"]["directions"].values()))
+
+        changed = run_case(case, root, root / "bitfield-bad", "gcc", self.flags,
+                           {"bad": ["gcc", "-DWIDTH=9", "-c", "{original}", "-o", "{object}"]})
+        self.assertEqual(changed["frontends"]["bad"]["directions"]["y"]["status"],
+                         "ABI_MISMATCH")
+        self.assertTrue(fatal(changed))
 
     def test_unknown_directive_is_not_executed(self):
         path = self.root / "struct-return-0_main.c"
