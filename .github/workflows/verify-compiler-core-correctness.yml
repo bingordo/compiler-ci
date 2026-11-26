@@ -44,7 +44,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ inputs.source_ref || 'main' }}
+          ref: 3555155841f2c0ee46dbdbc20da9eb038aabc6cf
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -58,6 +58,7 @@ jobs:
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "Compiler source SHA: $sha"
+          [[ "$sha" == "3555155841f2c0ee46dbdbc20da9eb038aabc6cf" ]] || { echo "P18 24-case wrong compiler source revision"; exit 1; }
           # Fail rather than silently accepting a moved/absent test suite.
           for test_source in \
             crates/opt/tests/native_cfg_differential.rs \
@@ -124,6 +125,23 @@ jobs:
           for format in elf gas; do
             grep -F "AL05_P18_NATIVE_TARGET arch=x86_64 format=$format" "$RUNNER_TEMP/al05-p18-x86.log"
           done
+
+      - name: P18 24 selected x86 native mutant and no-op differential, bounded cost
+        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
+        shell: bash
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          start_ms=$(date +%s%3N)
+          timeout --signal=TERM --kill-after=10s 4m \
+            cargo test -p compiler-opt --test al05_p9_mixed_native_bridge \
+              al05_p18_native_sensitivity::al05_p18_native_x86_selected_24_case_elf_gas_sensitivity \
+              -- --exact --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/al05-p18-x86-24.log"
+          elapsed_ms=$(($(date +%s%3N)-start_ms))
+          grep -F 'test al05_p18_native_sensitivity::al05_p18_native_x86_selected_24_case_elf_gas_sensitivity ... ok' "$RUNNER_TEMP/al05-p18-x86-24.log"
+          grep -E 'AL05_P18_SELECTED_SUMMARY .*arch=x86_64 selected=24 records=96 no_op_controls=96 verdict=PASS' "$RUNNER_TEMP/al05-p18-x86-24.log"
+          echo "AL05_P18_SELECTED_COST arch=x86_64 elapsed_ms=$elapsed_ms ceiling_ms=240000 verdict=PASS"
 
       # P17 test must run before unrelated all-crate checks and fail closed.
       # Source checkout, module parser and independent TypeId reference are
@@ -352,6 +370,61 @@ jobs:
               and r["verdict"]=="BOUNDED" for r in records)
           print("AL05_P18_NATIVE_LEDGER_VALIDATED records=8 case=1 arches=2 formats=2 families=2 controls=8 verdict=PASS")
           PY
+
+      - name: P18 24 selected AArch64/QEMU mutant and no-op differential, bounded cost
+        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
+        shell: bash
+        working-directory: compiler
+        env:
+          AL05_REQUIRE_AARCH64: '1'
+        run: |
+          set -euo pipefail
+          start_ms=$(date +%s%3N)
+          timeout --signal=TERM --kill-after=10s 4m \
+            cargo test -p compiler-opt --test al05_p9_mixed_native_bridge \
+              al05_p18_native_sensitivity::al05_p18_native_aarch64_selected_24_case_elf_gas_sensitivity \
+              -- --exact --ignored --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/al05-p18-aarch64-24.log"
+          elapsed_ms=$(($(date +%s%3N)-start_ms))
+          grep -F 'test al05_p18_native_sensitivity::al05_p18_native_aarch64_selected_24_case_elf_gas_sensitivity ... ok' "$RUNNER_TEMP/al05-p18-aarch64-24.log"
+          grep -E 'AL05_P18_SELECTED_SUMMARY .*arch=aarch64 selected=24 records=96 no_op_controls=96 verdict=PASS' "$RUNNER_TEMP/al05-p18-aarch64-24.log"
+          python3 - "$RUNNER_TEMP/al05-p18-x86-24.log" "$RUNNER_TEMP/al05-p18-aarch64-24.log" "$(git rev-parse HEAD)" <<'PY'
+          import collections, json, pathlib, sys
+          files = sys.argv[1:3]
+          sha = sys.argv[3]
+          records = []
+          by_arch = {}
+          for filename in files:
+              log = pathlib.Path(filename).read_text()
+              rows = [json.loads(line.split("AL05_P18_NATIVE_LEDGER ",1)[1])
+                      for line in log.splitlines() if "AL05_P18_NATIVE_LEDGER " in line]
+              assert len(rows) == 96, f"{filename}: expected 96 records got {len(rows)}"
+              arch = rows[0]["arch"]
+              assert arch not in by_arch
+              by_arch[arch] = {row["case_id"] for row in rows}
+              assert len(by_arch[arch]) == 24
+              records.extend(rows)
+          assert set(by_arch) == {"x86_64", "aarch64"}
+          assert by_arch["x86_64"] == by_arch["aarch64"]
+          assert len(records)==192
+          expected={(arch,case,fmt,kind) for arch in by_arch
+              for case in by_arch[arch] for fmt in ("elf","gas")
+              for kind in ("wrong-loop-phi","dropped-latch-divs")}
+          actual=[(row["arch"],row["case_id"],row["format"],row["mutation_kind"]) for row in records]
+          assert len(set(actual))==192 and set(actual)==expected
+          for row in records:
+              assert row["schema"]=="al05-p18-native-sensitivity-v1"
+              assert row["source_sha"]==sha
+              assert row["verifier"]=="PASS" and row["detected"] is True
+              assert row["no_op_control"]=="REJECTED"
+              assert row["host_oracle"]=="shared-p16-independent-c11"
+              assert row["native_oracle"]=="actual-elf-gas"
+              assert row["semantics"]=="FS1-DRAFT-NON-NORMATIVE"
+              assert row["verdict"]=="BOUNDED"
+              assert set(row["witness"])=={"x","y","bound"}
+          print(f"AL05_P18_SELECTED_LEDGER_VALIDATED source_sha={sha} cases=24 records=192 controls=192 formats=2 arches=2 families=2 verdict=PASS")
+          PY
+          echo "AL05_P18_SELECTED_COST arch=aarch64 elapsed_ms=$elapsed_ms ceiling_ms=240000 verdict=PASS"
 
       - name: AL-05 native x86 and AArch64 ELF/GAS with strict C11 oracle
         if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
