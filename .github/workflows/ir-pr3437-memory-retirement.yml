@@ -1,0 +1,62 @@
+# Disposable exact-source IR retirement gate; do not merge to compiler-ci main.
+name: IR PR3437 retire historical memory passes
+on:
+  push:
+    branches: [verify-ir-retire-memory-3437-20261126]
+    paths: ['.github/workflows/ir-pr3437-memory-retirement.yml']
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    env:
+      SOURCE_SHA: 886caa156a72e7bd3e87b8f8f7a3c4b55a21c29d
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm exact source and isolate supported optimizer workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          echo 'Audit obsolete Function memory entrypoints:'
+          git -C compiler grep -n -E 'legacy-function-memory-oracle|compiler_opt::dse::|compiler_opt::global_memory::' -- crates/opt || :
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-pr3437-memory
+      - name: Compile all optimizer targets
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --all-targets
+      - name: Native optimizer and memory semantic execution suites
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test typed_global_memory
+          cargo test -p compiler-opt --test typed_dse
+          cargo test -p compiler-opt --test memory_analysis_bounds
+          cargo test -p compiler-opt --test memory_execution_oracle
+          cargo test -p compiler-opt --test typed_native_parity
+          cargo test -p compiler-opt --test global_memory_profile -- --ignored --nocapture
+      - name: Scoped optimizer lint with pre-existing generated dead code exempt
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --lib -- -D warnings -A dead_code
+          cargo clippy --no-deps -p compiler-opt --test typed_native_parity --test global_memory_profile -- -D warnings -A dead_code
