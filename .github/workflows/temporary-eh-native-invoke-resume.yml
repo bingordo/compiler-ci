@@ -1,0 +1,54 @@
+# Temporary structural EH candidate; do not merge.
+name: Native TypeId invoke and resume consumer audit
+on:
+  pull_request:
+    paths: ['.github/workflows/temporary-eh-native-invoke-resume.yml']
+permissions:
+  contents: read
+jobs:
+  cfg:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: fff49a20648e59a9d4385990d9eca7810a0144f0
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source and isolate native core workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: temporary-native-inliner-acceptance
+          cache-on-failure: true
+      - name: Compile IR consumer inventory
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-ir --all-targets --features legacy-ssa-oracle
+      - name: Structural exceptional CFG regressions
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --lib --test exception_cfg --test terminator_edge_visitors
+      - name: Compile optimizer and machine consumer inventory
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --all-targets --keep-going
