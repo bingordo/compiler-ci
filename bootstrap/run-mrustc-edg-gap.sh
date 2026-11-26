@@ -1664,67 +1664,6 @@ fi
 # Baseline: these public C fixtures independently isolate GNU layout,
 # linkage, calling-convention, and naked attributes. GCC is the dialect
 # oracle; EDG acceptance is a different, parser-only result.
-# Public nested union/record layout; combine a MEMORY argument with sret.
-probe=/audit-tmp/edg-memory-arg-union
-mkdir -p "$probe"
-cat > "$probe/caller.c" <<'C'
-union U { unsigned long a; unsigned int b; };
-struct A { union U u; unsigned long b,c,d; };
-struct R { unsigned long a,b; union U u; };
-extern struct R exchange(struct A x, unsigned long tail);
-unsigned long invoke(unsigned long n) {
-    struct A x; struct R y;
-    x.u.a=n; x.b=n+1UL; x.c=n+2UL; x.d=n+3UL;
-    y=exchange(x,13UL);
-    if(x.u.a!=n) return 1UL;
-    return y.a+y.b+y.u.a;
-}
-C
-cat > "$probe/callee.c" <<'C'
-union U { unsigned long a; unsigned int b; };
-struct A { union U u; unsigned long b,c,d; };
-struct R { unsigned long a,b; union U u; };
-struct R exchange(struct A x, unsigned long tail) {
-    struct R y;
-    x.u.a+=1UL;
-    y.a=x.u.a+x.b; y.b=x.c+x.d; y.u.a=tail;
-    return y;
-}
-C
-cat > "$probe/main.c" <<'C'
-extern unsigned long invoke(unsigned long);
-int main(void) { return invoke(5UL)!=40UL; }
-C
-gcc -std=c11 -c "$probe/caller.c" -o "$probe/gcc-caller.o"
-gcc -std=c11 -c "$probe/callee.c" -o "$probe/gcc-callee.o"
-gcc -std=c11 "$probe/main.c" "$probe/gcc-caller.o" "$probe/gcc-callee.o" -o "$probe/gcc-only"
-set +e
-"$probe/gcc-only"
-echo "EDG_C_MEMORY_ARG_UNION_GCC_EXIT=$?"
-for side in caller callee; do
-  (
-    cd /workspace/edgcpp/build/gcc-release
-    timeout --signal=TERM --kill-after=10s 90s "$native" "$probe/native-$side.o" --gcc --c11 --no_strict_gnu --gnu_version "$gnu_number" "$probe/$side.c"
-  ) > "$probe/$side.log" 2>&1
-  rc=$?
-  echo "EDG_C_MEMORY_ARG_UNION_${side^^}_COMPILE_EXIT=$rc"
-  if (( rc != 0 )); then
-    grep -m 1 'rejected source:' "$probe/$side.log" | cut -c 1-500 |
-      sed "s/^/EDG_C_MEMORY_ARG_UNION_${side^^}_REJECTION=/" || true
-  fi
-  if (( rc == 0 )); then
-    other=caller
-    if [[ "$side" == caller ]]; then other=callee; fi
-    gcc -std=c11 "$probe/main.c" "$probe/native-$side.o" "$probe/gcc-$other.o" -o "$probe/mixed-$side" > "$probe/link-$side.log" 2>&1
-    link_rc=$?
-    echo "EDG_C_MEMORY_ARG_UNION_${side^^}_LINK_EXIT=$link_rc"
-    if (( link_rc == 0 )); then
-      "$probe/mixed-$side"
-      echo "EDG_C_MEMORY_ARG_UNION_${side^^}_EXEC_EXIT=$?"
-    fi
-  fi
-done
-set -e
 for kind in alignment linkage abi naked control_globals weak_function section_function control_asm aligned_global scalar_global weak_scalar_global; do
   fixture="/workspace/bootstrap/fixtures/edg-gnu-attributes/${kind}.c"
   test -s "$fixture"
@@ -2095,6 +2034,67 @@ for side in caller callee; do
     if (( link_rc == 0 )); then
       "$probe/mixed-$side"
       echo "EDG_C_MEMORY_ARG_${side^^}_EXEC_EXIT=$?"
+    fi
+  fi
+done
+set -e
+# Public nested union/record layout; combine a MEMORY argument with sret.
+probe=/audit-tmp/edg-memory-arg-union
+mkdir -p "$probe"
+cat > "$probe/caller.c" <<'C'
+union U { unsigned long a; unsigned int b; };
+struct A { union U u; unsigned long b,c,d; };
+struct R { unsigned long a,b; union U u; };
+extern struct R exchange(struct A x, unsigned long tail);
+unsigned long invoke(unsigned long n) {
+    struct A x; struct R y;
+    x.u.a=n; x.b=n+1UL; x.c=n+2UL; x.d=n+3UL;
+    y=exchange(x,13UL);
+    if(x.u.a!=n) return 1UL;
+    return y.a+y.b+y.u.a;
+}
+C
+cat > "$probe/callee.c" <<'C'
+union U { unsigned long a; unsigned int b; };
+struct A { union U u; unsigned long b,c,d; };
+struct R { unsigned long a,b; union U u; };
+struct R exchange(struct A x, unsigned long tail) {
+    struct R y;
+    x.u.a+=1UL;
+    y.a=x.u.a+x.b; y.b=x.c+x.d; y.u.a=tail;
+    return y;
+}
+C
+cat > "$probe/main.c" <<'C'
+extern unsigned long invoke(unsigned long);
+int main(void) { return invoke(5UL)!=40UL; }
+C
+gcc -std=c11 -c "$probe/caller.c" -o "$probe/gcc-caller.o"
+gcc -std=c11 -c "$probe/callee.c" -o "$probe/gcc-callee.o"
+gcc -std=c11 "$probe/main.c" "$probe/gcc-caller.o" "$probe/gcc-callee.o" -o "$probe/gcc-only"
+set +e
+"$probe/gcc-only"
+echo "EDG_C_MEMORY_ARG_UNION_GCC_EXIT=$?"
+for side in caller callee; do
+  (
+    cd /workspace/edgcpp/build/gcc-release
+    timeout --signal=TERM --kill-after=10s 90s "$native" "$probe/native-$side.o" --gcc --c11 --no_strict_gnu --gnu_version "$gnu_number" "$probe/$side.c"
+  ) > "$probe/$side.log" 2>&1
+  rc=$?
+  echo "EDG_C_MEMORY_ARG_UNION_${side^^}_COMPILE_EXIT=$rc"
+  if (( rc != 0 )); then
+    tail -n 8 "$probe/$side.log" | cut -c 1-500 |
+      sed "s/^/EDG_C_MEMORY_ARG_UNION_${side^^}_REJECTION=/" || true
+  fi
+  if (( rc == 0 )); then
+    other=caller
+    if [[ "$side" == caller ]]; then other=callee; fi
+    gcc -std=c11 "$probe/main.c" "$probe/native-$side.o" "$probe/gcc-$other.o" -o "$probe/mixed-$side" > "$probe/link-$side.log" 2>&1
+    link_rc=$?
+    echo "EDG_C_MEMORY_ARG_UNION_${side^^}_LINK_EXIT=$link_rc"
+    if (( link_rc == 0 )); then
+      "$probe/mixed-$side"
+      echo "EDG_C_MEMORY_ARG_UNION_${side^^}_EXEC_EXIT=$?"
     fi
   fi
 done
