@@ -1,0 +1,88 @@
+name: Candidate compact x86 machine IR 3241
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-compact-machine-group-3241.yml']
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 413fd94e2842a46d5f69d5a51a8654ddcef7d00e
+          path: baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d1821062c82acdc938155bbdcc860e27e40adc24
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: 66c599591115e9c17a1d802db3d048cf4f39d294
+          path: mini-c
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify revisions and isolate workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C baseline rev-parse HEAD)" = "413fd94e2842a46d5f69d5a51a8654ddcef7d00e"
+          test "$(git -C compiler rev-parse HEAD)" = "d1821062c82acdc938155bbdcc860e27e40adc24"
+          test "$(git -C mini-c rev-parse HEAD)" = "66c599591115e9c17a1d802db3d048cf4f39d294"
+          grep -q "66c599591115e9c17a1d802db3d048cf4f39d294" compiler/tools/mini-c-driver/Cargo.toml
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          rustc --version | tee -a "$GITHUB_STEP_SUMMARY"
+          for tree in baseline compiler; do
+            git -C "$tree" rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
+            cat > "$tree/Cargo.toml" <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          exclude = ["tools/mini-c-driver"]
+          EOF
+            rm -f "$tree/Cargo.lock"
+          done
+          mkdir -p baseline/crates/backend-x86/examples
+          cp compiler/crates/backend-x86/examples/machine_storage_census.rs baseline/crates/backend-x86/examples/
+      - name: Measure exact machine instruction sizes
+        run: |
+          set -euo pipefail
+          for tree in baseline compiler; do
+            (cd "$tree"; cargo run --quiet -p compiler-backend-x86 --example machine_storage_census) | tee "$RUNNER_TEMP/$tree-layout.tsv"
+          done
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import os, pathlib
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          def read(tree):
+              return {row[0]: int(row[1]) for row in (line.split("\t") for line in (root / (tree + "-layout.tsv")).read_text().splitlines()[1:])}
+          old, new = read("baseline"), read("compiler")
+          print("| Type | Baseline bytes | Candidate bytes |")
+          print("|---|---:|---:|")
+          for name in old:
+              print(f"| {name} | {old[name]} | {new[name]} |")
+          assert new["Inst"] < old["Inst"], "machine instruction size did not decrease"
+          PY
+      - name: Workspace compilation
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo check --workspace
+      - name: x86 machine and allocator unit tests
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --lib
+      - name: Existing Mini-C native GP group regressions
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: |
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test asm3_p15_gp_group_native -- --nocapture
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test asm3_p14_alternatives_ties_native -- --nocapture
