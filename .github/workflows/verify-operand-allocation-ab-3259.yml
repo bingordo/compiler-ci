@@ -1,0 +1,156 @@
+name: Operand allocation comparison 3259
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-operand-allocation-ab-3259.yml']
+permissions:
+  contents: read
+jobs:
+  measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: cdb92f6bb83d7e06bf23d2e7e481ae97fac4946a
+          path: baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7e5afe5d5683938fff17caac480b8dbf31595e20
+          path: candidate
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Build uninstrumented release binaries
+        run: |
+          set -euo pipefail
+          test "$(git -C baseline rev-parse HEAD)" = "cdb92f6bb83d7e06bf23d2e7e481ae97fac4946a"
+          test "$(git -C candidate rev-parse HEAD)" = "7e5afe5d5683938fff17caac480b8dbf31595e20"
+          cmp baseline/tools/mini-c-driver/Cargo.toml candidate/tools/mini-c-driver/Cargo.toml
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          rustc --version | tee -a "$GITHUB_STEP_SUMMARY"
+          for tree in baseline candidate; do
+            git -C "$tree" rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
+            cargo build --release --manifest-path "$tree/tools/mini-c-driver/Cargo.toml" --bin compiler-mini-c
+            cp "$tree/tools/mini-c-driver/target/release/compiler-mini-c" "$RUNNER_TEMP/$tree-normal"
+          done
+      - name: Build instrumented binaries with identical counting allocator
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          # CI-only instrumentation: count allocation requests, not allocator
+          # overhead, retained memory, or allocation calls in child processes.
+          prefix = r'''
+          use std::alloc::{GlobalAlloc, Layout, System};
+          use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+          static ALLOC: AtomicU64 = AtomicU64::new(0);
+          static REALLOC: AtomicU64 = AtomicU64::new(0);
+          static BYTES: AtomicU64 = AtomicU64::new(0);
+          struct Counting;
+          unsafe impl GlobalAlloc for Counting {
+              unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                  ALLOC.fetch_add(1, Relaxed);
+                  BYTES.fetch_add(layout.size() as u64, Relaxed);
+                  unsafe { System.alloc(layout) }
+              }
+              unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                  ALLOC.fetch_add(1, Relaxed);
+                  BYTES.fetch_add(layout.size() as u64, Relaxed);
+                  unsafe { System.alloc_zeroed(layout) }
+              }
+              unsafe fn realloc(&self, p: *mut u8, old: Layout, size: usize) -> *mut u8 {
+                  REALLOC.fetch_add(1, Relaxed);
+                  BYTES.fetch_add(size as u64, Relaxed);
+                  unsafe { System.realloc(p, old, size) }
+              }
+              unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
+                  unsafe { System.dealloc(p, layout) }
+              }
+          }
+          #[global_allocator]
+          static GLOBAL: Counting = Counting;
+          '''
+          for tree in ("baseline", "candidate"):
+              path = Path(tree) / "tools/mini-c-driver/src/main.rs"
+              source = path.read_text()
+              anchor = "    match run() {"
+              assert source.count(anchor) == 1
+              source = source.replace(anchor, '''    let outcome = run();
+              eprintln!("ALLOC_COUNTS\t{}\t{}\t{}", ALLOC.load(Relaxed), REALLOC.load(Relaxed), BYTES.load(Relaxed));
+              match outcome {''')
+              # Keep the initial inner module doc comment at the top.
+              first, rest = source.split("\n", 1)
+              path.write_text(first + "\n" + prefix + rest)
+          PY
+          for tree in baseline candidate; do
+            cargo build --release --manifest-path "$tree/tools/mini-c-driver/Cargo.toml" --bin compiler-mini-c
+            cp "$tree/tools/mini-c-driver/target/release/compiler-mini-c" "$RUNNER_TEMP/$tree-counted"
+          done
+      - name: Generate deterministic source workloads
+        run: |
+          mkdir -p "$RUNNER_TEMP/operand-ab"
+          python3 - <<'PY'
+          import os, pathlib
+          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "operand-ab"
+          for count in (100, 400):
+              with (root / f"functions-{count}.c").open("w") as f:
+                  for i in range(count):
+                      f.write(f"int func_{i}(int x, int y, int z) {{\n")
+                      for j in range(12):
+                          k = (i * 17 + j * 3) % 127 + 1
+                          f.write(f"  x = x * 3 + y + {k};\n")
+                          f.write("  if (x < z) y = y + x; else y = y - z;\n")
+                          f.write("  z = z + y;\n")
+                      f.write("  return x + y + z;\n}\n")
+          PY
+      - name: Run paired benchmark and verify outputs
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/operand-ab"
+          printf 'functions\temit\trepeat\trevision\trss_kib\twall_s\n' > "$root/timing.tsv"
+          printf 'functions\temit\trevision\talloc\trealloc\trequested_bytes\n' > "$root/alloc.tsv"
+          for count in 100 400; do
+            for emit in obj asm; do
+              for repeat in 1 2 3; do
+                order="baseline candidate"
+                if test "$repeat" = 2; then order="candidate baseline"; fi
+                for tree in $order; do
+                  /usr/bin/time -f '%M\t%e' -o "$root/time" "$RUNNER_TEMP/$tree-normal" "$root/functions-$count.c" --emit "$emit" -o "$root/$count-$emit-$tree-$repeat.out"
+                  printf '%s\t%s\t%s\t%s\t' "$count" "$emit" "$repeat" "$tree" >> "$root/timing.tsv"
+                  cat "$root/time" >> "$root/timing.tsv"
+                  cmp "$root/$count-$emit-$tree-1.out" "$root/$count-$emit-$tree-$repeat.out"
+                done
+                cmp "$root/$count-$emit-baseline-$repeat.out" "$root/$count-$emit-candidate-$repeat.out"
+              done
+              for tree in baseline candidate; do
+                "$RUNNER_TEMP/$tree-counted" "$root/functions-$count.c" --emit "$emit" -o "$root/counted.out" 2> "$root/counts.log"
+                cmp "$root/counted.out" "$root/$count-$emit-$tree-1.out"
+                printf '%s\t%s\t%s\t' "$count" "$emit" "$tree" >> "$root/alloc.tsv"
+                grep '^ALLOC_COUNTS' "$root/counts.log" | cut -f2- >> "$root/alloc.tsv"
+              done
+            done
+          done
+          cat "$root/timing.tsv" "$root/alloc.tsv"
+      - name: Summarize
+        run: |
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import csv, os, pathlib, statistics
+          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "operand-ab"
+          timing = list(csv.DictReader((root / "timing.tsv").open(), delimiter="\t"))
+          alloc = list(csv.DictReader((root / "alloc.tsv").open(), delimiter="\t"))
+          assert len(timing)==24 and len(alloc)==8
+          print("| Functions | Emit | Revision | Alloc requests | Realloc requests | Requested bytes | Median peak RSS KiB | Median wall s |")
+          print("|---:|---|---|---:|---:|---:|---:|---:|")
+          for row in alloc:
+              group = [r for r in timing if all(r[k]==row[k] for k in ("functions","emit","revision"))]
+              rss = statistics.median(int(r["rss_kib"]) for r in group)
+              wall = statistics.median(float(r["wall_s"]) for r in group)
+              print(f"| {row['functions']} | {row['emit']} | {row['revision']} | {row['alloc']} | {row['realloc']} | {row['requested_bytes']} | {rss} | {wall:.2f} |")
+          print("\nAll outputs byte-identical. Counts are Rust global allocator requests, including realloc requested sizes, not live bytes. Timing and RSS use uninstrumented binaries.")
+          PY
