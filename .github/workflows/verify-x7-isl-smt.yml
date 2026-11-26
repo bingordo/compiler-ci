@@ -1,5 +1,7 @@
 name: Verify X7 ISL source-DAG SMT equivalence
 on:
+  pull_request:
+    paths: ['.github/workflows/verify-x7-isl-smt.yml']
   workflow_dispatch:
   push:
     branches: [main]
@@ -14,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 52f666eb8e402a2c7f3b9307bfef071419f127e5
+          ref: e05242d80542045b4d85fb41d9d7bfad89a46cf8
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - name: Install pinned offline-only Z3 solver in isolated venv
@@ -23,6 +25,27 @@ jobs:
           python3 -m venv /tmp/x7-z3
           /tmp/x7-z3/bin/python -m pip install --disable-pip-version-check 'z3-solver==4.13.4.0'
           /tmp/x7-z3/bin/python -c 'import z3; print("X7_Z3_VERSION", z3.get_version_string())'
+      - name: Exact pinned Intel standard count helper corpus and generic semantic proofs
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          curl --fail --silent --show-error --location --retry 2 --max-time 45 \
+            'https://raw.githubusercontent.com/IntelLabs/isa-tools/16260979137c38339743a04b7fd5d9f0fa8a6ee5/stdlib.isa' \
+            --output /tmp/x7-stdlib-pinned.isa
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib,re
+          source=Path('/tmp/x7-stdlib-pinned.isa').read_text()
+          names=['Count_Set_Bits','Count_Leading_Zero_Bits','Count_Trailing_Zero_Bits']
+          for name in names:
+              pattern=r'function Std::Bits::'+name+r'\\(implicit size : Integer, x : Bits\\(size\\)\\) -> \\{0 \\.\\. size\\}'
+              assert re.search(pattern,source), name
+          assert 'for i := size-1 downto 0 do' in source
+          assert 'for i := 0 to size-1 do' in source
+          print('X7_ORIGINAL_ISL_COUNT_STDLIB_SHA256',hashlib.sha256(source.encode()).hexdigest())
+          PY
+          /tmp/x7-z3/bin/python -m unittest discover -s tools -p 'test_x86_isl_count_builtins.py' -v
+          /tmp/x7-z3/bin/python -m py_compile tools/x86_isl_semantic_core.py tools/x86_isl_symbolic_dag.py tools/x86_isl_smt_verify.py
       - name: Run independent source-vs-DAG SMT proof and mutation controls
         run: |
           set -euo pipefail
