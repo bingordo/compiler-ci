@@ -100,6 +100,32 @@ with tempfile.TemporaryDirectory() as d:
                                     "inline","__inline__","__inline","restrict",
                                     "__restrict__","_Atomic","typedef","struct","union",
                                     "enum","static","extern","register","const","volatile")
+                        # Reproduce the exact preprocessed parser error with
+                        # raw input so the diagnostic supplies a column.
+                        pre = tmp / "private-preprocessed.c"
+                        with pre.open("wb") as dst, (tmp/"private-cpp.log").open("wb") as err:
+                            cpp = subprocess.run(["cc","-E","-P",str(src)],
+                                                 stdout=dst,stderr=err,timeout=180)
+                        if cpp.returncode == 0:
+                            rc2,_ = attempt([driver,"--emit-obj",str(tmp/"private-raw.o"),str(pre)],
+                                            tmp/"private-raw.log",180)
+                            raw = (tmp/"private-raw.log").read_text(errors="replace")
+                            match = re.search(r":(\d+):(\d+): error\[S[0-9]{4}\]",raw)
+                            if match:
+                                line2,col2 = map(int,match.groups())
+                                with pre.open(errors="replace") as stream:
+                                    row = next(itertools.islice(stream,line2-1,line2),"")
+                                # Tokenize only the failing line and classify
+                                # tokens by a fixed public allowlist; no names
+                                # or literals from the source are emitted.
+                                vocabulary = set(keywords) | {"__attribute","__forceinline","__declspec","__const","__const__","__volatile__","always_inline","noinline","unused","noreturn","packed","aligned","int","char","long","short","unsigned","signed","float","double","void","_Bool","(",")",";",",","*","=","{","}","[","]"}
+                                tokens = list(re.finditer(r"[A-Za-z_][A-Za-z_0-9]*|[0-9]+|[^\s]",row))
+                                k = next((i for i,t in enumerate(tokens) if t.end() >= col2),None)
+                                if k is not None:
+                                    def classify(t):
+                                        return t.group() if t.group() in vocabulary else "other"
+                                    print("SYNTAX_TOKEN="+classify(tokens[k]),flush=True)
+                                    print("SYNTAX_SEQUENCE="+",".join(classify(t) for t in tokens[max(0,k-3):k+5]),flush=True)
                         for word in keywords:
                             if re.search(r"\b"+re.escape(word)+r"\b", window):
                                 print("SYNTAX_NEAR="+word, flush=True)
