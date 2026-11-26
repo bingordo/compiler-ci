@@ -19,11 +19,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: e08c8abda16987dc32249e428a293f7053341140
+          ref: b168060818957ce66f70d6e30493312da84fdaf8
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - run: test "$(git -C compiler rev-parse HEAD)" = e08c8abda16987dc32249e428a293f7053341140
+      - run: test "$(git -C compiler rev-parse HEAD)" = b168060818957ce66f70d6e30493312da84fdaf8
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -32,10 +32,55 @@ jobs:
       - name: Check backend and source regressions
         working-directory: compiler
         run: |
-          cargo test -p compiler --test riscv64_generic_cfg
+          RV64_CFG_FIXTURE_DIR=/tmp/rv64-cfg cargo test -p compiler --test riscv64_generic_cfg
           cargo test -p compiler-backend-riscv64 --lib --tests
           cargo test -p compiler --test riscv64_load_ir --test riscv64_source_preview
           cargo clippy -p compiler-backend-riscv64 --tests -- -D warnings
+      - name: Compare real CFG execution against independent GCC under QEMU
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/rv64-cfg
+          cat > harness.c <<'EOF'
+          extern long wide(long, long), many(long), nested(long, long);
+          extern long ref_wide(long, long), ref_many(long), ref_nested(long, long);
+          long step(long x) { return x + 1; }
+          static void finish(long code) {
+              register long a0 asm("a0") = code;
+              register long a7 asm("a7") = 93;
+              asm volatile("ecall" : : "r"(a0), "r"(a7) : "memory");
+              __builtin_unreachable();
+          }
+          void _start(void) {
+              for (long n = -1; n <= 8; ++n)
+                  for (long x = -40; x <= 40; x += 5) {
+                      if (wide(n, x) != ref_wide(n, x)) finish(1);
+                      if (many(x) != ref_many(x)) finish(2);
+                      if (nested(n, x) != ref_nested(n, x)) finish(3);
+                  }
+              finish(0);
+          }
+          EOF
+          cc=riscv64-linux-gnu-gcc
+          for name in wide many nested; do
+            "$cc" -march=rv64im -mabi=lp64 -O2 -ffreestanding -fno-builtin -fno-pie -fno-stack-protector -D"$name=ref_$name" -c "$name.c" -o "ref_$name.o"
+          done
+          "$cc" -march=rv64im -mabi=lp64 -O2 -ffreestanding -fno-builtin -fno-pie -fno-stack-protector -c harness.c -o harness.o
+          for isa in rv64i rv64izmmul rv64im; do
+            march="$isa"
+            if [ "$isa" = rv64izmmul ]; then march=rv64i_zmmul; fi
+            for name in wide many nested; do
+              riscv64-linux-gnu-as -march="$march" -mabi=lp64 "$name-$isa.asm" -o "$name-$isa-gas.o"
+              riscv64-linux-gnu-objcopy -O binary -j .text "$name-$isa.o" native.bin
+              riscv64-linux-gnu-objcopy -O binary -j .text "$name-$isa-gas.o" gas.bin
+              cmp native.bin gas.bin
+            done
+            for suffix in "" -gas; do
+              riscv64-linux-gnu-ld -m elf64lriscv -static --no-relax -e _start harness.o ref_wide.o ref_many.o ref_nested.o "wide-$isa$suffix.o" "many-$isa$suffix.o" "nested-$isa$suffix.o" -o check.elf
+              timeout 20s qemu-riscv64 check.elf
+              echo "$isa$suffix: 510 source CFG comparisons passed"
+            done
+          done
       - name: Publish candidate status
         if: always()
         env:
@@ -47,4 +92,4 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
             -f state="$state" -f context=rv64-r26-generic-cfg \
             -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            -f description="Compiler e08c8abda16987dc32249e428a293f7053341140"
+            -f description="Compiler b168060818957ce66f70d6e30493312da84fdaf8"
