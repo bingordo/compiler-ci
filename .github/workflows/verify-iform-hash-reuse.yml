@@ -1,0 +1,63 @@
+name: Intel worklist persistent hash reuse
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-iform-hash-reuse.yml']
+permissions:
+  contents: read
+jobs:
+  verify-hash-reuse:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d2b135bcbae0800f8e0cac512f0bb01ffa481217
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 093b3e03a063756a8a9d7f4a4ee22349f5580a91
+          path: baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify candidate and run affected suites
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "d2b135bcbae0800f8e0cac512f0bb01ffa481217"
+          python3 -m unittest discover -s tools -p test_x86_g10_catalog_census.py -v
+          python3 -m unittest discover -s tools -p test_x86_g10_source_operand_shapes.py -v
+          python3 -m unittest discover -s tools -p test_x86_iform_batch_worklist.py -v
+      - name: Compare complete worklists and normalized reports against baseline
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          PYTHONPATH=tools python3 - <<'PY'
+          import importlib.util
+          import json
+          import tempfile
+          from pathlib import Path
+          from unittest.mock import patch
+          from test_x86_g10_catalog_census import populated
+          from test_x86_iform_batch_worklist import make_form
+          import x86_iform_batch_worklist as new
+          spec = importlib.util.spec_from_file_location("old_worklist", "../baseline/tools/x86_iform_batch_worklist.py")
+          old = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(old)
+          for duplicate in (False, True):
+              with tempfile.TemporaryDirectory() as tmp:
+                  src = populated(Path(tmp), duplicate=duplicate)
+                  if duplicate:
+                      (src / "EXTRA.xml").write_text("<instruction><iform-group>" + make_form("DUP", "03", "03 /r") * 128 + "</iform-group></instruction>")
+                  with patch.object(old, "_hash", wraps=old._hash) as before, patch.object(new, "_hash", wraps=new._hash) as after:
+                      a = old.worklist(src, shard_count=64)
+                      b = new.worklist(src, shard_count=64)
+                      assert json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+                      assert json.dumps(old.normalize_source_operand_shapes(a, src), sort_keys=True) == json.dumps(new.normalize_source_operand_shapes(b, src), sort_keys=True)
+                      print("HASH_CALLS", len(b["forms"]), before.call_count, after.call_count)
+                      assert after.call_count < before.call_count
+          print("PERSISTENT_WORKLIST_AND_SHAPE_BYTE_PARITY_OK")
+          PY
