@@ -58,6 +58,25 @@ with tempfile.TemporaryDirectory() as d:
         # Public header families and fixed diagnostic phrases only.
         for tag,pattern in {"stdatomic":r"\bstdatomic\.h\b","stddef":r"\bstddef\.h\b","stdint":r"\bstdint\.h\b","stdlib":r"\bstdlib\.h\b","atomic_type":r"atomic type|_Atomic","gnu_attribute":r"__attribute__|__aligned__","unsupported_type":r"unsupported (?:source |scalar |C )?type|type[^\n]{0,40}unsupported","unsupported_builtin":r"unsupported (?:compiler )?builtin","unsupported_declaration":r"unsupported declaration","unsupported_argument":r"unsupported (?:call )?argument","unsupported_parameter":r"unsupported (?:formal )?parameter","unsupported_global":r"unsupported global","unsupported_record":r"unsupported (?:record|aggregate)","unsupported_op":r"unsupported (?:operator|opcode|operation)","unknown_type":r"unknown type|unknown typedef"}.items():
             if re.search(pattern,msg,re.I):print("DIAG_TAG="+tag,flush=True)
+        # Report fixed parser error families without copying diagnostic text,
+        # source paths, or identifiers from private translation units.
+        for tag, pattern in {
+            "expected_type": r"expected (?:a )?type specifier|expected (?:a )?type name",
+            "expected_declaration": r"expected (?:a )?declaration",
+            "expected_expression": r"expected (?:an )?expression",
+            "unsupported_storage": r"unsupported storage class",
+            "unterminated": r"unterminated",
+            "unsupported_attribute": r"unsupported GNU .*attribute",
+            "unsupported_type_specifier": r"unsupported type specifier",
+        }.items():
+            if re.search(pattern, msg, re.I):
+                print("SYNTAX_TAG="+tag, flush=True)
+        # Only known public system header names, with no private paths.
+        for header in ("stdio.h","string.h","stdbool.h","assert.h","limits.h",
+                       "errno.h","setjmp.h","math.h","unistd.h","time.h","stdarg.h",
+                       "sys/types.h","sys/stat.h","bits/types.h","bits/floatn.h"):
+            if re.search(r"(?:/|\\b)"+re.escape(header)+r":\d+", msg):
+                print("PUBLIC_DIAG_HEADER="+header, flush=True)
         codes = sorted(set(re.findall(r"error\[([PLST][0-9]{4})\]", msg)))
         print(f"CLIF_MODE={mode} SAMPLE={i} BYTES={src.stat().st_size} GCC_EXIT={gcc} CLIF_EXIT={rc} ELF={int(elf)} SECONDS={elapsed}", flush=True)
         print("CLIF_DIAG_IDS="+",".join(codes), flush=True)
