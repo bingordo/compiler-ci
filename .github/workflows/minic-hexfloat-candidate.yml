@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/mini-c
-          ref: 87e5e393ff2a2ff6f9602d214136617da8ae17ef
+          ref: af20898ec04bc0ecfaa68f150cfc0fa0e2e051d5
           path: mini-c
           persist-credentials: false
       - uses: Swatinem/rust-cache@v2
@@ -36,7 +36,39 @@ jobs:
       - name: Build and test Cranelift
         run: |
           cargo test --manifest-path mini-c/Cargo.toml -p mini-c-cranelift --lib
-          cargo build --manifest-path mini-c/Cargo.toml -p mini-c-cranelift
+      - name: Build reference compiler independently of unit test outcome
+        if: success() || failure()
+        run: cargo build --manifest-path mini-c/Cargo.toml -p mini-c-cranelift
+      - name: Native GCC bit-pattern oracle for hexadecimal constants
+        if: success() || failure()
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/literals.c" <<'C'
+          float f0(void) { return 0x1.000001p0f; }
+          float f1(void) { return 0x1.0000010000000000000000001p0f; }
+          float f2(void) { return 0x1p-149f; }
+          double d0(void) { return 0x1.00000000000008p0; }
+          double d1(void) { return 0x1.00000000000008000000001p0; }
+          double d2(void) { return 0x1p-1074; }
+          C
+          cat > "$RUNNER_TEMP/oracle.c" <<'C'
+          #include <stdint.h>
+          #include <string.h>
+          extern float f0(void),f1(void),f2(void);
+          extern double d0(void),d1(void),d2(void);
+          static uint32_t bits32(float f) { uint32_t n; memcpy(&n,&f,4); return n; }
+          static uint64_t bits64(double f) { uint64_t n; memcpy(&n,&f,8); return n; }
+          int main(void) {
+            return bits32(f0())!=0x3f800000u || bits32(f1())!=0x3f800001u ||
+              bits32(f2())!=1 || bits64(d0())!=0x3ff0000000000000ull ||
+              bits64(d1())!=0x3ff0000000000001ull || bits64(d2())!=1;
+          }
+          C
+          mini-c/target/debug/mini-c-cranelift --cpp=none --emit-obj "$RUNNER_TEMP/literals.o" "$RUNNER_TEMP/literals.c"
+          gcc "$RUNNER_TEMP/oracle.c" "$RUNNER_TEMP/literals.o" -o "$RUNNER_TEMP/check"
+          "$RUNNER_TEMP/check"
+          gcc "$RUNNER_TEMP/oracle.c" "$RUNNER_TEMP/literals.c" -o "$RUNNER_TEMP/reference"
+          "$RUNNER_TEMP/reference"
       - name: Replay strict observable Csmith
         if: success() || failure()
         run: |
