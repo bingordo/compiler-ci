@@ -1,4 +1,4 @@
-name: Mini-C shared float literal candidate
+name: Mini-C native shared float literal candidate
 on:
   pull_request:
     paths:
@@ -14,68 +14,33 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: d06a608a118be567d0cefea0b7a481496c2b6a9e
+          ref: ce6d46f07fd96e2d5f7d0572cbd3a4480c07de7e
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - uses: actions/checkout@v4
-        with:
-          repository: bingordo/mini-c
-          ref: main
-          fetch-depth: 0
-          path: mini-c
-          persist-credentials: false
-      - name: Integrate exact candidate with current main
-        run: |
-          set -euo pipefail
-          git -C mini-c rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
-          git -C mini-c -c user.name=compiler-ci -c user.email=compiler-ci@users.noreply.github.com merge --no-ff --no-edit af20898ec04bc0ecfaa68f150cfc0fa0e2e051d5
-          git -C mini-c log -1 --format='%H parents=%P' | tee -a "$GITHUB_STEP_SUMMARY"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: mini-c -> target
-          key: minic-hexfloat-candidate
-      - name: Record source and test exact rounding
+      - name: Record exact compiler and frontend pin
         run: |
           git -C compiler rev-parse HEAD
-          git -C mini-c rev-parse HEAD
-          cargo test --manifest-path mini-c/Cargo.toml -p mini-c-sema --test float_literal
-      - name: Build and test Cranelift
-        run: |
-          cargo test --manifest-path mini-c/Cargo.toml -p mini-c-cranelift --lib
-      - name: Build reference compiler independently of unit test outcome
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("compiler/tools/mini-c-driver/Cargo.toml")
+          s=p.read_text()
+          assert s.count("ssh://git@github.com/bingordo/mini-c.git")==2
+          p.write_text(s.replace("ssh://git@github.com/bingordo/mini-c.git","https://github.com/bingordo/mini-c.git"))
+          PY
+          grep 'rev =' compiler/tools/mini-c-driver/Cargo.toml
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: minic-native-hexfloat
+      - name: Native FP literal GCC ELF and GAS oracle
+        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test native_float_literals -- --nocapture
+      - name: Existing adapter unit tests
         if: success() || failure()
-        run: cargo build --manifest-path mini-c/Cargo.toml -p mini-c-cranelift
-      - name: Native GCC bit-pattern oracle for hexadecimal constants
+        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib
+      - name: Build native compiler
         if: success() || failure()
-        run: |
-          set -euo pipefail
-          cat > "$RUNNER_TEMP/literals.c" <<'C'
-          float f0(void) { return 0x1.000001p0f; }
-          float f1(void) { return 0x1.0000010000000000000000001p0f; }
-          float f2(void) { return 0x1p-149f; }
-          double d0(void) { return 0x1.00000000000008p0; }
-          double d1(void) { return 0x1.00000000000008000000001p0; }
-          double d2(void) { return 0x1p-1074; }
-          C
-          cat > "$RUNNER_TEMP/oracle.c" <<'C'
-          #include <stdint.h>
-          #include <string.h>
-          extern float f0(void),f1(void),f2(void);
-          extern double d0(void),d1(void),d2(void);
-          static uint32_t bits32(float f) { uint32_t n; memcpy(&n,&f,4); return n; }
-          static uint64_t bits64(double f) { uint64_t n; memcpy(&n,&f,8); return n; }
-          int main(void) {
-            return bits32(f0())!=0x3f800000u || bits32(f1())!=0x3f800001u ||
-              bits32(f2())!=1 || bits64(d0())!=0x3ff0000000000000ull ||
-              bits64(d1())!=0x3ff0000000000001ull || bits64(d2())!=1;
-          }
-          C
-          mini-c/target/debug/mini-c-cranelift --cpp=none --emit-obj "$RUNNER_TEMP/literals.o" "$RUNNER_TEMP/literals.c"
-          gcc "$RUNNER_TEMP/oracle.c" "$RUNNER_TEMP/literals.o" -o "$RUNNER_TEMP/check"
-          "$RUNNER_TEMP/check"
-          gcc "$RUNNER_TEMP/oracle.c" "$RUNNER_TEMP/literals.c" -o "$RUNNER_TEMP/reference"
-          "$RUNNER_TEMP/reference"
+        run: cargo build --manifest-path compiler/tools/mini-c-driver/Cargo.toml --bin compiler-mini-c
       - name: Replay strict observable Csmith
         if: success() || failure()
         run: |
@@ -84,19 +49,13 @@ jobs:
           sudo apt-get install -qq -y --no-install-recommends csmith libcsmith-dev gcc clang
           [[ $(dpkg-query -W -f='${Version}' csmith) == 2.3.0-* ]]
           header=$(dpkg -L libcsmith-dev | grep '/csmith.h$' | head -n1)
-          export CRANELIFT_BIN="$PWD/mini-c/target/debug/mini-c-cranelift"
-          test -x "$CRANELIFT_BIN"
-          cat > "$RUNNER_TEMP/cranelift-adapter" <<'SH'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          [[ $# == 5 && "$2" == -o && "$4" == --emit && "$5" == obj ]]
-          exec "$CRANELIFT_BIN" --cpp=none --emit-obj "$3" "$1"
-          SH
-          chmod +x "$RUNNER_TEMP/cranelift-adapter"
+          driver="$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c"
+          test -x "$driver"
+          frontend=$(PYTHONPATH=compiler/tools python3 -c 'from csmith_probe import pinned_frontend_revision; import sys; print(pinned_frontend_revision(open(sys.argv[1]).read()))' compiler/tools/mini-c-driver/Cargo.toml)
           evidence="$RUNNER_TEMP/csmith-evidence"
           python3 compiler/tools/csmith_probe.py --generate --cases-dir "$evidence/cases" --csmith csmith --seed-base 1 --seed-count 8 --profile restricted-observable
           rc=0
-          python3 compiler/tools/csmith_probe.py --probe --cases-dir "$evidence/cases" --artifacts-dir "$evidence/results" --include-dir "$(dirname "$header")" --preprocess-c --driver "$RUNNER_TEMP/cranelift-adapter" --compiler-sha "$(git -C compiler rev-parse HEAD)" --frontend-sha "$(git -C mini-c rev-parse HEAD)" --minimum-native 8 --run-timeout 5 --max-wall-seconds 120 || rc=$?
+          python3 compiler/tools/csmith_probe.py --probe --cases-dir "$evidence/cases" --artifacts-dir "$evidence/results" --include-dir "$(dirname "$header")" --preprocess-c --driver "$driver" --compiler-sha "$(git -C compiler rev-parse HEAD)" --frontend-sha "$frontend" --minimum-native 8 --run-timeout 5 --max-wall-seconds 120 || rc=$?
           python3 - "$evidence/results/results.jsonl" <<'PY'
           import json,sys
           for line in open(sys.argv[1]):
@@ -107,6 +66,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: cranelift-hexfloat-evidence
+          name: native-hexfloat-evidence
           path: ${{ runner.temp }}/csmith-evidence
           retention-days: 14
