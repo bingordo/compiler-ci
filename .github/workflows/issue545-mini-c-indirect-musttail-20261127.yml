@@ -1,0 +1,67 @@
+name: Issue545 Mini-C canonical indirect musttail C11 source to native
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/issue545-mini-c-indirect-musttail-20261127.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 38
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout pinned compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9e1f2ecd1454714a476756db9a3f5ea6d6f9aaa0
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout pinned Mini-C checked frontend
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: 2a2af64bf1eb21a685b099b07b2e906c249fff5c
+          path: mini-c
+          persist-credentials: false
+      - name: Prove exact inputs and Cargo pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = '9e1f2ecd1454714a476756db9a3f5ea6d6f9aaa0'
+          test "$(git -C mini-c rev-parse HEAD)" = '2a2af64bf1eb21a685b099b07b2e906c249fff5c'
+          test "$(grep -c '2a2af64bf1eb21a685b099b07b2e906c249fff5c' compiler/tools/mini-c-driver/Cargo.toml)" -eq 2
+          echo "Compiler: `$(git -C compiler rev-parse HEAD)`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Mini-C: `$(git -C mini-c rev-parse HEAD)`" >> "$GITHUB_STEP_SUMMARY"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Resolve public pinned frontend over HTTPS
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: issue545-minic-indirect-tail
+      - name: Mini-C musttail parser regression
+        run: cargo test --manifest-path mini-c/Cargo.toml -p mini-c-syntax --test musttail_return -- --nocapture
+      - name: Mini-C musttail semantic validation and fail-closed cases
+        run: cargo test --manifest-path mini-c/Cargo.toml -p mini-c-sema --test musttail_return -- --nocapture
+      - name: Full Mini-C syntax and checked semantic library regressions
+        run: |
+          cargo test --manifest-path mini-c/Cargo.toml -p mini-c-syntax --lib -- --test-threads=2
+          cargo test --manifest-path mini-c/Cargo.toml -p mini-c-sema --lib -- --test-threads=2
+      - name: Source to native x86 ELF and GAS PIC and frame regressions
+        run: |
+          cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test musttail_source_native -- --nocapture
+          cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test s13_p5c_native -- --nocapture
+      - name: AArch64 cross C compiler and QEMU
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu qemu-user
+      - name: Source to native AArch64 BR X16 and C11 ELF/GAS under QEMU
+        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test musttail_source_indirect_aarch64 -- --nocapture
+      - name: Full Mini-C driver library regression
+        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib -- --test-threads=2
+      - name: Strict Mini-C driver Clippy
+        run: cargo clippy --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --all-targets -- -D warnings
