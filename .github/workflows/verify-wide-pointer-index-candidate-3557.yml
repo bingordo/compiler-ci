@@ -8,7 +8,7 @@ permissions:
 jobs:
   pointer-index:
     runs-on: ubuntu-24.04
-    timeout-minutes: 19
+    timeout-minutes: 27
     steps:
       - uses: actions/checkout@v4
         with:
@@ -89,9 +89,75 @@ jobs:
               exit 1
             fi
           } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Exercise 64-bit high indices against GCC in a sparse virtual reservation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd width-probes
+          cat > highbits.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <sys/mman.h>
+          #include <stddef.h>
+          extern char *add_size_t(char *, unsigned long);
+          extern char *subtract_long(char *, long);
+          extern void advance_size_t(char **, unsigned long);
+          int main(void) {
+            size_t bytes=((size_t)1<<34)+4096;
+            char *region=mmap(0,bytes,PROT_NONE,
+                MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
+            if (region==MAP_FAILED) return 2;
+            char *p=region+64;
+            if (add_size_t(p,1UL<<31)!=region+(1UL<<31)+64) return 3;
+            if (add_size_t(p,1UL<<32)!=region+(1UL<<32)+64) return 4;
+            if (subtract_long(p,-(1L<<32))!=region+(1UL<<32)+64) return 5;
+            advance_size_t(&p,1UL<<32);
+            if (p!=region+(1UL<<32)+64) return 6;
+            if (munmap(region,bytes)!=0) return 7;
+            return 0;
+          }
+          EOF
+          gcc -std=gnu11 -O0 highbits.c gcc-wide.o -o highbits-gcc
+          ./highbits-gcc
+          gcc -std=gnu11 -O0 highbits.c native-wide.o -o highbits-native
+          ./highbits-native
+          echo "TYPEID_I64_HIGH_BIT_AND_4G_OFFSETS=PASS" >> "$GITHUB_STEP_SUMMARY"
+      - name: Unmodified cJSON and next blocker after full-width pointer offsets
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone -q --depth 1 --branch v1.7.19 https://github.com/DaveGamble/cJSON.git cjson
+          test "$(git -C cjson rev-parse HEAD)" = c859b25da02955fef659d658b8f324b5cde87be3
+          cmake -S cjson -B gcc-build -G Ninja -DCMAKE_C_COMPILER=cc -DBUILD_SHARED_LIBS=OFF -DENABLE_CUSTOM_COMPILER_FLAGS=OFF -DENABLE_CJSON_TEST=OFF -DENABLE_CJSON_UTILS=OFF -DENABLE_LOCALES=OFF
+          cmake --build gcc-build
+          test -s gcc-build/libcjson.a
+          compiler="$PWD/compiler/target/debug/compiler"
+          tc="$PWD/compiler/tools/cmake/typeid-gcc-adapter-toolchain.cmake"
+          cmake -S cjson -B native-build -G Ninja -DCMAKE_C_COMPILER="$compiler" -DCMAKE_C_COMPILER_ARG1=--gcc-driver -DCMAKE_TOOLCHAIN_FILE="$tc" -DBUILD_SHARED_LIBS=OFF -DENABLE_CUSTOM_COMPILER_FLAGS=OFF -DENABLE_CJSON_TEST=OFF -DENABLE_CJSON_UTILS=OFF -DENABLE_LOCALES=OFF
+          set +e
+          cmake --build native-build --verbose > native-build.log 2>&1
+          result=$?
+          set -e
+          if grep -Fq 'M9 expects a target-width 32-bit integer' native-build.log; then
+            echo "original full-width pointer-index blocker remains in cJSON" >&2
+            exit 1
+          fi
+          {
+            echo "GCC_CJSON_STATIC_LIBRARY=PASS"
+            echo "TYPEID_CJSON_BUILD_EXIT=$result"
+            if test "$result" -eq 0; then
+              test -s native-build/libcjson.a
+              echo "TYPEID_CJSON_STATIC_LIBRARY=PASS"
+            else
+              echo "TYPEID_CJSON_STATIC_LIBRARY=UNSUPPORTED"
+              echo "First subsequent compiler diagnostics:"
+              grep -m 8 -E 'compiler:|error:|unsupported|fatal' native-build.log || true
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: pointer-wide-3107-log
-          path: width-probes/wide.log
+          path: |
+            width-probes/wide.log
+            native-build.log
           if-no-files-found: ignore
