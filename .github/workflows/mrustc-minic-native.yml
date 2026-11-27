@@ -42,7 +42,7 @@ jobs:
           # Test the merged source-verified TypeId adapter (not the old mixed-global
           # branch) without changing compiler production history.
           # Manual dispatch can still select any explicit source_ref.
-          ref: ${{ inputs.source_ref || '7fc00c603aa052412b6e210b01ee098d33d13fc4' }}
+          ref: ${{ inputs.source_ref || 'dd3bb1a677cabadc21ca92f001236ac4fb98e1b9' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -374,6 +374,30 @@ jobs:
                       cmsg=(tmp/"clif.log").read_text(errors="replace")
                       ccodes=sorted(set(re.findall(r'\b[PLST][0-9]{4}\b',cmsg)))
                       print(f"CLIF_SAMPLE={i} EXIT={crc} ELF={int(clif_out.is_file() and clif_out.open('rb').read(4)==bytes([127,69,76,70]))} DIAG_IDS="+",".join(ccodes),flush=True)
+                      if i==0 and crc!=0:
+                          # Reparse GCC-preprocessed input; only public syntax
+                          # tokens, never source text, paths, or identifiers.
+                          pre=tmp/"private-preprocessed.c"
+                          with pre.open("wb") as dst, (tmp/"cpp.log").open("wb") as err:
+                              pp=subprocess.run(["gcc","-std=gnu11","-E","-P",str(src)],stdout=dst,stderr=err,timeout=180)
+                          if pp.returncode==0:
+                              replay=attempt([str(clif),"-std=gnu11","--cpp=none","--emit-obj",str(tmp/"replay.o"),str(pre)],tmp/"replay.log",180)
+                              raw=(tmp/"replay.log").read_text(errors="replace")
+                              m=re.search(r":(\d+):(\d+): error\[(S[0-9]{4})\]",raw)
+                              print("CLIF_RAW_EXIT="+str(replay)+" LOCATED="+str(int(m is not None)),flush=True)
+                              vocab=set("int long short signed unsigned char void float double struct union enum const volatile extern static typedef inline __attribute__ __attribute __extension__ __auto_type __typeof__ typeof __thread _Thread_local __asm__ asm __aligned__ aligned __builtin_va_list __int128 __float128 _Atomic _Alignas _Alignof __restrict __restrict__ if else for while return goto case default switch break continue".split())|set("(){}[];,=*&:+-/%<>!~?")
+                              expected=re.search(r"expected '([^'\n]*)', found '([^'\n]*)'",raw)
+                              if expected:
+                                  print("CLIF_EXPECTED="+(expected[1] if expected[1] in vocab else "other")+" FOUND="+(expected[2] if expected[2] in vocab else "other"),flush=True)
+                              if m:
+                                  import itertools
+                                  ln,col=map(int,m.groups()[:2])
+                                  with pre.open(errors="replace") as f:
+                                      row=next(itertools.islice(f,ln-1,ln),"")
+                                  ts=list(re.finditer(r"[A-Za-z_][A-Za-z_0-9]*|[0-9]+|[^\s]",row))
+                                  k=next((j for j,t in enumerate(ts) if t.end()>=col),None)
+                                  if k is not None:
+                                      print("CLIF_TOKEN_SEQUENCE="+",".join(t.group() if t.group() in vocab else "other" for t in ts[max(0,k-4):k+6]),flush=True)
                   # Only compiler-owned diagnostic IDs and fixed categories leave the runner.
                   msg=(tmp/"native.log").read_text(errors="replace").split("\nusage:",1)[0]
                   # Check public headers independently using the same native driver.
@@ -416,6 +440,27 @@ jobs:
                           else:
                               for line in (tmp/"layout.log").read_text(errors="replace").splitlines()[:3]:
                                   print("PUBLIC_LAYOUT_DIAG="+line[:300],flush=True)
+                  # The native bridge's errors need not carry a parser ID.
+                  # Export only fixed public attribute names and diagnostic classes.
+                  attr=re.search(r"unsupported GNU symbol attribute '([^'\n]+)'",msg)
+                  if attr:
+                      public=set("aligned packed section used unused weak visibility alias constructor destructor always_inline noinline cold hot noreturn returns_twice malloc format nonnull leaf nothrow access alloc_size alloc_align transparent_union vector_size mode may_alias deprecated externally_visible retain fallthrough cleanup sentinel warning error tls_model".split())
+                      name=attr[1].strip("_")
+                      print("NATIVE_UNSUPPORTED_GNU_ATTR="+(name if name in public else "other"),flush=True)
+                  for tag,phrase in {
+                      "annotation_size":"GNU annotated source too large",
+                      "annotation_count":"too many GNU annotations",
+                      "annotation_mixed":"mixed GNU advisory and symbol binding",
+                      "annotation_orphan":"GNU annotation not attached",
+                      "annotation_ambiguous":"ambiguous GNU annotation span",
+                      "tls_definition":"TLS address",
+                      "expected_type":"expected type",
+                      "statement_transfer":"checked statement expression unexpectedly terminated",
+                      "frame_slot":"frame slot",
+                      "unsupported_storage":"unsupported local storage class",
+                  }.items():
+                      if phrase in msg:
+                          print("NATIVE_DETAIL="+tag,flush=True)
                   # Emit only enumerated syntax tokens, never source identifiers or literals.
                   allowed = {";",",","(",")","{","}","[","]","*","=","...",":","__attribute__","__aligned__","__alignof__","__extension__","__asm__","__typeof__","typeof","_Atomic","_Alignas","_Alignof","_Static_assert","__atomic_load_n","__atomic_store_n","__int128","__float128","__builtin_va_list","__restrict","__restrict__","volatile","const","struct","union","enum","typedef","inline","int","char","void","long","short","unsigned","signed","float","double"}
                   m = re.search(r"expected '([^'\n]*)', found '([^'\n]*)'", msg)
