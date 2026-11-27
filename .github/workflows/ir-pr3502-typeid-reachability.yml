@@ -1,0 +1,56 @@
+# One-off source-pinned compiler IR reachability regression check.
+# Keep this on a temporary compiler-ci PR; never merge into recurring main.
+name: IR PR3502 canonical direct-call reachability
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ir-pr3502-typeid-reachability.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ir-pr3502-reachability-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  canonical-calls:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      COMPILER_SHA: fb4673d9c7c2f9b53ab2be026a4e18f00e6940f2
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.COMPILER_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source and isolate IR and optimizer workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          echo "Compiler SHA: $COMPILER_SHA" >> "$GITHUB_STEP_SUMMARY"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-pr3502-reachability
+      - name: Run native whole-module call-chain and pruning tests
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib dead_functions::tests -- --nocapture
+          cargo test -p compiler-opt --test dead_functions_reachability -- --nocapture
+      - name: Strict lint of changed optimizer library
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt --lib -- -D warnings
