@@ -1,0 +1,90 @@
+name: TEMP default x86 MOV source census 20261127
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temp-x86-default-mov-census-20261127.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source-census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 28
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 56ab1e43fee63e211177659bd70a0d3dd5e047ed
+          path: compiler
+          persist-credentials: false
+          ssh-key: ${{ secrets.CI_KEY }}
+      - name: Verify compiler and configure toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "56ab1e43fee63e211177659bd70a0d3dd5e047ed"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          echo "Exact compiler 56ab1e43fee63e211177659bd70a0d3dd5e047ed" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x86-default-mov-census
+      - name: Build production Mini-C compiler
+        working-directory: compiler
+        run: cargo build -p compiler --bin compiler
+      - name: Run real unprofiled source MOV inventory
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/straight.c" <<'SRC'
+          int identity(int x) { return x; }
+          int add_pair(int x,int y) { return x+y; }
+          int combine(int x,int y,int z) {
+              int sum=x+y;
+              if (z>0) sum=sum+z;
+              else sum=sum-z;
+              return sum;
+          }
+          int remap(int a,int b,int c,int d) {
+              int x=a+b;int y=c+d;
+              if (x>y) return x-y;
+              return y-x;
+          }
+          SRC
+          : > "$RUNNER_TEMP/mov-census.log"
+          for item in rolling_checksum branch_pressure straight x86_pgo_edges; do
+            case "$item" in
+              rolling_checksum|branch_pressure) source="tests/fixtures/inliner/$item.c" ;;
+              straight) source="$RUNNER_TEMP/straight.c" ;;
+              x86_pgo_edges) source="tests/fixtures/x86_pgo_edges.c" ;;
+            esac
+            echo "CENSUS_CASE=$item" | tee -a "$RUNNER_TEMP/mov-census.log"
+            COMPILER_X86_MOV_CENSUS=1 target/debug/compiler "$source" --language mini-c --target x86_64 --emit obj -o "$RUNNER_TEMP/$item.o" 2>&1 | tee -a "$RUNNER_TEMP/mov-census.log"
+          done
+          python3 - "$RUNNER_TEMP/mov-census.log" <<'PY'
+          import re,sys,collections
+          case=None; totals=collections.Counter(); bysite=collections.Counter()
+          for line in open(sys.argv[1]):
+              if line.startswith('CENSUS_CASE='):
+                  case=line.strip().split('=',1)[1]
+              m=re.search(r'X86_MOV_SUMMARY function=(\S+) region=(\S+) count=(\d+)',line)
+              if m: totals[(case,m[2])]+=int(m[3])
+              m=re.search(r'X86_MOV_SOURCE function=(\S+) region=(\S+) block=(\S+) site=(\S+) kind=(\S+) count=(\d+)',line)
+              if m: bysite[(case,m[2],m[5])]+=int(m[6])
+          assert totals and totals[('rolling_checksum','total')]>0
+          for (case,region),n in sorted(totals.items()):
+              print(f'CENSUS_AGG case={case} region={region} movs={n}')
+          for (case,region,kind),n in sorted(bysite.items(),key=lambda x:-x[1])[:35]:
+              print(f'CENSUS_KIND case={case} region={region} kind={kind} movs={n}')
+          PY
+      - name: Save physical MOV receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x86-default-mov-census
+          path: ${{ runner.temp }}/mov-census.log
+          if-no-files-found: ignore
