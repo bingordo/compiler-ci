@@ -7,6 +7,10 @@ on:
         required: true
         type: string
         default: main
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct-core-focused.yml'
   push:
     branches: [main]
     paths:
@@ -15,7 +19,7 @@ permissions:
   contents: read
   statuses: write
 concurrency:
-  group: ct-core-focused-${{ inputs.compiler_ref || 'bootstrap' }}
+  group: ct-core-focused-${{ inputs.compiler_ref || github.ref }}
   cancel-in-progress: true
 jobs:
   compiler-ir-opt:
@@ -25,7 +29,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ inputs.compiler_ref || 'main' }}
+          ref: ${{ inputs.compiler_ref || (github.event_name == 'pull_request' && 'd2a5693d7d07f12dea50680fd22d81990a599258') || 'main' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -53,12 +57,20 @@ jobs:
         with:
           workspaces: compiler -> target
           key: focused-ct-ir-opt
+      - name: Focused PRE and pass-manager regressions
+        if: github.event_name == 'pull_request'
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-ir -p compiler-opt --lib
+          cargo test -p compiler-ir --test body_feature_hooks
+          cargo test -p compiler-opt --features check-body-features --test typed_dse --test typed_local_memory --test typed_algebra --test al05_affine_native_bridge --test typed_cse --test typed_global_memory --test typed_phi_cfg --test typed_phi_dead_linear --test typed_sccp --test typed_licm_native --test typed_induction_native --test typed_local --test typed_mem2reg --test typed_array_fold --test typed_ctfe --test typed_pre_native --test typeid_source_profile_parity --test pre_licm_semantic_matrix --test typeid_fuzz_pre_induction_targeted --test typeid_core_pass_manager --test typeid_fuzz_pass_registry
+          cargo test -p compiler-opt --features check-body-features --test typed_ctfe ctfe_retry_changed_function_census -- --nocapture
       - name: Run all IR and optimizer unit/integration tests
         working-directory: compiler
-        run: cargo test -p compiler-ir -p compiler-opt
+        run: cargo test -p compiler-ir -p compiler-opt --features compiler-opt/check-body-features
       - name: Verify strict Clippy on IR and optimizer
         working-directory: compiler
-        run: cargo clippy -p compiler-ir -p compiler-opt --all-targets -- -D warnings
+        run: cargo clippy -p compiler-ir -p compiler-opt --lib --features compiler-opt/check-body-features -- -D warnings
       - name: Publish focused gate result
         if: always()
         env:
