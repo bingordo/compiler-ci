@@ -103,14 +103,15 @@ jobs:
           echo "Scheduled compiler main revision: $sha" >> "$GITHUB_STEP_SUMMARY"
 
   core:
-    if: github.event_name != 'schedule' && github.event_name != 'pull_request'
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ inputs.source_ref || 'main' }}
+          # Temporary candidate pin for PR-only plan validation; remove after runner lands.
+          ref: ${{ github.event_name == 'pull_request' && '32bbb3bdf87462df8ae2d35dc80e3d4faf018dd7' || inputs.source_ref || 'main' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -123,13 +124,42 @@ jobs:
           [workspace]
           resolver = "2"
           members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          exclude = ["crates/ir-macros", "crates/backend-aarch64"]
           EOF
           rm -f compiler/Cargo.lock
+      - name: Verify exact four-package runner plan
+        working-directory: compiler
+        run: |
+          python3 - <<'PY'
+          import json, subprocess
+          metadata = json.loads(subprocess.check_output(
+              ["cargo", "metadata", "--no-deps", "--format-version", "1"]))
+          members = set(metadata["workspace_members"])
+          actual = {p["name"] for p in metadata["packages"] if p["id"] in members}
+          expected = {"compiler-ir", "compiler-opt", "compiler-backend", "compiler-backend-x86"}
+          assert actual == expected, "Core package scope changed; review the explicit test selection"
+          PY
+          python3 - <<'PY'
+          import subprocess
+          result = subprocess.check_output(
+              ["python3", "tools/regression.py", "--profile", "workspace",
+               "--suite", "cargo-tests", "--no-isolate-build-failures", "--list"],
+              text=True)
+          commands = [line.split() for line in result.splitlines()
+                      if line.startswith(("cargo-build ", "cargo-tests "))]
+          assert commands == [
+              ["cargo-build", "cargo", "test", "--workspace", "--no-fail-fast", "--no-run"],
+              ["cargo-tests", "cargo", "test", "--workspace", "--no-fail-fast"],
+          ], "Expected one ordinary workspace build and test invocation"
+          print("Four-package runner plan verified")
+          PY
       - uses: Swatinem/rust-cache@v2
+        if: github.event_name != 'pull_request'
         with:
           workspaces: compiler -> target
           key: external-core
       - name: Install required native GDB test dependency
+        if: github.event_name != 'pull_request'
         shell: bash
         run: |
           sudo apt-get update -qq
@@ -137,9 +167,11 @@ jobs:
           command -v gdb
           gdb --version | head -n 1
       - name: Verify x86 native loop backedge regression
+        if: github.event_name != 'pull_request'
         working-directory: compiler
         run: cargo test -p compiler-backend-x86 --test bt4_x86_historical_arity_phi_native
       - name: Verify core and x86 backend
+        if: github.event_name != 'pull_request'
         working-directory: compiler
         # The workspace above contains exactly the four previously selected crates.
         run: python3 tools/regression.py --profile workspace --suite cargo-tests --no-isolate-build-failures --output target/regression-core
