@@ -1,0 +1,78 @@
+name: Mini-C integer union ABI candidate
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/minic-integer-union-candidate.yml'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  candidate:
+    if: github.head_ref == 'ci/minic-integer-union-abi' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1d8f6f4e2bc6e590f0654cdc313e834ef69d1276
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Exact source pins
+        run: |
+          git -C compiler rev-parse HEAD
+          grep 'rev =' compiler/tools/mini-c-driver/Cargo.toml
+          sed -i 's|ssh://git@github.com/bingordo/mini-c.git|https://github.com/bingordo/mini-c.git|g' compiler/tools/mini-c-driver/Cargo.toml
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: minic-native-hexfloat
+      - name: GCC union and bitfield ABI oracles
+        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test integer_union_abi --test bitfield_integer_abi --test record_array_storage -- --nocapture
+      - name: Build driver
+        if: success() || failure()
+        run: cargo build --manifest-path compiler/tools/mini-c-driver/Cargo.toml --bin compiler-mini-c
+      - uses: actions/download-artifact@v4
+        if: success() || failure()
+        with:
+          name: minic-bitfield-abi-evidence-bitfield-abi
+          run-id: '46045840708'
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/storage-replay
+      - name: Replay original union inputs
+        if: success() || failure()
+        env:
+          INPUTS: ${{ runner.temp }}/storage-replay
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,subprocess
+          root=pathlib.Path(os.environ["INPUTS"])/"restricted-unions"/"results"
+          driver=pathlib.Path("compiler/tools/mini-c-driver/target/debug/compiler-mini-c").resolve()
+          rows=[json.loads(x) for x in (root/"results.jsonl").read_text().splitlines()]
+          passed=0
+          for row in rows:
+              seed=row["seed"]
+              pre=root/f"case-{seed}"/"candidate.i"
+              assert hashlib.sha256(pre.read_bytes()).hexdigest()==row["preprocessed_sha256"]
+              work=pre.parent
+              obj=work/"new.o"
+              exe=work/"new.bin"
+              ref=work/"ref.bin"
+              subprocess.run(["gcc","-std=c99","-w","-O2",str(pre),"-o",str(ref)],check=True,timeout=30)
+              expect=subprocess.run([str(ref)],capture_output=True,check=True,timeout=5).stdout
+              assert b"checksum" in expect
+              result=subprocess.run([str(driver),str(pre),"--omit-unreferenced-static-bodies","--emit","obj","-o",str(obj)],capture_output=True,timeout=30)
+              if result.returncode:
+                  print("UNION_REPLAY",seed,"rejected",result.stderr.decode(errors="replace").splitlines()[0],flush=True)
+                  assert row["classification"]!="passed", (seed,"regression")
+                  continue
+              subprocess.run(["gcc",str(obj),"-o",str(exe)],check=True,timeout=30)
+              actual=subprocess.run([str(exe)],capture_output=True,check=True,timeout=5).stdout
+              assert actual==expect,(seed,actual,expect)
+              passed+=1
+              print("UNION_REPLAY",seed,"passed",flush=True)
+          print("UNION_TOTAL",passed,len(rows))
+          assert passed>=10
+          PY
