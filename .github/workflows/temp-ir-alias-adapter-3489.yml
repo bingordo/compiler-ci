@@ -1,0 +1,57 @@
+name: Temporary TypeId local-alias adapter retirement acceptance
+on:
+  pull_request:
+    paths: ['.github/workflows/temp-ir-alias-adapter-3489.yml']
+permissions: {contents: read}
+jobs:
+  native-memory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: 0111c905698aca2d202ddcbbc370a4d6f4951634
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin exact compiler commit and isolate optimizer
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-typeid-alias-adapter-retirement
+      - name: Obsolete Function alias entry and adapters remain absent
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          if git grep -nE 'classify_local_locations\(f: &Function|impl AliasBody for Function|use compiler_ir::Function' -- crates/opt/src/memory_alias_analysis.rs; then exit 1; fi
+          git grep -n 'pub fn classify_local_locations_typed' -- crates/opt/src/memory_alias_analysis.rs
+      - name: Full native alias, memory and independent execution regressions
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test alias_phi_exhaustive --test alias_phis --test memory_analysis_bounds --test memory_execution_oracle
+          cargo test -p compiler-opt --test typed_local_memory --test typed_global_memory --test typed_dse
+      - name: Compile all optimizer targets and strict production lint
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --all-targets
+          cargo clippy -p compiler-opt --lib -- -D warnings
+      - name: TypeId production export boundary
+        working-directory: compiler
+        run: python3 tools/check_mixed_function_export_boundary.py
