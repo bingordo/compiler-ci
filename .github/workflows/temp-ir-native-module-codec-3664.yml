@@ -1,0 +1,46 @@
+name: Temporary native module codec retirement acceptance
+on:
+  pull_request:
+    paths: ['.github/workflows/temp-ir-native-module-codec-3664.yml']
+permissions:
+  contents: read
+jobs:
+  codec-retirement:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      SOURCE_SHA: b8c79f3f14f35752318bf0aea47cd6c1009528f7
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source and inventory remaining historical codec callers
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          for symbol in 'read_type_annotated_module|write_type_annotated_module|value_text::' 'read_typed_module|write_typed_module|typed_text::' 'module_text::|ModuleSnapshot' 'legacy_function_signature|signatures::'; do
+            echo "=== $symbol ==="
+            git grep -nE "$symbol" -- '*.rs' '*.toml' '*.py' '*.yml' '*.yaml' || test "$?" = 1
+          done
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/ir-macros"]
+          EOF
+          rm -f Cargo.lock
+      - name: Native full module codec, declarations and canonical roundtrip
+        working-directory: compiler
+        run: cargo test -p compiler-ir --test native_module_data --test native_module_text_v3 --test native_module_declarations_v3 --test native_type_records_v3
+      - name: Existing IR unit and integration regression
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo test -p compiler-ir --lib
+      - name: Production graph boundary
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: python3 tools/check_mixed_function_export_boundary.py
