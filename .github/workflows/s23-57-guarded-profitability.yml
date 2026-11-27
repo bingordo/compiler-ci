@@ -1,0 +1,124 @@
+name: S23.57 pinned guarded batch profitability census
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-57-guarded-profitability.yml'
+permissions:
+  contents: read
+jobs:
+  guarded-cohorts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5d2ddb81c49662d5474f7130ad16f541371b8ec7
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record and verify exact compiler source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 5d2ddb81c49662d5474f7130ad16f541371b8ec7
+          echo "S2357_COMPILER_SHA=$(git -C compiler rev-parse HEAD)"
+      - name: Isolate core workspace from private frontend-only dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86","crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: s2357-opt-in-guarded-census
+      - name: Test TypeId admission and new no-mutation exact count receipts
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib --features experimental-typeid-guarded-admission generated_guarded_admission -- --nocapture
+      - name: Preserve default-on matcher and default-off build
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test native_s2350_shadow_parity
+          cargo test -p compiler-opt --test native_default_generated_flags
+          cargo check -p compiler-opt --no-default-features
+      - name: Validate benchmark sample generation and compile explicit profiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m compileall -q compiler/tools/typeid-rule-gen/guarded_bench_corpus.py
+          mkdir -p results
+          python3 compiler/tools/typeid-rule-gen/guarded_bench_corpus.py \
+            --out-dir results/source --seed 2357 --count 256
+          cargo build -q --manifest-path compiler/crates/opt/Cargo.toml \
+            --features experimental-typeid-guarded-admission --example profile_guarded_batch
+      - name: Run validated native TypeId corpus before/after the normal optimizer
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/time -f 'S2357_SAMPLED_PROFILE_WALL_S=%e S2357_SAMPLED_PROFILE_PEAK_RSS_KB=%M' \
+            compiler/target/debug/examples/profile_guarded_batch --after-native \
+            results/source/s2357-synthetic-i8.ir \
+            results/source/s2357-synthetic-i16.ir \
+            results/source/s2357-synthetic-i32.ir \
+            results/source/s2357-synthetic-i64.ir \
+            results/source/s2357-synthetic-i128.ir > results/corpus-results.jsonl
+          python3 - <<'PY'
+          import json
+          from collections import defaultdict
+          from pathlib import Path
+          rows = [json.loads(line) for line in Path('results/corpus-results.jsonl').read_text().splitlines()]
+          assert len(rows) == 10, len(rows)
+          result = defaultdict(lambda: defaultdict(int))
+          byrule = defaultdict(lambda: defaultdict(int))
+          for row in rows:
+              assert row['schema'] == 'compiler.guarded-batch-profitability.v1'
+              assert row['functions'] == 256
+              assert row['matched'] == row['admitted'] + row['skipped_shared'] + row['skipped_conflict']
+              assert row['input_intbins'] - row['output_intbins'] == row['admitted']
+              assert row['input_instructions'] >= row['output_instructions']
+              assert row['matcher_ns'] >= 0 and row['transaction_ns'] >= 0
+              assert len({x['id'] for x in row['active_rules']}) == len(row['active_rules'])
+              assert all(x['admitted'] <= x['matched'] for x in row['active_rules'])
+              assert sum(x['matched'] for x in row['active_rules']) == row['matched']
+              assert sum(x['admitted'] for x in row['active_rules']) == row['admitted']
+              for key in ['functions', 'matched', 'admitted', 'skipped_shared', 'skipped_conflict',
+                          'input_intbins', 'output_intbins', 'matcher_ns', 'transaction_ns']:
+                  result[row['stage']][key] += row[key]
+              for rule in row['active_rules']:
+                  byrule[row['stage']][rule['id']] += rule['admitted']
+          assert set(result) == {'unoptimized', 'after_native_integer'}
+          report = {'schema':'compiler.guarded-batch-profitability-census.v1',
+                    'source_kind':'synthetic-native-integer-v2',
+                    'source_seed':2357, 'functions_per_width':256,
+                    'records':len(rows), 'stages':dict(result),
+                    'admitted_by_rule':{k:dict(v) for k,v in byrule.items()}}
+          Path('results/summary.json').write_text(json.dumps(report,sort_keys=True,indent=2)+'\n')
+          print('S2357_SYNTHETIC_COHORT_SUMMARY '+json.dumps(report,sort_keys=True))
+          PY
+      - name: Strict lint only the opt-in profiling and matcher
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --lib --example profile_guarded_batch \
+            --features experimental-typeid-guarded-admission -- -D warnings -A dead_code
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: s2357-verified-corpus-statistics
+          path: |
+            results/corpus-results.jsonl
+            results/summary.json
+          retention-days: 14
