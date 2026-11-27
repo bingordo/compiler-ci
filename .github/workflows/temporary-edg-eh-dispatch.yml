@@ -1,0 +1,140 @@
+# Temporary exact-source EH dispatch probe; do not merge.
+name: EDG source-owned ordered catch dispatch
+on:
+  pull_request:
+    paths: ['.github/workflows/temporary-edg-eh-dispatch.yml']
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8
+    defaults:
+      run:
+        shell: edg-container-exec "bash -eo pipefail {0}"
+    env:
+      EDGCPP_EDG_REVISION: b195677be8b9b56c8337afad6be8064d21a54082
+      EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+      EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+      EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+      CARGO_PROFILE_DEV_DEBUG: '0'
+    steps:
+      - name: Check out exact upstream EDG
+        uses: actions/checkout@v4
+        with:
+          repository: bingundu/edgcpp
+          ref: b195677be8b9b56c8337afad6be8064d21a54082
+          path: edgcpp
+          persist-credentials: false
+      - name: Check out exact Rust bridge
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/edgcpp-rust
+          ref: 0ed09b0d1f9ac2899abadb3aaf2bfbc96448fbfe
+          path: edgcpp-rust
+          persist-credentials: false
+      - name: Build independent EDG source configuration with separate initializer routines
+        working-directory: edgcpp
+        env:
+          EDG_BASE: ${{ github.workspace }}/edgcpp/bases/docker/dev-env/gcc
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EDGCPP_EDG_REVISION"
+          # Source-backed macro configuration, not a binary/archive mismatch:
+          # EDG and the bridge MUST compile against the SAME generated header.
+          test -f cmake/macro-conf/linux-gcc-release/base.cmakedef
+          mkdir -p cmake/macro-conf/linux-gcc-eh-retained
+          printf 'import <linux-gcc-release/base>\nSEPARATE_ROUTINES_FOR_FILE_SCOPE_DYNAMIC_INITS=1\nDO_FULL_PORTABLE_EH_LOWERING=0\nGENERATE_EH_TABLES=0\n' \
+            >cmake/macro-conf/linux-gcc-eh-retained/base.cmakedef
+          printf 'import <linux-gcc-release/cpfe>\nBACK_END_IS_C_GEN_BE=0\nDO_IL_LOWERING=1\n' \
+            >cmake/macro-conf/linux-gcc-eh-retained/cpfe.cmakedef
+          printf 'import <linux-gcc-release/cdisp>\n' \
+            >cmake/macro-conf/linux-gcc-eh-retained/cdisp.cmakedef
+          cmake --preset linux-gcc-release \
+            -DEDG_MACRO_CONF=linux-gcc-eh-retained \
+            -DEDG_BUILD_LIB=OFF -DEDG_BUILD_CALLABLE_LIBRARY=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          grep -Eq '^#define SEPARATE_ROUTINES_FOR_FILE_SCOPE_DYNAMIC_INITS[[:space:]]+1$' \
+            build/gcc-release/src/includes/cmake_defines.h
+          echo 'EDG source-mode generated EH and backend definitions:'
+          grep -R -n -E '^#define (DO_FULL_PORTABLE_EH_LOWERING|GENERATE_EH_TABLES|BACK_END_IS_C_GEN_BE|DO_IL_LOWERING)' build/gcc-release/src/includes | head -n 32 || true
+          # The usual prebuilt archive has a different native IL layout and
+          # must NEVER be used for this alternate-configuration experiment.
+          cmake --build build/gcc-release --target edgcpfe --parallel 4
+          test -s build/gcc-release/lib/libedgcpfe.a
+          echo 'EDG_SEPARATE_INIT_BUILD=source macro=1' >> "$GITHUB_STEP_SUMMARY"
+      - name: Install Rust 1.99.1 and build compatible bridge
+        run: |
+          set -euo pipefail
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --profile minimal --default-toolchain 1.99.1
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
+          source edgcpp/build/gcc-release/environment.sh
+          python3 edgcpp-rust/tools/gen_wire_schema.py --check
+          test "$(git -C edgcpp-rust rev-parse HEAD)" = 0ed09b0d1f9ac2899abadb3aaf2bfbc96448fbfe
+          cargo test --manifest-path edgcpp-rust/Cargo.toml --test retained_eh -- --nocapture
+          cargo build --manifest-path edgcpp-rust/Cargo.toml --example parse
+          cargo test --manifest-path edgcpp-rust/Cargo.toml --lib retained_native_eh_wire_tests -- --nocapture
+          cargo test --manifest-path edgcpp-rust/Cargo.toml --lib \
+            separate_file_scope_initializer_owner_wire_tests -- --nocapture
+          cargo test --manifest-path edgcpp-rust/Cargo.toml --lib \
+            startup_provenance::tests:: -- --nocapture
+          cargo test --manifest-path edgcpp-rust/Cargo.toml --lib \
+            startup_provenance::tests::cleanup_call_requires_exact_direct_child_list -- --nocapture
+      - name: Parse original C++ throw catch with destructor using source-built retained mode
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source build/gcc-release/environment.sh
+          cat >build/gcc-release/eh-probe.cpp <<'CPP'
+          int touched=0;
+          struct Effect { ~Effect() noexcept { touched=touched*10+2; } };
+          int f() { try { Effect a; throw 7; } catch(double) { return -1; } catch(int n) { return touched*10+n; } catch(...) { return -2; } }
+          int main() { return f()!=27; }
+          CPP
+          cd build/gcc-release
+          gnu_number="$(g++ -dumpfullversion -dumpversion | awk -F. '{printf "%d%02d%02d",$1,$2,$3}')"
+          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" \
+            --example parse -- --g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number" \
+            eh-probe.cpp > "$RUNNER_TEMP/eh-probe.log" 2>&1 || {
+              tail -n 80 "$RUNNER_TEMP/eh-probe.log"; exit 1;
+            }
+          grep -Fq 'EDG status: 0' "$RUNNER_TEMP/eh-probe.log"
+          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" \
+            --example audit_retained_eh_semantics -- --g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number" \
+            eh-probe.cpp > "$RUNNER_TEMP/native-eh-semantic-audit.log" 2>&1 || {
+              tail -n 80 "$RUNNER_TEMP/native-eh-semantic-audit.log"; exit 1;
+            }
+          grep -Eq '^EDG_RETAINED_EH_SEMANTICS actions=[1-9][0-9]* kinds=\[.*\] internal_try=[0-9]+ itanium_abi_admitted=false$' "$RUNNER_TEMP/native-eh-semantic-audit.log"
+          grep -Eq '^EDG_NATIVE_EH_CLEANUP null=[0-9]+ joined=[0-9]+ unresolved=[0-9]+ regions=0$' "$RUNNER_TEMP/native-eh-semantic-audit.log"
+          grep -E '^EDG_NATIVE_EH_CLEANUP' "$RUNNER_TEMP/native-eh-semantic-audit.log" | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -Eq '^EDG_NATIVE_EH_TARGETS handlers=[1-9][0-9]* tries=[0-9]+ routines=[1-9][0-9]* unresolved=0$' "$RUNNER_TEMP/native-eh-semantic-audit.log"
+          grep -E '^EDG_NATIVE_EH_TARGETS' "$RUNNER_TEMP/native-eh-semantic-audit.log" | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -Eq '^EDG_NATIVE_CATCH_DISPATCH regions=[1-9][0-9]* clauses=3$' "$RUNNER_TEMP/native-eh-semantic-audit.log"
+          grep -E '^EDG_NATIVE_CATCH_DISPATCH' "$RUNNER_TEMP/native-eh-semantic-audit.log" | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -Fx 'EDG_NATIVE_CATCH_METADATA typed=2 catch_all=1 typed_with_rtti=2' "$RUNNER_TEMP/native-eh-semantic-audit.log" | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -E '^EDG_RETAINED_EH_SEMANTICS' "$RUNNER_TEMP/native-eh-semantic-audit.log" | tee -a "$GITHUB_STEP_SUMMARY"
+          # A successful parse alone does not prove the retained EH action
+          # source is present: require at least one original event 106.
+          grep -Eq '^EDG_NATIVE_RETAINED_EH nodes=[1-9][0-9]* itanium_abi_admitted=false$' "$RUNNER_TEMP/eh-probe.log" || {
+            grep -E 'EDG_NATIVE_RETAINED_EH|EDG status:|indexed IL' "$RUNNER_TEMP/eh-probe.log" | head -n 35 || true
+            exit 1
+          }
+          grep -E '^EDG_NATIVE_RETAINED_EH' "$RUNNER_TEMP/eh-probe.log" | head -n 14
+          g++ -std=c++17 -O0 eh-probe.cpp -o "$RUNNER_TEMP/eh-gcc"
+          "$RUNNER_TEMP/eh-gcc"
+          python3 - "$RUNNER_TEMP/eh-probe.log" <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import sys
+          text=open(sys.argv[1]).read()
+          print("EDG_SOURCE_EH=parsed GCC_ORACLE=exit0 TYPEID_ABI_ADMITTED=false")
+          print("portable_head_mentions=",text.count("__curr_eh_stack_entry"),
+                "native_try_mentions=",text.count("try_block"),
+                "lowered_eh_mentions=",text.count("lowered_eh_construct"))
+          PY
