@@ -42,7 +42,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 8c0113f4c15a2b599760caee41e2b44eda1fe189
+          ref: ef7fa517de685c0e9a3afd03d146a0036e5f7876
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -56,7 +56,7 @@ jobs:
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "Compiler source SHA: $sha"
-          [[ "$sha" == "8c0113f4c15a2b599760caee41e2b44eda1fe189" ]] || { echo "P18 24-case wrong compiler source revision"; exit 1; }
+          [[ "$sha" == "ef7fa517de685c0e9a3afd03d146a0036e5f7876" ]] || { echo "P18 24-case wrong compiler source revision"; exit 1; }
           # Fail rather than silently accepting a moved/absent test suite.
           for test_source in \
             crates/opt/tests/native_cfg_differential.rs \
@@ -329,6 +329,40 @@ jobs:
             gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
           aarch64-linux-gnu-gcc --version
           qemu-aarch64 --version
+      - name: P18 focused AArch64 m3s5c0 diagnostic
+        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
+        shell: bash
+        working-directory: compiler
+        env:
+          AL05_REQUIRE_AARCH64: '1'
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 2m cargo test -p compiler-opt --test al05_p9_mixed_native_bridge \
+            al05_p18_native_sensitivity::al05_p18_native_aarch64_m3s5c0_repro \
+            -- --exact --ignored --nocapture 2>&1 | tee "$RUNNER_TEMP/al05-p18-focused.log"
+          grep -F 'test al05_p18_native_sensitivity::al05_p18_native_aarch64_m3s5c0_repro ... ok' "$RUNNER_TEMP/al05-p18-focused.log"
+
+      - name: Diagnose failed P18 native trap path
+        if: failure()
+        shell: bash
+        run: |
+          set -eu
+          shopt -s nullglob
+          for dir in /tmp/al05-p9-mixed-dag-native-p18-aarch64-*; do
+            for obj in "$dir"/raw.o "$dir"/run-elf "$dir"/run-gas; do
+              if [ -f "$obj" ]; then
+                aarch64-linux-gnu-objdump -d --disassemble=Al05P9Mixed_P18_Raw "$obj" > "$obj.disassembly.txt" || true
+              fi
+            done
+            for exe in "$dir"/run-elf "$dir"/run-gas; do
+              if [ -x "$exe" ]; then
+                AL05_P18_TRACE=1 AL05_P18_PROBE=original-entered-trap \
+                  timeout --kill-after=1s 3s qemu-aarch64 -d in_asm -D "$exe.qemu.trace" "$exe" \
+                  > "$exe.probe.log" 2>&1 || true
+              fi
+            done
+          done
+
       - name: P18 AArch64 QEMU native mutant witness and no-op oracle sensitivity
         if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
         shell: bash
@@ -607,6 +641,9 @@ jobs:
             ${{ runner.temp }}/al05-linear-native-bridge.log
             ${{ runner.temp }}/al05-diamond-native-bridge.log
             ${{ runner.temp }}/al05-p8-native-dag.log
+            ${{ runner.temp }}/al05-p18-focused.log
+            ${{ runner.temp }}/al05-p18-aarch64-24.log
+            /tmp/al05-p9-mixed-dag-native-p18-aarch64-*/
             /tmp/al05-native-*/
             /tmp/al05-affine-native-*/
             /tmp/al05-param-native-*/
