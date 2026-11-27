@@ -1,0 +1,60 @@
+name: Temporary TypeId CT03 and pointer-alias test cutover
+on:
+  pull_request:
+    paths: ['.github/workflows/temp-ir-ct03-alias-3481.yml']
+permissions: {contents: read}
+jobs:
+  native-ct03-alias:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      SOURCE_SHA: 3234413556d6c76cf2c61aa3a06d7556bbdf2fb0
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact SHA and isolate tested optimizer
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-ct03-alias
+      - name: No historical Function graph API in retired optimizer tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          if git grep -nE 'to_legacy\(|from_legacy\(|native_memory_fixture|from_function\(|use compiler_ir::.*Function' -- crates/opt/tests/ct03_closeout.rs crates/opt/tests/alias_phi_exhaustive.rs; then
+            exit 1
+          fi
+      - name: Native regression and 216-case pointer phi matrices
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test ct03_closeout
+          cargo test -p compiler-opt --test alias_phi_exhaustive
+          cargo test -p compiler-opt --test alias_phis
+          cargo test -p compiler-opt --test memory_analysis_bounds
+          cargo test -p compiler-opt --test native_verifier_fixture_matrix
+      - name: All optimizer target compilation and production lint
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --all-targets
+          cargo clippy -p compiler-opt --lib -- -D warnings
+      - name: Native TypeId production graph boundary
+        working-directory: compiler
+        run: python3 tools/check_mixed_function_export_boundary.py
