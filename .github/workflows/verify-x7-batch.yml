@@ -16,14 +16,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: d2008f1effce37aebc8e1132afdeb1c9b8a43582
+          ref: b4b1c111e63e47e1bee157d75a458a768d5a42ec
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - name: Verify exact source and restrict workspace
         run: |
           set -euo pipefail
-          test "$(git -C compiler rev-parse HEAD)" = d2008f1effce37aebc8e1132afdeb1c9b8a43582
+          test "$(git -C compiler rev-parse HEAD)" = b4b1c111e63e47e1bee157d75a458a768d5a42ec
           git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
           git config --global --add url."https://github.com/".insteadOf "git@github.com:"
           cat > compiler/Cargo.toml <<'EOF'
@@ -46,3 +46,49 @@ jobs:
           fi
           cargo test -p compiler-backend-x86 "${args[@]}" --test x86_tzcnt_typeid_native --test review_narrow_compare_ctz_oracle -- --nocapture
           cargo check -p compiler-backend-x86 --no-default-features "${args[@]}"
+
+  driver:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b4b1c111e63e47e1bee157d75a458a768d5a42ec
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-target-driver
+      - name: Build real driver and test explicit source/replay target options
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = b4b1c111e63e47e1bee157d75a458a768d5a42ec
+          cargo build -p compiler --bin compiler --features compiler-backend-x86/x7-tzcnt-native-probe
+          bin=target/debug/compiler
+          fixture=crates/backend-x86/tests/fixtures/x86_selector_ctz_legacy_casts_v3.ir
+          export COMPILER_X86_TZCNT_TARGET=unsupported
+          for target in baseline bmi1 popcnt,lzcnt bmi1,popcnt; do
+            "$bin" --load-ir "$fixture" --x86-features "$target" --emit asm -o /tmp/target.s
+            "$bin" --load-ir "$fixture" --x86-features "$target" --emit obj -o /tmp/target.o
+            objdump -dr /tmp/target.o >/tmp/target.dump
+            if [[ "$target" == bmi1* ]]; then
+              test "$(grep -Ec '^[[:space:]]*tzcnt[lq][[:space:]]' /tmp/target.s)" = 2
+              test "$(grep -Ec '[[:space:]]tzcnt[[:space:]]' /tmp/target.dump)" = 2
+            else
+              test "$(grep -Ec '^[[:space:]]*bsf[lq][[:space:]]' /tmp/target.s)" = 2
+              test "$(grep -Ec '[[:space:]]bsf[[:space:]]' /tmp/target.dump)" = 2
+            fi
+          done
+          printf 'int f(int x) { return x+1; }\n' >/tmp/target.c
+          "$bin" /tmp/target.c --language mini-c --x86-features bmi1 --emit obj -o /tmp/source.o
+          for invalid in '' native unknown bmi1,bmi1 baseline,bmi1; do
+            if "$bin" --load-ir "$fixture" --x86-features "$invalid" --emit obj -o /tmp/reject.o; then exit 1; fi
+          done
+          if "$bin" --load-ir "$fixture" --target aarch64 --x86-features bmi1 --emit obj -o /tmp/reject.o; then exit 1; fi
