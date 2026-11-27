@@ -2205,7 +2205,7 @@ set +e
 (
   cd /workspace/edgcpp/build/gcc-release
   timeout --signal=TERM --kill-after=10s 90s \
-    "$native" /audit-tmp/mrustc-edg-native.o --gcc --c11 --no_strict_gnu --gnu_version "$gnu_number" "$AUDIT_SOURCE"
+    env EDG_PRIVATE_ADDRESS_SHAPE=1 "$native" /audit-tmp/mrustc-edg-native.o --gcc --c11 --no_strict_gnu --gnu_version "$gnu_number" "$AUDIT_SOURCE"
 ) > /audit-tmp/edg-generated-c-native.log 2>&1
 native_rc=$?
 set -e
@@ -2249,6 +2249,23 @@ PY
   python3 - /audit-tmp/edg-generated-c-native.log <<'PY'
 from pathlib import Path
 import re,sys
+# Correlate the exact source key privately; emit only fixed numeric facts.
+lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
+missing={tuple(s.split("\t")[1:]) for s in lines
+         if s.startswith("EDG_PRIVATE_ADDRESS_MISSING\t") and len(s.split("\t"))==4}
+keys=("base","object","target","storage","displaced","past","subobject","reflection")
+shapes=set()
+if len(missing)==1:
+    for s in lines:
+        if not s.startswith("EDG_PRIVATE_ADDRESS_SHAPE\t"):continue
+        parts=s.split("\t")
+        if len(parts)!=5 or tuple(parts[1:4]) not in missing:continue
+        fields=parts[4].split()
+        if len(fields)==len(keys) and all(re.fullmatch(re.escape(k)+r"=[0-9]{1,3}",v)
+                                          for k,v in zip(keys,fields)):
+            shapes.add(tuple(fields))
+if len(shapes)==1:
+    print("EDG_C_REAL_ADDRESS_SHAPE "+" ".join(next(iter(shapes))))
 schemas={
     "EDG_C_MIXED_PROOF_COMPLETE":(
         "EDG_C_REAL_MIXED_COMPLETE",
