@@ -1,0 +1,87 @@
+# Source-pinned focused IR tail-call admission test; never compiler-repo Actions.
+name: Issue545 canonical indirect musttail source to native
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/issue545-canonical-indirect-20261127.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  indirect-ir:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact compiler candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f9b0f171313dee2b63597bd708e5d6c37c4868d5
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify compiler source SHA
+        run: test "$(git -C compiler rev-parse HEAD)" = 'f9b0f171313dee2b63597bd708e5d6c37c4868d5'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build isolated IR workspace
+        run: |
+          mkdir -p work/crates work/tools
+          cp -a compiler/tools/typeid-rule-gen work/tools/
+          cp -a compiler/crates/ir compiler/crates/ir-macros compiler/crates/backend compiler/crates/backend-aarch64 compiler/crates/backend-x86 compiler/crates/opt work/crates/
+          cat > work/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/ir-macros", "crates/backend", "crates/backend-aarch64", "crates/backend-x86", "crates/opt"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: work
+          key: issue545-canonical-indirect-20261127
+      - name: Check focused native IR library and test
+        working-directory: work
+        run: cargo check -p compiler-ir --lib --test musttail_indirect_admission
+      - name: Run focused indirect required-tail admission tests
+        working-directory: work
+        run: cargo test -p compiler-ir --test musttail_indirect_admission -- --nocapture
+      - name: Run existing native IR tests
+        working-directory: work
+        run: cargo test -p compiler-ir --lib -- --test-threads=2
+      - name: Clippy correctness
+        working-directory: work
+        run: cargo clippy -p compiler-ir --lib --test musttail_indirect_admission -- -D clippy::correctness
+      - name: Compile x86 indirect sibling JMP
+        working-directory: work
+        run: cargo check -p compiler-backend-x86 --test tail_indirect_native --test musttail_indirect_native
+      - name: Current-main x86 native library regression
+        working-directory: work
+        run: cargo test -p compiler-backend-x86 --lib -- --test-threads=2
+      - name: x86 ELF/GAS PIC/frame linked execution and old tail regression
+        working-directory: work
+        run: cargo test -p compiler-backend-x86 --test tail_indirect_native --test tailcall_native --test musttail_indirect_native --test musttail_native -- --nocapture
+      - name: Current-main AArch64 library regression
+        if: ${{ !cancelled() }}
+        working-directory: work
+        run: cargo test -p compiler-backend-aarch64 --lib -- --test-threads=2
+      - name: Check AArch64 sibling-branch regression
+        if: ${{ !cancelled() }}
+        working-directory: work
+        run: cargo check -p compiler-backend-aarch64 --test tail_indirect_native --test musttail_indirect_native
+      - name: Cross-compiler and QEMU for independent C11 oracle
+        if: ${{ !cancelled() }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends qemu-user gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+      - name: Native AArch64 direct/indirect tail ABI execution (ELF and GAS)
+        if: ${{ !cancelled() }}
+        working-directory: work
+        env:
+          COMPILER_REQUIRE_AARCH64_QEMU: "1"
+        run: cargo test -p compiler-backend-aarch64 --test tail_indirect_native --test tail_call_native --test musttail_indirect_native --test musttail_native -- --nocapture
+      - name: x86 Clippy correctness
+        if: ${{ !cancelled() }}
+        working-directory: work
+        run: cargo clippy -p compiler-backend-x86 --lib --test tail_indirect_native --test musttail_indirect_native -- -D clippy::correctness
+      - name: AArch64 Clippy correctness
+        if: ${{ !cancelled() }}
+        working-directory: work
+        run: cargo clippy -p compiler-backend-aarch64 --lib --test tail_indirect_native --test musttail_indirect_native -- -D clippy::correctness
