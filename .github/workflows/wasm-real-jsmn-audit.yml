@@ -1,0 +1,179 @@
+# Source-pinned end-to-end C program coverage, not just W9 micro-tests.
+name: Wasm real library audit - jsmn
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/wasm-real-jsmn-audit.yml'
+  workflow_dispatch:
+    inputs:
+      compiler_sha:
+        description: 'Exact compiler commit to audit'
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  source-coverage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.compiler_sha || 'ec00e48b4683c9673941d671684ce75aa34515b8' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      # Explicit immutable public dependency checkouts eliminate anonymous
+      # Cargo Git fetches (which can return HTTP 403 on a fresh runner).
+      # The checked cargo rev pins remain unchanged and are verified below.
+      - name: Checkout pinned Mini-C frontend source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: b418c690364b64f7d00488d8768ef196b0c54683
+          path: mini-c-pinned
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Checkout pinned Oberon frontend source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/oberon
+          ref: 2d7e51d1615b3039adc4b3a1248782cee86d5903
+          path: oberon-pinned
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify pins and isolate production driver
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "${{ inputs.compiler_sha || 'ec00e48b4683c9673941d671684ce75aa34515b8' }}"
+          grep -F '04055e0c52ec91746fd2727544a485fafeb43850' compiler/crates/driver/Cargo.toml
+          grep -F '2d7e51d1615b3039adc4b3a1248782cee86d5903' compiler/crates/driver/Cargo.toml
+          test "$(git -C mini-c-pinned rev-parse HEAD)" = "b418c690364b64f7d00488d8768ef196b0c54683"
+          grep -F 'b418c690364b64f7d00488d8768ef196b0c54683' compiler/tools/mini-c-driver/Cargo.toml
+          git -C mini-c-pinned cat-file -e '04055e0c52ec91746fd2727544a485fafeb43850^{commit}'
+          test "$(git -C oberon-pinned rev-parse HEAD)" = "2d7e51d1615b3039adc4b3a1248782cee86d5903"
+          # Longest insteadOf prefix wins, preserving the exact Cargo git
+          # revision but retrieving source from verified local checkouts.
+          git config --global url."file://${GITHUB_WORKSPACE}/mini-c-pinned".insteadOf "ssh://git@github.com/bingordo/mini-c.git"
+          git config --global url."file://${GITHUB_WORKSPACE}/oberon-pinned".insteadOf "ssh://git@github.com/bingordo/oberon.git"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          # Keep the integrated revision's real workspace membership.
+          rm -f compiler/Cargo.lock
+          python3 --version
+          gcc --version | head -1
+      - name: Node.js reference WebAssembly engine
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Cache checked source compiler build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: wasm-w15-short-struct-returns-20261123
+      - name: Checkout unchanged jsmn v1.1.0
+        uses: actions/checkout@v4
+        with:
+          repository: zserge/jsmn
+          ref: fdcef3ebf886fa210d14956d3c068a653e76a24e
+          path: jsmn
+          persist-credentials: false
+      - name: Build production compiler
+        working-directory: compiler
+        run: cargo build -p compiler --bin compiler
+      - name: Compare upstream parser token traces against GCC
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C jsmn rev-parse HEAD)" = fdcef3ebf886fa210d14956d3c068a653e76a24e
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          root = pathlib.Path.cwd()
+          work = root / "jsmn"
+          cases = ["{}", "[]", '{"a":1,"b":[true,false,null]}',
+                   '{"nested":{"x":"abc"},"y":-42}', '[0,1,2,3]',
+                   '{"unfinished":', '["unterminated', '{"x": [1,2]}',
+                   '{"empty":"","escape":"a\\n"}']
+          # Use jsmn's documented static linkage option: only the scalar
+          # probe is public. The upstream implementation is not modified.
+          src = '#define JSMN_STATIC\n#include "jsmn.h"\n'
+          src += 'int probe(int c, int i, int f) {\n'
+          src += '  jsmn_parser p; jsmntok_t tokens[32]; int n;\n'
+          src += '  jsmn_init(&p);\n  switch(c) {\n'
+          for k, case in enumerate(cases):
+              src += f'    case {k}: n=jsmn_parse(&p,{json.dumps(case)},{len(case)},tokens,32); break;\n'
+          src += """    default: return -9999;
+            }
+            if (i < 0) return n;
+            if (n < 0 || i >= n || i >= 32) return -9999;
+            switch(f) {
+              case 0: return tokens[i].type;
+              case 1: return tokens[i].start;
+              case 2: return tokens[i].end;
+              case 3: return tokens[i].size;
+              default: return -9999;
+            }
+          }
+          """
+          (work / "probe.c").write_text(src)
+          harness = '#include <stdio.h>\nextern int probe(int,int,int);\n'
+          harness += 'int main(void) {\n'
+          harness += f'for (int c=0;c<{len(cases)};c++) {{\n'
+          harness += 'printf("%d\\n",probe(c,-1,0));\n'
+          harness += 'for(int i=0;i<32;i++) for(int f=0;f<4;f++) printf("%d\\n",probe(c,i,f));\n'
+          harness += '} return 0; }\n'
+          (work / "oracle.c").write_text(harness)
+          subprocess.run(["gcc","-std=c11","-O2",str(work/"probe.c"),
+                          str(work/"oracle.c"),"-o",str(work/"oracle")],check=True,timeout=60)
+          expected = subprocess.check_output([str(work/"oracle")],text=True,timeout=30)
+          wasm = work / "probe.wasm"
+          result = subprocess.run([str(root/"compiler/target/debug/compiler"),
+              str(work/"probe.c"),"--language","mini-c","--target","wasm32",
+              "--emit","wasm","-o",str(wasm)],text=True,capture_output=True,timeout=120)
+          report = {"library":"jsmn", "revision":"fdcef3ebf886fa210d14956d3c068a653e76a24e",
+                    "cases":len(cases), "gcc":"pass", "compiler_exit":result.returncode}
+          if result.returncode:
+              report["wasm"] = "compile_gap"
+              report["diagnostic"] = result.stderr
+              report["partial_artifact"] = wasm.exists()
+              print(result.stderr)
+              # An ordinary unsupported-source rejection is measured, not
+              # treated as an execution pass. Crashes and partial output fail.
+              fail = (wasm.exists() or result.returncode < 0 or
+                      "panicked at" in result.stderr or "stack overflow" in result.stderr
+                      or result.returncode >= 128)
+          else:
+              js = """const fs=require('node:fs');
+          const e=new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(process.argv[1])),{}).exports;
+          for(let c=0;c<Number(process.argv[2]);c++){
+            console.log(e.probe(c,-1,0));
+            for(let i=0;i<32;i++)for(let f=0;f<4;f++)console.log(e.probe(c,i,f));
+          }"""
+              actual = subprocess.run(["node","-e",js,str(wasm),str(len(cases))],
+                                      text=True,capture_output=True,timeout=30)
+              fail = actual.returncode != 0 or actual.stdout != expected
+              report["wasm"] = ("runtime_error" if actual.returncode else
+                                "mismatch" if fail else "pass")
+              report["diagnostic"] = actual.stderr
+              if fail:
+                  report["expected"] = expected
+                  report["actual"] = actual.stdout
+          output=json.dumps(report,indent=2)
+          print(output)
+          (root/"jsmn-audit.json").write_text(output+"\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"],"a") as f:
+              f.write("### Real library: jsmn\n\nStatus: "+report["wasm"]+"\n")
+          raise SystemExit(int(fail))
+          PY
+      - name: Preserve measured result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jsmn-audit
+          path: jsmn-audit.json
+          if-no-files-found: warn
