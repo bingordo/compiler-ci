@@ -42,7 +42,7 @@ jobs:
           # Test the merged source-verified TypeId adapter (not the old mixed-global
           # branch) without changing compiler production history.
           # Manual dispatch can still select any explicit source_ref.
-          ref: ${{ inputs.source_ref || '039b5cf19f03e53a32114fcf74ee198acd8269ab' }}
+          ref: ${{ inputs.source_ref || 'b792b997483cfbaac8a22b5bd42e7701dd6512cb' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -398,6 +398,20 @@ jobs:
                                       if s[:1].isdigit(): return "number"
                                       return "other"
                                   print("CLIF_EXPECTED="+token_class(expected[1])+" FOUND="+token_class(found),flush=True)
+                                  # Permit an exact spelling only if independently
+                                  # found in public GCC/system headers or mrustc's
+                                  # public code generator. Never emit private names.
+                                  if token_class(found)=="reserved-identifier":
+                                      public_paths=[Path("/usr/include"),Path("mrustc/src/trans/codegen_c.cpp")]
+                                      gcc_headers=subprocess.check_output(["gcc","-print-file-name=include"],text=True).strip()
+                                      public_paths.append(Path(gcc_headers))
+                                      for public_path in public_paths:
+                                          check=subprocess.run(["grep","-r","-l","-F","-w","--",found,str(public_path)],
+                                                               stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=25)
+                                          if check.returncode==0:
+                                              print("CLIF_PUBLIC_TOKEN="+found,flush=True)
+                                              break
+
                               if m:
                                   import itertools
                                   ln,col=map(int,m.groups()[:2])
@@ -409,6 +423,35 @@ jobs:
                                       print("CLIF_TOKEN_SEQUENCE="+",".join(token_class(t.group()) if expected else (t.group() if t.group() in vocab else "other") for t in ts[max(0,k-4):k+6]),flush=True)
                   # Only compiler-owned diagnostic IDs and fixed categories leave the runner.
                   msg=(tmp/"native.log").read_text(errors="replace").split("\nusage:",1)[0]
+                  # Resolve errors to immutable compiler source locations by
+                  # matching compiler-owned diagnostic literals privately.
+                  # Report only known component IDs, hashed relative paths,
+                  # and line numbers; no message or private source is copied.
+                  if rc!=0 and msg:
+                      import hashlib
+                      matches=[]
+                      components={"syntax":Path("mini-c-compat/crates/syntax/src"),
+                                  "sema":Path("mini-c-compat/crates/sema/src"),
+                                  "native":Path("compiler/tools/mini-c-driver/src"),
+                                  "ir":Path("compiler/crates/ir/src"),
+                                  "backend":Path("compiler/crates/backend/src"),
+                                  "x86":Path("compiler/crates/backend-x86/src")}
+                      for component,directory in components.items():
+                          for path in directory.rglob("*.rs"):
+                              for line_no,line in enumerate(path.read_text(errors="replace").splitlines(),1):
+                                  for lit in re.findall(r'"((?:\\.|[^"\\])*)"',line):
+                                      # Format arguments are not diagnostic text.
+                                      pieces=re.split(r"\{[^{}]*\}",lit)
+                                      pieces=[part for part in pieces if len(part.strip())>=15]
+                                      if pieces and all(part in msg for part in pieces):
+                                          score=sum(len(part) for part in pieces)
+                                          if score>=20:
+                                              rel=str(path.relative_to(directory))
+                                              matches.append((score,component,hashlib.sha256(rel.encode()).hexdigest()[:12],line_no))
+                      for score,component,file_id,line_no in sorted(set(matches),reverse=True)[:8]:
+                          print(f"NATIVE_DIAGNOSTIC_SITE={component}:{file_id}:{line_no} MATCH_LENGTH={score}",flush=True)
+                      print("NATIVE_MESSAGE_BYTES="+str(len(msg.encode())),flush=True)
+
                   # Check public headers independently using the same native driver.
                   # These contain no private source; only stable categories are reported.
                   if i==0:
