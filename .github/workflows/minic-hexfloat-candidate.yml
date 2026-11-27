@@ -14,7 +14,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: e6fdceb7a9ec6c804d8fab22757547aba71df800
+          ref: 5bd9f055ee2de2178c2a3615d000e6484690d19a
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -36,3 +36,30 @@ jobs:
       - name: Full adapter suite
         if: success() || failure()
         run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib
+      - name: Strict whole-source observable Csmith replay
+        if: success() || failure()
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y --no-install-recommends csmith libcsmith-dev gcc clang
+          header=$(dpkg -L libcsmith-dev | grep '/csmith.h$' | head -n1)
+          compiler_sha=$(git -C compiler rev-parse HEAD)
+          manifest=compiler/tools/mini-c-driver/Cargo.toml
+          frontend=$(PYTHONPATH=compiler/tools python3 -c 'from csmith_probe import pinned_frontend_revision; import sys; print(pinned_frontend_revision(open(sys.argv[1]).read()))' "$manifest")
+          cargo build --manifest-path "$manifest" --bin compiler-mini-c
+          evidence="$RUNNER_TEMP/strict-evidence"
+          python3 compiler/tools/csmith_probe.py --generate --cases-dir "$evidence/cases" --csmith csmith --seed-base 1 --seed-count 8 --profile restricted-observable
+          python3 compiler/tools/csmith_probe.py --probe --cases-dir "$evidence/cases" --artifacts-dir "$evidence/results" --include-dir "$(dirname "$header")" --preprocess-c --driver "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" --compiler-sha "$compiler_sha" --frontend-sha "$frontend" --minimum-native 8 --run-timeout 5 --max-wall-seconds 180 || failure=1
+          python3 - "$evidence/results/results.jsonl" <<'PY'
+          import json,sys
+          for line in open(sys.argv[1]):
+              r=json.loads(line)
+              print("STRICT_RESULT",json.dumps({k:r.get(k) for k in ("seed","classification","compiler","frontend_diagnostic")}))
+          PY
+          exit "${failure:-0}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: strict-csmith-after-restricted-milestone
+          path: ${{ runner.temp }}/strict-evidence
+          retention-days: 14
