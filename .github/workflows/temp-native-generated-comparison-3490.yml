@@ -1,0 +1,68 @@
+name: Temporary native TypeId generated rules comparison feature acceptance
+on:
+  pull_request:
+    paths: ['.github/workflows/temp-native-generated-comparison-3490.yml']
+permissions: {contents: read}
+jobs:
+  generated-comparison:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: 95db717adf7f45f04b125536746406266fb51c3e
+      CARGO_INCREMENTAL: '0'
+      RULE_BENCH_BATCH: '5'
+      RULE_BENCH_REPEATS: '3'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin exact compiler commit and isolate optimizer
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: legacy-rule-comparison-example-retirement
+      - name: No retired DCE API in feature-gated opt-in example
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          if git grep -nE 'use compiler_opt::\{eliminate_dead_code|[^_]eliminate_dead_code\(' -- crates/opt/examples/compare_generated_rules.rs; then exit 1; fi
+          git grep -n 'typed_local::eliminate_dead_code_typed' -- crates/opt/examples/compare_generated_rules.rs
+      - name: Feature-enabled generated rule regression and sample compile
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --features experimental-generated-rules --lib experimental_generated_rules::tests
+          cargo check -p compiler-opt --features experimental-generated-rules --example compare_generated_rules
+      - name: Native executable benchmark smoke with reduced repeats
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo run -p compiler-opt --features experimental-generated-rules --example compare_generated_rules -- --native
+      - name: Enumerated constant fusion gap and semantic validation
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo run -p compiler-opt --features experimental-generated-rules --example compare_generated_rules -- --scan-gaps
+      - name: All targets and strict production lint
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --features experimental-generated-rules --all-targets
+          cargo clippy -p compiler-opt --lib -- -D warnings
+      - name: Native optimizer API boundary
+        working-directory: compiler
+        run: python3 tools/check_mixed_function_export_boundary.py
