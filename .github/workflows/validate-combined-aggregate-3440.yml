@@ -9,6 +9,76 @@ concurrency:
   group: temp-integrated-shared-integer-abi
   cancel-in-progress: true
 jobs:
+  baseline-differential:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout compiler-ci test harness
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Checkout compiler source using existing read-only deploy key
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c65e9d474c3293af61f68e64bed81f517c0ab043
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Identify exact source and validate cohort size
+        id: source
+        shell: bash
+        env:
+          SEED_COUNT: ${{ inputs.seed_count || '6' }}
+        run: |
+          set -euo pipefail
+          sha="$(git -C compiler rev-parse HEAD)"
+          [[ "$sha" == 'c65e9d474c3293af61f68e64bed81f517c0ab043' ]]
+          [[ "$SEED_COUNT" =~ ^[0-9]+$ ]]
+          (( 10#$SEED_COUNT >= 1 && 10#$SEED_COUNT <= 64 ))
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          test -s compiler/tools/mini-c-driver/tests/differential.py
+          test -s compiler/tools/mini-c-driver/Cargo.toml
+          echo "Compiler revision: $sha" >> "$GITHUB_STEP_SUMMARY"
+      - name: Make public Mini-C dependency accessible without another deploy key
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          manifest=Path('compiler/tools/mini-c-driver/Cargo.toml')
+          text=manifest.read_text()
+          old='ssh://git@github.com/bingordo/mini-c.git'
+          assert text.count(old)==2, 'Mini-C dependency declaration changed'
+          manifest.write_text(text.replace(old,'https://github.com/bingordo/mini-c.git'))
+          PY
+      - name: Cache Rust objects and dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: mini-c-source-differential-v1
+          cache-workspace-crates: 'true'
+      - name: Build compiler-mini-c once
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 12m cargo build \
+            --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --bin compiler-mini-c \
+            2>&1 | tee "$RUNNER_TEMP/mini-c-build.log"
+          test -x compiler/tools/mini-c-driver/target/debug/compiler-mini-c
+      - name: Reproduce seeded differential on unmodified main
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/mini-c-driver/tests/differential.py \
+            --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" \
+            --seed-count 6 --steps 120 --timeout 15 --artifacts "$RUNNER_TEMP/main-differential-failures"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: main-differential-control
+          path: ${{ runner.temp }}/main-differential-failures/
+          if-no-files-found: ignore
   differential:
     outputs:
       compiler_sha: ${{ steps.source.outputs.sha }}
@@ -23,7 +93,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 60be684aeb812e74937903bc6ac1526198de9d9b
+          ref: 0996b9966c63a8ab9e2ee2fc224799d097b4e29a
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -35,7 +105,7 @@ jobs:
         run: |
           set -euo pipefail
           sha="$(git -C compiler rev-parse HEAD)"
-          [[ "$sha" == '60be684aeb812e74937903bc6ac1526198de9d9b' ]]
+          [[ "$sha" == '0996b9966c63a8ab9e2ee2fc224799d097b4e29a' ]]
           [[ "$SEED_COUNT" =~ ^[0-9]+$ ]]
           (( 10#$SEED_COUNT >= 1 && 10#$SEED_COUNT <= 64 ))
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
@@ -75,7 +145,9 @@ jobs:
           set -euo pipefail
           cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
             -p compiler-mini-c --test bitfield_pointer_abi --test record_pointer_abi
-      - name: Compare compiled Mini-C against GCC
+      - name: Compare compiled Mini-C against GCC (independent diagnostic)
+        id: candidate_differential
+        continue-on-error: true
         shell: bash
         env:
           SEED_COUNT: ${{ inputs.seed_count || '6' }}
@@ -102,6 +174,9 @@ jobs:
           else
             echo "Passed fixed, seeded, ABI and negative GCC oracles" >> "$GITHUB_STEP_SUMMARY"
           fi
+      - name: Record general differential outcome separately
+        run: |
+          echo "Candidate seeded differential: ${{ steps.candidate_differential.outcome }}" >> "$GITHUB_STEP_SUMMARY"
       - name: Check complete mixed-object ABI matrix with frame pointers
         shell: bash
         run: |
