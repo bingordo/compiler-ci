@@ -1,0 +1,60 @@
+name: RV64 direct indirect and void GP call candidate
+on:
+  workflow_dispatch:
+  push:
+    branches: ['ci/rv64-gp-call-targets']
+    paths: ['.github/workflows/verify-rv64-gp-call-targets.yml']
+permissions:
+  contents: read
+  statuses: write
+jobs:
+  rv64-memory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: afec65dd410a1d52959ec3d1fef967dfddcb7848
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - run: test "$(git -C compiler rev-parse HEAD)" = afec65dd410a1d52959ec3d1fef967dfddcb7848
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install RV64 toolchain
+        run: sudo apt-get install -y --no-install-recommends gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu qemu-user
+      - name: Verify source and generated encoder
+        working-directory: compiler
+        run: |
+          python3 tools/riscv_udb_rust_leaf_forms.py --catalog data/riscv_udb_r0_catalog.json --output crates/backend-riscv64/src/generated_encoding.rs --check
+          RV64_MEMORY_FIXTURE_DIR=/tmp/rv64-memory cargo test -p compiler --test riscv64_scalar_memory
+          RV64_GLOBAL_FIXTURE_DIR=/tmp/rv64-globals cargo test -p compiler --test riscv64_global_data
+          cargo test -p compiler-backend --lib rv64_global_data_tests
+          RV64_POINTER_FIXTURE_DIR=/tmp/rv64-pointer cargo test -p compiler --test riscv64_pointer_abi
+          RV64_CALL_FIXTURE_DIR=/tmp/rv64-calls cargo test -p compiler --test riscv64_gp_calls
+          cargo test -p compiler-backend-riscv64 --all-targets
+          cargo test -p compiler --test riscv64_source_preview --test riscv64_generic_cfg --test riscv64_load_ir
+          cargo clippy -p compiler-backend-riscv64 --tests -- -D warnings
+      - name: Verify GCC interoperability and memory effects
+        run: python3 compiler/tools/rv64_scalar_memory_oracle.py /tmp/rv64-memory
+      - name: Verify global storage and relocations against GCC
+        run: python3 compiler/tools/rv64_global_data_oracle.py /tmp/rv64-globals
+      - name: Verify fixed pointer ABI interoperability
+        run: python3 compiler/tools/rv64_pointer_abi_oracle.py /tmp/rv64-pointer
+      - name: Verify direct and indirect fixed GP calls
+        run: python3 compiler/tools/rv64_gp_calls_oracle.py /tmp/rv64-calls
+      - name: Publish candidate status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          state=failure
+          if [ "$JOB_STATUS" = success ]; then state=success; fi
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -f state="$state" -f context=rv64-gp-call-targets -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" -f description="Compiler afec65dd410a1d52959ec3d1fef967dfddcb7848"
