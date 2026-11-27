@@ -1,0 +1,63 @@
+# Temporary source-pinned validation for compiler TypeId loop/induction cleanup.
+name: IR PR3630 TypeId loop and induction retirement
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ir-pr3630-native-loop-retirement.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ir-pr3630-typeid-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  loop-induction:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      COMPILER_SHA: f0c0e33fba21869ac7c0bc268c264cc982b120ba
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.COMPILER_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check source commit and isolate IR and optimizer
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          echo "Compiler candidate: $COMPILER_SHA" >> "$GITHUB_STEP_SUMMARY"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-3630-native-loop
+      - name: Full optimizer library tests and native loop/induction integration
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test induction_native native_multilatch_induction_analysis_recognizes_consistent_steps_only -- --nocapture
+          cargo test -p compiler-opt --test typed_induction_native --no-run
+          cargo test -p compiler-opt --test licm_native --no-run
+      - name: Strict IR and optimizer lint with unrelated x86 dep exceptions
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir --lib -- -D warnings
+          # backend-x86 dev dependency has independent dead_code and
+          # too_many_arguments warnings; suppress only these existing lints.
+          cargo clippy -p compiler-opt --lib -- -D warnings -A dead_code -A clippy::too_many_arguments
