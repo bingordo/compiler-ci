@@ -7,16 +7,16 @@ permissions:
 jobs:
   original-contracts:
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ad41bdb722a62ce4412ae1b64d62b4db79472c0a
+          ref: 3654a7602f24afc2dfd1b3912f87873c34fb7085
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - name: Verify exact compiler source
-        run: test "$(git rev-parse HEAD)" = ad41bdb722a62ce4412ae1b64d62b4db79472c0a
+        run: test "$(git rev-parse HEAD)" = 3654a7602f24afc2dfd1b3912f87873c34fb7085
       - uses: actions/cache/restore@v4
         id: xed-cache
         with:
@@ -124,6 +124,48 @@ jobs:
           assert r['new_production_rules']==0
           assert r['matched'],r
           PY
+      - name: Full original source corpus census across scalar and packed scopes
+        run: |
+          set -euo pipefail
+          export PATH=/tmp/x7-z3/bin:$PATH
+          export PYTHONPATH="$PWD/tools"
+          mkdir -p /tmp/x7-full-census
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from x86_iform_helper_dependencies import build
+          from x86_iform_proof_work_dag import plan
+          from x86_isl_operation_proof_worker import OperationProofBatch
+          from x86_isl_operation_model_census import audit
+          root=Path('/tmp/x7-full-census')
+          xml=Path('/tmp/intel-sdm/data/instruction')
+          parser=Path('/tmp/x7-parser/export')
+          index=build(xml,shards=16)
+          queue=plan(index,shards=16)
+          prepared=OperationProofBatch(index,queue)
+          def save(name,value):
+              (root/name).write_text(json.dumps(value,sort_keys=True))
+          save('index.json',index)
+          save('queue.json',queue)
+          scopes=[(w,None) for w in (8,16,32,64,128,256,512)]
+          scopes += [(w,lane) for w in (128,256,512)
+                     for lane in (8,16,32,64,128)]
+          for width,lane in scopes:
+              scope=f'{width}-{lane or "scalar"}'
+              reports=[prepared.verify(xml,parser,width=width,element_width=lane,
+                         shard_index=shard,max_checks=256,timeout_ms=2000,
+                         workers=4,model_workers=2,cache_dir=Path('/tmp/x7-b3-parser-cache'))
+                       for shard in range(16)]
+              census=audit(index,queue,reports)
+              s=census['summary']
+              assert s['operations_accounted_for']==s['operations_indexed']==1641,s
+              assert s['source_models_reported_by_status'].get('deferred_by_model_check_budget',0)==0,s
+              assert census['source_form_impact']['summary']['original_source_iforms']==10859
+              save(scope+'.json',census)
+              print('X7_FULL_SCOPE',scope,json.dumps(s,sort_keys=True),flush=True)
+              for row in census['source_form_impact']['ranked_source_blockers'][:12]:
+                  print('X7_FULL_BLOCKER',scope,json.dumps(row,sort_keys=True),flush=True)
+          PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -131,3 +173,4 @@ jobs:
           path: |
             /tmp/x7-vex-contracts.json
             /tmp/x7-vex-proof-batch.json
+            /tmp/x7-full-census
