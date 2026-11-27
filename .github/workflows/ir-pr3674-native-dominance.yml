@@ -1,0 +1,60 @@
+# One-off source-pinned test gate; close this CI PR without merging.
+name: IR PR3674 native CHK dominance retirement
+on:
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/ir-pr3674-native-dominance.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ir-pr3674-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  ir-native-dominance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      COMPILER_SHA: d0ba30b5bcb2e12a075f58cc23b301a579df3c16
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.COMPILER_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm exact compiler source and isolate IR/optimizer workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          echo "Compiler candidate: $COMPILER_SHA" >> "$GITHUB_STEP_SUMMARY"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: native-CHK-ir3674
+      - name: Run independent IR/unit/oracle and optimizer tests
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir
+          cargo test -p compiler-opt --lib
+          cargo check -p compiler-backend-x86 --lib
+          cargo check -p compiler-backend --lib
+      - name: Verify IR oracle feature and scoped strict Clippy
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-ir --features legacy-ssa-oracle
+          cargo clippy -p compiler-ir --lib -- -D warnings
+          cargo clippy -p compiler-opt --lib -- -D warnings -A dead_code -A clippy::too_many_arguments
