@@ -1,0 +1,238 @@
+# Temporary source-pinned native ARM64 acceptance for compiler PR #3102.
+name: C1 Mini-C large record returns and native ABI regression
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/verify-c1-minic-indirect-record-3102.yml'
+permissions:
+  contents: read
+jobs:
+  deterministic-source-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2161ea468ee9489df2a36c4070fa4d17f96be35f
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler source and Python generator syntax
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "2161ea468ee9489df2a36c4070fa4d17f96be35f"
+          python3 -m py_compile compiler/tools/aarch64_c1_source_oracle.py compiler/tools/aarch64_c1_call_oracle.py compiler/tools/aarch64_c1_mixed_call_oracle.py compiler/tools/aarch64_c1_deep_call_oracle.py compiler/tools/aarch64_c1_record_call_oracle.py compiler/tools/tests/test_aarch64_c1_source_oracle.py
+      - name: Deterministic seeded source and negative report mutation suite
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s compiler/tools/tests \
+            -p test_aarch64_c1_source_oracle.py -v
+  actual-native-aarch64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2161ea468ee9489df2a36c4070fa4d17f96be35f
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Record exact source and configure public frontend Git dependency
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          test "$(git -C compiler rev-parse HEAD)" = "2161ea468ee9489df2a36c4070fa4d17f96be35f"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+          gcc --version | head -n 1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: c1-aarch64-source-aggregate-v1
+      - name: Compile production checked source driver and verify report CLI
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo build --release -p compiler --bin compiler
+          cargo test -p compiler --test aarch64_selector_report_cli -- --nocapture
+          cargo test -p compiler-backend-aarch64 --test ctz_select_calls -- --nocapture
+      - name: Native selected-machine X8 result address GCC differential
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-aarch64 --test dedicated_result_address_native -- --nocapture
+      - name: Native single-GP record result and nested call GCC differential
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/aarch64_single_gp_record_return_oracle.py \
+            --compiler compiler/target/release/compiler --output results/single-gp-returns
+          python3 compiler/tools/aarch64_single_gp_record_return_oracle.py \
+            --compiler compiler/target/release/compiler --output results/indirect-returns --indirect
+      - name: Full IR library regression
+        working-directory: compiler
+        run: cargo test -p compiler-ir --lib
+      - name: Target-independent checked aggregate regression suite
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for filter in aggregate_abi:: aggregate_call:: checked_plain_struct_fields checked_w12i; do
+            cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib "$filter" -- --nocapture
+          done
+      - name: "Baseline native W32/W64/memory, W32/mixed/deep fixed GP calls"
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          for family in w32 w64 memory calls mixedcalls deepcalls; do
+            python3 compiler/tools/aarch64_c1_source_oracle.py \
+              --compiler compiler/target/release/compiler \
+              --output "results/$family-baseline" --family "$family" \
+              --seed 23 --functions 8 --samples 128 --execute-native
+          done
+      - name: "Native small-record 8/12/16/20/24-byte by-value smoke across AAPCS64 GP stack"
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/aarch64_c1_source_oracle.py \
+            --compiler compiler/target/release/compiler \
+            --output results/records-smoke-17 --seed 17 --family records \
+            --functions 20 --samples 64 --execute-native
+      - name: "Native source aggregate entry and two external by-value calls, non-PIC"
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/aarch64_c1_source_oracle.py \
+            --compiler compiler/target/release/compiler \
+            --output results/records-53 --seed 53 --family records \
+            --functions 40 --samples 256 --execute-native
+      - name: "Native direct and indirect record transport, PIC"
+        run: |
+          set -euo pipefail
+          python3 compiler/tools/aarch64_c1_source_oracle.py \
+            --compiler compiler/target/release/compiler \
+            --output results/records-pic-157 --seed 157 --family records \
+            --functions 40 --samples 256 --pic --execute-native
+      - name: Check generic result group transport on both fixed native ABIs
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib typeid_ -- --nocapture
+          cargo test -p compiler-backend --test typeid_integer_result_transport -- --nocapture
+      - name: "Reconcile native GCC by-value ABI, selector rule and ELF bytes"
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          rows=[json.loads(p.read_text()) for p in sorted(Path("results").glob("*/summary.json"))]
+          assert len(rows)==9,len(rows)
+          families=("w32","w64","memory","calls","mixedcalls","deepcalls","records")
+          counts={family:sum(r["functions"] for r in rows if r["family"]==family)
+                  for family in families}
+          assert counts=={"w32":8,"w64":8,"memory":8,"calls":8,
+                          "mixedcalls":8,"deepcalls":8,"records":100},counts
+          records=[r for r in rows if r["family"]=="records"]
+          assert len(records)==3 and sorted(r["pic"] for r in records)==[False,False,True]
+          assert all(r["native_executed"] and r["object_parity"] for r in rows)
+          assert all(r["coverage"]["handwritten"]==0 for r in rows)
+          assert all(r["coverage"]["generated"]>0 and r["coverage"]["text_bytes"]>0 for r in rows)
+          assert all("A64_CALL_DIRECT_64" in r["coverage"]["rule_ids"] for r in records)
+          assert len({r["source_sha256"] for r in rows})==len(rows)
+          summary={
+            "family_functions":counts,
+            "native_evaluations":sum(r["functions"]*r["samples_per_function"] for r in rows),
+            "generated_scalar_decisions":sum(r["coverage"]["generated"] for r in rows),
+            "handwritten_scalar_fallbacks":sum(r["coverage"]["handwritten"] for r in rows),
+            "generated_cfg_terminators":sum(r["coverage"]["terminators"] for r in rows),
+            "physical_function_text_bytes":sum(r["coverage"]["text_bytes"] for r in rows),
+            "independent_GCC_record_results_and_side_effect_witness_equal":True,
+            "report_on_off_ELF_identical":True,
+          }
+          print("A64_C1_SOURCE_RECORD_BYVALUE_GCC",json.dumps(summary,sort_keys=True),flush=True)
+          PY
+          echo 'AArch64 checked source 8/12/16/20/24B records in AAPCS64 grouped register and stack ABI, independent native GCC result/witness PASS pinned 2161ea468ee9489df2a36c4070fa4d17f96be35f' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: aarch64-c1-seeded-source-oracle-reproducers
+          path: results/
+          if-no-files-found: ignore
+          retention-days: 21
+
+  x86-library-regression-comparison:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+      CARGO_TARGET_DIR: ${{ github.workspace }}/compiler/target
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2161ea468ee9489df2a36c4070fa4d17f96be35f
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 56ab1e43fee63e211177659bd70a0d3dd5e047ed
+          path: baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify exact candidate and integrated main baseline
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          test "$(git -C compiler rev-parse HEAD)" = 2161ea468ee9489df2a36c4070fa4d17f96be35f
+          test "$(git -C baseline rev-parse HEAD)" = 56ab1e43fee63e211177659bd70a0d3dd5e047ed
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: c1-x86-record-library-v1
+      - name: Run both full native x86 library suites without hiding failures
+        run: |
+          set -euo pipefail
+          mkdir -p library-results
+          for tree in baseline compiler; do
+            set +e
+            (cd "$tree" && cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib -- --test-threads=1) > "library-results/$tree.log" 2>&1
+            rc=$?
+            set -e
+            printf '%s\n' "$rc" > "library-results/$tree.exit"
+            cat "library-results/$tree.log"
+          done
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          def read(tree):
+              log=Path(f"library-results/{tree}.log").read_text()
+              statuses=dict(re.findall(r"^test (\S+) \.\.\. (ok|FAILED|ignored)(?:,.*)?$",log,re.M))
+              assert statuses and re.search(r"test result: (?:ok|FAILED)\.",log), f"{tree}: missing completed test suite"
+              code=int(Path(f"library-results/{tree}.exit").read_text())
+              assert (code==0)==all(s!="FAILED" for s in statuses.values()), (tree,code)
+              return statuses
+          base,candidate=read("baseline"),read("compiler")
+          known={n for n,s in base.items() if s=="FAILED"}
+          failed={n for n,s in candidate.items() if s=="FAILED"}
+          print("Baseline failures:",sorted(known))
+          print("Candidate failures:",sorted(failed))
+          assert not set(base)-set(candidate), "Existing tests disappeared"
+          assert not {n for n,s in base.items() if s!="ignored" and candidate.get(n)=="ignored"}, "Active tests became ignored"
+          assert not failed-known, f"New x86 failures: {sorted(failed-known)}"
+          assert all(candidate.get(n)=="ok" for n in candidate if "array_record" in n or "indirect_record" in n or "single_gp_record_results" in n)
+          print("No additional x86 failures relative to exact integrated main baseline")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x86-library-regression-comparison
+          path: library-results/
+          retention-days: 21
