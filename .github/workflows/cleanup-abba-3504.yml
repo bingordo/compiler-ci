@@ -1,0 +1,62 @@
+name: One-off cleanup matched release comparison
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/cleanup-abba-3504.yml'
+permissions:
+  contents: read
+jobs:
+  matched-release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 953813d9e95f59f7c24aaa8fe80443b4a2457621
+          path: baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9ab2a9aa5ca026a4eeaa78917696ccedd6bf7b56
+          path: candidate
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Build identical release harnesses
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmp baseline/crates/opt/tests/typed_ctfe.rs candidate/crates/opt/tests/typed_ctfe.rs
+          for v in baseline candidate; do
+            git -C "$v" rev-parse HEAD
+            printf '[workspace]\nresolver = "2"\nmembers = ["crates/ir", "crates/opt"]\n' > "$v/Cargo.toml"
+            rm -f "$v/Cargo.lock"
+          done
+          rustc --version
+          cd baseline
+          cargo generate-lockfile
+          cp Cargo.lock ../candidate/Cargo.lock
+          cargo test --locked --release -p compiler-opt --test typed_ctfe --no-run
+          cd ../candidate
+          cargo test --locked --release -p compiler-opt --test typed_ctfe --no-run
+      - name: Compare optimized IR and ABBA timings/RSS
+        shell: bash
+        run: |
+          set -euo pipefail
+          for v in baseline candidate; do
+            bin=$(find "$v/target/release/deps" -maxdepth 1 -type f -executable -name 'typed_ctfe-*')
+            test "$(printf '%s\n' "$bin" | wc -l)" = 1
+            cp "$bin" "$RUNNER_TEMP/$v"
+          done
+          round=0
+          for v in baseline candidate candidate baseline; do
+            round=$((round+1))
+            TYPEID_SOURCE_TX_OUTPUT="$RUNNER_TEMP/$v-$round.ir" /usr/bin/time -f "MATCHED_RSS variant=$v round=$round peak_kib=%M wall_s=%e" "$RUNNER_TEMP/$v" --exact typeid_source_single_transaction_profile --ignored --nocapture
+            if test "$round" != 1; then
+              cmp "$RUNNER_TEMP/baseline-1.ir" "$RUNNER_TEMP/$v-$round.ir"
+            fi
+          done
+          echo 'All four canonical SSA outputs identical.'
