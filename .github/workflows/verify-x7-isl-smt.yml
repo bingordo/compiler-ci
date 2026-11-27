@@ -1,5 +1,7 @@
 name: Verify X7 ISL source-DAG SMT equivalence
 on:
+  pull_request:
+    paths: ['.github/workflows/verify-x7-isl-smt.yml']
   workflow_dispatch:
   push:
     branches: [main]
@@ -14,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 52f666eb8e402a2c7f3b9307bfef071419f127e5
+          ref: 95581f0d79b47fc4a73a31a090ccfe0599bb8e9f
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - name: Install pinned offline-only Z3 solver in isolated venv
@@ -26,7 +28,44 @@ jobs:
       - name: Run independent source-vs-DAG SMT proof and mutation controls
         run: |
           set -euo pipefail
-          git rev-parse HEAD
+          test "$(git rev-parse HEAD)" = 95581f0d79b47fc4a73a31a090ccfe0599bb8e9f
+          export PATH=/tmp/x7-z3/bin:$PATH
+          if ! command -v z3; then sudo apt-get update -qq && sudo apt-get install -y z3; fi
+          z3 --version
+          git clone --filter=blob:none --sparse https://github.com/intel/SDM.git /tmp/intel-sdm
+          git -C /tmp/intel-sdm fetch --depth 1 origin 35eface1b7ee003a1cda95005ec5fd83de658a64
+          git -C /tmp/intel-sdm checkout 35eface1b7ee003a1cda95005ec5fd83de658a64
+          git -C /tmp/intel-sdm sparse-checkout set data/instruction
+          export X7_PINNED_INTEL_DIR=/tmp/intel-sdm/data/instruction
+          git clone --filter=blob:none https://github.com/intelxed/xed.git /tmp/xed
+          git -C /tmp/xed checkout 0bcb6237345c5066726dcc08b3d87928df3b5b26
+          git clone --filter=blob:none https://github.com/intelxed/mbuild.git /tmp/mbuild
+          git -C /tmp/mbuild checkout 1b437e409221a2b5703b4d8896baa20d43e4ba1a
+          (cd /tmp/xed && ./mfile.py --no-encoder)
+          (cd /tmp && python3 /tmp/xed/pysrc/xed_to_db.py --xed-dgen /tmp/xed/obj/dgen --out /tmp/x7-xed-upstream.json --compact)
+          python3 tools/import_xed_forms.py --xed-json /tmp/x7-xed-upstream.json --xed-revision 0bcb6237345c5066726dcc08b3d87928df3b5b26 --legacy-forms data/x86_encoding_forms.json --output /tmp/x7-xed-normalized.json --report /tmp/x7-xed-report.json
+          export X7_PINNED_XED_INVENTORY=/tmp/x7-xed-normalized.json
+          python3 - <<'PY'
+          import json
+          for row in json.load(open('/tmp/x7-xed-normalized.json'))['forms']:
+              if row['iform'] in ('TZCNT_GPRv_GPRv','LZCNT_GPRv_GPRv','POPCNT_GPRv_GPRv'):
+                  print('X7_UNARY_REAL_XED',json.dumps(row,sort_keys=True))
+          PY
+          /tmp/x7-z3/bin/python -m unittest discover -s tools -p 'test_x86_isl_indexed_update_smt.py' -v
+          /tmp/x7-z3/bin/python -m unittest discover -s tools -p 'test_x7_ip2_physical_receipt_join.py' -v
+          /tmp/x7-z3/bin/python -m unittest discover -s tools -p 'test_x7_ip3_discovered_physical_join.py' -v
+          /tmp/x7-z3/bin/python -m unittest discover -s tools -p 'test_x7_ip3_real_source_gp_join.py' -v
+          /tmp/x7-z3/bin/python -m unittest discover -s tools -p 'test_x86_isl_generic_bit_flags_smt.py' -v
+          /tmp/x7-z3/bin/python -m unittest discover -s tools -p 'test_x86_isl_operation_proof_worker.py' -v
+          /tmp/x7-z3/bin/python -m unittest discover -s tools -p 'test_x86_isl_b3_record_worker.py' -v
+          /tmp/x7-z3/bin/python -m unittest discover -s tools -p 'test_x86_isl_operation_model_census.py' -v
+          /tmp/x7-z3/bin/python -m unittest discover -s tools -p 'test_x86_isl_source_form_impact.py' -v
+          /tmp/x7-z3/bin/python -m unittest discover -s tools -p 'test_x86_isl_bit_primitives.py' -v
+          /tmp/x7-z3/bin/python -m unittest discover -s tools -p 'test_x7_ip2_pure_dag_candidates.py' -v
+          /tmp/x7-z3/bin/python -m unittest discover -s tools -p 'test_x7_ip2_ir_equivalence.py' -v
+          /tmp/x7-z3/bin/python -m unittest discover -s tools -p 'test_x7_ip2_original_source_graph.py' -v
+          /tmp/x7-z3/bin/python -m unittest discover -s tools -p 'test_x7_ip2_source_verified_dag.py' -v
+          /tmp/x7-z3/bin/python -m unittest discover -s tools -p 'test_x86_isl_count_builtins.py' -v
           /tmp/x7-z3/bin/python -m unittest discover -s tools -p 'test_x86_isl_smt_verify.py' -v
           /tmp/x7-z3/bin/python -m unittest discover -s tools -p 'test_x86_isl_record_effects_smt.py' -v
           /tmp/x7-z3/bin/python -m unittest discover -s tools -p 'test_x86_isl_definedness_smt.py' -v
@@ -38,3 +77,36 @@ jobs:
           /tmp/x7-z3/bin/python -m py_compile tools/x86_isl_iform_effect_plan.py
           /tmp/x7-z3/bin/python -m py_compile tools/x86_form_memory_contract.py
           /tmp/x7-z3/bin/python -m py_compile tools/x86_isl_ordered_effect_trace.py tools/x86_isl_form_evidence.py tools/x86_isl_smt_verify.py
+
+  native-bitcount:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 95581f0d79b47fc4a73a31a090ccfe0599bb8e9f
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source and restrict workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 95581f0d79b47fc4a73a31a090ccfe0599bb8e9f
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-batch-baseline
+      - name: Real GAS and ELF bitcount result and RFLAGS oracle
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --test x86_bitcount_physical_native -- --nocapture
