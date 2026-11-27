@@ -1,0 +1,110 @@
+name: S23.59 prove 20 generated native TypeId rule families
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-59-bulk-unconditional.yml'
+permissions:
+  contents: read
+jobs:
+  audited-bulk-ssa:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: dfaa53f7840101fbb11636759956038f913503b1
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record actual source-pinned compiler SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = dfaa53f7840101fbb11636759956038f913503b1
+          echo "S2359_SOURCE_SHA=$(git -C compiler rev-parse HEAD)"
+      - name: Check source grammar, deterministic 20-family cross-product and guard receipts
+        working-directory: compiler/tools/typeid-rule-gen
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest -v test_rules test_ssa_codegen test_bulk_unconditional_laws test_guarded_ssa_codegen test_guarded_batch_proofs
+          python3 - <<'PY'
+          from pathlib import Path
+          from bulk_unconditional_laws import verify_appendix
+          from rules import parse_rules, matching_orientations
+          source=Path('examples.rules').read_text()
+          rules=verify_appendix(source)
+          assert len(parse_rules(source)) == 108
+          print('S2359_NEW_FAMILIES=20')
+          print('S2359_NEW_ORIENTATIONS=', sum(len(matching_orientations(r.pattern)) for r in rules))
+          PY
+      - name: Independently prove all NEW source and operand-order instances at all five bitvector widths
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq z3
+          cd compiler/tools/typeid-rule-gen
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, json
+          from bulk_unconditional_laws import verify_appendix
+          from prove import verify
+          source=Path('examples.rules').read_text()
+          rules=verify_appendix(source)
+          result=verify(rules, 'z3', timeout_ms=3500, process_timeout=5.0)
+          assert result['family_count']==20
+          assert result['sat_negative_controls']==5
+          assert all(item['result']=='unsat' for item in result['proofs'])
+          print('S2359_NEW_QFBV_PROOF_COUNT=', result['proof_count'])
+          print('S2359_FULL_108_SOURCE_SHA256=', hashlib.sha256(source.encode()).hexdigest())
+          Path('/tmp/s2359-proof-summary.json').write_text(json.dumps({
+            'source_sha256':hashlib.sha256(source.encode()).hexdigest(),
+            'family_count':result['family_count'],
+            'proof_count':result['proof_count'],
+            'sat_negative_controls':result['sat_negative_controls'],
+            'proofs':result['proofs']
+          },sort_keys=True))
+          PY
+      - name: Isolate native core from private frontend-only dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86","crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: s2359-bulk-108-rules
+      - name: Run all twenty generated native SSA differential cases at five widths
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test native_s2359_bulk_laws -- --nocapture
+      - name: Preserve entire compiler-opt unit suite and the default 155 rules
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test native_default_generated_flags
+          cargo test -p compiler-opt --test native_s2350_shadow_parity
+          cargo check -p compiler-opt --no-default-features
+      - name: Strict native optimizer Clippy
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --lib -- -D warnings -A dead_code
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: s2359-audited-new-width-orientation-proofs
+          path: /tmp/s2359-proof-summary.json
+          retention-days: 14
