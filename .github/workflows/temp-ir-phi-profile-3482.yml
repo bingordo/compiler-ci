@@ -1,0 +1,57 @@
+name: Temporary TypeId pointer-phi profile retirement
+on:
+  pull_request:
+    paths: ['.github/workflows/temp-ir-phi-profile-3482.yml']
+permissions: {contents: read}
+jobs:
+  phi-profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      SOURCE_SHA: 5414232a2a2c1ba39f9f5ed432cd29543aecf071
+      CARGO_INCREMENTAL: '0'
+      MEMORY_REPETITIONS: '3'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler SHA and isolate optimizer workspace
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-phi-profile-retirement
+      - name: No Function graph or legacy conversion in profile input
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          if git grep -nE 'to_legacy\(|from_legacy\(|native_memory_fixture|from_function\(' -- crates/opt/tests/alias_phi_profile.rs; then exit 1; fi
+      - name: Run opt-in native TypeId pointer-phi profile
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test alias_phi_profile -- --ignored --nocapture
+          cargo test -p compiler-opt --test alias_phi_exhaustive
+          cargo test -p compiler-opt --test alias_phis
+      - name: Compile all optimizer targets and lint production
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --all-targets
+          cargo clippy -p compiler-opt --lib -- -D warnings
+      - name: Enforce native graph API boundary
+        working-directory: compiler
+        run: python3 tools/check_mixed_function_export_boundary.py
