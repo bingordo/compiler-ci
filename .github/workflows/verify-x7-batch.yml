@@ -1,97 +1,84 @@
-name: X7 batched compiler candidate validation
-# Reusable manual gate: supply the exact compiler commit SHA on dispatch.
-# This workflow never enables its experimental feature in default codegen.
+name: X7 generated physical GP recipe batch
 on:
-  workflow_dispatch:
-    inputs:
-      source_ref:
-        description: "Exact compiler candidate SHA (40 hex digits)"
-        required: true
-        type: string
+  pull_request:
+    paths: ['.github/workflows/verify-x7-batch.yml']
 permissions:
   contents: read
-concurrency:
-  group: x7-batch-${{ inputs.source_ref }}
-  cancel-in-progress: true
 jobs:
-  physical-ctz:
-    name: Physical CTZ ${{ matrix.variant }}
+  generic-gp:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        variant: [baseline, probe]
-    env:
-      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-      CARGO_INCREMENTAL: "0"
-      SOURCE_REF: "${{ inputs.source_ref }}"
     steps:
-      - name: Validate source-ref shape
-        shell: bash
-        run: |
-          set -euo pipefail
-          [[ "$SOURCE_REF" =~ ^[0-9a-f]{40}$ ]] || { echo "Full exact SHA required" >&2; exit 1; }
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ env.SOURCE_REF }}
+          ref: 627c17390730e15fc7f812b636439793cd34b81e
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Verify exact candidate and configure public git dependencies
-        shell: bash
+      - name: Verify exact source and restrict workspace
         run: |
           set -euo pipefail
-          sha="$(git -C compiler rev-parse HEAD)"
-          test "$sha" = "$SOURCE_REF"
-          echo "X7 tested compiler SHA: $sha, mode: ${{ matrix.variant }}" >> "$GITHUB_STEP_SUMMARY"
-          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
-          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
-      - name: Restrict workspace to core source crates
-        shell: bash
-        run: |
+          test "$(git -C compiler rev-parse HEAD)" = 627c17390730e15fc7f812b636439793cd34b81e
           cat > compiler/Cargo.toml <<'EOF'
           [workspace]
           resolver = "2"
-          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          members = ["crates/ir", "crates/ir-macros", "crates/opt", "crates/backend", "crates/backend-x86"]
           EOF
           rm -f compiler/Cargo.lock
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: compiler -> target
-          key: x7-batch-${{ matrix.variant }}
-      - name: Native TypeId CTZ independent C11 GAS/ELF oracle
-        shell: bash
+          key: x7-generic-gp-recipes
+      - uses: actions/cache/restore@v4
+        id: xed-cache
+        with:
+          path: /tmp/x7-xed-upstream.json
+          key: x7-xed-export-0bcb6237345c5066726dcc08b3d87928df3b5b26-1b437e409221a2b5703b4d8896baa20d43e4ba1a
+      - name: Build pinned upstream XED exporter
+        if: steps.xed-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/intelxed/xed.git /tmp/xed
+          git -C /tmp/xed checkout 0bcb6237345c5066726dcc08b3d87928df3b5b26
+          git clone --filter=blob:none https://github.com/intelxed/mbuild.git /tmp/mbuild
+          git -C /tmp/mbuild checkout 1b437e409221a2b5703b4d8896baa20d43e4ba1a
+          (cd /tmp/xed && ./mfile.py --no-encoder)
+          (cd /tmp && python3 /tmp/xed/pysrc/xed_to_db.py --xed-dgen /tmp/xed/obj/dgen --out /tmp/x7-xed-upstream.json --compact)
+      - uses: actions/cache/save@v4
+        if: steps.xed-cache.outputs.cache-hit != 'true'
+        with:
+          path: /tmp/x7-xed-upstream.json
+          key: x7-xed-export-0bcb6237345c5066726dcc08b3d87928df3b5b26-1b437e409221a2b5703b4d8896baa20d43e4ba1a
+      - name: Generate all eligible exact XED scalar GP forms
         working-directory: compiler
         run: |
           set -euo pipefail
-          if test "${{ matrix.variant }}" = probe; then
-            cargo test -p compiler-backend-x86 --test x7_ctz_bsf_zeroing_probe --features x7-bsf-zeroing-probe -- --nocapture
-          else
-            cargo test -p compiler-backend-x86 --test x7_ctz_bsf_zeroing_probe -- --nocapture
-          fi
-      - name: Existing narrow CTZ regression and measured dependency tests
-        shell: bash
+          python3 tools/x7_generate_gp_register_recipes.py --xed-json /tmp/x7-xed-upstream.json --report /tmp/x7-gp-recipes.json --rust crates/backend-x86/tests/x7_generated_gp_recipe_rows.inc
+          python3 - <<'PY'
+          import json
+          r=json.load(open('/tmp/x7-gp-recipes.json'))
+          print('X7_GENERATED_GP_FORM_NAMES',[(x['iform'],x['bits']) for x in r['rows']])
+          raw=json.load(open('/tmp/x7-xed-upstream.json'))
+          for x in raw['Instructions']:
+              if x.get('iclass') in ('ANDN','BLSI','SHLX','PDEP') and x.get('mod_required')==[3]:
+                  print('X7_GP_REAL_OPERAND_METADATA',json.dumps(x,sort_keys=True))
+          # Emit exact metadata before enforcing nonempty generation.
+          assert len(r['rows'])>=20 and r['production_selection_eligible_forms']==0,r['rejected_vex_forms']
+          assert {x['reg'][0] for x in r['rows']}=={'operand','extension'}
+          PY
+          cp crates/backend-x86/tests/x7_gp_register_recipe_oracle.rs.in crates/backend-x86/tests/x7_gp_register_recipe_oracle.rs
+      - name: Compare shared physical stream GAS and ELF for whole generated cohort
         working-directory: compiler
         run: |
           set -euo pipefail
-          if test "${{ matrix.variant }}" = probe; then
-            cargo test -p compiler-backend-x86 --test review_narrow_compare_ctz_oracle --features x7-bsf-zeroing-probe
-            cargo test -p compiler-backend-x86 --test x7_measured_bsf_dependencies --features x7-bsf-zeroing-probe
-          else
-            cargo test -p compiler-backend-x86 --test review_narrow_compare_ctz_oracle
-            cargo test -p compiler-backend-x86 --test x7_measured_bsf_dependencies
-          fi
-      - name: Backend normal and no-default build checks
-        shell: bash
-        working-directory: compiler
-        run: |
-          set -euo pipefail
-          if test "${{ matrix.variant }}" = probe; then
-            cargo check -p compiler-backend-x86 --features x7-bsf-zeroing-probe
-            cargo check -p compiler-backend-x86 --no-default-features --features x7-bsf-zeroing-probe
-          else
-            cargo check -p compiler-backend-x86
-            cargo check -p compiler-backend-x86 --no-default-features
-          fi
+          cargo test -p compiler-backend-x86 --test x7_gp_register_recipe_oracle -- --nocapture
+          cargo test -p compiler-backend-x86 --lib
+          cargo check -p compiler-backend-x86 --no-default-features
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-generic-gp-recipes
+          path: |
+            /tmp/x7-gp-recipes.json
+            /tmp/x7-xed-upstream.json
