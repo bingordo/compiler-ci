@@ -1,0 +1,51 @@
+name: TEMP x86 measured profile replay ABBA #3483
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temp-x86-profile-replay-abba-3483.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  paired-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_INCREMENTAL: "0"
+      COMPILER_X86_PGO_BENCH_ABBA: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1dda8b09b2108969b1f2fc3fa6800c10c7b8b1a1
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check pinned compiler and git config
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "1dda8b09b2108969b1f2fc3fa6800c10c7b8b1a1"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          echo "Exact compiler 1dda8b09b2108969b1f2fc3fa6800c10c7b8b1a1" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x86-pgo-replay-abba
+      - name: Run real-source instrumented training and paired default/replay ELF/GAS
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 25m cargo test --release -p compiler --test x86_edge_pgo_runtime_source -- --ignored --nocapture 2>&1 | tee "$RUNNER_TEMP/x86-profile-replay-abba.log"
+          grep -F "X86_RUNTIME_PGO_ABBA profile=profile_elf" "$RUNNER_TEMP/x86-profile-replay-abba.log"
+          grep -F "X86_RUNTIME_PGO_ABBA profile=profile_gas" "$RUNNER_TEMP/x86-profile-replay-abba.log"
+          grep -F "X86_PGO_REPLAY source=rolling_checksum" "$RUNNER_TEMP/x86-profile-replay-abba.log"
+          grep -F "test result: ok. 1 passed;" "$RUNNER_TEMP/x86-profile-replay-abba.log"
+      - name: Save observational samples
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x86-profile-replay-abba-3483
+          path: ${{ runner.temp }}/x86-profile-replay-abba.log
+          if-no-files-found: ignore
