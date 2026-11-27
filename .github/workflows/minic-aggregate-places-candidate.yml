@@ -8,53 +8,70 @@ permissions:
   contents: read
   actions: read
 jobs:
-  storage-triage:
+  candidate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 97456af759ebe1e77d1a168cdae7e5f309667035
+          ref: 0f9f226977c291001ce6f80cda9b221bfb6c9818
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Probe unit tests
+      - name: Source pins
         run: |
           git -C compiler rev-parse HEAD
-          cd compiler/tools
-          python3 -m unittest test_csmith_probe
+          grep 'rev =' compiler/tools/mini-c-driver/Cargo.toml
+          sed -i 's|ssh://git@github.com/bingordo/mini-c.git|https://github.com/bingordo/mini-c.git|g' compiler/tools/mini-c-driver/Cargo.toml
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: minic-native-hexfloat
+      - name: GCC mixed shared bitfield INTEGER ABI
+        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test bitfield_integer_abi --test mixed_bitfield_storage -- --nocapture
+      - name: Build driver
+        if: success() || failure()
+        run: cargo build --manifest-path compiler/tools/mini-c-driver/Cargo.toml --bin compiler-mini-c
       - uses: actions/download-artifact@v4
+        if: success() || failure()
         with:
           name: minic-bitfield-abi-evidence-bitfield-abi
           run-id: '46045840708'
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/storage-replay
-      - name: Exact failure and source inventory
+      - name: Replay exact original bitfield inputs
+        if: success() || failure()
         env:
           INPUTS: ${{ runner.temp }}/storage-replay
         run: |
           set -euo pipefail
           PYTHONPATH=compiler/tools python3 - <<'PY'
-          import hashlib,json,os,pathlib,re
-          from csmith_probe import is_explicit_frontend_rejection
-          root=pathlib.Path(os.environ["INPUTS"])
-          for profile in ("restricted-bitfields","restricted-unions","restricted-storage"):
-              results=root/profile/"results"
-              for line in (results/"results.jsonl").read_text().splitlines():
-                  row=json.loads(line)
-                  if row["classification"] not in ("compiler-crash","unsupported-front-end"):
-                      continue
-                  seed=row["seed"]
-                  diagnostic=row["compiler"]["stderr_preview"].splitlines()[0]
-                  classified=row["compiler"]["exit_code"]==1 and is_explicit_frontend_rejection(diagnostic.encode())
-                  print("STORAGE_GAP",profile,seed,classified,diagnostic,flush=True)
-                  if profile!="restricted-bitfields":
-                      continue
-                  pre=results/f"case-{seed}"/"candidate.i"
-                  assert hashlib.sha256(pre.read_bytes()).hexdigest()==row["preprocessed_sha256"]
-                  text=pre.read_text()
-                  for match in re.finditer(r"(?m)^\s*(?:struct|union)\s+\w+\s*\{[^{}]*\}\s*;",text):
-                      if ":" in match.group():
-                          print("BITFIELD_LAYOUT",seed,match.group()[:2000],flush=True)
+          import hashlib,json,os,pathlib,subprocess
+          root=pathlib.Path(os.environ["INPUTS"])/"restricted-bitfields"/"results"
+          driver=pathlib.Path("compiler/tools/mini-c-driver/target/debug/compiler-mini-c").resolve()
+          rows=[json.loads(x) for x in (root/"results.jsonl").read_text().splitlines()]
+          passed=0
+          for row in rows:
+              seed=row["seed"]
+              pre=root/f"case-{seed}"/"candidate.i"
+              assert hashlib.sha256(pre.read_bytes()).hexdigest()==row["preprocessed_sha256"]
+              work=pre.parent
+              obj=work/"new.o"
+              exe=work/"new.bin"
+              ref=work/"ref.bin"
+              subprocess.run(["gcc","-std=c99","-w","-O2",str(pre),"-o",str(ref)],check=True,timeout=30)
+              expect=subprocess.run([str(ref)],capture_output=True,check=True,timeout=5).stdout
+              assert b"checksum" in expect
+              result=subprocess.run([str(driver),str(pre),"--omit-unreferenced-static-bodies","--emit","obj","-o",str(obj)],capture_output=True,timeout=30)
+              if result.returncode:
+                  print("BITFIELD_REPLAY",seed,"rejected",result.stderr.decode(errors="replace").splitlines()[0],flush=True)
+                  continue
+              subprocess.run(["gcc",str(obj),"-o",str(exe)],check=True,timeout=30)
+              actual=subprocess.run([str(exe)],capture_output=True,check=True,timeout=5).stdout
+              assert actual==expect, (seed,actual,expect)
+              passed+=1
+              print("BITFIELD_REPLAY",seed,"passed",flush=True)
+          print("BITFIELD_TOTAL",passed,len(rows))
+          assert passed>=15
           PY
