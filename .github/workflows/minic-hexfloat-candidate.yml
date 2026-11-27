@@ -7,17 +7,44 @@ on:
 permissions:
   contents: read
 jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: main
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Resolve main
+        id: source
+        run: echo "sha=$(git -C compiler rev-parse HEAD)" >> "$GITHUB_OUTPUT"
   candidate:
+    needs: snapshot
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline, integrated]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 43f2baf109884797db8441609df218a3473cc36b
+          ref: ${{ needs.snapshot.outputs.sha }}
+          fetch-depth: 0
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
+      - name: Integrate exact candidate
+        if: matrix.variant == 'integrated'
+        run: |
+          set -euo pipefail
+          git -C compiler -c user.name=compiler-ci -c user.email=compiler-ci@users.noreply.github.com merge --no-ff --no-edit 43f2baf109884797db8441609df218a3473cc36b
+          git -C compiler log -1 --format='%H parents=%P' | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Record exact source
         run: |
           git -C compiler rev-parse HEAD
@@ -30,6 +57,7 @@ jobs:
       - name: Probe unit tests
         run: cd compiler/tools && python3 -m unittest test_csmith_probe
       - name: GCC record and pointer array ELF and GAS oracles
+        if: matrix.variant == 'integrated'
         run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test record_array_storage -- --nocapture
       - name: Existing adapter unit suite
         if: success() || failure()
@@ -70,6 +98,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: expanded-csmith-evidence
+          name: expanded-csmith-evidence-${{ matrix.variant }}
           path: ${{ runner.temp }}/strict-evidence
           retention-days: 14
