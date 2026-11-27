@@ -1,0 +1,59 @@
+name: Temporary native TypeId affine cancellation oracle retirement
+on:
+  pull_request:
+    paths: ['.github/workflows/temp-ir-affine-3488.yml']
+permissions: {contents: read}
+jobs:
+  affine-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      SOURCE_SHA: 9e7d3bd2b6029622fd9644819665ebff40f66a5a
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Pin exact compiler commit and isolate optimizer
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-affine-native-retirement
+      - name: No affine Function adapter or stale observer consumers
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test ! -f crates/opt/tests/support/native_algebra_observation.rs
+          if git grep -nE 'native_algebra_observation|observe_native_algebra|to_legacy\(|from_legacy\(' -- crates/opt/tests; then exit 1; fi
+      - name: Run native affine and adjacent regressions
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test affine_cancellation
+          cargo test -p compiler-opt --test ctz_total_folding
+          cargo test -p compiler-opt --test division_effects
+          cargo test -p compiler-opt --test generated_native_oracle
+          cargo test -p compiler-opt --test native_cfg_differential
+      - name: Compile all optimizer targets and strict production lint
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --all-targets
+          cargo clippy -p compiler-opt --lib -- -D warnings
+      - name: Ensure one native production optimizer graph
+        working-directory: compiler
+        run: python3 tools/check_mixed_function_export_boundary.py
