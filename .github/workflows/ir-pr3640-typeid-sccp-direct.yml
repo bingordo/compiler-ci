@@ -1,0 +1,60 @@
+# Temporary exact-source validation; close PR without merging.
+name: IR PR3640 direct TypeId SCCP solver
+on:
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/ir-pr3640-typeid-sccp-direct.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ir-pr3640-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  native-sccp:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      COMPILER_SHA: 081db2e404705829d866140ffa9022e079cb3aef
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.COMPILER_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check exact source and isolate optimizer workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          echo "Compiler candidate: $COMPILER_SHA" >> "$GITHUB_STEP_SUMMARY"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: typeid-pr3640-sccp-direct
+      - name: Native SCCP library and integration regressions
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test typed_sccp
+          cargo test -p compiler-opt --test sccp_sparse_native
+          cargo test -p compiler-opt --test typed_core_pipeline --no-run
+          cargo test -p compiler-opt --test typeid_core_pass_manager --no-run
+      - name: Strict IR and scoped optimizer lint
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir --lib -- -D warnings
+          cargo clippy -p compiler-opt --lib -- -D warnings -A dead_code -A clippy::too_many_arguments
