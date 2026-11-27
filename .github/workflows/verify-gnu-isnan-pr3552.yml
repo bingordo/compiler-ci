@@ -1,0 +1,121 @@
+name: GNU isnan TypeId acceptance PR3552
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-gnu-isnan-pr3552.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-isnan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d0399f39241e3cc043099d60428dc0b4a7864e4d
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Build candidate production Rust compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = d0399f39241e3cc043099d60428dc0b4a7864e4d
+          timeout --signal=TERM --kill-after=10s 14m cargo build --manifest-path compiler/Cargo.toml -p compiler --bin compiler
+          echo "COMPILER_SHA=$(git -C compiler rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Check exact pinned Mini-C frontend semantics
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone -q ssh://git@github.com/bingordo/mini-c.git minic
+          git -C minic checkout -q 8d3aa8948a7e1aec37ed8781fc774e576937b3bb
+          test "$(git -C minic rev-parse HEAD)" = 8d3aa8948a7e1aec37ed8781fc774e576937b3bb
+          timeout --signal=TERM --kill-after=10s 6m cargo test --manifest-path minic/Cargo.toml -p mini-c-sema gnu_nan_and_isnan_checked_float_results -- --nocapture
+      - name: Independent GCC and TypeId FP isnan runtime differential
+        shell: bash
+        run: |
+          set -euo pipefail
+          compiler="$PWD/compiler/target/debug/compiler"
+          mkdir -p standalone
+          cd standalone
+          cat > fp.c <<'EOF'
+          int classify_float(float x) { return __builtin_isnan(x); }
+          int classify_double(double x) { return __builtin_isnan(x); }
+          int classify_literal(void) { return __builtin_isnan(__builtin_nanf("")); }
+          EOF
+          cat > check.c <<'EOF'
+          #include <math.h>
+          extern int classify_float(float);
+          extern int classify_double(double);
+          extern int classify_literal(void);
+          int main(void) {
+            float fs[] = {0.0f,-0.0f,1.0f,-2.5f,INFINITY,-INFINITY,NAN};
+            double ds[] = {0.0,-0.0,1.0,-2.5,INFINITY,-INFINITY,NAN};
+            for (unsigned i=0;i<7;i++) {
+              int expected = i==6;
+              if (!!classify_float(fs[i]) != expected) return 1;
+              if (!!classify_double(ds[i]) != expected) return 2;
+            }
+            return classify_literal()==1 ? 0 : 3;
+          }
+          EOF
+          gcc -std=gnu11 -O0 fp.c check.c -o oracle
+          ./oracle
+          "$compiler" --gcc-driver -std=gnu11 -c fp.c -o native.o
+          gcc -std=gnu11 -O0 check.c native.o -o native
+          ./native
+          for source in \
+              'int f(float x) { return __builtin_isnan(); }' \
+              'int f(float x) { return __builtin_isnan(x,x); }' \
+              'int f(float x) { return __builtin_isnan(1); }' \
+              'int f(float x) { return __builtin_isnan((void*)0); }'; do
+            printf '%s\n' "$source" > bad.c
+            if "$compiler" --gcc-driver -c bad.c -o bad.o > bad.log 2>&1; then
+              echo "invalid GNU isnan accepted: $source" >&2
+              exit 1
+            fi
+            test ! -e bad.o
+          done
+          echo "GCC_TYPEID_ISNAN_F32_F64_RUNTIME=PASS" >> "$GITHUB_STEP_SUMMARY"
+      - name: Unmodified cJSON GNU isnan acceptance and first next blocker
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone -q --depth 1 --branch v1.7.19 https://github.com/DaveGamble/cJSON.git cjson
+          test "$(git -C cjson rev-parse HEAD)" = c859b25da02955fef659d658b8f324b5cde87be3
+          cmake -S cjson -B gcc-build -G Ninja -DCMAKE_C_COMPILER=cc -DBUILD_SHARED_LIBS=OFF -DENABLE_CUSTOM_COMPILER_FLAGS=OFF -DENABLE_CJSON_TEST=OFF -DENABLE_CJSON_UTILS=OFF -DENABLE_LOCALES=OFF
+          cmake --build gcc-build
+          test -s gcc-build/libcjson.a
+          c="$PWD/compiler/target/debug/compiler"
+          tc="$PWD/compiler/tools/cmake/typeid-gcc-adapter-toolchain.cmake"
+          cmake -S cjson -B native-build -G Ninja -DCMAKE_C_COMPILER="$c" -DCMAKE_C_COMPILER_ARG1=--gcc-driver -DCMAKE_TOOLCHAIN_FILE="$tc" -DBUILD_SHARED_LIBS=OFF -DENABLE_CUSTOM_COMPILER_FLAGS=OFF -DENABLE_CJSON_TEST=OFF -DENABLE_CJSON_UTILS=OFF -DENABLE_LOCALES=OFF
+          set +e
+          cmake --build native-build --verbose > native-build.log 2>&1
+          result=$?
+          set -e
+          if grep -Fq 'unsupported compiler builtin __builtin_isnan' native-build.log; then
+            echo "original GNU isnan cJSON blocker remains" >&2
+            exit 1
+          fi
+          {
+            echo 'GCC_CJSON_STATIC_LIBRARY=PASS'
+            echo "TYPEID_CJSON_BUILD_EXIT=$result"
+            if test "$result" -eq 0; then
+              test -s native-build/libcjson.a
+              echo "TYPEID_CJSON_STATIC_LIBRARY=PASS"
+            else
+              echo "TYPEID_CJSON_STATIC_LIBRARY=UNSUPPORTED"
+              echo "First subsequent compiler diagnostic:"
+              grep -m 8 -E 'compiler:|error:|unsupported|fatal' native-build.log || true
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gnu-isnan-cjson-source-pinned
+          path: native-build.log
+          if-no-files-found: ignore
