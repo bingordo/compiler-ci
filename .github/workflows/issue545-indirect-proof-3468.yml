@@ -1,5 +1,5 @@
 # Source-pinned focused IR tail-call admission test; never compiler-repo Actions.
-name: Issue545 indirect musttail proof
+name: Issue545 indirect tail ABI and A64 BR
 on:
   pull_request:
     paths:
@@ -10,27 +10,27 @@ permissions:
 jobs:
   indirect-ir:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Checkout exact compiler candidate
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 4d86d5b915e6c40229da60357bfe26794778c973
+          ref: 6317e498e40bcacb0227999a42985ff04a5f8b6a
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - name: Verify compiler source SHA
-        run: test "$(git -C compiler rev-parse HEAD)" = '4d86d5b915e6c40229da60357bfe26794778c973'
+        run: test "$(git -C compiler rev-parse HEAD)" = '6317e498e40bcacb0227999a42985ff04a5f8b6a'
       - uses: dtolnay/rust-toolchain@stable
       - name: Build isolated IR workspace
         run: |
           mkdir -p work/crates
-          cp -a compiler/crates/ir work/crates/
+          cp -a compiler/crates/ir compiler/crates/backend compiler/crates/backend-aarch64 work/crates/
           cat > work/Cargo.toml <<'EOF'
           [workspace]
           resolver = "2"
-          members = ["crates/ir"]
+          members = ["crates/ir", "crates/backend", "crates/backend-aarch64"]
           EOF
       - uses: Swatinem/rust-cache@v2
         with:
@@ -48,3 +48,18 @@ jobs:
       - name: Clippy correctness
         working-directory: work
         run: cargo clippy -p compiler-ir --lib --test musttail_indirect_admission -- -D clippy::correctness
+      - name: Check AArch64 sibling-branch regression
+        working-directory: work
+        run: cargo check -p compiler-backend-aarch64 --test tail_indirect_native
+      - name: Cross-compiler and QEMU for independent C11 oracle
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends qemu-user gcc-aarch64-linux-gnu
+      - name: Native AArch64 direct/indirect tail ABI execution (ELF and GAS)
+        working-directory: work
+        env:
+          COMPILER_REQUIRE_AARCH64_QEMU: "1"
+        run: cargo test -p compiler-backend-aarch64 --test tail_indirect_native --test tail_call_native -- --nocapture
+      - name: AArch64 Clippy correctness
+        working-directory: work
+        run: cargo clippy -p compiler-backend-aarch64 --lib --test tail_indirect_native -- -D clippy::correctness
