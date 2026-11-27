@@ -1,0 +1,89 @@
+name: S23.56 reviewed guarded SSA matcher wiring
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-56-guarded-ssa-wiring.yml'
+permissions:
+  contents: read
+jobs:
+  guarded-opt-in:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 79eea692a4bd031c6efb0a54ef057384d3204987
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check exact candidate commit and sealed generator source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 79eea692a4bd031c6efb0a54ef057384d3204987
+          echo "S2356_COMPILER_SHA=$(git -C compiler rev-parse HEAD)"
+          python3 - <<'PY'
+          import hashlib, pathlib
+          root=pathlib.Path('compiler/tools/typeid-rule-gen/pinned')
+          expected={
+            'expr_rules.json':'05bea3bc2e3658cb2b37d0239f8663705f2822a41153ecaa9ba06d269e19beaf',
+            'expr_fusion.json':'c45626a624307e7f79d9243ac2e9d49d44e0df71461519dcf98c5b8b043ed628',
+          }
+          for name,sha in expected.items():
+              actual=hashlib.sha256((root/name).read_bytes()).hexdigest()
+              assert actual==sha, (name, actual, sha)
+          print('S2356_APPROVED_INPUTS_MATCH_S2354_QFBV_PROOF')
+          PY
+      - name: Check canonical rule generator and immutable reviewed Rust fragment
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd compiler/tools/typeid-rule-gen
+          python3 -m compileall -q guarded_ssa_codegen.py test_guarded_ssa_codegen.py
+          python3 -m unittest -v test_guarded_ssa_codegen test_guarded_batch_proofs test_batch_inventory test_ssa_codegen
+          python3 guarded_ssa_codegen.py --emit-reviewed-fragment \
+            --source pinned/expr_rules.json --source pinned/expr_fusion.json > /tmp/s2356-fragment.rs
+          python3 guarded_ssa_codegen.py --emit-reviewed-fragment \
+            --source pinned/expr_rules.json --source pinned/expr_fusion.json > /tmp/s2356-fragment-again.rs
+          cmp /tmp/s2356-fragment.rs /tmp/s2356-fragment-again.rs
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path('/tmp/s2356-fragment.rs').read_text()
+          assert s.count('return Some((')==67
+          assert 'pub trait SsaView' not in s and 'pub enum Opcode' not in s
+          print('S2356_REVIEWED_67_SOURCE_MATCHER_OK')
+          PY
+      - name: Isolate core workspace without private driver-only dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86","crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: s2356-source-pinned-guarded-ssa
+      - name: Compile and run native TypeId guarded batch integration
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib --features experimental-typeid-guarded-admission generated_guarded_admission -- --nocapture
+      - name: Verify old default-on generated rules and nonexperimental build
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test native_s2350_shadow_parity
+          cargo test -p compiler-opt --test native_default_generated_flags
+          cargo check -p compiler-opt --no-default-features
+      - name: Lint all wired TypeId guarded modules
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --lib --features experimental-typeid-guarded-admission -- -D warnings -A dead_code
