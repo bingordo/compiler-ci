@@ -1,0 +1,112 @@
+name: S23.60 prove distributive carry and mask laws
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-60-distributive-carry.yml'
+permissions:
+  contents: read
+jobs:
+  s2360-proven-rule-batch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2f643c46e38f0f111e4a9b5ea03eccfe54a64803
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm pinned source SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 2f643c46e38f0f111e4a9b5ea03eccfe54a64803
+          echo "S2360_COMPILER_SHA=$(git -C compiler rev-parse HEAD)"
+      - name: Validate deterministic families, source receipts and test corpus
+        shell: bash
+        working-directory: compiler/tools/typeid-rule-gen
+        run: |
+          set -euo pipefail
+          python3 -m unittest -v test_rules test_ssa_codegen \
+            test_bulk_unconditional_laws test_batch_distributive_carry \
+            test_guarded_ssa_codegen test_guarded_batch_proofs
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          from batch_distributive_carry import batch_from_source
+          from rules import matching_orientations
+          source = Path("examples.rules").read_text()
+          rules=batch_from_source(source)
+          assert len(rules)==15
+          print("S2360_NEW_FAMILIES=",len(rules))
+          print("S2360_NEW_ORIENTATIONS=",sum(len(matching_orientations(r.pattern)) for r in rules))
+          print("S2360_FULL_RULE_SOURCE_SHA256=",hashlib.sha256(source.encode()).hexdigest())
+          PY
+      - name: Independently Z3-prove all new width and orientation instances
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq z3
+          cd compiler/tools/typeid-rule-gen
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, hashlib
+          from batch_distributive_carry import batch_from_source
+          from prove import verify
+          source=Path("examples.rules").read_text()
+          result=verify(batch_from_source(source), "z3", timeout_ms=3500, process_timeout=5.0)
+          assert result["family_count"]==15
+          assert result["sat_negative_controls"]==5
+          assert all(row["result"]=="unsat" for row in result["proofs"])
+          print("S2360_NEW_QFBV_PROOFS=",result["proof_count"])
+          Path("/tmp/s2360-proofs.json").write_text(json.dumps({
+            "source_sha256":hashlib.sha256(source.encode()).hexdigest(),
+            "proofs":result["proofs"],"family_count":15,
+            "proof_count":result["proof_count"],
+            "sat_negative_controls":5
+          },sort_keys=True))
+          PY
+      - name: Isolate native core from private frontend-only dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86","crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: s2360-batch-123-rules
+      - name: Execute all 15 declarative source cases on 5 native widths
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test native_s2360_distributive_carry -- --nocapture
+      - name: Existing default-on, opt-out, guarded and source rules regressions
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test native_s2359_bulk_laws
+          cargo test -p compiler-opt --test native_default_generated_flags
+          cargo test -p compiler-opt --test native_s2350_shadow_parity
+          cargo check -p compiler-opt --no-default-features
+      - name: Strict optimizer lint
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --lib -- -D warnings -A dead_code
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: s2360-independent-QFBV-rule-receipts
+          path: /tmp/s2360-proofs.json
+          retention-days: 14
