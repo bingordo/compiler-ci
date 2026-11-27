@@ -1,0 +1,76 @@
+name: GNU orphan annotation exact cJSON source context PR3556
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-gnu-orphan-annotation-pr3556.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  orphan-diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 23
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 5688e9d0ce5d8b02c60b5b670c86a2eb6c628c59
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Build exact compiler and run orphan diagnostic regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 5688e9d0ce5d8b02c60b5b670c86a2eb6c628c59
+          timeout --signal=TERM --kill-after=10s 14m cargo build --manifest-path compiler/Cargo.toml -p compiler --bin compiler
+          timeout --signal=TERM --kill-after=10s 6m cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib orphan_annotation_diagnostic_reports_exact_source_offset -- --nocapture
+      - name: Reproduce unchanged cJSON and print first orphan event context
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone -q --depth 1 --branch v1.7.19 https://github.com/DaveGamble/cJSON.git cjson
+          test "$(git -C cjson rev-parse HEAD)" = c859b25da02955fef659d658b8f324b5cde87be3
+          cc -std=gnu11 -E -P -x c cjson/cJSON.c -o cjson-preprocessed.c
+          cmake -S cjson -B gcc-build -G Ninja -DCMAKE_C_COMPILER=cc -DBUILD_SHARED_LIBS=OFF -DENABLE_CUSTOM_COMPILER_FLAGS=OFF -DENABLE_CJSON_TEST=OFF -DENABLE_CJSON_UTILS=OFF -DENABLE_LOCALES=OFF
+          cmake --build gcc-build
+          test -s gcc-build/libcjson.a
+          compiler="$PWD/compiler/target/debug/compiler"
+          tc="$PWD/compiler/tools/cmake/typeid-gcc-adapter-toolchain.cmake"
+          cmake -S cjson -B native-build -G Ninja -DCMAKE_C_COMPILER="$compiler" -DCMAKE_C_COMPILER_ARG1=--gcc-driver -DCMAKE_TOOLCHAIN_FILE="$tc" -DBUILD_SHARED_LIBS=OFF -DENABLE_CUSTOM_COMPILER_FLAGS=OFF -DENABLE_CJSON_TEST=OFF -DENABLE_CJSON_UTILS=OFF -DENABLE_LOCALES=OFF
+          set +e
+          cmake --build native-build --verbose > native-build.log 2>&1
+          rc=$?
+          set -e
+          echo "TYPEID_CJSON_BUILD_EXIT=$rc" | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          output=Path('native-build.log').read_text(errors='replace')
+          lines=[line for line in output.splitlines() if 'compiler:' in line]
+          print('FIRST_COMPILER_DIAGNOSTICS=')
+          for line in lines[:6]:
+              print(line)
+          m=re.search(r'GNU annotation not attached to a checked file-scope symbol at byte (\d+)',output)
+          if not m:
+              print('Original orphan event is not present; next compiler gap:',lines[:3])
+          else:
+              pos=int(m.group(1))
+              data=Path('cjson-preprocessed.c').read_bytes()
+              print('ORPHAN_EVENT_AT_BYTE=',pos,' PREPROCESSED_SIZE=',len(data))
+              print('ORPHAN_CONTEXT_BEGIN')
+              print(data[max(0,pos-700):min(len(data),pos+500)].decode('utf-8','replace'))
+              print('ORPHAN_CONTEXT_END')
+          PY
+          echo "GCC_CJSON_STATIC_LIBRARY=PASS" >> "$GITHUB_STEP_SUMMARY"
+          echo "TYPEID_CJSON_STATIC_LIBRARY=$(test "$rc" -eq 0 && echo PASS || echo UNSUPPORTED)" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gnu-orphan-cjson-context-pr3556
+          path: |
+            native-build.log
+            cjson-preprocessed.c
+          if-no-files-found: ignore
