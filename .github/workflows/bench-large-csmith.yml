@@ -1,4 +1,4 @@
-name: One-off large Csmith compile-time profile
+name: One-off sparse mem2reg Csmith A/B
 on:
   pull_request:
     branches: [main]
@@ -15,7 +15,7 @@ jobs:
   compile-time:
     if: github.head_ref == 'bench/large-csmith-compile-time' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
         with:
@@ -23,103 +23,115 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: main
-          path: compiler
+          ref: 634e186ede654db1b1aabef0597dad7c5d90efb4
+          path: baseline
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Prepare toolchain and source
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/csmith-bench"
-          git -C compiler rev-parse HEAD | tee "$RUNNER_TEMP/csmith-bench/compiler-sha"
-          sudo apt-get update -qq
-          sudo apt-get install -qq -y --no-install-recommends csmith libcsmith-dev gcc time
-          dpkg-query -W csmith libcsmith-dev gcc > "$RUNNER_TEMP/csmith-bench/packages"
-          grep -q '^csmith[[:space:]]2.3.0-' "$RUNNER_TEMP/csmith-bench/packages"
-          header="$(dpkg -L libcsmith-dev | grep '/csmith.h$' | head -n1)"
-          test -s "$header"
-          echo "CSMITH_INCLUDE=$(dirname "$header")" >> "$GITHUB_ENV"
-          python3 - <<'PY'
-          from pathlib import Path
-          p=Path("compiler/tools/mini-c-driver/Cargo.toml")
-          text=p.read_text()
-          old="ssh://git@github.com/bingordo/mini-c.git"
-          assert text.count(old)==2
-          p.write_text(text.replace(old,"https://github.com/bingordo/mini-c.git"))
-          PY
-      - name: Check profiler availability
-        run: |
-          set -euo pipefail
-          if ! command -v perf >/dev/null; then
-            sudo apt-get install -y linux-tools-common linux-tools-generic
-          fi
-          perf --version
-          sudo perf record -e cpu-clock:u -o /tmp/csmith-perf-probe.data -- sleep 0.1
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 51ad4db0658f417218716e02b0c42d5eee830b57
+          path: candidate
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           name: large-csmith-compile-time
           run-id: 46029541162
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/original-csmith
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: compiler/tools/mini-c-driver -> target
-          key: mini-c-release-csmith-profile-v1
-      - name: Build production native driver in release mode with profiling symbols
-        env:
-          CARGO_PROFILE_RELEASE_DEBUG: '1'
-          RUSTFLAGS: '-C force-frame-pointers=yes'
+      - name: Prepare exact inputs and revisions
         run: |
           set -euo pipefail
-          cargo build --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c 2>&1 | tee "$RUNNER_TEMP/csmith-bench/build.log"
-          sha256sum compiler/tools/mini-c-driver/target/release/compiler-mini-c > "$RUNNER_TEMP/csmith-bench/driver-sha256"
-      - name: Profile exact Csmith inputs with a bounded CPU-clock sample
-        run: |
-          set -euo pipefail
-          out="$RUNNER_TEMP/csmith-bench"
-          original="$RUNNER_TEMP/original-csmith"
-          python3 - "$original" "$out" <<'PY'
+          mkdir -p "$RUNNER_TEMP/csmith-ab" "$RUNNER_TEMP/bench-bin"
+          git -C baseline rev-parse HEAD | tee "$RUNNER_TEMP/csmith-ab/baseline-sha"
+          git -C candidate rev-parse HEAD | tee "$RUNNER_TEMP/csmith-ab/candidate-sha"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          python3 - "$RUNNER_TEMP/original-csmith" "$RUNNER_TEMP/csmith-ab" <<'PY'
           import hashlib, json, pathlib, shutil, sys
-          src, dst = map(pathlib.Path, sys.argv[1:])
-          report = json.loads((src/"report.json").read_text())
+          src,dst=map(pathlib.Path,sys.argv[1:])
+          report=json.loads((src/"report.json").read_text())
           for seed in (1001,1002):
-              case = next(c for c in report["cases"] if c["seed"] == seed)
+              case=next(c for c in report["cases"] if c["seed"]==seed)
               for ext,key in (("c","source_sha256"),("i","preprocessed_sha256")):
-                  p = src/f"case-{seed}.{ext}"
-                  assert hashlib.sha256(p.read_bytes()).hexdigest() == case[key]
+                  p=src/f"case-{seed}.{ext}"
+                  assert hashlib.sha256(p.read_bytes()).hexdigest()==case[key]
                   shutil.copyfile(p,dst/p.name)
               print("VERIFIED_INPUT",seed,case["lines"],case["preprocessed_sha256"])
           PY
-          lscpu > "$out/host.txt"
-          bin="$PWD/compiler/tools/mini-c-driver/target/release/compiler-mini-c"
-          # Short strict-mode probe, not a timing comparison.
-          set +e
-          timeout --kill-after=5s 20s "$bin" "$out/case-1001.i" --emit obj -o "$out/strict.o" > "$out/strict.log" 2>&1
-          strict_status=$?
-          set -e
-          echo "STRICT_EXIT $strict_status"
-          head -c 4000 "$out/strict.log"
-          for seed in 1001 1002; do
-            p="$out/profile-$seed"
-            rm -f "$p.o"
-            set +e
-            sudo perf record -e cpu-clock:u -F 99 -g --call-graph fp -o "$p.data" -- timeout --kill-after=5s 90s "$bin" "$out/case-$seed.i" --emit obj -o "$p.o" --omit-unreferenced-static-bodies > "$p.log" 2>&1
-            status=$?
-            set -e
-            echo "PROFILE_EXIT $seed $status"
-            head -c 4000 "$p.log"
-            sudo chmod a+r "$p.data"
-            perf report -i "$p.data" --stdio --no-children --sort comm,dso,symbol --percent-limit 0.3 > "$p-self.txt"
-            perf report -i "$p.data" --stdio --children --sort comm,dso,symbol --percent-limit 1 > "$p-inclusive.txt"
-            perf script -i "$p.data" > "$p-stacks.txt"
-            echo "SELF_PROFILE $seed"
-            head -70 "$p-self.txt"
-            echo "INCLUSIVE_PROFILE $seed"
-            head -90 "$p-inclusive.txt"
+          lscpu > "$RUNNER_TEMP/csmith-ab/host.txt"
+          gcc --version > "$RUNNER_TEMP/csmith-ab/gcc.txt"
+          rustc --version > "$RUNNER_TEMP/csmith-ab/rustc.txt"
+          for rev in baseline candidate; do
+            sed -i 's#ssh://git@github.com/bingordo/mini-c.git#https://github.com/bingordo/mini-c.git#g' "$rev/tools/mini-c-driver/Cargo.toml"
           done
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            baseline/tools/mini-c-driver -> target
+            candidate/tools/mini-c-driver -> target
+            candidate -> target
+          key: csmith-sparse-mem2reg-ab-v1
+      - name: Verify candidate promotion regressions
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path candidate/Cargo.toml -p compiler-opt --release --lib mem2reg 2>&1 | tee "$RUNNER_TEMP/csmith-ab/mem2reg-tests.log"
+          cargo clippy --manifest-path candidate/Cargo.toml -p compiler-opt --lib -- -D warnings 2>&1 | tee "$RUNNER_TEMP/csmith-ab/clippy.log"
+      - name: Build same-runner release baseline and candidate
+        run: |
+          set -euo pipefail
+          for rev in baseline candidate; do
+            cargo build --release --manifest-path "$rev/tools/mini-c-driver/Cargo.toml" -p compiler-mini-c --bin compiler-mini-c 2>&1 | tee "$RUNNER_TEMP/csmith-ab/build-$rev.log"
+            cp "$rev/tools/mini-c-driver/target/release/compiler-mini-c" "$RUNNER_TEMP/bench-bin/$rev"
+            sha256sum "$RUNNER_TEMP/bench-bin/$rev" >> "$RUNNER_TEMP/csmith-ab/driver-sha256"
+          done
+      - name: Measure and verify exact original inputs
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/csmith-ab" "$RUNNER_TEMP/bench-bin" <<'PY'
+          import json, pathlib, subprocess, sys, time
+          out,bins=map(pathlib.Path,sys.argv[1:])
+          results=[]
+          def save():
+              (out/"ab.json").write_text(json.dumps(results,indent=2))
+          def execute(cmd,limit,log):
+              with log.open("wb") as stream:
+                  return subprocess.run(["timeout","--kill-after=5s",f"{limit}s",*map(str,cmd)],stdout=stream,stderr=subprocess.STDOUT).returncode
+          for seed in (1001,1002):
+              src=out/f"case-{seed}.i"
+              checksum=out/f"gcc-{seed}.checksum"
+              gcc=out/f"gcc-{seed}"
+              status=execute(["gcc","-O2","-w",src,"-o",gcc],120,out/f"gcc-{seed}.log")
+              reference=execute([gcc],15,checksum) if status==0 else -1
+              print("GCC_ORACLE",seed,status,reference,flush=True)
+              for rep,order in enumerate((("baseline","candidate"),("candidate","baseline"))):
+                  for rev in order:
+                      # Baseline large-input timeout is a censored sample, not a timing.
+                      label=f"{seed}-{rev}-{rep}"
+                      obj=out/f"{label}.o"
+                      timing=out/f"{label}.time"
+                      start=time.monotonic()
+                      rc=execute(["/usr/bin/time","-f","%e %U %S %M","-o",timing,bins/rev,src,
+                                  "--emit","obj","-o",obj,"--omit-unreferenced-static-bodies"],
+                                 90 if rev=="baseline" else 180,out/f"{label}.log")
+                      record={"seed":seed,"revision":rev,"rep":rep,"exit":rc,"wall_seconds":time.monotonic()-start}
+                      if rc==0 and obj.exists():
+                          elapsed,user,system,rss=map(float,timing.read_text().splitlines()[-1].split())
+                          record.update(cpu_seconds=user+system,wall_seconds=elapsed,rss_kib=int(rss),object_bytes=obj.stat().st_size)
+                          exe=out/f"{label}.exe"
+                          link=execute(["gcc",obj,"-o",exe],60,out/f"{label}.link")
+                          check=out/f"{label}.checksum"
+                          run=execute([exe],15,check) if link==0 else -1
+                          record["verified"]=reference==0 and run==0 and check.read_bytes()==checksum.read_bytes()
+                      else:
+                          print("DIAGNOSTIC",label,(out/f"{label}.log").read_text(errors="replace")[:2000],flush=True)
+                      results.append(record)
+                      print("AB",json.dumps(record),flush=True)
+                      save()
+          PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: large-csmith-compile-profile
-          path: ${{ runner.temp }}/csmith-bench/
+          name: sparse-mem2reg-csmith-ab
+          path: ${{ runner.temp }}/csmith-ab/
           retention-days: 14
