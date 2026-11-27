@@ -15,7 +15,7 @@ jobs:
   compile-time:
     if: github.head_ref == 'bench/large-csmith-compile-time' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -23,7 +23,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 51ad4db0658f417218716e02b0c42d5eee830b57
+          ref: d457121e5e6c0d5ac36f1e36b2c8f97cee14d55d
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -99,15 +99,22 @@ jobs:
           set -e
           echo "STRICT_EXIT $strict_status"
           head -c 4000 "$out/strict.log"
-          for seed in 1002; do
+          for seed in 1001 1002; do
             p="$out/profile-$seed"
             rm -f "$p.o"
             set +e
-            sudo perf record -e cpu-clock:u -F 99 -g --call-graph fp -o "$p.data" -- timeout --kill-after=5s 90s "$bin" "$out/case-$seed.i" --emit obj -o "$p.o" --omit-unreferenced-static-bodies > "$p.log" 2>&1
+            sudo perf record -e cpu-clock:u -F 99 -g --call-graph fp -o "$p.data" -- timeout --kill-after=5s 180s "$bin" "$out/case-$seed.i" --emit obj -o "$p.o" --omit-unreferenced-static-bodies > "$p.log" 2>&1
             status=$?
             set -e
             echo "PROFILE_EXIT $seed $status"
             head -c 4000 "$p.log"
+            if [ "$status" = 0 ]; then
+              gcc -O2 -w "$out/case-$seed.i" -o "$p.gcc"
+              gcc "$p.o" -o "$p.exe"
+              timeout 20s "$p.gcc" > "$p.gcc.checksum"
+              timeout 20s "$p.exe" > "$p.native.checksum"
+              cmp "$p.gcc.checksum" "$p.native.checksum" && echo "CHECKSUM_MATCH $seed"
+            fi
             sudo chmod a+r "$p.data"
             perf report -i "$p.data" --stdio --call-graph none --no-children --sort comm,dso,symbol --percent-limit 0.3 > "$p-self.txt"
             perf report -i "$p.data" --stdio --call-graph none --children --sort comm,dso,symbol --percent-limit 1 > "$p-inclusive.txt"
