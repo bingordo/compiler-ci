@@ -6,104 +6,55 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+  actions: read
 jobs:
-  candidate:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - variant: merged
-            sha: 7b61a901c7eaf69e05df85a137d1e1ab2e7bc512
-          - variant: bitfield-abi
-            sha: b6b53f79f62286729abd0240e294bffbade0172c
+  storage-triage:
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ matrix.sha }}
+          ref: 97456af759ebe1e77d1a168cdae7e5f309667035
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Record exact source
+      - name: Probe unit tests
         run: |
           git -C compiler rev-parse HEAD
-          grep 'rev =' compiler/tools/mini-c-driver/Cargo.toml
-          sed -i 's|ssh://git@github.com/bingordo/mini-c.git|https://github.com/bingordo/mini-c.git|g' compiler/tools/mini-c-driver/Cargo.toml
-      - uses: Swatinem/rust-cache@v2
+          cd compiler/tools
+          python3 -m unittest test_csmith_probe
+      - uses: actions/download-artifact@v4
         with:
-          workspaces: compiler/tools/mini-c-driver -> target
-          key: minic-native-hexfloat
-      - name: Probe unit tests
-        run: cd compiler/tools && python3 -m unittest test_csmith_probe
-      - name: GCC record and pointer array ELF and GAS oracles
-        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test record_array_storage -- --nocapture
-      - name: GCC by-value record argument places oracle
-        if: success() || failure()
-        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test record_argument_places -- --nocapture
-      - name: Large native body GCC oracle
-        if: success() || failure()
-        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test large_native_body -- --nocapture
-      - name: GCC discarded record expressions oracle
-        if: success() || failure()
-        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test discard_record_expressions -- --nocapture
-      - name: Full-width array indices GCC and trap oracle
-        if: success() || failure()
-        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test wide_checked_array_index -- --nocapture
-      - name: GCC goto and label CFG oracle
-        if: success() || failure()
-        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test goto_labels -- --nocapture
-      - name: Mixed bitfield and static union GCC oracles
-        if: success() || failure()
-        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test mixed_bitfield_storage -- --nocapture
-      - name: Bitfield INTEGER ABI GCC interoperability
-        if: matrix.variant == 'bitfield-abi' && (success() || failure())
-        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test bitfield_integer_abi -- --nocapture
-      - name: Existing adapter unit suite
-        if: success() || failure()
-        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib
-      - name: Replay combined Csmith campaigns
-        if: success() || failure()
+          name: minic-bitfield-abi-evidence-bitfield-abi
+          run-id: '46045840708'
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/storage-replay
+      - name: Exact failure and source inventory
+        env:
+          INPUTS: ${{ runner.temp }}/storage-replay
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -qq -y --no-install-recommends csmith libcsmith-dev gcc clang
-          header=$(dpkg -L libcsmith-dev | grep '/csmith.h$' | head -n1)
-          compiler_sha=$(git -C compiler rev-parse HEAD)
-          manifest=compiler/tools/mini-c-driver/Cargo.toml
-          frontend=$(PYTHONPATH=compiler/tools python3 -c 'from csmith_probe import pinned_frontend_revision; import sys; print(pinned_frontend_revision(open(sys.argv[1]).read()))' "$manifest")
-          cargo build --manifest-path "$manifest" --bin compiler-mini-c
-          evidence="$RUNNER_TEMP/strict-evidence"
-          failure=0
-          profiles="restricted-combined restricted-widths restricted-control restricted-storage restricted-arrays restricted-pointers restricted-structs restricted-compound restricted-observable"
-          if [[ "${{ matrix.variant }}" == bitfield-abi ]]; then
-            profiles="$profiles restricted-bitfields restricted-unions restricted-volatile"
-          fi
-          for profile in $profiles; do
-            extra=()
-            count=16
-            case "$profile" in restricted-structs|restricted-arrays|restricted-pointers|restricted-compound) count=32;; esac
-            if [[ "$profile" == restricted-observable ]]; then
-              count=8
-            else
-              extra=(--omit-unreferenced-static-bodies)
-            fi
-            cases="$evidence/$profile/cases"
-            results="$evidence/$profile/results"
-            python3 compiler/tools/csmith_probe.py --generate --cases-dir "$cases" --csmith csmith --seed-base 1 --seed-count "$count" --profile "$profile"
-            python3 compiler/tools/csmith_probe.py --probe --cases-dir "$cases" --artifacts-dir "$results" --include-dir "$(dirname "$header")" --preprocess-c --driver "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" --compiler-sha "$compiler_sha" --frontend-sha "$frontend" --minimum-native 0 --compile-timeout 30 --run-timeout 5 --max-wall-seconds 240 "${extra[@]}" || failure=1
-            python3 - "$results/results.jsonl" "$profile" <<'PY'
-          import json,sys
-          for line in open(sys.argv[1]):
-              r=json.loads(line)
-              print("CAMPAIGN_RESULT",sys.argv[2],json.dumps({k:r.get(k) for k in ("seed","classification","compiler","frontend_diagnostic")}))
+          PYTHONPATH=compiler/tools python3 - <<'PY'
+          import hashlib,json,os,pathlib,re
+          from csmith_probe import is_explicit_frontend_rejection
+          root=pathlib.Path(os.environ["INPUTS"])
+          for profile in ("restricted-bitfields","restricted-unions","restricted-storage"):
+              results=root/profile/"results"
+              for line in (results/"results.jsonl").read_text().splitlines():
+                  row=json.loads(line)
+                  if row["classification"] not in ("compiler-crash","unsupported-front-end"):
+                      continue
+                  seed=row["seed"]
+                  diagnostic=row["compiler"]["stderr_preview"].splitlines()[0]
+                  classified=row["compiler"]["exit_code"]==1 and is_explicit_frontend_rejection(diagnostic.encode())
+                  print("STORAGE_GAP",profile,seed,classified,diagnostic,flush=True)
+                  if profile!="restricted-bitfields":
+                      continue
+                  pre=results/f"case-{seed}"/"candidate.i"
+                  assert hashlib.sha256(pre.read_bytes()).hexdigest()==row["preprocessed_sha256"]
+                  text=pre.read_text()
+                  for match in re.finditer(r"(?m)^\s*(?:struct|union)\s+\w+\s*\{[^{}]*\}\s*;",text):
+                      if ":" in match.group():
+                          print("BITFIELD_LAYOUT",seed,match.group()[:2000],flush=True)
           PY
-          done
-          exit "$failure"
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: minic-bitfield-abi-evidence-${{ matrix.variant }}
-          path: ${{ runner.temp }}/strict-evidence
-          retention-days: 14
