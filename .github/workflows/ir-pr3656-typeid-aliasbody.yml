@@ -1,0 +1,64 @@
+# Temporary exact-source gate; do not merge into compiler-ci main.
+name: IR PR3656 direct TypeId memory alias view
+on:
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/ir-pr3656-typeid-aliasbody.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ir-pr3656-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  typeid-memory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      COMPILER_SHA: ebd3b8927d361784a97db11a57df3a7d961a5e23
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.COMPILER_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm source SHA and use minimal workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          echo "Exact compiler candidate: $COMPILER_SHA" >> "$GITHUB_STEP_SUMMARY"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-pr3656-memory
+      - name: Full optimizer unit and targeted memory suites
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test typed_dse
+          cargo test -p compiler-opt --test typed_global_memory
+          cargo test -p compiler-opt --test typed_local_memory
+          cargo test -p compiler-opt --test memory_analysis_bounds
+          cargo test -p compiler-opt --test alias_phis
+          cargo test -p compiler-opt --test memory_native --no-run
+          cargo test -p compiler-opt --test memory_execution_oracle --no-run
+      - name: Strict IR and scoped optimizer Clippy
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-ir --lib -- -D warnings
+          # Scope-only exceptions for existing unrelated backend-x86 dev-dependency warnings.
+          cargo clippy -p compiler-opt --lib -- -D warnings -A dead_code -A clippy::too_many_arguments
