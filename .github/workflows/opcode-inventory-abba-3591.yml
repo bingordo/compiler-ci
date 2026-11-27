@@ -1,0 +1,74 @@
+name: One-off opcode inventory matched release comparison
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/opcode-inventory-abba-3591.yml'
+permissions:
+  contents: read
+jobs:
+  matched-release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 622d8b416c414bc9d771280724f03cc39199b257
+          path: baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d2a5693d7d07f12dea50680fd22d81990a599258
+          path: candidate
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Build identical release harnesses
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmp baseline/crates/opt/tests/typed_ctfe.rs candidate/crates/opt/tests/typed_ctfe.rs
+          for v in baseline candidate; do
+            git -C "$v" rev-parse HEAD
+            printf '[workspace]\nresolver = "2"\nmembers = ["crates/ir", "crates/opt"]\n' > "$v/Cargo.toml"
+            rm -f "$v/Cargo.lock"
+          done
+          rustc --version
+          cd baseline
+          cargo generate-lockfile
+          cp Cargo.lock ../candidate/Cargo.lock
+          build_harness() {
+            local variant="$1"
+            cargo test --locked --release -p compiler-opt --test typed_ctfe --no-run --message-format=json > "$RUNNER_TEMP/$variant-build.json"
+            python3 - "$RUNNER_TEMP/$variant-build.json" "$RUNNER_TEMP/$variant" <<'PY'
+          import json, os, shutil, sys
+          paths = []
+          for line in open(sys.argv[1]):
+              item = json.loads(line)
+              if item.get("reason") == "compiler-artifact" and item.get("target", {}).get("name") == "typed_ctfe" and item.get("executable"):
+                  paths.append(item["executable"])
+          assert len(paths) == 1, paths
+          shutil.copy2(paths[0], sys.argv[2])
+          assert os.access(sys.argv[2], os.X_OK)
+          PY
+          }
+          build_harness baseline
+          cd ../candidate
+          build_harness candidate
+      - name: Compare optimized IR and ABBA timings/RSS
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x "$RUNNER_TEMP/baseline"
+          test -x "$RUNNER_TEMP/candidate"
+          round=0
+          for v in baseline candidate candidate baseline candidate baseline baseline candidate; do
+            round=$((round+1))
+            TYPEID_SOURCE_TX_OUTPUT="$RUNNER_TEMP/$v-$round.ir" /usr/bin/time -f "MATCHED_RSS variant=$v round=$round peak_kib=%M wall_s=%e" "$RUNNER_TEMP/$v" --exact typeid_source_single_transaction_profile --ignored --nocapture
+            if test "$round" != 1; then
+              cmp "$RUNNER_TEMP/baseline-1.ir" "$RUNNER_TEMP/$v-$round.ir"
+            fi
+          done
+          echo 'All four canonical SSA outputs identical.'
