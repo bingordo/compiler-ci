@@ -1,0 +1,47 @@
+# Temporary shared CFI validation; do not merge.
+name: Shared native CFI and EH personality interoperability
+on:
+  pull_request:
+    paths: ['.github/workflows/temporary-eh-cfi.yml']
+permissions:
+  contents: read
+jobs:
+  cfi:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      SOURCE_SHA: 24025d41f0b232bcd80c6205dc0237c8d29aa4ed
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact revision and isolate backend workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir-macros", "crates/ir", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: temporary-eh-shared-cfi
+          cache-on-failure: true
+      - name: Shared record and GCC unwind interoperation
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib
+          cargo test -p compiler-backend --test itanium_lsda_runtime -- --nocapture
+      - name: Existing native x86 and AArch64 library regressions
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend-x86 -p compiler-backend-aarch64 --lib
