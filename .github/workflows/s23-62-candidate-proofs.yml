@@ -1,0 +1,77 @@
+name: S23.62 admitted algebra native validation
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-62-candidate-proofs.yml'
+permissions:
+  contents: read
+jobs:
+  validate-batch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 47c49dde0a88549e63547410518605ef71c3ce74
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm exact source and install offline solver
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 47c49dde0a88549e63547410518605ef71c3ce74
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq z3
+      - name: Verify old receipts, generator and prove exact admitted source
+        working-directory: compiler/tools/typeid-rule-gen
+        run: |
+          set -euo pipefail
+          python3 -m unittest -v test_rules test_ssa_codegen test_bulk_unconditional_laws test_batch_distributive_carry test_guarded_ssa_codegen test_guarded_batch_proofs
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, json
+          from rules import parse_rules
+          from prove import verify
+          from ssa_codegen import generate_ssa
+          source = Path("examples.rules").read_text()
+          rules = parse_rules(source)
+          candidates = parse_rules(Path("s2362-candidates.rules").read_text())
+          assert len(rules) == 153
+          admitted = rules[123:]
+          assert len(admitted) == 30 and all(r in candidates for r in admitted)
+          generate_ssa(rules)
+          result = verify(admitted, "z3", timeout_ms=3500, process_timeout=5.0)
+          assert result["family_count"] == 30 and result["sat_negative_controls"] == 5
+          result["source_sha256"] = hashlib.sha256(source.encode()).hexdigest()
+          Path("/tmp/s2362-proofs.json").write_text(json.dumps(result, indent=2, sort_keys=True))
+          PY
+      - name: Isolate native core from private frontend dependencies
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86","crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: s2362-algebra-153
+      - name: Native differential tests, old rules and opt-out
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test native_s2360_distributive_carry -- --nocapture
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test native_s2359_bulk_laws
+          cargo test -p compiler-opt --test native_default_generated_flags
+          cargo test -p compiler-opt --test native_s2350_shadow_parity
+          cargo check -p compiler-opt --no-default-features
+          cargo clippy -p compiler-opt --lib -- -D warnings -A dead_code
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: s2362-admission-proof-receipts
+          path: /tmp/s2362-proofs.json
+          retention-days: 14
