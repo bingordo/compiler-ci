@@ -1,0 +1,142 @@
+name: Temporary Mini-C C99 array parameter brackets 310
+on:
+  pull_request:
+    paths: ['.github/workflows/temp-mini-c-c99-prototype-brackets-310.yml']
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: f1bc8d3a04a1d2b49c45385463e5378d869ea619
+          persist-credentials: false
+      - run: git rev-parse HEAD
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/debug
+          key: mini-c-native-vla-scopes-307
+          restore-keys: |
+            mini-c-native-ubuntu-block-static-296
+            mini-c-native-
+      - run: cargo check --workspace --all-targets --keep-going
+      - run: cargo test --workspace --no-fail-fast
+      - run: cargo clippy -p mini-c-sema -p mini-c-cranelift --all-targets -- -D warnings
+      - name: GCC differential for definition parameter bounds
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/vla.c" <<'EOF'
+          int f(int n,int m,int a[restrict *][*]);
+          unsigned long g(int n,int (*p)[n++]);
+          int f(int n,int m,int a[static restrict n][m]) {
+              int (*p)[m]=a;
+              m=1; p[1][2]=17;
+              return sizeof(*p)==16 && a[1][2]==17;
+          }
+          unsigned long g(int n,int (*p)[n++]) {
+              return sizeof(*p)+(unsigned long)n;
+          }
+          int main(void) {
+              int a[3][4];
+              if(!f(3,4,a) || a[1][2]!=17) return 1;
+              if(g(4,a)!=21) return 2;
+              return 0;
+          }
+          EOF
+          gcc -std=c99 -pedantic-errors "$RUNNER_TEMP/vla.c" -o "$RUNNER_TEMP/oracle"
+          "$RUNNER_TEMP/oracle"
+          cargo run -q -p mini-c-cranelift -- --cpp=none --emit-obj "$RUNNER_TEMP/vla.o" "$RUNNER_TEMP/vla.c"
+          gcc "$RUNNER_TEMP/vla.o" -o "$RUNNER_TEMP/native"
+          "$RUNNER_TEMP/native"
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b16293f50ca07d062923167a435b6e9c357ce1d6
+          fetch-depth: 0
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Validate exact candidate frontend pin on current compiler
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          sed -i 's/b418c690364b64f7d00488d8768ef196b0c54683/f1bc8d3a04a1d2b49c45385463e5378d869ea619/g' tools/mini-c-driver/Cargo.toml
+          git diff -- tools/mini-c-driver/Cargo.toml
+          test "$(grep -c f1bc8d3a04a1d2b49c45385463e5378d869ea619 tools/mini-c-driver/Cargo.toml)" = 2
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tools/mini-c-driver/target/debug
+          key: mini-c-typeid-vla-parameters-3607
+          restore-keys: |
+            mini-c-typeid-vla-typedefs-3583
+            mini-c-typeid-c99-integration-3575
+            mini-c-typeid-static-literals-3524
+            mini-c-typeid-static-storage-3522
+            mini-c-typeid-
+      - run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib global_data
+      - run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml --test c99_block_static --test c99_static_literal_roots --test c99_funcname --test c99_saved_vla_strides --test record_array_storage --test c99_vla_typedefs --test c99_vla_parameters --test goto_labels --test wide_checked_array_index
+      - run: cargo build --manifest-path tools/mini-c-driver/Cargo.toml
+      - name: GCC differential runtime for ELF and GAS
+        shell: bash
+        run: |
+          set -euo pipefail
+          for src in tools/mini-c-driver/tests/fixtures/c99_{block_static,static_literal_roots,funcname,saved_vla_strides,vla_typedefs,vla_parameters}.c; do
+          driver=tools/mini-c-driver/target/debug/compiler-mini-c
+          gcc -std=c99 -pedantic-errors "$src" -o "$RUNNER_TEMP/oracle"
+          "$RUNNER_TEMP/oracle"
+          "$driver" "$src" -o "$RUNNER_TEMP/native.o"
+          gcc "$RUNNER_TEMP/native.o" -o "$RUNNER_TEMP/native"
+          "$RUNNER_TEMP/native"
+          "$driver" "$src" --emit asm -o "$RUNNER_TEMP/native.s"
+          gcc "$RUNNER_TEMP/native.s" -o "$RUNNER_TEMP/native-gas"
+          "$RUNNER_TEMP/native-gas"
+          readelf -r "$RUNNER_TEMP/native.o"
+          done
+      - name: GCC differential prototype and bracket syntax
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/vla.c" <<'EOF'
+          int f(int n,int m,int a[restrict *][*]);
+          unsigned long g(int n,int (*p)[n++]);
+          int f(int n,int m,int a[static restrict n][m]) {
+              int (*p)[m]=a;
+              m=1; p[1][2]=17;
+              return sizeof(*p)==16 && a[1][2]==17;
+          }
+          unsigned long g(int n,int (*p)[n++]) {
+              return sizeof(*p)+(unsigned long)n;
+          }
+          int main(void) {
+              int a[3][4];
+              if(!f(3,4,a) || a[1][2]!=17) return 1;
+              if(g(4,a)!=21) return 2;
+              return 0;
+          }
+          EOF
+          gcc -std=c99 -pedantic-errors "$RUNNER_TEMP/vla.c" -o "$RUNNER_TEMP/oracle"
+          "$RUNNER_TEMP/oracle"
+          driver=tools/mini-c-driver/target/debug/compiler-mini-c
+          "$driver" "$RUNNER_TEMP/vla.c" -o "$RUNNER_TEMP/native.o"
+          gcc "$RUNNER_TEMP/native.o" -o "$RUNNER_TEMP/native"
+          "$RUNNER_TEMP/native"
+          "$driver" "$RUNNER_TEMP/vla.c" --emit asm -o "$RUNNER_TEMP/native.s"
+          gcc "$RUNNER_TEMP/native.s" -o "$RUNNER_TEMP/native-gas"
+          "$RUNNER_TEMP/native-gas"
