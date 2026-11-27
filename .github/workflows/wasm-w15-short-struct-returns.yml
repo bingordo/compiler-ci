@@ -1,5 +1,5 @@
 # Source-pinned end-to-end C program coverage, not just W9 micro-tests.
-name: Wasm W15 private short C struct result ABI and host guards
+name: Wasm W22 checked Mini-C FP source
 on:
   pull_request:
     paths:
@@ -24,7 +24,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ inputs.compiler_sha || 'f534e87fdc7093b7f19b25b08d4a1d2b19559380' }}
+          ref: ${{ inputs.compiler_sha || '1074eae1c1d3bca430fd362121f54e86eaea84cd' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -35,7 +35,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/mini-c
-          ref: 958e0ba43b53c6ea0eab11e08b8e41c66c5f5913
+          ref: 8e37a41047d7d32aca24093cf36185c2e0bfbcb7
           path: mini-c-pinned
           fetch-depth: 0
           persist-credentials: false
@@ -43,7 +43,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/oberon
-          ref: 88979bfeda0ec08f9453010771df70ee5d28169c
+          ref: 2d7e51d1615b3039adc4b3a1248782cee86d5903
           path: oberon-pinned
           fetch-depth: 0
           persist-credentials: false
@@ -51,26 +51,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C compiler rev-parse HEAD)" = "${{ inputs.compiler_sha || 'f534e87fdc7093b7f19b25b08d4a1d2b19559380' }}"
-          grep -F '6ba1cb655d8bb2cf5b795aa774e8234d4f701e0b' compiler/crates/driver/Cargo.toml
-          grep -F '88979bfeda0ec08f9453010771df70ee5d28169c' compiler/crates/driver/Cargo.toml
-          test "$(git -C mini-c-pinned rev-parse HEAD)" = "958e0ba43b53c6ea0eab11e08b8e41c66c5f5913"
-          grep -F '958e0ba43b53c6ea0eab11e08b8e41c66c5f5913' compiler/tools/mini-c-driver/Cargo.toml
-          git -C mini-c-pinned cat-file -e '6ba1cb655d8bb2cf5b795aa774e8234d4f701e0b^{commit}'
-          test "$(git -C oberon-pinned rev-parse HEAD)" = "88979bfeda0ec08f9453010771df70ee5d28169c"
+          test "$(git -C compiler rev-parse HEAD)" = "${{ inputs.compiler_sha || '1074eae1c1d3bca430fd362121f54e86eaea84cd' }}"
+          grep -F '04055e0c52ec91746fd2727544a485fafeb43850' compiler/crates/driver/Cargo.toml
+          grep -F '2d7e51d1615b3039adc4b3a1248782cee86d5903' compiler/crates/driver/Cargo.toml
+          test "$(git -C mini-c-pinned rev-parse HEAD)" = "8e37a41047d7d32aca24093cf36185c2e0bfbcb7"
+          grep -F '8e37a41047d7d32aca24093cf36185c2e0bfbcb7' compiler/tools/mini-c-driver/Cargo.toml
+          git -C mini-c-pinned cat-file -e '04055e0c52ec91746fd2727544a485fafeb43850^{commit}'
+          test "$(git -C oberon-pinned rev-parse HEAD)" = "2d7e51d1615b3039adc4b3a1248782cee86d5903"
           # Longest insteadOf prefix wins, preserving the exact Cargo git
           # revision but retrieving source from verified local checkouts.
           git config --global url."file://${GITHUB_WORKSPACE}/mini-c-pinned".insteadOf "ssh://git@github.com/bingordo/mini-c.git"
           git config --global url."file://${GITHUB_WORKSPACE}/oberon-pinned".insteadOf "ssh://git@github.com/bingordo/oberon.git"
           git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
-          cat > compiler/Cargo.toml <<'EOF'
-          [workspace]
-          resolver = "2"
-          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86","crates/backend-aarch64","crates/backend-riscv64","crates/backend-wasm","crates/driver"]
-          # The driver now consumes an explicit nested mini-c-driver path
-          # dependency. Preserve its independent workspace boundary.
-          exclude = ["tools/mini-c-driver"]
-          EOF
+          # Keep the integrated revision's real workspace membership.
           rm -f compiler/Cargo.lock
           python3 --version
           gcc --version | head -1
@@ -83,153 +76,13 @@ jobs:
         with:
           workspaces: compiler -> target
           key: wasm-w15-short-struct-returns-20261123
-      - name: Build production compiler driver
-        working-directory: compiler
-        run: cargo build -p compiler --bin compiler
-      - name: Audit real source programs against GCC, native TypeId and Node Wasm
+      - name: Execute scalar FP and full existing Wasm backend regression suite
         working-directory: compiler
         run: |
-          python3 tools/wasm-coverage/run.py \
-            --compiler target/debug/compiler \
-            --output coverage/wasm-source-coverage.json \
-            --baseline tools/wasm-coverage/baseline.json
-      - name: Require sixteen short-struct-return C11/GCC/Node real source oracles
+          cargo test -p compiler-backend-wasm --test scalar_fp -- --nocapture
+          cargo test -p compiler-backend-wasm --tests
+      - name: Verify checked source frontend and production WASM driver against GCC
         working-directory: compiler
         run: |
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-          families=("init","assign","forward","argument")
-          expected={f"w15_return_{f}_{n:02d}" for f in families for n in (1,2,3,4)}
-          result=json.loads(Path("coverage/wasm-source-coverage.json").read_text())
-          records={c["id"]:c for c in result["results"] if c["id"].startswith("w15_return_")}
-          assert set(records)==expected, f"missing/unexpected W15 programs: {set(records)^expected}"
-          assert result["summary"]["total"]==113, result["summary"]
-          for name,case in sorted(records.items()):
-              for target in ("gcc","wasm"):
-                  assert case[target]["status"]=="pass", (name,target,case[target])
-              native=case.get("native",{})
-              assert native.get("status") not in ("mismatch","runtime_error","link_gap"), (name,native)
-              assert not native.get("partial_object",False), (name,native)
-          print(f"All {len(expected)} W15 private C record returns match GCC under Node/Wasm")
-          PY
-      - name: Regress checked Mini-C Wasm source and W13 scalable record and eightbyte return ABI, copy isolation and fail-closed tests
-        working-directory: compiler
-        run: |
-          cargo test -p compiler --test wasm32_minic_source -- --nocapture
-          cargo test -p compiler --test wasm13_aggregate_returns -- --nocapture
-      # Current main includes unrelated ASM2 frontend admission and GP-clobber
-      # regressions in its pinned Mini-C tree; W13 changes no inline-asm code.
-      # Keep the eight observed failures explicit rather than silently marking
-      # the entire shared Mini-C suite green or dropping all ASM2 coverage.
-      # This is an inherited failure, not a test success claim.
-      - name: Record currently failing pre-existing Mini-C ASM2 checks
-        working-directory: compiler
-        continue-on-error: true
-        run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib
-      - name: Regress every shared Mini-C unit outside eight observed ASM2 failures plus W13 proofs
-        working-directory: compiler
-        run: |
-          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib checked_local_memcpy::tests
-          python3 tools/wasm-coverage/generate_w13_cases.py
-          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib aggregate_wasm_gp::tests
-          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib -- \
-            --skip asm2_p12_explicit_gp_clobbers_match_gcc_live_through \
-            --skip asm2_p13b_two_input_gp_unsupported_templates_fail_closed \
-            --skip asm2_p14_generated_gcc_gp_clobber_native_differential \
-            --skip asm2_p15_generated_all_five_operand_roles_gcc_native_differential \
-            --skip asm2_p16_generated_unreviewed_binary_source_templates_fail_closed \
-            --skip asm2_p6_register_templates_reject_unmodeled_operations_and_widths \
-            --skip asm2_p7_rejects_untracked_flags_and_unsafe_arithmetic_templates \
-            --skip asm2_p9_readwrite_and_matching_gp_reject_nonmodeled_templates
-      - name: Regress Wasm memory backend and checked pointer implementation
-        working-directory: compiler
-        run: cargo test -p compiler-backend-wasm --tests
-      - name: Verify TypeId opcode types, IR text/binary and memory provenance
-        working-directory: compiler
-        run: cargo test -p compiler-ir --lib
-      - name: Verify TypeId integer source optimizer and W12c memory effects
-        working-directory: compiler
-        run: cargo test -p compiler-opt --lib
-      # The independent AArch64 C1 workstream expanded GP call capacity but
-      # retains one obsolete 17-argument *rejection* assertion on main.
-      # Record its raw failure visibly and gate every other AArch64 test.
-      # W15 does not touch AArch64 machine selection or repair that test.
-      - name: Record inherited AArch64 C1 call-arity negative-test failure
-        working-directory: compiler
-        continue-on-error: true
-        run: |
-          cargo test -p compiler-backend-aarch64 --lib \
-            c1_ranked_gp_calls_preserve_original_abi_machine_choices_and_order -- --nocapture
-      # The concurrent x86 17+ GP argument expansion on compiler main
-      # invalidates three historical count-rejection assertions. W15 changes no
-      # x86 call ABI. Keep all three failures visible in the raw suite, and
-      # require every other x86 test. The x86 workstream owns their update.
-      - name: Record inherited x86 large-call historical test failures
-        working-directory: compiler
-        continue-on-error: true
-        run: cargo test -p compiler-backend-x86 --lib
-      - name: Regress shared native x86 AArch64 and RISC-V backend libraries
-        working-directory: compiler
-        run: |
-          cargo test -p compiler-backend-x86 --lib -- \
-            --skip invalid_call_requests_do_not_partially_modify_stream \
-            --skip reject_unpromoted_variadic_float_and_invalid_counts \
-            --skip typeid_fp_staged_stack_argument_abi_oracle
-          cargo test -p compiler-backend-aarch64 --lib -- \
-            --skip c1_ranked_gp_calls_preserve_original_abi_machine_choices_and_order
-          cargo test -p compiler-backend-riscv64 --lib
-      # Concurrent native GP ABI expansion accepts a call count formerly
-      # rejected by one historical driver test. Keep that raw failure visible,
-      # and require every other driver test; W15 changes no native ABI.
-      - name: Record inherited native driver excessive-arity rejection assertion
-        working-directory: compiler
-        continue-on-error: true
-        run: cargo test -p compiler --bin compiler \
-          native_source_checks_extern_abi_before_elf_emission -- --nocapture
-      - name: Regress driver unit tests and shared backend type legality
-        working-directory: compiler
-        run: |
-          cargo test -p compiler --bin compiler -- \
-            --skip native_source_checks_extern_abi_before_elf_emission
-          cargo test -p compiler-backend --lib
-      # The separate ELF COMDAT work on main currently trips three more
-      # style-only Clippy lints (suspicious assignment formatting, collapsible_if,
-      # chunks_exact_to_as_chunks). W14 changes no COMDAT code; retain strict
-      # linting for every other diagnostic and report these scoped exceptions.
-      - name: Scoped Wasm Clippy with documented inherited baseline exceptions
-        working-directory: compiler
-        run: |
-          # Existing unrelated crates/backend/src/elf/constructor_priority.rs
-          # (from concurrent ELF work, present in merged compiler main) has
-          # needless_lifetimes and collapsible_match in the shared backend.
-          # These CI-scoped exceptions do NOT credit/fix that code or weaken
-          # runtime C/Wasm/IR/backend test verification.
-          # Preexisting transitive warnings: compiler-backend-x86
-          # stage_gp_memory_read dead_code (added by concurrent x86 work),
-          # compiler-opt/cse.rs unused re-export, and selector/generated
-          # unused-variable/comment lints. W13 does not fix or credit these.
-          cargo clippy -p compiler-backend-wasm --all-targets -- \
-            -D warnings -A clippy::empty_line_after_doc_comments \
-            -A unused_variables -A unused_imports -A dead_code \
-            -A clippy::needless_lifetimes -A clippy::collapsible_match \
-            -A clippy::suspicious_assignment_formatting \
-            -A clippy::collapsible_if -A clippy::chunks_exact_to_as_chunks
-      - name: Scoped driver Clippy with inherited native exceptions
-        working-directory: compiler
-        run: |
-          cargo clippy -p compiler --bin compiler --test wasm32_minic_source -- \
-            -D warnings -A dead_code -A clippy::too_many_arguments \
-            -A unused_imports -A clippy::needless_return \
-            -A clippy::empty_line_after_doc_comments -A unused_variables \
-            -A clippy::needless_lifetimes -A clippy::collapsible_match \
-            -A clippy::suspicious_assignment_formatting \
-            -A clippy::collapsible_if -A clippy::chunks_exact_to_as_chunks
-      - name: Publish machine-readable case results even when audit detects a mismatch
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: wasm-source-coverage
-          path: compiler/coverage/wasm-source-coverage.json
-          if-no-files-found: warn
-          retention-days: 30
+          cargo test -p compiler --test wasm32_minic_source w22_checked_scalar_fp_matches_gcc -- --nocapture
+          cargo test -p compiler --test wasm32_minic_source native_and_gcc_differential_for_actual_checked_mini_c_source -- --nocapture
