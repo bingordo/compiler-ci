@@ -44,7 +44,7 @@ base = list(PROFILES["restricted-compound"])
 for opt in ("--max-funcs","--max-block-depth","--max-block-size","--max-expr-complexity"):
     i = base.index(opt)
     del base[i:i+2]
-for idx, (funcs, block, depth) in enumerate([(20,8,4),(60,12,5),(120,16,5),(240,20,6)]):
+for idx, (funcs, block, depth) in enumerate([(20,8,4),(60,12,5),(120,16,5),(60,12,5),(60,12,5),(60,12,5)]):
     flags = base + ["--max-funcs",str(funcs),"--max-block-size",str(block),
                     "--max-block-depth",str(depth),"--max-expr-complexity","8"]
     verify_generator_options(help_text, tuple(flags))
@@ -61,7 +61,7 @@ for idx, (funcs, block, depth) in enumerate([(20,8,4),(60,12,5),(120,16,5),(240,
     case["source_bytes"] = src.stat().st_size
     case["source_sha256"] = hashlib.sha256(src.read_bytes()).hexdigest()
     save()
-    if gen.returncode or not case["source_bytes"]:
+    if gen.returncode or case["lines"] < 1000:
         continue
     prep = timed(["gcc","-E","-P","-std=c99","-I",include,str(src),"-o",str(pre)],stem+"-pre")
     case["preprocess"] = prep
@@ -82,6 +82,8 @@ for idx, (funcs, block, depth) in enumerate([(20,8,4),(60,12,5),(120,16,5),(240,
                 sample["object_bytes"] = obj.stat().st_size if obj.exists() else None
             case["samples"].setdefault(label,[]).append(sample)
             print(stem,label,round_idx,sample.get("cpu_seconds"),sample["status"],sample["exit"],flush=True)
+            if not success(sample) and round_idx == 0:
+                print("FIRST_DIAGNOSTIC", stem, label, sample["stderr"][:4000], flush=True)
             save()
     case["medians"] = {}
     for label, samples in case["samples"].items():
@@ -109,3 +111,6 @@ for c in report["cases"]:
     vals=[m.get(k,{}).get("cpu_seconds","NA") for k in ("gcc-O0","gcc-O2","gcc-O3","native")]
     print("|", " | ".join(map(str,[c["seed"],c["lines"],*vals,m.get("native",{}).get("rss_kib","NA")])), "|")
 save()
+
+if not any("native" in c.get("medians",{}) for c in report["cases"]):
+    raise SystemExit("No successful native compile-time samples")
