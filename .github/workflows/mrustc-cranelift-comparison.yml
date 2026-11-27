@@ -1,0 +1,402 @@
+name: Cranelift reference mrustc generated-C comparison
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/mrustc-cranelift-comparison.yml'
+      - 'bootstrap/probe-mrustc-cranelift-reference.py'
+      - 'bootstrap/run-mrustc-edg-cranelift.sh'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Compiler source branch, tag, or SHA'
+        required: false
+        default: main
+        type: string
+      edg_creduce:
+        description: 'Enable C-Reduce on exact generated C'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mrustc-cranelift-comparison-${{ github.head_ref || inputs.source_ref || 'main' }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout compiler-ci smoke fixtures
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout compiler using existing read-only deploy key
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          # Test the merged source-verified TypeId adapter (not the old mixed-global
+          # branch) without changing compiler production history.
+          # Manual dispatch can still select any explicit source_ref.
+          ref: ${{ inputs.source_ref || 'b3489a796bd13b788930703787718ed9952855d6' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+
+      - name: Resolve exact frontend source pins from checked-out compiler
+        id: frontend-pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          from pathlib import Path
+          import re
+          import tomllib
+
+          with Path("compiler/crates/driver/Cargo.toml").open("rb") as f:
+              driver = tomllib.load(f)["dependencies"]
+          with Path("compiler/tools/mini-c-driver/Cargo.toml").open("rb") as f:
+              mini = tomllib.load(f)["dependencies"]
+          # The Mini-C syntax/sema crates moved into a separate workspace.
+          # The main driver preprocessor may use a DIFFERENT pinned revision.
+          def pin(deps, crate, repo):
+              dep = deps[crate]
+              assert dep["git"] == f"ssh://git@github.com/bingordo/{repo}.git"
+              sha = dep["rev"]
+              assert re.fullmatch(r"[0-9a-f]{40}", sha), (crate, sha)
+              return sha
+          oberon = pin(driver, "oberon-front-ir", "oberon")
+          preprocessor = pin(driver, "mini-c-preprocess", "mini-c")
+          syntax = pin(mini, "mini-c-syntax", "mini-c")
+          sema = pin(mini, "mini-c-sema", "mini-c")
+          assert syntax == sema, "Mini-C syntax/sema must use one source revision"
+          assert driver["mini-c-preprocess"]["features"] == ["internal-rcc"]
+          print(f"oberon_sha={oberon}")
+          print(f"mini_c_frontend_sha={syntax}")
+          print(f"mini_c_preprocess_sha={preprocessor}")
+          PY
+
+      - name: Checkout pinned Oberon frontend source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/oberon
+          ref: ${{ steps.frontend-pins.outputs.oberon_sha }}
+          path: oberon
+          persist-credentials: false
+
+      - name: Checkout pinned Mini-C frontend source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: ${{ steps.frontend-pins.outputs.mini_c_preprocess_sha }}
+          path: mini-c
+          persist-credentials: false
+      - name: Checkout compiler-pinned Mini-C for generated-C compatibility audit
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          # Use precisely the grammar and checker revision required by the
+          # bootstrapped driver rather than a historical parser snapshot.
+          ref: ${{ steps.frontend-pins.outputs.mini_c_frontend_sha }}
+          path: mini-c-compat
+          persist-credentials: false
+      - name: Checkout pinned mrustc
+        uses: actions/checkout@v4
+        with:
+          repository: thepowersgang/mrustc
+          ref: master
+          path: mrustc
+          persist-credentials: false
+
+      - name: Identify mrustc cache revision
+        id: mrustc-revision
+        shell: bash
+        run: echo "sha=$(git -C mrustc rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore prebuilt mrustc and Rust 1.90 libraries
+        id: mrustc-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            mrustc/bin
+            mrustc/output-1.90.0
+          key: mrustc-bootstrap-v1-${{ runner.os }}-ubuntu2404-rust190-${{ steps.mrustc-revision.outputs.sha }}
+
+      - name: Install mrustc build dependencies when the toolchain needs building
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.mrustc-cache.outputs.cache-hit }}" == "true" ]] &&
+             [[ -x mrustc/bin/mrustc ]] &&
+             [[ -x mrustc/bin/minicargo ]] &&
+             [[ -f mrustc/output-1.90.0/libcore.rlib ]]; then
+            echo "Cached mrustc is complete; skipping apt install." >> "$GITHUB_STEP_SUMMARY"
+          else
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends build-essential zlib1g-dev pkg-config cmake curl python3 libssl-dev
+          fi
+          # GCC and Cargo are required even when mrustc itself came from cache.
+          command -v gcc
+          command -v cargo
+          command -v python3
+
+      - name: Record reproducibility inputs and target crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Compiler SHA: $(git -C compiler rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          echo "mrustc SHA: $(git -C mrustc rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Host: $(uname -m) / $(lsb_release -rs)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Rust crate editions:" >> "$GITHUB_STEP_SUMMARY"
+          grep -Rh '^edition[[:space:]]*=' compiler/crates/*/Cargo.toml | sort | uniq -c >> "$GITHUB_STEP_SUMMARY"
+          echo "First target: compiler-ir (no frontend dependency); then compiler-opt, backend, driver." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build mrustc and matching Rust 1.90 libraries
+        id: toolchain
+        shell: bash
+        working-directory: mrustc
+        env:
+          RUSTC_VERSION: '1.90.0'
+          MRUSTC_TARGET_VER: '1.90'
+          OUTDIR_SUF: '-1.90.0'
+          PARLEVEL: '2'
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.mrustc-cache.outputs.cache-hit }}" == "true" ]] && \
+             [[ -x bin/mrustc ]] && [[ -x bin/minicargo ]] && \
+             [[ -f output-1.90.0/libcore.rlib ]]; then
+            echo "Using cached mrustc toolchain and Rust libraries" >> "$GITHUB_STEP_SUMMARY"
+          else
+            # Missing/incomplete caches rebuild in this runner.
+            timeout --signal=TERM --kill-after=10s 20m make -j2
+            timeout --signal=TERM --kill-after=10s 10m make RUSTCSRC
+            timeout --signal=TERM --kill-after=10s 55m make -f minicargo.mk LIBS
+          fi
+          test -x bin/mrustc
+          test -x bin/minicargo
+          test -f output-1.90.0/libcore.rlib
+
+      - name: Cache validated mrustc toolchain
+        if: success() && steps.mrustc-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            mrustc/bin
+            mrustc/output-1.90.0
+          key: mrustc-bootstrap-v1-${{ runner.os }}-ubuntu2404-rust190-${{ steps.mrustc-revision.outputs.sha }}
+
+      - name: Snapshot C files before translation
+        shell: bash
+        run: |
+          find mrustc -type f -name '*.c' -printf '%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/mrustc-c-before.txt"
+
+      - name: Attempt compiler-ir Rust-to-C emission
+        id: translate
+        shell: bash
+        working-directory: mrustc
+        env:
+          RUSTC_VERSION: '1.90.0'
+          MRUSTC_TARGET_VER: '1.90'
+          OUTDIR_SUF: '-1.90.0'
+          PARLEVEL: '2'
+          CC: gcc
+        run: |
+          set -euo pipefail
+          # This is deliberately a bounded first-crate feasibility probe, not
+          # an assertion that the full Cargo workspace is supported.
+          set +e
+          # minicargo's positional argument is the crate DIRECTORY, not Cargo.toml.
+          # Share one fresh per-run directory across all compiler crate probes.
+          # minicargo can now reuse compiler-ir and other completed dependencies.
+          # Do not persist private generated C/rlibs in public Actions caches.
+          timeout --signal=TERM --kill-after=10s 20m bin/minicargo \
+            -L output-1.90.0 -o output-compiler-bootstrap \
+            ../compiler/crates/ir > "$RUNNER_TEMP/mrustc-probe.log" 2>&1
+          rc=$?
+          set -e
+          echo "mrustc/minicargo exit code: $rc" >> "$GITHUB_STEP_SUMMARY"
+          find . -type f -name '*.c' -printf '%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/mrustc-c-after.txt"
+          # Before-snapshot is relative to mrustc/; after-snapshot is also
+          # relative to mrustc/, avoiding false differences from prefix changes.
+          comm -13 "$RUNNER_TEMP/mrustc-c-before.txt" "$RUNNER_TEMP/mrustc-c-after.txt" > "$RUNNER_TEMP/mrustc-c-new.txt"
+          echo "New C files from attempted translation: $(wc -l < "$RUNNER_TEMP/mrustc-c-new.txt")" >> "$GITHUB_STEP_SUMMARY"
+          echo "All C files (includes prebuilt Rust stdlib): $(wc -l < "$RUNNER_TEMP/mrustc-c-after.txt")" >> "$GITHUB_STEP_SUMMARY"
+          # Do not print private compiler source or raw diagnostics into public CI.
+          python3 - "$RUNNER_TEMP/mrustc-probe.log" "$GITHUB_STEP_SUMMARY" <<'PY'
+          import pathlib, re, sys
+          log = pathlib.Path(sys.argv[1]).read_text(errors="replace")
+          categories = {
+              "manifest or dependency resolution": r"failed to (load|parse|select|resolve)|dependency|manifest",
+              "missing files or paths": r"No such file|not found|cannot open",
+              "unsupported Rust feature": r"unsupported|not implemented|unimplemented|TODO",
+              "type or parsing error": r"parse error|type error|error:|ERROR:",
+              "compiler crash": r"SIGSEGV|segmentation fault|panic|assertion failed",
+              "GCC diagnostic": r"gcc: error|fatal error:|compilation terminated",
+          }
+          print("Diagnostic categories (counts; non-exclusive):", file=open(sys.argv[2], "a"))
+          with open(sys.argv[2], "a") as out:
+              for name, pattern in categories.items():
+                  print(f"- {name}: {len(re.findall(pattern, log, re.I))}", file=out)
+          PY
+          echo "Target translation must succeed before GCC syntax and object tests run." >> "$GITHUB_STEP_SUMMARY"
+          if (( rc != 0 )); then
+            # Only show a bounded, non-source-bearing summary here. Private
+            # diagnostics remain in the runner temp log.
+            echo "minicargo failed; inspect diagnostic categories above." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "probe_exit=$rc" >> "$GITHUB_OUTPUT"
+          # A nonzero exit is a real failed acceptance gate, not a green probe.
+          exit "$rc"
+
+      - name: Generate small real mrustc compiler-ir executable C as reduction seed
+        if: always() && steps.translate.outcome == 'success'
+        shell: bash
+        working-directory: mrustc
+        env:
+          RUSTC_VERSION: '1.90.0'
+          MRUSTC_TARGET_VER: '1.90'
+          OUTDIR_SUF: '-1.90.0'
+          PARLEVEL: '2'
+          CC: gcc
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 15m bin/minicargo \
+            -L output-1.90.0 -o output-compiler-bootstrap \
+            ../bootstrap/mrustc-gcc-smoke > "$RUNNER_TEMP/mrustc-small-smoke.log" 2>&1
+          # The compiler-ir library alone emits a 65+ MB file. This
+          # source-owned public executable smoke emits a much smaller C unit
+          # without compiling the unrelated optimizer, backends, or driver.
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          from pathlib import Path
+          units=[p.stat().st_size for p in Path("output-compiler-bootstrap").rglob("*.c") if p.is_file() and p.stat().st_size]
+          assert len(units) >= 2, "expected library C plus executable C"
+          print("Generated-C unit count:", len(units))
+          print("Smallest generated-C bytes:", min(units))
+          assert min(units) < 1024*1024, "missing <1MiB executable seed"
+          PY
+
+
+
+      - name: Build and probe Mini-C Cranelift reference
+        id: minic-clif
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.99.1 --profile minimal > "$RUNNER_TEMP/clif-rust.log" 2>&1
+          set +e
+          cargo +1.99.1 build --release --manifest-path mini-c-compat/Cargo.toml -p mini-c-cranelift --no-default-features > "$RUNNER_TEMP/minic-clif-build.log" 2>&1
+          rc=$?
+          set -e
+          echo "MINIC_CLIF_BUILD_EXIT=$rc"
+          if (( rc != 0 )); then
+            grep -oE 'error\[E[0-9]{4}\]' "$RUNNER_TEMP/minic-clif-build.log" | sort -u || true
+            exit "$rc"
+          fi
+          python3 bootstrap/probe-mrustc-cranelift-reference.py minic "$PWD/mini-c-compat/target/release/mini-c-cranelift" "$PWD/mrustc/output-compiler-bootstrap"
+
+
+      - name: Checkout Mini-C type-only qualifier candidate independently of compiler pin
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: 9924b8cc54211d59c20632951788e1ab40bff0ea
+          path: mini-c-current
+          persist-credentials: false
+
+      - name: Compare current Mini-C parser and Cranelift against real C and public headers
+        id: minic-current
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +1.99.1 build --release --manifest-path mini-c-current/Cargo.toml -p mini-c-cranelift -p mini-c --no-default-features > "$RUNNER_TEMP/minic-current-build.log" 2>&1 || {
+            echo "MINIC_CURRENT_BUILD_EXIT=1"
+            grep -oE 'error\[E[0-9]{4}\]' "$RUNNER_TEMP/minic-current-build.log" | sort -u || true
+            exit 1
+          }
+          echo "MINIC_CURRENT_BUILD_EXIT=0"
+          cargo +1.99.1 test --manifest-path mini-c-current/Cargo.toml -p mini-c-sema gnu_member_alignment_checks_natural_target_layout -- --nocapture
+          cargo +1.99.1 test --manifest-path mini-c-current/Cargo.toml -p mini-c-sema atomic_single_byte_aggregate_declarations_are_layout_checked -- --nocapture
+          cargo +1.99.1 test --manifest-path mini-c-current/Cargo.toml -p mini-c-cranelift --no-default-features --test c11_atomic_rejection
+          # Public GCC header only: identify the exact atomic typedef at the first semantic rejection.
+          printf '#include <stdatomic.h>\n' > "$RUNNER_TEMP/public-atomic.c"
+          gcc -std=gnu11 -E -P -x c "$RUNNER_TEMP/public-atomic.c" > "$RUNNER_TEMP/public-atomic.i"
+          grep -nE 'typedef.*_Atomic|_Atomic.*atomic_' "$RUNNER_TEMP/public-atomic.i" | head -n 60
+          python3 - <<'PY'
+          import subprocess,tempfile
+          from pathlib import Path
+          driver=Path("mini-c-current/target/release/mini-c-cranelift").resolve()
+          cases={
+              "stddef":"#include <stddef.h>\nint test(void){return 42;}\n",
+              "stdint":"#include <stdint.h>\nint test(void){return 42;}\n",
+              "stdatomic":"#include <stdatomic.h>\nint test(void){return 42;}\n",
+              "stdlib":"#include <stdlib.h>\nint test(void){return 42;}\n",
+              "gnu_tls_decl":"#include <setjmp.h>\nextern __thread jmp_buf *panic_target;\nextern __thread void *panic_value;\nint test(void){return 42;}\n",
+              "c11_tls_decl":"extern _Thread_local int counter;\nint test(void){return 42;}\n",
+              "gnu_tls_access":"__thread int counter=7;\nint test(void){return ++counter;}\n",
+              **{name.replace("/","_").replace(".","_"):"#include <"+name+">\nint test(void){return 42;}\n" for name in ("stdio.h","string.h","stdbool.h","assert.h","limits.h","errno.h","setjmp.h","math.h","unistd.h","time.h","stdarg.h","sys/types.h","sys/stat.h")},
+              "aligned_member":"struct X { char a; long b __attribute__((__aligned__(16))); };\nint test(void){return sizeof(struct X)==32;}\n",
+              "alignof_member":"struct X { char a; long b __attribute__((__aligned__(__alignof__(long)))); };\nint test(void){return sizeof(struct X)==16;}\n",
+          }
+          with tempfile.TemporaryDirectory() as d:
+              for name,source in cases.items():
+                  p=Path(d)/"probe.c"; p.write_text(source)
+                  out=Path(d)/"probe.o";out.unlink(missing_ok=True)
+                  r=subprocess.run([str(driver),"-std=gnu11","--cpp=cc","--emit-obj",str(out),str(p)],capture_output=True,text=True,timeout=60)
+                  print(f"PUBLIC_CURRENT_{name.upper()}_EXIT={r.returncode}",flush=True)
+                  # Public, synthetic inputs only; no private C diagnostics.
+                  for line in r.stderr.splitlines()[:3]:
+                      print(f"PUBLIC_CURRENT_{name.upper()}_DIAG={line[:300]}",flush=True)
+          PY
+          python3 bootstrap/probe-mrustc-cranelift-reference.py minic "$PWD/mini-c-current/target/release/mini-c-cranelift" "$PWD/mrustc/output-compiler-bootstrap" -std=gnu11
+
+      - name: Checkout exact EDG callable source
+        uses: actions/checkout@v4
+        with:
+          repository: bingundu/edgcpp
+          ref: b195677be8b9b56c8337afad6be8064d21a54082
+          path: edgcpp
+          persist-credentials: false
+
+      - name: Checkout exact EDG bridge
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/edgcpp-rust
+          ref: ebc85760134b50b477d0466a4d5bcd967a0c3cad
+          path: edgcpp-rust
+          persist-credentials: false
+
+      - name: Build and probe EDG Cranelift reference
+        id: edg-clif
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          timeout --signal=TERM --kill-after=20s 35m docker run --rm --entrypoint /bin/bash \
+            -v "$PWD:/workspace" -v "$RUNNER_TEMP:/audit-tmp" \
+            ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8 \
+            -euo pipefail /workspace/bootstrap/run-mrustc-edg-cranelift.sh > "$RUNNER_TEMP/edg-clif.log" 2>&1
+          rc=$?
+          set -e
+          echo "EDG_CLIF_PROBE_EXIT=$rc"
+          grep -E '^CLIF_MODE=edg SAMPLE=[01] BYTES=[0-9]+ GCC_EXIT=-?[0-9]+ CLIF_EXIT=-?[0-9]+ ELF=[01] SECONDS=[0-9.]+$|^CLIF_DIAG_IDS=([PLST][0-9]{4}(,|$))*$|^CLIF_DIAG_CATEGORIES=([a-z]+(,|$))*$' "$RUNNER_TEMP/edg-clif.log" || true
+          grep -oE 'error\[E[0-9]{4}\]' "$RUNNER_TEMP/edg-clif.log" | sort -u || true
+          grep -E '^DIAG_TAG=(stdatomic|stddef|stdint|stdlib|atomic_type|gnu_attribute|unsupported_type|unsupported_builtin|unsupported_declaration|unsupported_argument|unsupported_parameter|unsupported_global|unsupported_record|unsupported_op|unknown_type)$' "$RUNNER_TEMP/edg-clif.log" || true
+          exit "$rc"
+
+      - name: Require both reference probe outcomes
+        if: always()
+        run: |
+          echo "Mini-C Cranelift: ${{ steps.minic-clif.outcome }}"
+          echo "EDG Cranelift: ${{ steps.edg-clif.outcome }}"
+          test "${{ steps.minic-clif.outcome }}" = success
+          test "${{ steps.edg-clif.outcome }}" = success
+          test "${{ steps.minic-current.outcome }}" = success
