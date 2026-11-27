@@ -1,4 +1,4 @@
-name: X7 full original Intel operation contract and model census
+name: X7 original unary physical receipts
 on:
   pull_request:
     paths: ['.github/workflows/verify-x7-generic-isl-parser-bridge.yml']
@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ed30246e8501b77699b6895f511f9908be179c4e
+          ref: 97c2ae6804af07faefd1b7b81aa919a9684ee04d
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - name: Record exact source and standalone unit tests
@@ -45,58 +45,33 @@ jobs:
           cd /tmp/isa-tools
           opam install --switch="$GITHUB_WORKSPACE" . --deps-only --yes
           opam exec --switch="$GITHUB_WORKSPACE" -- dune build bin/x86_isl_ast_export.exe
-      - name: Full original corpus B2 and B3 model census (64-bit conditional scope)
+
+      - name: Regenerate exact original unary source and XED proof receipts
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = ed30246e8501b77699b6895f511f9908be179c4e
+          test "$(git rev-parse HEAD)" = 97c2ae6804af07faefd1b7b81aa919a9684ee04d
           git clone --filter=blob:none --sparse https://github.com/intel/SDM.git /tmp/intel-sdm
           git -C /tmp/intel-sdm fetch --depth 1 origin 35eface1b7ee003a1cda95005ec5fd83de658a64
           git -C /tmp/intel-sdm checkout 35eface1b7ee003a1cda95005ec5fd83de658a64
           git -C /tmp/intel-sdm sparse-checkout set data/instruction
+          git clone --filter=blob:none https://github.com/intelxed/xed.git /tmp/xed
+          git -C /tmp/xed checkout 0bcb6237345c5066726dcc08b3d87928df3b5b26
+          git clone --filter=blob:none https://github.com/intelxed/mbuild.git /tmp/mbuild
+          git -C /tmp/mbuild checkout 1b437e409221a2b5703b4d8896baa20d43e4ba1a
+          (cd /tmp/xed && ./mfile.py --no-encoder)
+          (cd /tmp && python3 /tmp/xed/pysrc/xed_to_db.py --xed-dgen /tmp/xed/obj/dgen --out /tmp/x7-xed-upstream.json --compact)
           python3 -m venv /tmp/x7-z3
           /tmp/x7-z3/bin/python -m pip install --disable-pip-version-check 'z3-solver==4.13.4.0'
-          mkdir -p /tmp/x7-full-b3/shards
-          python3 tools/x86_iform_helper_dependencies.py --xml-dir /tmp/intel-sdm/data/instruction --out /tmp/x7-full-b3/index.json --shards 8
-          python3 tools/x86_iform_proof_work_dag.py --dependency-index /tmp/x7-full-b3/index.json --out /tmp/x7-full-b3/queue.json --shards 8
-          /tmp/x7-z3/bin/python -m unittest discover -s tools -p 'test_x86_isl_operation_model_census.py' -v
-          /tmp/x7-z3/bin/python -m unittest discover -s tools -p 'test_x86_isl_b3_record_worker.py' -v
-          failed=0
-          for shard in $(seq 0 7); do
-            /tmp/x7-z3/bin/python tools/x86_isl_operation_proof_worker.py \
-              --dependency-index /tmp/x7-full-b3/index.json \
-              --proof-work-queue /tmp/x7-full-b3/queue.json \
-              --xml-dir /tmp/intel-sdm/data/instruction \
-              --parser /tmp/isa-tools/_build/default/bin/x86_isl_ast_export.exe \
-              --width 64 --shard-index "$shard" --jobs 4 --model-jobs 2 \
-              --cache-dir /tmp/x7-b3-parser-cache --max-checks 256 --timeout-ms 2000 \
-              --out "/tmp/x7-full-b3/shards/op-shard-$(printf '%02d' "$shard").json" || failed=1
-          done
-          python3 tools/x86_isl_operation_model_census.py \
-            --dependency-index /tmp/x7-full-b3/index.json \
-            --proof-work-queue /tmp/x7-full-b3/queue.json \
-            --reports-dir /tmp/x7-full-b3/shards --out /tmp/x7-full-b3/census.json
+          /tmp/x7-z3/bin/python tools/x7_original_unary_receipts.py --xml-dir /tmp/intel-sdm/data/instruction --parser /tmp/isa-tools/_build/default/bin/x86_isl_ast_export.exe --xed-json /tmp/x7-xed-upstream.json --cache-dir /tmp/x7-parser-cache --out /tmp/x7-unary-receipts.json
           python3 - <<'PY'
           import json
-          c=json.load(open('/tmp/x7-full-b3/census.json'))
-          s=c['summary']
-          assert s['operations_accounted_for']==s['operations_indexed']==1641,s
-          assert s['complete_source_operation_accounting'] is True
-          assert s['production_selection_eligible_forms']==s['fully_verified_x86_instruction_forms']==0
-          assert s['source_models_reported_by_status'].get('deferred_by_model_check_budget',0)==0,s
-          impact=c['source_form_impact']
-          assert impact['summary']['original_source_iforms']==10859
-          assert impact['summary']['original_iforms_selection_eligible']==0
-          for row in c['operations']:
-              if row.get('typeid_value_candidates',{}).get('candidates'):
-                  print('X7_IR_CANDIDATES',row['operation'],json.dumps(row['typeid_value_candidates'],sort_keys=True))
-          for row in impact['ranked_source_blockers']:
-              if row['category']=='operation_model_reason':
-                  print('X7_ACTUAL_B3_BLOCKER',json.dumps(row,sort_keys=True))
+          r=json.load(open('/tmp/x7-unary-receipts.json'))
+          assert len(r['rows'])==6 and r['new_production_rules']==0
+          bound=[x for x in r['rows'] if x['status']=='source_value_and_flag_contract_bound']
+          assert {(x['operation'],x['width']) for x in bound}>={('TZCNT',32),('TZCNT',64)}
+          assert all(x['production_selection_eligible'] is False for x in r['rows'])
           PY
-          test "$failed" = 0
       - uses: actions/upload-artifact@v4
-        if: always()
         with:
-          name: x7-full-original-intel-b3-64bit-source-census
-          path: /tmp/x7-full-b3
-          if-no-files-found: error
+          name: x7-original-unary-receipts
+          path: /tmp/x7-unary-receipts.json
