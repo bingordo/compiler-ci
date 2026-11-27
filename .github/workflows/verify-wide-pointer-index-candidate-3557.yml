@@ -1,0 +1,97 @@
+name: TypeId full-width pointer offset candidate PR3557
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-wide-pointer-index-candidate-3557.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  pointer-index:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 19
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ee9a87222c9fc6889b8aadf6bf2ebd2d0bcb14a9
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Build source-pinned production Rust GCC driver
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = ee9a87222c9fc6889b8aadf6bf2ebd2d0bcb14a9
+          timeout --signal=TERM --kill-after=10s 13m cargo build -p compiler --bin compiler --manifest-path compiler/Cargo.toml
+          timeout --signal=TERM --kill-after=10s 5m cargo check -p compiler-backend-aarch64 -p compiler-backend-x86 -p compiler-ir -p compiler-backend --manifest-path compiler/Cargo.toml
+      - name: Source-level width matrix against independent GCC
+        shell: bash
+        run: |
+          set -euo pipefail
+          compiler="$PWD/compiler/target/debug/compiler"
+          mkdir -p width-probes
+          cd width-probes
+          cat > narrow.c <<'EOF'
+          char *add_i32(char *p, int n) { return p+n; }
+          int *step_i32(int *p, int n) { return p+n; }
+          EOF
+          cat > wide.c <<'EOF'
+          char *add_size_t(char *p, unsigned long n) { return p+n; }
+          char *subtract_long(char *p, long n) { return p-n; }
+          int *step_size_t(int *p, unsigned long n) { return p+n; }
+          void advance_size_t(char **p, unsigned long n) { *p += n; }
+          EOF
+          cat > harness.c <<'EOF'
+          extern char *add_i32(char *, int);
+          extern int *step_i32(int *, int);
+          extern char *add_size_t(char *, unsigned long);
+          extern char *subtract_long(char *, long);
+          extern int *step_size_t(int *, unsigned long);
+          extern void advance_size_t(char **, unsigned long);
+          int main(void) {
+            char a[64]={0};
+            int b[32]={0};
+            char *p = a+10;
+            if (add_i32(p,-5)!=a+5 || step_i32(b+3,2)!=b+5) return 1;
+            if (add_size_t(p,3)!=a+13 || subtract_long(p,-3)!=a+13) return 2;
+            if (step_size_t(b+3,2)!=b+5) return 3;
+            advance_size_t(&p,3);
+            if (p!=a+13) return 4;
+            return 0;
+          }
+          EOF
+          gcc -std=gnu11 -O0 -c narrow.c -o gcc-narrow.o
+          gcc -std=gnu11 -O0 -c wide.c -o gcc-wide.o
+          gcc -std=gnu11 -O0 harness.c gcc-narrow.o gcc-wide.o -o gcc-oracle
+          ./gcc-oracle
+          "$compiler" --gcc-driver -std=gnu11 -c narrow.c -o native-narrow.o
+          gcc -std=gnu11 -O0 harness.c native-narrow.o gcc-wide.o -o mixed-narrow
+          ./mixed-narrow
+          set +e
+          "$compiler" --gcc-driver -std=gnu11 -c wide.c -o native-wide.o > wide.log 2>&1
+          rc=$?
+          set -e
+          {
+            echo "GCC_POINTER_INDEX_ORACLE=PASS"
+            echo "TYPEID_NARROW_POINTER_INDEX=PASS"
+            echo "TYPEID_WIDE_POINTER_OBJECT_RC=$rc"
+            if test "$rc" -eq 0; then
+              gcc -std=gnu11 -O0 harness.c native-narrow.o native-wide.o -o native-wide
+              ./native-wide
+              echo "TYPEID_WIDE_POINTER_INDEX_RUNTIME=PASS"
+            else
+              test ! -e native-wide.o
+              echo "TYPEID_WIDE_POINTER_INDEX_RUNTIME=FAILED"
+              grep -m 5 -E 'M9 expects|compiler:|unsupported|error:' wide.log || true
+              exit 1
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pointer-wide-3107-log
+          path: width-probes/wide.log
+          if-no-files-found: ignore
