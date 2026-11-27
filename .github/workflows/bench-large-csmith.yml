@@ -1,0 +1,69 @@
+name: One-off large Csmith compile-time benchmark
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/bench-large-csmith.yml'
+      - 'tools/large_csmith_compile_bench.py'
+permissions:
+  contents: read
+concurrency:
+  group: large-csmith-bench-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  compile-time:
+    if: github.head_ref == 'bench/large-csmith-compile-time' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: main
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Prepare toolchain and source
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/csmith-bench"
+          git -C compiler rev-parse HEAD | tee "$RUNNER_TEMP/csmith-bench/compiler-sha"
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y --no-install-recommends csmith libcsmith-dev gcc time
+          dpkg-query -W csmith libcsmith-dev gcc > "$RUNNER_TEMP/csmith-bench/packages"
+          grep -q '^csmith[[:space:]]2.3.0-' "$RUNNER_TEMP/csmith-bench/packages"
+          header="$(dpkg -L libcsmith-dev | grep '/csmith.h$' | head -n1)"
+          test -s "$header"
+          echo "CSMITH_INCLUDE=$(dirname "$header")" >> "$GITHUB_ENV"
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("compiler/tools/mini-c-driver/Cargo.toml")
+          text=p.read_text()
+          old="ssh://git@github.com/bingordo/mini-c.git"
+          assert text.count(old)==2
+          p.write_text(text.replace(old,"https://github.com/bingordo/mini-c.git"))
+          PY
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: mini-c-release-compile-bench-v1
+      - name: Build production native driver in release mode
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c 2>&1 | tee "$RUNNER_TEMP/csmith-bench/build.log"
+          sha256sum compiler/tools/mini-c-driver/target/release/compiler-mini-c > "$RUNNER_TEMP/csmith-bench/driver-sha256"
+      - name: Measure sequential compilation (not runtime)
+        run: |
+          set -euo pipefail
+          python3 -m py_compile tools/large_csmith_compile_bench.py
+          python3 tools/large_csmith_compile_bench.py "$RUNNER_TEMP/csmith-bench" compiler/tools/mini-c-driver/target/release/compiler-mini-c "$CSMITH_INCLUDE" | tee "$RUNNER_TEMP/csmith-bench/benchmark.log"
+          sed -n '/^|/p' "$RUNNER_TEMP/csmith-bench/benchmark.log" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: large-csmith-compile-time
+          path: ${{ runner.temp }}/csmith-bench/
+          retention-days: 14
