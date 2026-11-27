@@ -1,4 +1,4 @@
-name: One-off linear CFG cycle and symbol index validation
+name: One-off indexed mem2reg eligibility and allocator scaling
 on:
   pull_request:
     branches: [main]
@@ -10,21 +10,30 @@ jobs:
   validate:
     if: github.head_ref == 'bench/linear-cycle-symbol-index' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 06bcabdba036d7d548dad30bd244c10f91e57645
-          path: compiler
+          ref: d457121e5e6c0d5ac36f1e36b2c8f97cee14d55d
+          path: baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2784bbca6925b667cb77f916c04233fb5eeaeb0d
+          path: candidate
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: compiler -> target
-          key: linear-cycle-symbol-index
-      - name: Test optimizer and generic backend
-        working-directory: compiler
+          workspaces: |
+            baseline -> target
+            candidate -> target
+          key: indexed-overlap-allocator-order
+      - name: Verify exact candidate optimizer and backend
+        working-directory: candidate
         run: |
           set -euo pipefail
           git rev-parse HEAD
@@ -32,3 +41,53 @@ jobs:
           cargo test --release -p compiler-opt --lib
           cargo test --release -p compiler-backend --lib
           cargo clippy -p compiler-opt -p compiler-backend --lib -- -D warnings
+      - name: Add identical diagnostic-only allocator harness to both checkouts
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/scaling.rs" <<'RS'
+
+          #[test]
+          fn diagnostic_simplify_scaling_ab() {
+              for (shape, sizes) in [("path", &[128u32,512,2048,8192][..]),
+                                      ("clique", &[128u32,512,1024][..])] {
+                  for &n in sizes {
+                      let mut graph: BTreeMap<u32, BTreeSet<u32>> =
+                          (0..n).map(|i| (i, BTreeSet::new())).collect();
+                      for a in 0..n {
+                          let limit = if shape == "path" { (a + 2).min(n) } else { n };
+                          for b in a + 1..limit {
+                              graph.get_mut(&a).unwrap().insert(b);
+                              graph.get_mut(&b).unwrap().insert(a);
+                          }
+                      }
+                      let required = HashSet::new();
+                      let weights = HashMap::new();
+                      let choices = |_:u32| 8usize;
+                      let expected = simplify_order(&graph, &required, &weights, &choices);
+                      let mut samples = Vec::new();
+                      for _ in 0..5 {
+                          let start = std::time::Instant::now();
+                          let order = std::hint::black_box(simplify_order(
+                              std::hint::black_box(&graph), &required, &weights, &choices));
+                          samples.push(start.elapsed().as_nanos());
+                          assert_eq!(order, expected);
+                      }
+                      samples.sort_unstable();
+                      eprintln!("SCALING shape={} n={} median_ns={} samples={:?}",
+                          shape, n, samples[2], samples);
+                  }
+              }
+          }
+          RS
+          for rev in baseline candidate; do
+            git -C "$rev" rev-parse HEAD
+            cat "$RUNNER_TEMP/scaling.rs" >> "$rev/crates/backend/tests/unit/regalloc.rs"
+            cargo test --release --manifest-path "$rev/Cargo.toml" -p compiler-backend --lib diagnostic_simplify_scaling_ab --no-run
+          done
+      - name: Measure same-runner allocator simplification
+        run: |
+          set -euo pipefail
+          for rev in baseline candidate candidate baseline; do
+            echo "REVISION $rev"
+            cargo test --release --manifest-path "$rev/Cargo.toml" -p compiler-backend --lib diagnostic_simplify_scaling_ab -- --nocapture
+          done
