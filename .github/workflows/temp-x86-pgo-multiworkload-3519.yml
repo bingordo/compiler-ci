@@ -1,0 +1,55 @@
+name: TEMP x86 two-source verified PGO replay #3519
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temp-x86-pgo-multiworkload-3519.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  two-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_INCREMENTAL: "0"
+      COMPILER_X86_PGO_BENCH_ABBA: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 2646b072f97521ea34c351633e52650acc5478bf
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source pin
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "2646b072f97521ea34c351633e52650acc5478bf"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          echo "compiler SHA: 2646b072f97521ea34c351633e52650acc5478bf" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x86-pgo-real-source
+      - name: Source profile train and native replay on two independent programs
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 25m cargo test --release -p compiler --test x86_edge_pgo_runtime_source -- --ignored --nocapture 2>&1 | tee "$RUNNER_TEMP/x86-pgo-two-source.log"
+          grep -F "X86_PGO_REPLAY source=rolling_checksum" "$RUNNER_TEMP/x86-pgo-two-source.log"
+          grep -F "X86_PGO_REPLAY source=branch_pressure" "$RUNNER_TEMP/x86-pgo-two-source.log"
+          for source in rolling_checksum branch_pressure; do
+            for format in profile_elf profile_gas; do
+              grep -F "X86_RUNTIME_PGO_ABBA profile=$format workload=$source" "$RUNNER_TEMP/x86-pgo-two-source.log"
+            done
+          done
+          grep -F "test result: ok. 2 passed;" "$RUNNER_TEMP/x86-pgo-two-source.log"
+      - name: Save observational source benchmark measurements
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x86-pgo-two-source-3519
+          path: ${{ runner.temp }}/x86-pgo-two-source.log
+          if-no-files-found: ignore
