@@ -10,12 +10,12 @@ permissions:
 jobs:
   candidate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 838dc43d639323dc5190226c16a5856d239ba3e1
+          ref: 622d8b416c414bc9d771280724f03cc39199b257
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -32,6 +32,9 @@ jobs:
         run: cd compiler/tools && python3 -m unittest test_csmith_probe
       - name: GCC mixed shared bitfield INTEGER ABI
         run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test bitfield_integer_abi --test mixed_bitfield_storage -- --nocapture
+      - name: Existing adapter suite
+        if: success() || failure()
+        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib
       - name: Build driver
         if: success() || failure()
         run: cargo build --manifest-path compiler/tools/mini-c-driver/Cargo.toml --bin compiler-mini-c
@@ -79,3 +82,32 @@ jobs:
           print("BITFIELD_TOTAL",passed,len(rows))
           assert passed>=15
           PY
+      - name: Broad postmerge Csmith campaign
+        if: success() || failure()
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y --no-install-recommends csmith libcsmith-dev gcc clang
+          header=$(dpkg -L libcsmith-dev | grep '/csmith.h$' | head -n1)
+          compiler_sha=$(git -C compiler rev-parse HEAD)
+          manifest=compiler/tools/mini-c-driver/Cargo.toml
+          frontend=$(PYTHONPATH=compiler/tools python3 -c 'from csmith_probe import pinned_frontend_revision; import sys; print(pinned_frontend_revision(open(sys.argv[1]).read()))' "$manifest")
+          evidence="$RUNNER_TEMP/postmerge-evidence"
+          failure=0
+          for profile in restricted-combined restricted-widths restricted-control restricted-storage restricted-arrays restricted-pointers restricted-structs restricted-compound restricted-observable restricted-bitfields restricted-unions restricted-volatile; do
+            extra=(--omit-unreferenced-static-bodies)
+            count=16
+            minimum=0
+            case "$profile" in restricted-arrays|restricted-pointers) count=32; minimum=32;; restricted-structs|restricted-compound) count=32; minimum=31;; restricted-bitfields) minimum=15;; restricted-unions) minimum=10;; restricted-volatile) minimum=3;; restricted-combined|restricted-widths) minimum=16;; restricted-control) minimum=14;; restricted-storage) minimum=1;; restricted-observable) count=8; extra=();; esac
+            cases="$evidence/$profile/cases"
+            results="$evidence/$profile/results"
+            python3 compiler/tools/csmith_probe.py --generate --cases-dir "$cases" --csmith csmith --seed-base 1 --seed-count "$count" --profile "$profile"
+            python3 compiler/tools/csmith_probe.py --probe --cases-dir "$cases" --artifacts-dir "$results" --include-dir "$(dirname "$header")" --preprocess-c --driver "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" --compiler-sha "$compiler_sha" --frontend-sha "$frontend" --minimum-native "$minimum" --compile-timeout 30 --run-timeout 5 --max-wall-seconds 240 "${extra[@]}" || failure=1
+          done
+          exit "$failure"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: postmerge-bitfield-storage-evidence
+          path: ${{ runner.temp }}/postmerge-evidence
+          retention-days: 14
