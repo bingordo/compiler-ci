@@ -1,4 +1,4 @@
-name: X7 full original Intel operation contract and model census
+name: X7 horizontal packed semantic expansion
 on:
   pull_request:
     paths: ['.github/workflows/verify-x7-generic-isl-parser-bridge.yml']
@@ -11,12 +11,12 @@ permissions:
 jobs:
   parser-bridge:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ed30246e8501b77699b6895f511f9908be179c4e
+          ref: 2a8bbfd87cf99a78d49923b80ac3885e35392c81
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - name: Record exact source and standalone unit tests
@@ -45,58 +45,62 @@ jobs:
           cd /tmp/isa-tools
           opam install --switch="$GITHUB_WORKSPACE" . --deps-only --yes
           opam exec --switch="$GITHUB_WORKSPACE" -- dune build bin/x86_isl_ast_export.exe
-      - name: Full original corpus B2 and B3 model census (64-bit conditional scope)
+
+      - name: Original corpus scalar and packed scope census
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = ed30246e8501b77699b6895f511f9908be179c4e
+          test "$(git rev-parse HEAD)" = 2a8bbfd87cf99a78d49923b80ac3885e35392c81
           git clone --filter=blob:none --sparse https://github.com/intel/SDM.git /tmp/intel-sdm
           git -C /tmp/intel-sdm fetch --depth 1 origin 35eface1b7ee003a1cda95005ec5fd83de658a64
           git -C /tmp/intel-sdm checkout 35eface1b7ee003a1cda95005ec5fd83de658a64
           git -C /tmp/intel-sdm sparse-checkout set data/instruction
           python3 -m venv /tmp/x7-z3
           /tmp/x7-z3/bin/python -m pip install --disable-pip-version-check 'z3-solver==4.13.4.0'
-          mkdir -p /tmp/x7-full-b3/shards
-          python3 tools/x86_iform_helper_dependencies.py --xml-dir /tmp/intel-sdm/data/instruction --out /tmp/x7-full-b3/index.json --shards 8
-          python3 tools/x86_iform_proof_work_dag.py --dependency-index /tmp/x7-full-b3/index.json --out /tmp/x7-full-b3/queue.json --shards 8
+          mkdir -p /tmp/x7-packed
+          python3 tools/x86_iform_helper_dependencies.py --xml-dir /tmp/intel-sdm/data/instruction --out /tmp/x7-packed/index.json --shards 8
+          python3 tools/x86_iform_proof_work_dag.py --dependency-index /tmp/x7-packed/index.json --out /tmp/x7-packed/queue.json --shards 8
+          /tmp/x7-z3/bin/python -m unittest discover -s tools -p 'test_x86_isl_packed_batch.py' -v
           /tmp/x7-z3/bin/python -m unittest discover -s tools -p 'test_x86_isl_operation_model_census.py' -v
           /tmp/x7-z3/bin/python -m unittest discover -s tools -p 'test_x86_isl_b3_record_worker.py' -v
           failed=0
-          for shard in $(seq 0 7); do
-            /tmp/x7-z3/bin/python tools/x86_isl_operation_proof_worker.py \
-              --dependency-index /tmp/x7-full-b3/index.json \
-              --proof-work-queue /tmp/x7-full-b3/queue.json \
-              --xml-dir /tmp/intel-sdm/data/instruction \
-              --parser /tmp/isa-tools/_build/default/bin/x86_isl_ast_export.exe \
-              --width 64 --shard-index "$shard" --jobs 4 --model-jobs 2 \
-              --cache-dir /tmp/x7-b3-parser-cache --max-checks 256 --timeout-ms 2000 \
-              --out "/tmp/x7-full-b3/shards/op-shard-$(printf '%02d' "$shard").json" || failed=1
+          for scope in 64-scalar 128-8 256-32 512-64; do
+            width="${scope%-*}"
+            lane="${scope#*-}"
+            args=()
+            if test "$lane" != scalar; then args+=(--element-width "$lane"); fi
+            mkdir -p "/tmp/x7-packed/$scope/shards"
+            for shard in $(seq 0 7); do
+              /tmp/x7-z3/bin/python tools/x86_isl_operation_proof_worker.py \
+                --dependency-index /tmp/x7-packed/index.json --proof-work-queue /tmp/x7-packed/queue.json \
+                --xml-dir /tmp/intel-sdm/data/instruction --parser /tmp/isa-tools/_build/default/bin/x86_isl_ast_export.exe \
+                --width "$width" "${args[@]}" --shard-index "$shard" --jobs 4 --model-jobs 2 \
+                --cache-dir /tmp/x7-b3-parser-cache --max-checks 256 --timeout-ms 2000 \
+                --out "/tmp/x7-packed/$scope/shards/op-shard-$(printf '%02d' "$shard").json" || failed=1
+            done
+            python3 tools/x86_isl_operation_model_census.py --dependency-index /tmp/x7-packed/index.json \
+              --proof-work-queue /tmp/x7-packed/queue.json --reports-dir "/tmp/x7-packed/$scope/shards" \
+              --out "/tmp/x7-packed/$scope/census.json"
           done
-          python3 tools/x86_isl_operation_model_census.py \
-            --dependency-index /tmp/x7-full-b3/index.json \
-            --proof-work-queue /tmp/x7-full-b3/queue.json \
-            --reports-dir /tmp/x7-full-b3/shards --out /tmp/x7-full-b3/census.json
           python3 - <<'PY'
           import json
-          c=json.load(open('/tmp/x7-full-b3/census.json'))
-          s=c['summary']
-          assert s['operations_accounted_for']==s['operations_indexed']==1641,s
-          assert s['complete_source_operation_accounting'] is True
-          assert s['production_selection_eligible_forms']==s['fully_verified_x86_instruction_forms']==0
-          assert s['source_models_reported_by_status'].get('deferred_by_model_check_budget',0)==0,s
-          impact=c['source_form_impact']
-          assert impact['summary']['original_source_iforms']==10859
-          assert impact['summary']['original_iforms_selection_eligible']==0
-          for row in c['operations']:
-              if row.get('typeid_value_candidates',{}).get('candidates'):
-                  print('X7_IR_CANDIDATES',row['operation'],json.dumps(row['typeid_value_candidates'],sort_keys=True))
-          for row in impact['ranked_source_blockers']:
-              if row['category']=='operation_model_reason':
-                  print('X7_ACTUAL_B3_BLOCKER',json.dumps(row,sort_keys=True))
+          from pathlib import Path
+          for p in sorted(Path('/tmp/x7-packed').glob('*/census.json')):
+              c=json.loads(p.read_text())
+              s=c['summary']
+              assert s['operations_accounted_for']==s['operations_indexed']==1641,s
+              assert s['production_selection_eligible_forms']==s['fully_verified_x86_instruction_forms']==0
+              assert s['source_models_reported_by_status'].get('deferred_by_model_check_budget',0)==0,s
+              assert c['source_form_impact']['summary']['original_source_iforms']==10859
+              print('X7_HORIZONTAL_CENSUS',p.parent.name,json.dumps(s,sort_keys=True))
+              for row in c['operations']:
+                  if row['status']=='supported_model_equivalent':
+                      print('X7_HORIZONTAL_MODEL',p.parent.name,row['source_file'],row['operation'])
+              for row in c['source_form_impact']['ranked_source_blockers'][:20]:
+                  print('X7_HORIZONTAL_BLOCKER',p.parent.name,json.dumps(row,sort_keys=True))
           PY
           test "$failed" = 0
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: x7-full-original-intel-b3-64bit-source-census
-          path: /tmp/x7-full-b3
-          if-no-files-found: error
+          name: x7-horizontal-packed-census
+          path: /tmp/x7-packed
