@@ -1,0 +1,80 @@
+name: Mini-C mixed FP benchmark blocker replay
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/minic-mixed-fp-benchmark-blocker.yml'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  replay:
+    if: github.head_ref == 'ci/minic-mixed-fp-benchmark-blocker' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 8107336cb10f7016135b683adf3cf8b30ba45de1
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record source and configure build
+        run: |
+          git -C compiler rev-parse HEAD
+          grep 'rev =' compiler/tools/mini-c-driver/Cargo.toml
+          sed -i 's|ssh://git@github.com/bingordo/mini-c.git|https://github.com/bingordo/mini-c.git|g' compiler/tools/mini-c-driver/Cargo.toml
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: minic-mixed-fp-benchmark
+      - name: GCC mixed GP and FP differential
+        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test fp_mixed_ssa -- --nocapture
+      - name: Build native release driver
+        if: success() || failure()
+        run: cargo build --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml --bin compiler-mini-c
+      - uses: actions/download-artifact@v4
+        if: success() || failure()
+        with:
+          name: large-csmith-compile-time
+          run-id: '46028292070'
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/original-benchmark
+      - name: Strict replay of exact benchmark translation units
+        if: success() || failure()
+        env:
+          INPUTS: ${{ runner.temp }}/original-benchmark
+          EVIDENCE: ${{ runner.temp }}/benchmark-replay
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE"
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,subprocess
+          root=pathlib.Path(os.environ["INPUTS"])
+          evidence=pathlib.Path(os.environ["EVIDENCE"])
+          driver=pathlib.Path("compiler/tools/mini-c-driver/target/release/compiler-mini-c").resolve()
+          report=json.loads((root/"report.json").read_text())
+          cases={c["seed"]:c for c in report["cases"]}
+          results=[]
+          for seed in (1001,1002,1004,1005,1006):
+              case=cases[seed]
+              pre=root/f"case-{seed}.i"
+              digest=hashlib.sha256(pre.read_bytes()).hexdigest()
+              assert digest==case["preprocessed_sha256"], seed
+              obj=evidence/f"case-{seed}.o"
+              log=evidence/f"case-{seed}.log"
+              with log.open("wb") as stream:
+                  result=subprocess.run(["timeout","--kill-after=5s","180s",str(driver),str(pre),"--emit","obj","-o",str(obj)],stdout=stream,stderr=subprocess.STDOUT)
+              row={"seed":seed,"sha256":digest,"exit":result.returncode,"object":obj.is_file(),"diagnostic":log.read_text(errors="replace")[:4000]}
+              results.append(row)
+              print("STRICT_BENCHMARK",json.dumps(row),flush=True)
+              (evidence/"results.json").write_text(json.dumps(results,indent=2))
+          if not all(r["exit"]==0 and r["object"] for r in results):
+              raise SystemExit("Strict benchmark compilation remains incomplete")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mixed-fp-benchmark-replay
+          path: ${{ runner.temp }}/benchmark-replay
+          retention-days: 14
