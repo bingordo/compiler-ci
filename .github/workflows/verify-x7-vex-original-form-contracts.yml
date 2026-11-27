@@ -7,16 +7,16 @@ permissions:
 jobs:
   original-contracts:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: f3acd00d38e1651b1799f6e8a912518fa128d3eb
+          ref: 117afa3209054d47d362f92afa209a37b471f936
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - name: Verify exact compiler source
-        run: test "$(git rev-parse HEAD)" = f3acd00d38e1651b1799f6e8a912518fa128d3eb
+        run: test "$(git rev-parse HEAD)" = 117afa3209054d47d362f92afa209a37b471f936
       - uses: actions/cache/restore@v4
         id: xed-cache
         with:
@@ -53,8 +53,50 @@ jobs:
           set -euo pipefail
           python3 tools/x7_original_vex_form_contracts.py --xml-dir "$X7_PINNED_INTEL_DIR" --xed-json "$X7_PINNED_XED_JSON" --out /tmp/x7-vex-contracts.json
           python3 -m unittest discover -s tools -p test_x7_original_vex_form_contracts.py -v
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: 5.4.1
+      - name: Build pinned upstream Intel AST exporter
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libgmp-dev pkg-config cmake libz3-dev
+          git clone --filter=blob:none https://github.com/IntelLabs/isa-tools.git /tmp/isa-tools
+          git -C /tmp/isa-tools checkout 16260979137c38339743a04b7fd5d9f0fa8a6ee5
+          git -C /tmp/isa-tools submodule update --init --recursive
+          cp tools/x86_isl_ast_export.ml tools/x86_isl_ast_json.ml /tmp/isa-tools/bin/
+          cat >> /tmp/isa-tools/bin/dune <<'EOF'
+          (executable
+           (name x86_isl_ast_export)
+           (modules x86_isl_ast_export x86_isl_ast_json)
+           (libraries libISA yojson))
+          EOF
+          cd /tmp/isa-tools
+          opam install --switch="$GITHUB_WORKSPACE" . --deps-only --yes
+          opam exec --switch="$GITHUB_WORKSPACE" -- dune build bin/x86_isl_ast_export.exe
+
+      - name: Batched independent semantic proof join
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/x7-z3
+          /tmp/x7-z3/bin/python -m pip install --disable-pip-version-check 'z3-solver==4.13.4.0'
+          export PATH=/tmp/x7-z3/bin:$PATH
+          python -m unittest discover -s tools -p test_x86_isl_operation_proof_worker.py -v
+          python -m unittest discover -s tools -p test_x7_vex_scalar_proof_batch.py -v
+          python tools/x7_vex_scalar_proof_batch.py --xml-dir /tmp/intel-sdm/data/instruction --xed-json /tmp/x7-xed-upstream.json --parser /tmp/isa-tools/_build/default/bin/x86_isl_ast_export.exe --cache-dir /tmp/x7-b3-parser-cache --workers 4 --model-workers 2 --out /tmp/x7-vex-proof-batch.json
+          python - <<'PY'
+          import json
+          r=json.load(open('/tmp/x7-vex-proof-batch.json'))
+          assert r['input_form_count']==22 and not r['source_form_blockers'],r
+          assert len(r['matched'])+len(r['blocked'])==22,r
+          assert len(r['proof_batches'])==2,r
+          assert r['new_production_rules']==0
+          assert r['matched'],r
+          PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: x7-vex-original-contracts
-          path: /tmp/x7-vex-contracts.json
+          path: |
+            /tmp/x7-vex-contracts.json
+            /tmp/x7-vex-proof-batch.json
