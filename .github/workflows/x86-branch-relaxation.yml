@@ -1,0 +1,57 @@
+name: x86 branch relaxation validation
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/x86-branch-relaxation.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  aligned-text:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c7389937b78782095927feed7ffcf418494dda14
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify candidate and configure dependencies
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "c7389937b78782095927feed7ffcf418494dda14"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+      - name: Restrict workspace to core crates (avoid unrelated frontend authentication)
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x86-text-align
+      - name: Verify branch relaxation
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-backend-x86 --lib relaxation -- --nocapture
+          cargo test -p compiler-backend-x86 --lib large_branch_stream_still_relaxes_near_branches -- --nocapture
+      - name: Verify physical text section and linked addresses
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --test text_section_alignment -- --nocapture
+      - name: Shared ELF and x86 backend library regressions
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib
+          cargo test -p compiler-backend-x86 --test att_module
+          cargo test -p compiler-backend-x86 --lib
+          cargo check -p compiler-backend-x86 --no-default-features
