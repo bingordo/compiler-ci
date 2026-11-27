@@ -1,0 +1,60 @@
+name: X7 pinned original VEX form contracts
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-x7-vex-original-form-contracts.yml']
+permissions:
+  contents: read
+jobs:
+  original-contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f3acd00d38e1651b1799f6e8a912518fa128d3eb
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler source
+        run: test "$(git rev-parse HEAD)" = f3acd00d38e1651b1799f6e8a912518fa128d3eb
+      - uses: actions/cache/restore@v4
+        id: xed-cache
+        with:
+          path: /tmp/x7-xed-upstream.json
+          key: x7-xed-export-0bcb6237345c5066726dcc08b3d87928df3b5b26-1b437e409221a2b5703b4d8896baa20d43e4ba1a
+      - name: Build pinned upstream XED exporter
+        if: steps.xed-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/intelxed/xed.git /tmp/xed
+          git -C /tmp/xed checkout 0bcb6237345c5066726dcc08b3d87928df3b5b26
+          git clone --filter=blob:none https://github.com/intelxed/mbuild.git /tmp/mbuild
+          git -C /tmp/mbuild checkout 1b437e409221a2b5703b4d8896baa20d43e4ba1a
+          (cd /tmp/xed && ./mfile.py --no-encoder)
+          (cd /tmp && python3 /tmp/xed/pysrc/xed_to_db.py --xed-dgen /tmp/xed/obj/dgen --out /tmp/x7-xed-upstream.json --compact)
+      - uses: actions/cache/save@v4
+        if: steps.xed-cache.outputs.cache-hit != 'true'
+        with:
+          path: /tmp/x7-xed-upstream.json
+          key: x7-xed-export-0bcb6237345c5066726dcc08b3d87928df3b5b26-1b437e409221a2b5703b4d8896baa20d43e4ba1a
+      - name: Obtain pinned original Intel instruction XML
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --sparse https://github.com/intel/SDM.git /tmp/intel-sdm
+          git -C /tmp/intel-sdm fetch --depth 1 origin 35eface1b7ee003a1cda95005ec5fd83de658a64
+          git -C /tmp/intel-sdm checkout 35eface1b7ee003a1cda95005ec5fd83de658a64
+          git -C /tmp/intel-sdm sparse-checkout set data/instruction
+          test "$(git -C /tmp/intel-sdm rev-parse HEAD)" = 35eface1b7ee003a1cda95005ec5fd83de658a64
+      - name: Discover source forms and reject altered contracts
+        env:
+          X7_PINNED_INTEL_DIR: /tmp/intel-sdm/data/instruction
+          X7_PINNED_XED_JSON: /tmp/x7-xed-upstream.json
+        run: |
+          set -euo pipefail
+          python3 tools/x7_original_vex_form_contracts.py --xml-dir "$X7_PINNED_INTEL_DIR" --xed-json "$X7_PINNED_XED_JSON" --out /tmp/x7-vex-contracts.json
+          python3 -m unittest discover -s tools -p test_x7_original_vex_form_contracts.py -v
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-vex-original-contracts
+          path: /tmp/x7-vex-contracts.json
