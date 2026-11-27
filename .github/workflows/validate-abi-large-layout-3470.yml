@@ -1,4 +1,4 @@
-name: TEMP shared ABI large-layout classification 3470
+name: TEMP SysV large aggregate slots 3485
 on:
   pull_request:
     branches: [main]
@@ -6,26 +6,77 @@ on:
 permissions:
   contents: read
 jobs:
-  planner:
+  large-minic:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: e89e53248ca968e3f38431e24efc05d77c86c436
+          ref: 3f4aee8b37c557521ab597a391bcbcf73e6f5adc
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Run actual shared classifier and planner unit tests without rebuilding compiler
+      - name: Verify exact source and prepare Mini-C dependency
+        run: |
+          set -euxo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 3f4aee8b37c557521ab597a391bcbcf73e6f5adc
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('compiler/tools/mini-c-driver/Cargo.toml')
+          s=p.read_text()
+          old='ssh://git@github.com/bingordo/mini-c.git'
+          assert s.count(old)==2
+          p.write_text(s.replace(old,'https://github.com/bingordo/mini-c.git'))
+          PY
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: mini-c-source-differential-v1
+      - name: Build native driver
+        run: cargo build --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+      - name: Run harness unit controls
+        run: python3 -m unittest discover -s compiler/tests/gcc -p 'test_*.py'
+      - name: Run generated larger MEMORY ABI matrix
         run: |
           set -euo pipefail
-          test "$(git -C compiler rev-parse HEAD)" = "e89e53248ca968e3f38431e24efc05d77c86c436"
-          cat > "$RUNNER_TEMP/abi_tests.rs" <<EOF
-          #[path = "$PWD/compiler/crates/backend/src/abi_classify.rs"]
-          mod abi_classify;
-          #[path = "$PWD/compiler/crates/backend/src/abi_plan.rs"]
-          mod abi_plan;
-          EOF
-          rustc --edition=2021 --test "$RUNNER_TEMP/abi_tests.rs" -o "$RUNNER_TEMP/abi_tests"
-          "$RUNNER_TEMP/abi_tests"
+          PYTHONPATH="$PWD/compiler/tests/gcc" python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          from gcc_compat_argument_probes import generate_large
+          from gcc_compat_inventory import inventory
+          from gcc_compat_runner import run_case, fatal
+          from gcc_compat_coverage import summarize
+          work = Path(os.environ["RUNNER_TEMP"]) / "large-abi"
+          root = work / "sources"
+          root.mkdir(parents=True)
+          generate_large(root)
+          cases = inventory(root, "probe-arg-combined-")
+          assert len(cases) == 24
+          adapters = {"minic": [str(Path("compiler/tools/mini-c-driver/target/debug/compiler-mini-c").resolve()), "{source}", "--emit", "obj", "-o", "{object}"]}
+          records = []
+          for opt in ("-O0", "-O2"):
+              for case in cases:
+                  record = run_case(case, root, work / opt[1:] / case["case"], "gcc", ["-std=gnu11", opt, "-w", "-fno-pie"], adapters)
+                  record["origin"] = "generated-argument-probe"
+                  records.append(record)
+                  (work / "report.json").write_text(json.dumps({"compiler_sha": "3f4aee8b37c557521ab597a391bcbcf73e6f5adc", "records": records, "planned_records": 48}, indent=2))
+                  print(opt, case["case"], record["status"], {k:v["status"] for k,v in record["frontends"].get("minic",{}).get("directions",{}).items()}, flush=True)
+          summary = summarize(records, adapters, 48)
+          print("LARGE_ABI_SUMMARY", json.dumps(summary), flush=True)
+          (work / "coverage-summary.json").write_text(json.dumps(summary, indent=2))
+          assert len(records) == 48 and all(r["status"] == "REFERENCE_PASS" and not fatal(r) for r in records)
+          PY
+      - name: Test shared ABI projection, caller and entry without unrelated workspace dependencies
+        if: always()
+        run: |
+          set -euo pipefail
+          printf '[workspace]\nresolver = "2"\nmembers = ["crates/ir", "crates/backend"]\n' > compiler/Cargo.toml
+          cargo test --manifest-path compiler/Cargo.toml -p compiler-backend --lib typeid_integer_call
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: large-abi-minic
+          path: |
+            ${{ runner.temp }}/large-abi/report.json
+            ${{ runner.temp }}/large-abi/coverage-summary.json
