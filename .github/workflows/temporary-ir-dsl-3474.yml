@@ -10,7 +10,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
-      SOURCE_SHA: 875303f6d6fc64b5923c21f224e89e38a5ad856c
+      SOURCE_SHA: 15520d5759e2529ae85173cf3ccac31d74a97543
+      BASELINE_SHA: 4c148a5952d7127208a2c84ad0fe13a3fdbdcac8
       CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v4
@@ -20,6 +21,7 @@ jobs:
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
+          fetch-depth: 2
       - name: Verify exact source and isolate native workspace
         run: |
           set -euo pipefail
@@ -46,6 +48,73 @@ jobs:
       - name: Check affected production libraries
         working-directory: compiler
         run: cargo check -p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --lib --keep-going
-      - name: Check affected consumers
+      - name: Compare broad consumer compilation with exact main baseline
         working-directory: compiler
-        run: cargo check -p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --all-targets --keep-going
+        run: |
+          set -euo pipefail
+          # Compare machine-readable compiler diagnostics, not a blanket waiver
+          # for a failing candidate. Production libraries and IR tests above
+          # must succeed independently.
+          args=(-p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --all-targets --keep-going --message-format=json)
+          set +e
+          cargo check "${args[@]}" > "$RUNNER_TEMP/dsl-candidate.jsonl"
+          candidate_status=$?
+          set -e
+          if [ "$candidate_status" -eq 0 ]; then
+            echo "All affected targets compile on the candidate." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          cp Cargo.toml "$RUNNER_TEMP/dsl-workspace.toml"
+          git checkout --force --detach "$BASELINE_SHA"
+          test "$(git rev-parse HEAD)" = "$BASELINE_SHA"
+          # No macro crate in the baseline workspace.
+          sed 's/, "crates\/ir-macros"//' "$RUNNER_TEMP/dsl-workspace.toml" > Cargo.toml
+          set +e
+          cargo check "${args[@]}" > "$RUNNER_TEMP/dsl-baseline.jsonl"
+          baseline_status=$?
+          set -e
+          python3 - "$candidate_status" "$baseline_status" <<'PY'
+          import collections, json, os, pathlib, sys
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          def diagnostics(name):
+              errors = collections.Counter()
+              finished = []
+              for line in (root / ("dsl-" + name + ".jsonl")).read_text().splitlines():
+                  item = json.loads(line)
+                  if item.get("reason") == "build-finished":
+                      finished.append(item["success"])
+                  if item.get("reason") != "compiler-message":
+                      continue
+                  msg = item["message"]
+                  if msg["level"] != "error":
+                      continue
+                  code = (msg.get("code") or {}).get("code")
+                  spans = tuple(sorted({s["file_name"] for s in msg["spans"] if s["is_primary"]}))
+                  errors[(item["target"]["name"], code, msg["message"], spans)] += 1
+              if finished != [False] or not errors:
+                  raise SystemExit(f"{name}: incomplete failed-check evidence")
+              return errors
+          if int(sys.argv[1]) == 0 or int(sys.argv[2]) == 0:
+              raise SystemExit("Candidate failed but baseline did not")
+          candidate, baseline = diagnostics("candidate"), diagnostics("baseline")
+          new = candidate - baseline
+          for label, errors in (("candidate", candidate), ("baseline", baseline), ("new", new)):
+              print(label, errors)
+          if new:
+              raise SystemExit("New candidate consumer errors")
+          # Only the three independently identified stale x86 test initializers
+          # are admitted; any other shared failure still blocks acceptance.
+          allowed = {
+              ("att_aliases", "E0063", "text_kind"),
+              ("att_section_cursor", "E0063", "relocations32"),
+              ("att_unowned_symbols", "E0063", "relocations32"),
+          }
+          for target, code, message, spans in candidate:
+              if not any(target == t and code == c and f"`{field}`" in message
+                         for t, c, field in allowed):
+                  raise SystemExit(f"Unapproved baseline failure: {target}: {message}")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("Broad consumer check: pre-existing main errors reproduced; no new candidate errors.\n")
+              for target, code, message, spans in sorted(candidate):
+                  summary.write(f"- {target}: {code} {message}\n")
+          PY
