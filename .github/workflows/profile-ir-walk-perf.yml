@@ -1,0 +1,85 @@
+name: One-off perf IR walk profile
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/profile-ir-walk-perf.yml'
+permissions:
+  contents: read
+jobs:
+  profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ba211ad29090e5253605cb278d6b36d7fcbf2e97
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check perf access before expensive build
+        run: |
+          if ! command -v perf >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y linux-tools-common linux-tools-generic
+          fi
+          command -v perf
+          perf --version
+          cat /proc/sys/kernel/perf_event_paranoid
+          sudo perf record -e cpu-clock:u -o /tmp/perf-probe.data -- sleep 0.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: release-perf-ir-walk
+      - name: Build release compiler with symbols and frame pointers
+        working-directory: compiler
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: "1"
+          RUSTFLAGS: "-C force-frame-pointers=yes"
+        run: |
+          git rev-parse HEAD
+          rustc --version
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          cargo build --release -p compiler --bin compiler
+      - name: Prepare checked-source workloads and profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          python3 - <<'PY'
+          import pathlib, sys, re
+          sys.path.insert(0,"compiler/tools")
+          from s23_real_source_abba import pinned_sources
+          src,_=pinned_sources(pathlib.Path("compiler"))
+          # Group 32 independent copies of the pinned 12 musl functions.
+          # This is a synthetic TU of unchanged function bodies with renamed symbols.
+          out=[]
+          for i in range(32):
+              for name,p in src.items():
+                  out.append(re.sub(r"\b"+name+r"\b",name+"_p"+str(i),p.read_text()))
+          pathlib.Path("results/musl_group.c").write_text("\n".join(out))
+          # Separate memory/control-flow-heavy probe with calls and loops.
+          pathlib.Path("results/loop_group.c").write_text("\n".join(
+              "int loop%d(int n,int x){int s=x; int i=0; while(i<n){if(i&1){s=s+i;}else{s=s-x;} i=i+1;} return s;}"%i
+              for i in range(96)))
+          PY
+          bin="$PWD/compiler/target/release/compiler"
+          for name in musl_group loop_group; do
+            "$bin" "results/$name.c" --language mini-c --emit obj -o "results/$name.o"
+            /usr/bin/time -f 'WALL %e RSS %M' "$bin" "results/$name.c" --language mini-c --emit obj -o "results/$name.o"
+            sudo perf record -e cpu-clock:u -F 999 -g --call-graph fp -o "results/$name.data" -- bash -c 'for i in $(seq 1 12); do "$1" "$2" --language mini-c --emit obj -o "$3" || exit; done' _ "$bin" "results/$name.c" "results/$name.o"
+            sudo chmod a+r "results/$name.data"
+            perf report -i "results/$name.data" --stdio --no-children --sort comm,dso,symbol --percent-limit 0.3 > "results/$name-self.txt"
+            perf report -i "results/$name.data" --stdio --children --sort comm,dso,symbol --percent-limit 1 > "results/$name-inclusive.txt"
+            perf script -i "results/$name.data" > "results/$name-stacks.txt"
+            echo "PROFILE $name"
+            head -85 "results/$name-self.txt"
+            head -100 "results/$name-inclusive.txt"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ir-walk-perf
+          path: results/
+          retention-days: 3
