@@ -1,4 +1,4 @@
-name: S23.62 candidate algebra proofs
+name: S23.62 admitted algebra native validation
 on:
   pull_request:
     paths:
@@ -6,57 +6,72 @@ on:
 permissions:
   contents: read
 jobs:
-  prove-candidates:
+  validate-batch:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 0147f62467ca5ee000d74155cd48811350737fad
+          ref: 80982b47df0788642d52fd38c8ad8e6602c96dad
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Confirm source and install offline solver
+      - name: Confirm exact source and install offline solver
         run: |
           set -euo pipefail
-          test "$(git -C compiler rev-parse HEAD)" = 0147f62467ca5ee000d74155cd48811350737fad
+          test "$(git -C compiler rev-parse HEAD)" = 80982b47df0788642d52fd38c8ad8e6602c96dad
           sudo apt-get update -qq
           sudo apt-get install -y -qq z3
-      - name: Check inventory, prove every orientation and record receipts
+      - name: Verify old receipts, generator and prove exact admitted source
         working-directory: compiler/tools/typeid-rule-gen
         run: |
           set -euo pipefail
+          python3 -m unittest -v test_rules test_ssa_codegen test_bulk_unconditional_laws test_batch_distributive_carry test_guarded_ssa_codegen test_guarded_batch_proofs
           python3 - <<'PY'
           from pathlib import Path
           import hashlib, json
-          from rules import parse_rules, matching_orientations
+          from rules import parse_rules
           from prove import verify
           from ssa_codegen import generate_ssa
-          current = Path("examples.rules").read_text()
-          candidate = Path("s2362-candidates.rules").read_text()
-          rules = parse_rules(candidate)
-          assert len(rules) == 35
-          # Combined parser checks names and canonical commutative patterns.
-          combined = parse_rules(current + "\n" + candidate.split("\n", 1)[1])
-          assert len(combined) == len(parse_rules(current)) + len(rules)
-          print("CANDIDATE_ORIENTATIONS", sum(len(matching_orientations(r.pattern)) for r in rules))
-          result = verify(rules, "z3", timeout_ms=3500, process_timeout=5.0)
-          assert result["family_count"] == 35 and result["sat_negative_controls"] == 5
-          result["candidate_source_sha256"] = hashlib.sha256(candidate.encode()).hexdigest()
+          source = Path("examples.rules").read_text()
+          rules = parse_rules(source)
+          candidates = parse_rules(Path("s2362-candidates.rules").read_text())
+          assert len(rules) == 153
+          admitted = rules[123:]
+          assert len(admitted) == 30 and all(r in candidates for r in admitted)
+          generate_ssa(rules)
+          result = verify(admitted, "z3", timeout_ms=3500, process_timeout=5.0)
+          assert result["family_count"] == 30 and result["sat_negative_controls"] == 5
+          result["source_sha256"] = hashlib.sha256(source.encode()).hexdigest()
           Path("/tmp/s2362-proofs.json").write_text(json.dumps(result, indent=2, sort_keys=True))
-          # Report which candidates the existing matcher can emit without
-          # changing runtime support. This is not native execution validation.
-          for rule in rules:
-              try:
-                  generate_ssa([rule])
-                  print("MATCHER_OK", rule.name)
-              except ValueError as exc:
-                  print("MATCHER_UNSUPPORTED", rule.name, str(exc))
           PY
+      - name: Isolate native core from private frontend dependencies
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir","crates/opt","crates/backend","crates/backend-x86","crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+          key: s2362-algebra-153
+      - name: Native differential tests, old rules and opt-out
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test native_s2360_distributive_carry -- --nocapture
+          cargo test -p compiler-opt --lib
+          cargo test -p compiler-opt --test native_s2359_bulk_laws
+          cargo test -p compiler-opt --test native_default_generated_flags
+          cargo test -p compiler-opt --test native_s2350_shadow_parity
+          cargo check -p compiler-opt --no-default-features
+          cargo clippy -p compiler-opt --lib -- -D warnings -A dead_code
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: s2362-proof-receipts
+          name: s2362-admission-proof-receipts
           path: /tmp/s2362-proofs.json
           retention-days: 14
