@@ -1,0 +1,132 @@
+name: One-off SCCP and leaf index Csmith profile
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/bench-csmith-sccp-leaf.yml'
+      - 'tools/large_csmith_compile_bench.py'
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: large-csmith-bench-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  compile-time:
+    if: github.head_ref == 'bench/csmith-sccp-leaf-index' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a6ecf2809872e6da9d7d74f2545439de9ebfbf91
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Prepare toolchain and source
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/csmith-bench"
+          git -C compiler rev-parse HEAD | tee "$RUNNER_TEMP/csmith-bench/compiler-sha"
+          # The preserved .i files are already preprocessed. No Csmith
+          # installation or package repository refresh is needed.
+          gcc --version > "$RUNNER_TEMP/csmith-bench/gcc.txt"
+          command -v perf
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("compiler/tools/mini-c-driver/Cargo.toml")
+          text=p.read_text()
+          old="ssh://git@github.com/bingordo/mini-c.git"
+          p.write_text(text.replace(old,"https://github.com/bingordo/mini-c.git"))
+          PY
+      - name: Check profiler availability
+        run: |
+          set -euo pipefail
+          perf --version
+          sudo perf record -e cpu-clock:u -o /tmp/csmith-perf-probe.data -- sleep 0.1
+      - uses: actions/download-artifact@v4
+        with:
+          name: large-csmith-compile-time
+          run-id: 46029541162
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/original-csmith
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: mini-c-release-csmith-profile-v1
+      - name: Validate optimizer
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          cargo test --release -p compiler-opt --lib
+          cargo clippy -p compiler-opt --lib -- -D warnings
+      - name: Build production native driver in release mode with profiling symbols
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: '1'
+          RUSTFLAGS: '-C force-frame-pointers=yes'
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c 2>&1 | tee "$RUNNER_TEMP/csmith-bench/build.log"
+          sha256sum compiler/tools/mini-c-driver/target/release/compiler-mini-c > "$RUNNER_TEMP/csmith-bench/driver-sha256"
+      - name: Profile exact Csmith inputs with a bounded CPU-clock sample
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/csmith-bench"
+          original="$RUNNER_TEMP/original-csmith"
+          python3 - "$original" "$out" <<'PY'
+          import hashlib, json, pathlib, shutil, sys
+          src, dst = map(pathlib.Path, sys.argv[1:])
+          report = json.loads((src/"report.json").read_text())
+          for seed in (1001,1002):
+              case = next(c for c in report["cases"] if c["seed"] == seed)
+              for ext,key in (("c","source_sha256"),("i","preprocessed_sha256")):
+                  p = src/f"case-{seed}.{ext}"
+                  assert hashlib.sha256(p.read_bytes()).hexdigest() == case[key]
+                  shutil.copyfile(p,dst/p.name)
+              print("VERIFIED_INPUT",seed,case["lines"],case["preprocessed_sha256"])
+          PY
+          lscpu > "$out/host.txt"
+          bin="$PWD/compiler/tools/mini-c-driver/target/release/compiler-mini-c"
+          # Short strict-mode probe, not a timing comparison.
+          set +e
+          timeout --kill-after=5s 20s "$bin" "$out/case-1001.i" --emit obj -o "$out/strict.o" > "$out/strict.log" 2>&1
+          strict_status=$?
+          set -e
+          echo "STRICT_EXIT $strict_status"
+          head -c 4000 "$out/strict.log"
+          for seed in 1001 1002; do
+            p="$out/profile-$seed"
+            rm -f "$p.o"
+            set +e
+            sudo perf record -e cpu-clock:u -F 99 -g --call-graph fp -o "$p.data" -- timeout --kill-after=5s 180s "$bin" "$out/case-$seed.i" --emit obj -o "$p.o" --omit-unreferenced-static-bodies > "$p.log" 2>&1
+            status=$?
+            set -e
+            echo "PROFILE_EXIT $seed $status"
+            head -c 4000 "$p.log"
+            if [ "$status" = 0 ]; then
+              gcc -O2 -w "$out/case-$seed.i" -o "$p.gcc"
+              gcc "$p.o" -o "$p.exe"
+              timeout 20s "$p.gcc" > "$p.gcc.checksum"
+              timeout 20s "$p.exe" > "$p.native.checksum"
+              cmp "$p.gcc.checksum" "$p.native.checksum" && echo "CHECKSUM_MATCH $seed"
+            fi
+            sudo chmod a+r "$p.data"
+            perf report -i "$p.data" --stdio --call-graph none --no-children --sort comm,dso,symbol --percent-limit 0.3 > "$p-self.txt"
+            perf report -i "$p.data" --stdio --call-graph none --children --sort comm,dso,symbol --percent-limit 1 > "$p-inclusive.txt"
+            perf script -i "$p.data" > "$p-stacks.txt"
+            echo "SELF_PROFILE $seed"
+            head -70 "$p-self.txt"
+            echo "INCLUSIVE_PROFILE $seed"
+            head -90 "$p-inclusive.txt"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: large-csmith-compile-profile
+          path: ${{ runner.temp }}/csmith-bench/
+          retention-days: 14
