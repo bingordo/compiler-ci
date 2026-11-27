@@ -1,4 +1,4 @@
-name: Mini-C composed product and GP variadic ABI candidate
+name: Mini-C merged composed ABI regression
 on:
   pull_request:
     paths:
@@ -7,44 +7,17 @@ on:
 permissions:
   contents: read
 jobs:
-  snapshot:
-    runs-on: ubuntu-24.04
-    outputs:
-      sha: ${{ steps.source.outputs.sha }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: bingordo/compiler
-          ref: main
-          path: compiler
-          ssh-key: ${{ secrets.CI_KEY }}
-          persist-credentials: false
-      - name: Resolve main
-        id: source
-        run: echo "sha=$(git -C compiler rev-parse HEAD)" >> "$GITHUB_OUTPUT"
   candidate:
-    needs: snapshot
-    strategy:
-      fail-fast: false
-      matrix:
-        variant: [baseline, integrated]
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ needs.snapshot.outputs.sha }}
-          fetch-depth: 0
+          ref: eca569ee607d71d144ac4bb20ac4374613af8c7f
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Integrate exact candidate
-        if: matrix.variant == 'integrated'
-        run: |
-          set -euo pipefail
-          git -C compiler -c user.name=compiler-ci -c user.email=compiler-ci@users.noreply.github.com merge --no-ff --no-edit 60fbf88727081deb869c14bd293968e59f740b02
-          git -C compiler log -1 --format='%H parents=%P' | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Record source and frontend pin
         run: |
           set -euo pipefail
@@ -62,7 +35,6 @@ jobs:
           workspaces: compiler/tools/mini-c-driver -> target
           key: minic-aggregate-places-candidate
       - name: GCC mixed product and variadic ABI regression
-        if: matrix.variant == 'integrated'
         run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test aggregate_variadic_abi -- --nocapture
       - name: GCC aggregate place and discarded call regression
         if: success() || failure()
@@ -72,7 +44,7 @@ jobs:
       - name: Adapter unit tests on all variants
         if: success() || failure()
         run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib
-      - name: Replay original 32 structure seeds
+      - name: Replay 128 restricted structural and compound seeds
         if: success() || failure()
         shell: bash
         run: |
@@ -89,21 +61,20 @@ jobs:
           mkdir -p "$RUNNER_TEMP/struct-evidence"
           evidence="$RUNNER_TEMP/struct-evidence"
           failure=0
-          for profile in restricted-structs; do
+          for profile in restricted-structs restricted-arrays restricted-pointers restricted-compound; do
             cases="$evidence/$profile/cases"
             results="$evidence/$profile/results"
             python3 compiler/tools/csmith_probe.py --generate --cases-dir "$cases" --csmith csmith --seed-base 1 --seed-count 32 --profile "$profile"
             python3 compiler/tools/csmith_probe.py --probe --cases-dir "$cases" --artifacts-dir "$results" --include-dir "$(dirname "$header")" --preprocess-c --driver "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" --compiler-sha "$compiler_sha" --frontend-sha "$frontend" --minimum-native 0 --run-timeout 5 --max-wall-seconds 300 --omit-unreferenced-static-bodies || failure=1
             if [[ -s "$results/results.jsonl" ]]; then
-              python3 - "$results/results.jsonl" "$profile" "${{ matrix.variant }}" <<'PY'
+              python3 - "$results/results.jsonl" "$profile" <<'PY'
           import json,sys
           rows=[json.loads(line) for line in open(sys.argv[1])]
           for r in rows:
               print("STRUCTURAL_RESULT", sys.argv[2], json.dumps({k:r.get(k) for k in ("seed","classification","compiler","frontend_diagnostic")}))
           assert len(rows)==32, "incomplete replay"
-          if sys.argv[3]=="integrated":
-              assert sum(r["classification"]=="passed" for r in rows)>=31
-              assert all(r["classification"] in ("passed","reference-timeout") for r in rows)
+          assert sum(r["classification"]=="passed" for r in rows)>=31
+          assert all(r["classification"] in ("passed","reference-timeout") for r in rows)
           PY
             else
               failure=1
@@ -113,6 +84,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: composed-abi-csmith-evidence-${{ matrix.variant }}
+          name: merged-composed-abi-evidence
           path: ${{ runner.temp }}/struct-evidence
           retention-days: 14
