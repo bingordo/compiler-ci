@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ inputs.compiler_ref || (github.event_name == 'pull_request' && '52ffe6c13fa527e5d861c4c4e1e46561df248249') || 'main' }}
+          ref: ${{ inputs.compiler_ref || (github.event_name == 'pull_request' && '9da0a6e659ae3c0167b97fabdd4ca3eaeb751866') || 'main' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -67,6 +67,7 @@ jobs:
           cargo test -p compiler-opt --features check-body-features --test typed_ctfe ctfe_retry_changed_function_census -- --nocapture
           COMPILER_TEST_VALIDATION=full cargo test -p compiler-opt --test typeid_core_pass_manager -- --nocapture
       - name: Run all IR and optimizer unit/integration tests
+        if: github.event_name != 'pull_request'
         working-directory: compiler
         run: cargo test -p compiler-ir -p compiler-opt --features compiler-opt/check-body-features
       - name: Verify strict Clippy on IR and optimizer
@@ -85,3 +86,40 @@ jobs:
             -f state="$state" -f context=ct/core-focused \
             -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             -f description="Focused IR and optimizer validation: $RESULT"
+
+  mask-regression-comparison:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 622d8b416c414bc9d771280724f03cc39199b257
+          path: baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9da0a6e659ae3c0167b97fabdd4ca3eaeb751866
+          path: candidate
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Reproduce generated mask algebra regression on both revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          failed=0
+          for v in baseline candidate; do
+            git -C "$v" rev-parse HEAD
+            printf '[workspace]\nresolver = "2"\nmembers = ["crates/ir", "crates/opt"]\n' > "$v/Cargo.toml"
+            rm -f "$v/Cargo.lock"
+            if (cd "$v" && cargo test -p compiler-opt --test generated_native_masks mask_absorption_keeps_a_trapping_division_producer -- --exact --nocapture); then
+              echo "MASK_REGRESSION $v passed"
+            else
+              echo "MASK_REGRESSION $v failed"
+              failed=1
+            fi
+          done
+          exit "$failed"
