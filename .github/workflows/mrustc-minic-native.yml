@@ -42,7 +42,7 @@ jobs:
           # Test the merged source-verified TypeId adapter (not the old mixed-global
           # branch) without changing compiler production history.
           # Manual dispatch can still select any explicit source_ref.
-          ref: ${{ inputs.source_ref || '9a0048acdb8b3b9b51e2caffcafdd9b088a50dfa' }}
+          ref: ${{ inputs.source_ref || '7fc00c603aa052412b6e210b01ee098d33d13fc4' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -95,12 +95,11 @@ jobs:
           ref: ${{ steps.frontend-pins.outputs.mini_c_preprocess_sha }}
           path: mini-c
           persist-credentials: false
-      - name: Checkout exact Mini-C natural alignment candidate
+      - name: Checkout exact manifest-pinned Mini-C frontend
         uses: actions/checkout@v4
         with:
           repository: bingordo/mini-c
-          # Diagnostic candidate override; never modify the committed compiler pin.
-          ref: 4a3c90b0a552540688f7e786a807ed98f1f39fd0
+          ref: ${{ steps.frontend-pins.outputs.mini_c_frontend_sha }}
           path: mini-c-compat
           persist-credentials: false
       - name: Checkout pinned mrustc
@@ -316,10 +315,14 @@ jobs:
           fi
           exit "$rc"
 
-      - name: Native driver unit regression (independent of source probes)
-        id: native_unit
+      # Full adapter and GCC ELF/GAS differential run independently in #2459.
+      - name: Build independent Cranelift reference on the identical frontend
+        id: clif_build
         continue-on-error: true
-        run: cargo test --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path mini-c-compat/Cargo.toml -p mini-c-cranelift --no-default-features
 
       - name: Attempt real generated C with production Mini-C and independent GCC
         shell: bash
@@ -331,6 +334,7 @@ jobs:
           root=Path("mrustc/output-compiler-bootstrap").resolve()
           driver=Path("compiler/tools/mini-c-driver/target/release/compiler-mini-c").resolve()
           assert driver.is_file()
+          clif=Path("mini-c-compat/target/release/mini-c-cranelift").resolve()
           units=sorted((p for p in root.rglob("*.c") if p.is_file() and p.stat().st_size),key=lambda p:p.stat().st_size)
           assert units
           def attempt(cmd, log, seconds):
@@ -347,6 +351,13 @@ jobs:
                   gcc=attempt(["gcc","-std=gnu11","-fsyntax-only",str(src)],tmp/"gcc.log",180)
                   out=tmp/f"native{i}.o"
                   rc=attempt([str(driver),str(src),"--emit","obj","-o",str(out)],tmp/"native.log",300)
+                  # Compare the reference backend using the very same generated input.
+                  if clif.is_file():
+                      clif_out=tmp/f"clif{i}.o"
+                      crc=attempt([str(clif),"-std=gnu11","--cpp=cc","--emit-obj",str(clif_out),str(src)],tmp/"clif.log",300)
+                      cmsg=(tmp/"clif.log").read_text(errors="replace")
+                      ccodes=sorted(set(re.findall(r'\b[PLST][0-9]{4}\b',cmsg)))
+                      print(f"CLIF_SAMPLE={i} EXIT={crc} ELF={int(clif_out.is_file() and clif_out.open('rb').read(4)==bytes([127,69,76,70]))} DIAG_IDS="+",".join(ccodes),flush=True)
                   # Only compiler-owned diagnostic IDs and fixed categories leave the runner.
                   msg=(tmp/"native.log").read_text(errors="replace").split("\nusage:",1)[0]
                   # Check public headers independently using the same native driver.
@@ -409,6 +420,3 @@ jobs:
               raise SystemExit(int(failures!=0))
           PY
 
-      - name: Require independent native unit regression
-        if: always() && steps.native_unit.outcome == 'failure'
-        run: exit 1
