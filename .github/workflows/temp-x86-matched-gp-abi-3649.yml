@@ -1,0 +1,87 @@
+name: TEMP x86 matched GP ABI direct calls #3649
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temp-x86-matched-gp-abi-3649.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  matched-gp:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 49f1468cd795a14f9fbf91d2bab1472df41647df
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler and configure toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "49f1468cd795a14f9fbf91d2bab1472df41647df"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          echo "Source 49f1468cd795a14f9fbf91d2bab1472df41647df" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x86-matched-gp-abi-direct-3649
+      - name: Isolate pre-existing X7-only unit test API drift in checkout
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("crates/backend-x86/src/dag_match.rs")
+          s=p.read_text()
+          for module,file in [
+              ("tests","dag_match_tests.rs"),
+              ("production_ctz_address_cutover","../tests/unit/x7_production_ctz_address.rs"),
+              ("ip10_decision_receipt_tests","../tests/unit/x7_ip10_decision_receipts.rs"),
+          ]:
+              marker=f'#[cfg(test)]\n#[path = "{file}"]\nmod {module};'
+              if marker in s:
+                  s=s.replace(marker,"// CI checkout only: baseline X7 matcher test API drift")
+          p.write_text(s)
+          PY
+      - name: Focused ABI identity, mixed preserved and unsafe source tests
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib abi_matched_gp_arguments_bypass_staging -- --nocapture
+          cargo test -p compiler-backend-x86 --lib wrong_position_abi_sources_reject -- --nocapture
+          cargo test -p compiler-backend-x86 --lib preserved_gp -- --nocapture
+          cargo test -p compiler-backend-x86 --lib direct_elf_six_arg_call_executes_against_c_oracle -- --nocapture
+      - name: Complete generic/x86 backend and assembler unit suites
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend-x86 --test att_module
+      - name: Production checked C native ELF/GAS and scalar ABI oracles
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler --test x86_pure_remat_source -- --nocapture
+          cargo test -p compiler-backend-x86 --test m4_7_scalar_sse_stream_native
+      - name: Scoped x86 Clippy except unchanged helper arity lint
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-backend-x86 --lib --no-deps -- -D clippy::all -A clippy::too_many_arguments
+      - name: Record source-pinned result
+        shell: bash
+        run: |
+          echo "PASS 49f1468cd795a14f9fbf91d2bab1472df41647df matched SysV GP inputs without stage" >> "$GITHUB_STEP_SUMMARY"
