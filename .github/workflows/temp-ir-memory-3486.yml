@@ -1,0 +1,55 @@
+name: Temporary native TypeId pointer and memory regression retirement
+on:
+  pull_request:
+    paths: ['.github/workflows/temp-ir-memory-3486.yml']
+permissions: {contents: read}
+jobs:
+  native-alias-memory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      SOURCE_SHA: 61dee61e7c0fda9ed622f0f758a126f18ee89f23
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler source and isolate optimizer workspace
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-native-memory-test-retirement
+      - name: Historical Function graph adapter absent from both migrated suites
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          if git grep -nE 'from_function\(|native_memory_fixture|to_legacy\(|from_legacy\(|compiler_ir::\{verify|fn fun\(' -- crates/opt/tests/alias_phis.rs crates/opt/tests/memory_analysis_bounds.rs; then exit 1; fi
+      - name: Native pointer-phi and full 600-block memory stress regressions
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test alias_phis --test memory_analysis_bounds --test alias_phi_exhaustive
+          cargo test -p compiler-opt --test alias_phi_profile --no-run
+      - name: All optimizer targets and strict production Clippy
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo check -p compiler-opt --all-targets
+          cargo clippy -p compiler-opt --lib -- -D warnings
+      - name: TypeId graph export boundary
+        working-directory: compiler
+        run: python3 tools/check_mixed_function_export_boundary.py
