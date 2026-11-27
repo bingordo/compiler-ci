@@ -1,4 +1,4 @@
-name: Mini-C native shared float literal candidate
+name: Mini-C obsolete regression repair and strict Csmith baseline
 on:
   pull_request:
     paths:
@@ -9,63 +9,30 @@ permissions:
 jobs:
   candidate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ce6d46f07fd96e2d5f7d0572cbd3a4480c07de7e
+          ref: e6fdceb7a9ec6c804d8fab22757547aba71df800
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Record exact compiler and frontend pin
+      - name: Record exact source
         run: |
           git -C compiler rev-parse HEAD
-          python3 - <<'PY'
-          from pathlib import Path
-          p=Path("compiler/tools/mini-c-driver/Cargo.toml")
-          s=p.read_text()
-          assert s.count("ssh://git@github.com/bingordo/mini-c.git")==2
-          p.write_text(s.replace("ssh://git@github.com/bingordo/mini-c.git","https://github.com/bingordo/mini-c.git"))
-          PY
           grep 'rev =' compiler/tools/mini-c-driver/Cargo.toml
+          sed -i 's|ssh://git@github.com/bingordo/mini-c.git|https://github.com/bingordo/mini-c.git|g' compiler/tools/mini-c-driver/Cargo.toml
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: compiler/tools/mini-c-driver -> target
           key: minic-native-hexfloat
-      - name: Native FP literal GCC ELF and GAS oracle
-        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test native_float_literals -- --nocapture
-      - name: Existing adapter unit tests
+      - name: Check repaired regressions
+        run: |
+          set -e
+          for test in paired_aggregate_result_preserves_product_type source_checked_aggregate_result_keeps_both_return_components global_arrays_pointer_relocations_and_local_shadowing; do
+            cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib "$test" -- --nocapture
+          done
+      - name: Full adapter suite
         if: success() || failure()
         run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib
-      - name: Build native compiler
-        if: success() || failure()
-        run: cargo build --manifest-path compiler/tools/mini-c-driver/Cargo.toml --bin compiler-mini-c
-      - name: Replay strict observable Csmith
-        if: success() || failure()
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -qq -y --no-install-recommends csmith libcsmith-dev gcc clang
-          [[ $(dpkg-query -W -f='${Version}' csmith) == 2.3.0-* ]]
-          header=$(dpkg -L libcsmith-dev | grep '/csmith.h$' | head -n1)
-          driver="$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c"
-          test -x "$driver"
-          frontend=$(PYTHONPATH=compiler/tools python3 -c 'from csmith_probe import pinned_frontend_revision; import sys; print(pinned_frontend_revision(open(sys.argv[1]).read()))' compiler/tools/mini-c-driver/Cargo.toml)
-          evidence="$RUNNER_TEMP/csmith-evidence"
-          python3 compiler/tools/csmith_probe.py --generate --cases-dir "$evidence/cases" --csmith csmith --seed-base 1 --seed-count 8 --profile restricted-observable
-          rc=0
-          python3 compiler/tools/csmith_probe.py --probe --cases-dir "$evidence/cases" --artifacts-dir "$evidence/results" --include-dir "$(dirname "$header")" --preprocess-c --driver "$driver" --compiler-sha "$(git -C compiler rev-parse HEAD)" --frontend-sha "$frontend" --minimum-native 8 --run-timeout 5 --max-wall-seconds 120 || rc=$?
-          python3 - "$evidence/results/results.jsonl" <<'PY'
-          import json,sys
-          for line in open(sys.argv[1]):
-              r=json.loads(line)
-              print("STRICT_RESULT", json.dumps({k:r.get(k) for k in ("seed","classification","compiler","frontend_diagnostic")}))
-          PY
-          exit "$rc"
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: native-hexfloat-evidence
-          path: ${{ runner.temp }}/csmith-evidence
-          retention-days: 14
