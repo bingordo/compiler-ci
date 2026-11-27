@@ -1,0 +1,62 @@
+name: S23.62 candidate algebra proofs
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/s23-62-candidate-proofs.yml'
+permissions:
+  contents: read
+jobs:
+  prove-candidates:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 0147f62467ca5ee000d74155cd48811350737fad
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Confirm source and install offline solver
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = 0147f62467ca5ee000d74155cd48811350737fad
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq z3
+      - name: Check inventory, prove every orientation and record receipts
+        working-directory: compiler/tools/typeid-rule-gen
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, json
+          from rules import parse_rules, matching_orientations
+          from prove import verify
+          from ssa_codegen import generate_ssa
+          current = Path("examples.rules").read_text()
+          candidate = Path("s2362-candidates.rules").read_text()
+          rules = parse_rules(candidate)
+          assert len(rules) == 35
+          # Combined parser checks names and canonical commutative patterns.
+          combined = parse_rules(current + "\n" + candidate.split("\n", 1)[1])
+          assert len(combined) == len(parse_rules(current)) + len(rules)
+          print("CANDIDATE_ORIENTATIONS", sum(len(matching_orientations(r.pattern)) for r in rules))
+          result = verify(rules, "z3", timeout_ms=3500, process_timeout=5.0)
+          assert result["family_count"] == 35 and result["sat_negative_controls"] == 5
+          result["candidate_source_sha256"] = hashlib.sha256(candidate.encode()).hexdigest()
+          Path("/tmp/s2362-proofs.json").write_text(json.dumps(result, indent=2, sort_keys=True))
+          # Report which candidates the existing matcher can emit without
+          # changing runtime support. This is not native execution validation.
+          for rule in rules:
+              try:
+                  generate_ssa([rule])
+                  print("MATCHER_OK", rule.name)
+              except ValueError as exc:
+                  print("MATCHER_UNSUPPORTED", rule.name, str(exc))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: s2362-proof-receipts
+          path: /tmp/s2362-proofs.json
+          retention-days: 14
