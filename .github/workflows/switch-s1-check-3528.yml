@@ -1,0 +1,45 @@
+name: Temporary S1 switch compile gate
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/switch-s1-check-3528.yml'
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1446bbf12198c3c4525568b897e8e1f959af0a35
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact revision
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = '1446bbf12198c3c4525568b897e8e1f959af0a35'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: switch-s1-core
+      - name: Check core crates and all backend consumers
+        working-directory: compiler
+        run: |
+          set -o pipefail
+          cargo check -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 -p compiler-backend-riscv64 -p compiler-backend-wasm --all-targets 2>&1 | tee /tmp/switch-check.log
+      - name: Focused switch regression
+        working-directory: compiler
+        run: cargo test -p compiler-ir --test switch_cfg
+      - name: Preserve compiler diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: switch-compile-diagnostics
+          path: /tmp/switch-check.log
+          if-no-files-found: warn
+          retention-days: 7
