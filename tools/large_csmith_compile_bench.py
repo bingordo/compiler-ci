@@ -70,13 +70,15 @@ for idx, (funcs, block, depth) in enumerate([(20,8,4),(60,12,5),(120,16,5),(60,1
         continue
     case["preprocessed_sha256"] = hashlib.sha256(pre.read_bytes()).hexdigest()
     case["preprocessed_bytes"] = pre.stat().st_size
-    labels = ["gcc-O0","gcc-O2","gcc-O3","native"]
+    labels = ["gcc-O0","gcc-O2","gcc-O3","native","native-omit-unused"]
     for round_idx in range(3):
         for label in labels[round_idx:] + labels[:round_idx]:
             obj = out / (stem+"-"+label+".o")
             obj.unlink(missing_ok=True)
-            cmd = ([driver,str(pre),"--emit","obj","-o",str(obj)] if label == "native"
+            cmd = ([driver,str(pre),"--emit","obj","-o",str(obj)] if label.startswith("native")
                    else ["gcc","-std=c99","-w","-"+label.split("-")[1],"-c",str(pre),"-o",str(obj)])
+            if label == "native-omit-unused":
+                cmd.append("--omit-unreferenced-static-bodies")
             sample = timed(cmd,stem+"-"+label+"-"+str(round_idx))
             if success(sample):
                 sample["object_bytes"] = obj.stat().st_size if obj.exists() else None
@@ -102,15 +104,19 @@ for idx, (funcs, block, depth) in enumerate([(20,8,4),(60,12,5),(120,16,5),(60,1
                                           "stdout":result["stdout"].decode(errors="replace")}
         else:
             case["checksums"][label] = {"status":"link-failed","exit":link["code"]}
+    refs = [case["checksums"].get(k) for k in ("gcc-O0","gcc-O2","gcc-O3")]
+    reference_ok = all(r and r["status"] == "ok" and r["exit"] == 0 for r in refs) and refs[0] == refs[1] == refs[2]
+    case["verified"] = {k: bool(reference_ok and case["checksums"].get(k) == refs[0])
+                        for k in ("native","native-omit-unused")}
     save()
 
-print("| seed | lines | GCC O0 CPU s | GCC O2 CPU s | GCC O3 CPU s | native CPU s | native RSS KiB |")
-print("|---|---:|---:|---:|---:|---:|---:|")
+print("| seed | lines | GCC O0 CPU s | GCC O2 CPU s | GCC O3 CPU s | native CPU s | omit-unused CPU s | native RSS KiB | omit-unused RSS KiB | verified strict/omit |")
+print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---|")
 for c in report["cases"]:
     m=c.get("medians",{})
-    vals=[m.get(k,{}).get("cpu_seconds","NA") for k in ("gcc-O0","gcc-O2","gcc-O3","native")]
-    print("|", " | ".join(map(str,[c["seed"],c["lines"],*vals,m.get("native",{}).get("rss_kib","NA")])), "|")
+    vals=[m.get(k,{}).get("cpu_seconds","NA") for k in ("gcc-O0","gcc-O2","gcc-O3","native","native-omit-unused")]
+    print("|", " | ".join(map(str,[c["seed"],c["lines"],*vals,m.get("native",{}).get("rss_kib","NA"),m.get("native-omit-unused",{}).get("rss_kib","NA"),str(c.get("verified",{}))])), "|")
 save()
 
-if not any("native" in c.get("medians",{}) for c in report["cases"]):
-    raise SystemExit("No successful native compile-time samples")
+if not any(any(c.get("verified",{}).values()) for c in report["cases"]):
+    raise SystemExit("No checksum-verified native compile-time samples in either mode")
