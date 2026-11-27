@@ -48,7 +48,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/edgcpp-rust
-          ref: ${{ inputs.source_ref || 'fc5adba5dc9061cc24517544c23ee92ab0151b5e' }}
+          ref: ${{ inputs.source_ref || '2c724ca460ee19902ee74250672972748a40dbe4' }}
           path: edgcpp-rust
           persist-credentials: false
       - name: Record exact revision
@@ -59,7 +59,7 @@ jobs:
           test "${#sha}" -eq 40
           echo "EDG Rust commit: $sha" | tee -a "$GITHUB_STEP_SUMMARY"
           if [[ "${{ github.event_name }}" != workflow_dispatch ]]; then
-            test "$sha" = fc5adba5dc9061cc24517544c23ee92ab0151b5e
+            test "$sha" = 2c724ca460ee19902ee74250672972748a40dbe4
           fi
       - name: Check out source headers matching the pinned EDG library
         uses: actions/checkout@v4
@@ -127,6 +127,26 @@ jobs:
           cargo test --features codegen --lib retired_source_hook_wire_tests -- --nocapture
           ! grep -Eq 'edgcpp_capture_|postlower_virtual_calls|prelower_virtual_calls' cpp/bridge.cpp
           echo "Normal EDG back_end entry and IL traversal, no private lowering hooks" >> "$GITHUB_STEP_SUMMARY"
+      - name: Verify qualified scope chain cycles and deep native namespace names
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          g++ -std=c++11 -Wall -Wextra -Werror "$GITHUB_WORKSPACE/edgcpp-rust/tests/qualified_scope_prefix.cpp" -o "$RUNNER_TEMP/qualified-scope-prefix"
+          "$RUNNER_TEMP/qualified-scope-prefix"
+          g++ -std=c++11 -Wall -Wextra -Werror "$GITHUB_WORKSPACE/edgcpp-rust/tests/scope_tree.cpp" -o "$RUNNER_TEMP/scope-tree"
+          "$RUNNER_TEMP/scope-tree"
+          g++ -std=c++11 -Wall -Wextra -Werror "$GITHUB_WORKSPACE/edgcpp-rust/tests/expression_tree.cpp" -o "$RUNNER_TEMP/expression-tree"
+          "$RUNNER_TEMP/expression-tree"
+          g++ -std=c++11 -Wall -Wextra -Werror "$GITHUB_WORKSPACE/edgcpp-rust/tests/ordinal_path.cpp" -o "$RUNNER_TEMP/ordinal-path"
+          "$RUNNER_TEMP/ordinal-path"
+          source build/gcc-release/environment.sh
+          cd build/gcc-release
+          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" --example parse -- --c++20 "$GITHUB_WORKSPACE/edgcpp-rust/tests/fixtures/namespaces.cpp" >"$RUNNER_TEMP/namespace-probe.log" 2>&1
+          grep -Fq 'EDG status: 0' "$RUNNER_TEMP/namespace-probe.log"
+          grep -Fq 'variable outer::inner::nested' "$RUNNER_TEMP/namespace-probe.log"
+          prefix=$(printf 'deep_%s::' $(seq 0 135))
+          grep -Fq "variable ${prefix}depth_value" "$RUNNER_TEMP/namespace-probe.log"
       - name: Run focused pointer call compatibility audit tests
         working-directory: edgcpp-rust
         run: |
@@ -175,6 +195,69 @@ jobs:
           cargo test --features codegen --lib exact_prototype_required_and_large_signatures_rejected -- --nocapture
           rustup component add clippy
           cargo clippy --features codegen --lib -- -D clippy::correctness
+      - name: Execute large integer and FP signatures and bodies
+        working-directory: edgcpp-rust
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          export EDG_LARGE_FP_TEST_OBJECT="$RUNNER_TEMP/large-fp.o"
+          export EDG_LARGE_INTEGER_TEST_OBJECT="$RUNNER_TEMP/large-int.o"
+          cargo test --features codegen --lib large_fp_signature_locals_and_flat_body_emit
+          cargo test --features codegen --lib large_integer_signature_and_locals_emit
+          python3 - <<'PY' > "$RUNNER_TEMP/large-signatures-driver.c"
+          n=300
+          print("extern double large_fp_body("+",".join(["double"]*n)+");")
+          print("extern long large_integer_body("+",".join(["long"]*n)+");")
+          print("int main(void) {")
+          print("return large_fp_body("+",".join(["1.0"]*(n-1)+["37.5"])+")!=37.5 ||")
+          print("large_integer_body("+",".join(["1L"]*(n-1)+["53L"])+")!=53; }")
+          PY
+          gcc "$RUNNER_TEMP/large-signatures-driver.c" "$RUNNER_TEMP/large-fp.o" "$RUNNER_TEMP/large-int.o" -o "$RUNNER_TEMP/large-signatures"
+          "$RUNNER_TEMP/large-signatures"
+      - name: Check uncapped native literal and routine relocation pools
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source build/gcc-release/environment.sh
+          cd build/gcc-release
+          python3 - <<'PY' > large-relocations.c
+          n=4101
+          print("void target(void) {}")
+          print("char *large_literals[] = {")
+          for i in range(n): print(f'"literal-{i:05}",')
+          print("}; void (*large_routines[])(void) = {")
+          for i in range(n): print("target,")
+          print("};")
+          PY
+          gcc -std=c11 -fsyntax-only large-relocations.c
+          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" --example audit_large_relocations -- --c11 large-relocations.c
+      - name: Verify uncapped wire count witnesses
+        working-directory: edgcpp-rust
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test --features codegen --lib wire_counts_accept_large_dense_lists_and_reject_incomplete_witnesses
+      - name: Parse native statement and record field lists above former cap
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source build/gcc-release/environment.sh
+          cd build/gcc-release
+          python3 - <<'PY' > large-wire.c
+          n=10001
+          print("struct wide_record {")
+          for i in range(n): print(f"int field_{i};")
+          print("}; struct wide_record wide;")
+          print("int many_statements(int x) {")
+          for i in range(n): print("x=x+1;")
+          print("return x; }")
+          print("int last_field(void) {return wide.field_10000;}")
+          PY
+          gcc -std=c11 -fsyntax-only large-wire.c
+          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" --example parse -- --c11 large-wire.c >"$RUNNER_TEMP/large-wire.log" 2>&1
+          grep -Fq 'EDG status: 0' "$RUNNER_TEMP/large-wire.log"
       - name: Validate global materialization unknown high bit without stale mask
         working-directory: edgcpp-rust
         run: |
@@ -199,6 +282,48 @@ jobs:
             -o "$RUNNER_TEMP/deep-native-array-40"
           "$RUNNER_TEMP/deep-native-array-40"
           echo 'Pinned EDG and GCC accept a real 40-dimensional C11 array' >> "$GITHUB_STEP_SUMMARY"
+      - name: Probe deep declaration scopes against pinned EDG and GCC
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source build/gcc-release/environment.sh
+          cd build/gcc-release
+          {
+            for i in $(seq 0 249); do echo "namespace nest_$i {"; done
+            echo 'int terminal_value = 37;'
+            for i in $(seq 0 249); do echo '}'; done
+            printf 'int main() { return '
+            printf 'nest_%s::' $(seq 0 249)
+            echo 'terminal_value != 37; }'
+          } > deep-declaration-scopes.cpp
+          g++ -std=c++20 -O0 -Wall -Wextra -Werror deep-declaration-scopes.cpp -o "$RUNNER_TEMP/deep-declaration-scopes"
+          "$RUNNER_TEMP/deep-declaration-scopes"
+          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" --example parse -- --c++20 deep-declaration-scopes.cpp >"$RUNNER_TEMP/deep-declaration-scopes.log" 2>&1
+          grep -Fq 'EDG status: 0' "$RUNNER_TEMP/deep-declaration-scopes.log"
+          prefix=$(printf 'nest_%s::' $(seq 0 249))
+          grep -Fq "variable ${prefix}terminal_value" "$RUNNER_TEMP/deep-declaration-scopes.log"
+      - name: Probe deep native type chains and recursive record references
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source build/gcc-release/environment.sh
+          cd build/gcc-release
+          dims=""
+          for i in $(seq 1 96); do dims="${dims}[1]"; done
+          {
+            printf 'int deep_type%s;\n' "$dims"
+            echo 'struct recursive_b;'
+            echo 'struct recursive_a { struct recursive_b *next; int value; };'
+            echo 'struct recursive_b { struct recursive_a *prev; };'
+            echo 'struct recursive_a node_a; struct recursive_b node_b;'
+            echo 'int main(void) { node_a.next=&node_b; node_b.prev=&node_a; return sizeof deep_type != sizeof(int) || node_a.next->prev != &node_a; }'
+          } > deep-native-types.c
+          gcc -std=c11 -O0 -Wall -Wextra -Werror deep-native-types.c -o "$RUNNER_TEMP/deep-native-types"
+          "$RUNNER_TEMP/deep-native-types"
+          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" --example parse -- --c11 deep-native-types.c >"$RUNNER_TEMP/deep-native-types.log" 2>&1
+          grep -Fq 'EDG status: 0' "$RUNNER_TEMP/deep-native-types.log"
       - name: Verify deep record image and fail-closed deep array against EDG/GCC
         working-directory: edgcpp
         run: |
@@ -218,16 +343,163 @@ jobs:
           if EDG_DESIGNATED_CASE=record cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" --example audit_designated_images -- --c11 "$b" 2>&1 | tee "$RUNNER_TEMP/deep-designated-record.log"; then record_ok=true; fi
           echo "Native deep designated array image: $array_ok" >> "$GITHUB_STEP_SUMMARY"
           echo "Native deep designated record image: $record_ok" >> "$GITHUB_STEP_SUMMARY"
-          # For this 40-dimensional array, either an exact native byte image
-          # or an explicit malformed/incomplete snapshot is admissible.
-          # Never treat missing/truncated image records as successful parsing.
-          if [ "$array_ok" = true ]; then
-            grep -Fq 'EDG_DEEP_DESIGNATOR_IMAGE name=deep_designated_array bytes=4 value=37' "$RUNNER_TEMP/deep-designated-images.log"
-          else
-            grep -Fq 'EDG compilation: MalformedCallback' "$RUNNER_TEMP/deep-designated-images.log"
-          fi
+          # Deep designated array construction is now iterative.
+          test "$array_ok" = true
+          grep -Fq 'EDG_DEEP_DESIGNATOR_IMAGE name=deep_designated_array bytes=4 value=37' "$RUNNER_TEMP/deep-designated-images.log"
           test "$record_ok" = true
           grep -Fq 'EDG_DEEP_DESIGNATOR_IMAGE name=deep_designated_record bytes=4 value=53' "$RUNNER_TEMP/deep-designated-record.log"
+      - name: Verify images and relocations above former size ceilings
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source build/gcc-release/environment.sh
+          cd build/gcc-release
+          cat > large-images.c <<'EOF'
+          unsigned char image_4097[4097] = { [0]=13, [4096]=89 };
+          unsigned char image_600000[600000] = { [0]=13, [599999]=89 };
+          EOF
+          cat "$GITHUB_WORKSPACE/edgcpp-rust/tests/fixtures/audit_reloc_513.c" >> large-images.c
+          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" --example audit_large_images -- --c11 large-images.c
+          cat > image-driver.c <<'EOF'
+          extern unsigned char image_4097[4097], image_600000[600000];
+          extern int audit_reloc_bad_use(void);
+          int main(void) {
+            return image_4097[0]!=13 || image_4097[4096]!=89 ||
+                image_600000[0]!=13 || image_600000[599999]!=89 ||
+                image_600000[300000]!=0 || audit_reloc_bad_use()!=37;
+          }
+          EOF
+          gcc -std=c11 -O0 large-images.c image-driver.c -o "$RUNNER_TEMP/gcc-large-images"
+          "$RUNNER_TEMP/gcc-large-images"
+          cargo run --quiet --features codegen --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" --example codegen -- large-images.o --c11 large-images.c
+          gcc large-images.o image-driver.c -o "$RUNNER_TEMP/edg-large-images"
+          "$RUNNER_TEMP/edg-large-images"
+      - name: Execute compact large local aggregate copy and fill
+        working-directory: edgcpp-rust
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          export EDG_BULK_IMAGE_TEST_OBJECT="$RUNNER_TEMP/bulk-local.o"
+          cargo test --features codegen --lib bulk_local_images_have_small_code_and_exact_tail -- --nocapture
+          cat > "$RUNNER_TEMP/bulk-driver.c" <<'EOF'
+          extern long bulk_copy(void), bulk_zero(void);
+          int main(void) {
+            const unsigned long n=65541;
+            const unsigned long offsets[]={0,7,8,64,n/2,n-6,n-5,n-2,n-1};
+            long expected=0;
+            for (unsigned i=0;i<sizeof offsets/sizeof offsets[0];++i)
+              expected+=(offsets[i]%251)+1;
+            return bulk_copy()!=expected || bulk_zero()!=0;
+          }
+          EOF
+          gcc "$RUNNER_TEMP/bulk-driver.c" "$RUNNER_TEMP/bulk-local.o" -o "$RUNNER_TEMP/bulk-local"
+          "$RUNNER_TEMP/bulk-local"
+      - name: Execute compact aggregate copy with overlap and exact tails
+        working-directory: edgcpp-rust
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          export EDG_BULK_COPY_TEST_OBJECT="$RUNNER_TEMP/bulk-copy.o"
+          cargo test --features codegen --lib bulk_aggregate_copy_has_compact_code_and_overlap_semantics -- --nocapture
+          cat > "$RUNNER_TEMP/copy-driver.c" <<'EOF'
+          #include <string.h>
+          #include <stdlib.h>
+          #include <stdint.h>
+          typedef long (*copy_fn)(void *, const void *);
+          extern long copy_7(void *,const void *),copy_63(void *,const void *);
+          extern long copy_64(void *,const void *),copy_65(void *,const void *);
+          extern long copy_65541(void *,const void *);
+          int main(void) {
+            const size_t sizes[]={7,63,64,65,65541};
+            const copy_fn copies[]={copy_7,copy_63,copy_64,copy_65,copy_65541};
+            for(size_t k=0;k<5;k++) {
+              size_t n=sizes[k],len=2*n+32;
+              unsigned char *a=malloc(len),*b=malloc(len);
+              if(!a||!b) return 1;
+              const size_t starts[][2]={{0,0},{1,0},{0,1},{3,7},{7,3},{n+8,0},{0,n+8}};
+              for(size_t j=0;j<sizeof starts/sizeof starts[0];j++) {
+                for(size_t i=0;i<len;i++) a[i]=b[i]=(unsigned char)(i%251);
+                size_t d=starts[j][0],s=starts[j][1];
+                memmove(b+d,b+s,n);
+                copies[k](a+d,a+s);
+                if(memcmp(a,b,len)) return 2;
+              }
+              free(a);free(b);
+            }
+            return 0;
+          }
+          EOF
+          gcc "$RUNNER_TEMP/copy-driver.c" "$RUNNER_TEMP/bulk-copy.o" -o "$RUNNER_TEMP/bulk-copy"
+          "$RUNNER_TEMP/bulk-copy"
+      - name: Compare native large struct and union assignments with GCC
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source build/gcc-release/environment.sh
+          cd build/gcc-release
+          cat > large-copy.c <<'EOF'
+          struct big { unsigned char data[4097]; int end; };
+          union big_union { unsigned char data[4097]; long align; };
+          void copy_struct(struct big *d,struct big *s) { *d=*s; }
+          void copy_union(union big_union *d,union big_union *s) { *d=*s; }
+          EOF
+          cat > copy-driver.c <<'EOF'
+          #include <string.h>
+          struct big { unsigned char data[4097]; int end; };
+          union big_union { unsigned char data[4097]; long align; };
+          extern void copy_struct(struct big *,struct big *);
+          extern void copy_union(union big_union *,union big_union *);
+          int main(void) {
+            struct big a={0},b={0};
+            union big_union c={0},d={0};
+            for(unsigned i=0;i<4097;i++) a.data[i]=c.data[i]=(unsigned char)(i%251);
+            a.end=37;
+            copy_struct(&b,&a);copy_union(&d,&c);
+            copy_struct(&b,&b);copy_union(&d,&d);
+            return b.end!=37||memcmp(a.data,b.data,4097)||memcmp(c.data,d.data,4097);
+          }
+          EOF
+          gcc -std=c11 -O0 large-copy.c copy-driver.c -o "$RUNNER_TEMP/gcc-large-copy"
+          "$RUNNER_TEMP/gcc-large-copy"
+          cargo run --quiet --features codegen --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" --example codegen -- large-copy.o --c11 large-copy.c
+          gcc large-copy.o copy-driver.c -o "$RUNNER_TEMP/edg-large-copy"
+          "$RUNNER_TEMP/edg-large-copy"
+      - name: Compare large BSS array and record objects against GCC
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source build/gcc-release/environment.sh
+          cd build/gcc-release
+          cat > large-bss.c <<'EOF'
+          unsigned char big_array[33554433];
+          struct large_record { unsigned char bytes[33554433]; int end; };
+          struct large_record big_record;
+          int touch_large(void) {
+            big_array[33554432]=13;
+            big_record.bytes[33554432]=19;
+            big_record.end=37;
+            return big_array[0]+big_record.bytes[0]+big_array[33554432]+big_record.bytes[33554432]+big_record.end;
+          }
+          EOF
+          cat > large-bss-driver.c <<'EOF'
+          extern int touch_large(void);
+          int main(void) { return touch_large()!=69; }
+          EOF
+          gcc -std=c11 -O0 large-bss.c large-bss-driver.c -o "$RUNNER_TEMP/gcc-large-bss"
+          "$RUNNER_TEMP/gcc-large-bss"
+          cargo run --quiet --features codegen --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" --example codegen -- large-bss.o --c11 large-bss.c
+          gcc large-bss.o large-bss-driver.c -o "$RUNNER_TEMP/edg-large-bss"
+          "$RUNNER_TEMP/edg-large-bss"
+      - name: Check branching aggregate layout and shared type DAG
+        working-directory: edgcpp-rust
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo test --features codegen --lib branching_records_have_no_artificial_depth_limit
+          cargo test --features codegen --lib shared_by_value_layouts_are_memoized_and_cycles_rejected
       - name: Check iterative Rust aggregate layout, copy and cycle boundaries
         working-directory: edgcpp-rust
         run: |
@@ -358,6 +630,26 @@ jobs:
           "$RUNNER_TEMP/lifetime-c11"
           "$RUNNER_TEMP/lifetime-cpp20"
           echo 'Pinned EDG C11/C++20 owner snapshots and GCC source oracles passed' >> "$GITHUB_STEP_SUMMARY"
+      - name: Probe deep native statement paths against pinned EDG and GCC
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source build/gcc-release/environment.sh
+          cd build/gcc-release
+          {
+            echo 'int deep_statements(volatile int *p) {'
+            for i in $(seq 0 79); do echo "if (*p != $i) {"; done
+            echo 'return 7;'
+            for i in $(seq 0 79); do echo '}'; done
+            echo 'return 9; }'
+            echo 'int main(void) { int x = 100; return deep_statements(&x) != 7; }'
+          } > deep-statements.c
+          gcc -std=c11 -O0 -Wall -Wextra -Werror deep-statements.c -o "$RUNNER_TEMP/deep-statements"
+          "$RUNNER_TEMP/deep-statements"
+          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" --example parse -- --c11 deep-statements.c >"$RUNNER_TEMP/deep-statements.log" 2>&1
+          grep -Fq 'EDG status: 0' "$RUNNER_TEMP/deep-statements.log"
+          awk '/^statement deep_statements path=/{n=split($3,p,"[.]"); if(n>max)max=n} END{print "deep statement path components:",max; exit !(max>128)}' "$RUNNER_TEMP/deep-statements.log"
       - name: Run all Rust library tests with codegen
         working-directory: edgcpp-rust
         run: |
