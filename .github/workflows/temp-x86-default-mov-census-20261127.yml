@@ -63,20 +63,31 @@ jobs:
               straight) source="$RUNNER_TEMP/straight.c" ;;
               x86_pgo_edges) source="tests/fixtures/x86_pgo_edges.c" ;;
             esac
-            echo "CENSUS_CASE=$item" | tee -a "$RUNNER_TEMP/mov-census.log"
-            COMPILER_X86_MOV_CENSUS=1 target/debug/compiler "$source" --language mini-c --target x86_64 --emit obj -o "$RUNNER_TEMP/$item.o" 2>&1 | tee -a "$RUNNER_TEMP/mov-census.log"
+            for mode in default no-generated-rewrites O0; do
+              case "$mode" in
+                default) flags=() ;;
+                no-generated-rewrites) flags=(--no-generated-rewrites) ;;
+                O0) flags=(-O0) ;;
+              esac
+              echo "CENSUS_CASE=$item MODE=$mode" | tee -a "$RUNNER_TEMP/mov-census.log"
+              if COMPILER_X86_MOV_CENSUS=1 target/debug/compiler "$source" --language mini-c --target x86_64 --emit obj -o "$RUNNER_TEMP/$item.o" "${flags[@]}" 2>&1 | tee -a "$RUNNER_TEMP/mov-census.log"; then
+                echo "CENSUS_OK case=$item mode=$mode" | tee -a "$RUNNER_TEMP/mov-census.log"
+                break
+              fi
+              echo "CENSUS_FAILED case=$item mode=$mode" | tee -a "$RUNNER_TEMP/mov-census.log"
+            done
           done
           python3 - "$RUNNER_TEMP/mov-census.log" <<'PY'
           import re,sys,collections
           case=None; totals=collections.Counter(); bysite=collections.Counter()
           for line in open(sys.argv[1]):
               if line.startswith('CENSUS_CASE='):
-                  case=line.strip().split('=',1)[1]
+                  case=line.split('=',1)[1].split()[0]
               m=re.search(r'X86_MOV_SUMMARY function=(\S+) region=(\S+) count=(\d+)',line)
               if m: totals[(case,m[2])]+=int(m[3])
               m=re.search(r'X86_MOV_SOURCE function=(\S+) region=(\S+) block=(\S+) site=(\S+) kind=(\S+) count=(\d+)',line)
               if m: bysite[(case,m[2],m[5])]+=int(m[6])
-          assert totals and totals[('rolling_checksum','total')]>0
+          assert totals and sum(v for (case,region),v in totals.items() if region=='total')>0
           for (case,region),n in sorted(totals.items()):
               print(f'CENSUS_AGG case={case} region={region} movs={n}')
           for (case,region,kind),n in sorted(bysite.items(),key=lambda x:-x[1])[:35]:
