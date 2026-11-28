@@ -21,6 +21,7 @@ on:
           - infrastructure
           - core-build
           - core-tests
+          - doctest
           - gcc
           - minic
           - native-smoke
@@ -45,6 +46,37 @@ env:
   CARGO_PROFILE_DEV_DEBUG: '0'
   CARGO_PROFILE_TEST_DEBUG: '0'
 jobs:
+  doctest:
+    if: inputs.lane == 'doctest' || github.event.label.name == 'rg-doctest'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ github.event_name == 'pull_request' && 'baa73ff3f4d35a8580ac835f5aa428bdddbc502c' || inputs.source_ref || 'main' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify RISC-V documentation examples
+        working-directory: compiler
+        run: |
+          git rev-parse HEAD
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text('[workspace]\nresolver = "2"\nmembers = ["crates/ir", "crates/backend", "crates/backend-riscv64"]\n')
+          PY
+          status=0
+          CARGO_TERM_COLOR=never cargo test -p compiler-backend-riscv64 --doc > "$RUNNER_TEMP/rg-doctest.log" 2>&1 || status=$?
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          log = (Path(os.environ["RUNNER_TEMP"]) / "rg-doctest.log").read_text(errors="replace")
+          results = re.findall(r"test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;", log)
+          print("Doctest aggregate:", results)
+          assert results and all(int(row[1]) == 0 for row in results)
+          PY
+          exit "$status"
   core-build:
     if: inputs.lane == 'core-build' || inputs.lane == 'core-tests' || github.event.label.name == 'rg-core-build' || github.event.label.name == 'rg-core-tests'
     runs-on: ubuntu-24.04
