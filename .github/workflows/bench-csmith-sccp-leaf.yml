@@ -1,0 +1,161 @@
+name: One-off matched mem2reg store-kind gate comparison
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/bench-csmith-sccp-leaf.yml'
+      - 'tools/large_csmith_compile_bench.py'
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: large-csmith-bench-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  compile-time:
+    if: github.head_ref == 'bench/csmith-sccp-leaf-index' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c8fa58d599f7bb4b1686f7008cceaeb29de61780
+          fetch-depth: 3
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Prepare toolchain and source
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/csmith-bench"
+          git -C compiler rev-parse HEAD | tee "$RUNNER_TEMP/csmith-bench/compiler-sha"
+          # The preserved .i files are already preprocessed. No Csmith
+          # installation or package repository refresh is needed.
+          gcc --version > "$RUNNER_TEMP/csmith-bench/gcc.txt"
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("compiler/tools/mini-c-driver/Cargo.toml")
+          text=p.read_text()
+          old="ssh://git@github.com/bingordo/mini-c.git"
+          p.write_text(text.replace(old,"https://github.com/bingordo/mini-c.git"))
+          PY
+      - uses: actions/download-artifact@v4
+        with:
+          name: large-csmith-compile-time
+          run-id: 46029541162
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/original-csmith
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: mini-c-release-csmith-profile-v1
+      - name: Validate merged backend and middle-end integration
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          cargo test --release -p compiler-opt --lib
+          cargo test --release -p compiler-opt --test typed_mem2reg --test mem2reg_native
+          cargo clippy -p compiler-opt --lib -- -D warnings
+          cargo check --workspace
+      - name: Diagnostic-only disable generated rewrite group after normal unit tests
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("compiler/crates/opt/Cargo.toml")
+          text=p.read_text()
+          old='default = ["experimental-typeid-guarded-admission"]'
+          assert text.count(old)==1
+          p.write_text(text.replace(old,"default = []"))
+          PY
+          # Opt-in diagnostic bridge to the EXISTING owned-source optimizer
+          # profile, not the cloning transactional profiling entry point.
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("compiler/crates/opt/src/typed_pipeline.rs")
+          s=p.read_text()
+          old="        CheckedSourceScope::Core =>\n            optimize_typeid_source_impl(module,options,None,None,TypeIdOptimizationLevel::O2,owned).map(|_| ()),"
+          new="""        CheckedSourceScope::Core => {
+              let mut profile=crate::native_integer_algebra::NativeIntegerPhaseProfile::default();
+              let result=optimize_typeid_source_impl(module,options,Some(&mut profile),None,TypeIdOptimizationLevel::O2,owned);
+              for (name,ns) in [
+                  ("input_validation",profile.source_input_validation_ns),
+                  ("clone",profile.source_clone_ns),
+                  ("core",profile.source_core_ns),
+                  ("ctfe",profile.source_ctfe_ns),
+                  ("retry",profile.source_core_retry_ns),
+                  ("native_integer",profile.source_integer_ns),
+                  ("output_validation",profile.source_output_validation_ns),
+                  ("commit",profile.source_commit_ns),
+              ] { eprintln!("OPT_TIME_PHASE\\t{name}\\t{ns}"); }
+              for (i,name) in TYPED_CORE_PASS_NAMES.iter().enumerate() {
+                  eprintln!("OPT_TIME_PASS\\t{name}\\t{}\\t{}",profile.source_core_pass_ns[i],profile.source_core_retry_pass_ns[i]);
+              }
+              eprintln!("OPT_TIME_PRE_DETAIL\\t{:?}\\t{:?}",profile.source_pre_phase,profile.source_retry_pre_phase);
+              eprintln!("OPT_TIME_PROMOTION_DETAIL\\t{:?}\\t{:?}",profile.source_core_promotion_phase,profile.source_retry_promotion_phase);
+              result.map(|_| ())
+          },"""
+          assert s.count(old)==1
+          p.write_text(s.replace(old,new))
+          PY
+          git -C compiler diff -- crates/opt/Cargo.toml crates/opt/src/typed_pipeline.rs > "$RUNNER_TEMP/csmith-bench/diagnostic.patch"
+          cat "$RUNNER_TEMP/csmith-bench/diagnostic.patch"
+      - name: Build diagnostic native driver in ordinary release mode
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c 2>&1 | tee "$RUNNER_TEMP/csmith-bench/build.log"
+          out="$RUNNER_TEMP/csmith-bench"
+          bin=compiler/tools/mini-c-driver/target/release/compiler-mini-c
+          cp "$bin" "$out/candidate-driver"
+          # Revert only the changed production file to the exact PR base.
+          # Both binaries share all other code and diagnostic settings.
+          git -C compiler show 4d9e292e7011d04986b74efb29b436e53bbe3ca9:crates/opt/src/mem2reg_core.rs > compiler/crates/opt/src/mem2reg_core.rs
+          cargo build --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c 2>&1 | tee "$out/build-base.log"
+          cp "$bin" "$out/base-driver"
+          sha256sum "$out/"*-driver > "$out/driver-sha256"
+      - name: Time exact Csmith inputs with backend pass report
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/csmith-bench"
+          original="$RUNNER_TEMP/original-csmith"
+          python3 - "$original" "$out" <<'PY'
+          import hashlib, json, pathlib, shutil, sys
+          src, dst = map(pathlib.Path, sys.argv[1:])
+          report = json.loads((src/"report.json").read_text())
+          for seed in (1001,1002):
+              case = next(c for c in report["cases"] if c["seed"] == seed)
+              for ext,key in (("c","source_sha256"),("i","preprocessed_sha256")):
+                  p = src/f"case-{seed}.{ext}"
+                  assert hashlib.sha256(p.read_bytes()).hexdigest() == case[key]
+                  shutil.copyfile(p,dst/p.name)
+              print("VERIFIED_INPUT",seed,case["lines"],case["preprocessed_sha256"])
+          PY
+          lscpu > "$out/host.txt"
+          for seed in 1001 1002; do
+            gcc -O2 -w "$out/case-$seed.i" -o "$out/gcc-$seed"
+            timeout 20s "$out/gcc-$seed" > "$out/gcc-$seed.checksum"
+            order="base candidate"
+            if [ "$seed" = 1002 ]; then order="candidate base"; fi
+            for variant in $order; do
+              p="$out/$variant-$seed"
+              COMPILER_BACKEND_TIME_REPORT=1 /usr/bin/time -f 'wall=%e user=%U sys=%S maxrss_kib=%M' -o "$p.time" timeout --kill-after=5s 600s "$out/$variant-driver" "$out/case-$seed.i" --emit obj -o "$p.o" --omit-unreferenced-static-bodies >"$p.log" 2>&1
+              echo "TIMING $variant $seed"
+              cat "$p.time" "$p.log"
+              gcc "$p.o" -o "$p.exe"
+              timeout 20s "$p.exe" > "$p.checksum"
+              cmp "$out/gcc-$seed.checksum" "$p.checksum"
+              echo "CHECKSUM_MATCH $variant $seed"
+            done
+            cmp "$out/base-$seed.o" "$out/candidate-$seed.o"
+            echo "OBJECT_MATCH $seed"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: large-csmith-compile-profile
+          path: ${{ runner.temp }}/csmith-bench/
+          retention-days: 14
