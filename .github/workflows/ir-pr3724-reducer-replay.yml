@@ -1,0 +1,61 @@
+# One-off exact source validation; close PR unmerged after verification.
+name: IR PR3724 native text retirement
+on:
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/ir-pr3724-reducer-replay.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ir-pr3724-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  native-text:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      COMPILER_SHA: 512ba8399be2adea14210fcbac54a0a4fd78bede
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.COMPILER_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check exact source and isolate optimizer workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          echo "Verified compiler candidate: $COMPILER_SHA" >> "$GITHUB_STEP_SUMMARY"
+          echo 'Retired Rust API inventory (must be empty):'
+          if git -C compiler grep -n -E 'typed_ssa_text|read_typed_ssa|write_typed_ssa' -- '*.rs'; then exit 1; else test "$?" -eq 1; fi
+          echo 'Other tracked source references:'
+          git -C compiler grep -n -E 'typed_ssa_text|read_typed_ssa|write_typed_ssa' -- '*.toml' '*.py' '*.sh' '*.yml' '*.yaml' || test "$?" -eq 1
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-pr3704-opt-reducer
+      - name: Focused canonical replay, optimizer tests and target compilation
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test typed_ssa_body
+          cargo test -p compiler-opt --test typed_core_pipeline --test typed_native_parity --test alive_lite
+          cargo check -p compiler-ir -p compiler-opt --all-targets
+      - name: Strict scoped Clippy
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p compiler-opt --lib -- -D warnings -A dead_code -A clippy::too_many_arguments
