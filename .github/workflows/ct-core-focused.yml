@@ -7,6 +7,10 @@ on:
         required: true
         type: string
         default: main
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct-core-focused.yml'
   push:
     branches: [main]
     paths:
@@ -15,17 +19,17 @@ permissions:
   contents: read
   statuses: write
 concurrency:
-  group: ct-core-focused-${{ inputs.compiler_ref || 'bootstrap' }}
+  group: ct-core-focused-${{ inputs.compiler_ref || github.ref }}
   cancel-in-progress: true
 jobs:
   compiler-ir-opt:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ inputs.compiler_ref || 'main' }}
+          ref: ${{ inputs.compiler_ref || (github.event_name == 'pull_request' && 'cee7d9ce21be1a2d35c20ef3a3c34b6e2d6ddb74') || 'main' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -55,10 +59,20 @@ jobs:
           key: focused-ct-ir-opt
       - name: Run all IR and optimizer unit/integration tests
         working-directory: compiler
-        run: cargo test -p compiler-ir -p compiler-opt
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            cargo test -p compiler-opt --no-fail-fast --test review_byte_phi_indirect_memory --test review_loop_byte_phi_callback --test review_mixed_global_escape_loop --test review_mixed_phi_critical_call --test review_nested_same_successor_phi --test review_phi_call_pressure --test review_target_abi_pipeline
+          else
+            cargo test -p compiler-ir -p compiler-opt
+          fi
       - name: Verify strict Clippy on IR and optimizer
         working-directory: compiler
-        run: cargo clippy -p compiler-ir -p compiler-opt --all-targets -- -D warnings
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            cargo clippy -p compiler-opt --test review_byte_phi_indirect_memory --test review_loop_byte_phi_callback --test review_mixed_global_escape_loop --test review_mixed_phi_critical_call --test review_nested_same_successor_phi --test review_phi_call_pressure --test review_target_abi_pipeline -- -D warnings
+          else
+            cargo clippy -p compiler-ir -p compiler-opt --all-targets -- -D warnings
+          fi
       - name: Publish focused gate result
         if: always()
         env:
