@@ -1,4 +1,4 @@
-name: TEMP EDG mixed aggregate source planner
+name: TEMP Mini-C final mixed ABI integration with shared frame
 on:
   pull_request:
     branches: [main]
@@ -6,107 +6,81 @@ on:
 permissions:
   contents: read
 jobs:
-  edg-mixed-source-planner:
+  minic-integration:
+    outputs:
+      compiler_sha: ${{ steps.source.outputs.sha }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
-    container:
-      image: ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8
-    defaults:
-      run:
-        shell: edg-container-exec "bash -eo pipefail {0}"
-    env:
-      COMPILER_SHA: 058af60976a189d1f5ae7f1bfbdf303d0de21ab2
-      EDG_SOURCE_SHA: b195677be8b9b56c8337afad6be8064d21a54082
-      EDG_RELEASE_TAG: edgcpfe-v2026.11.14-upstream-177765bb7731
-      EDG_RELEASE_SHA256: 1ce495b629924f31382ecccc891a7a72caae1014ddfa2ba7dd39b44d8b0a9526
-      RUST_TOOLCHAIN_VERSION: 1.99.1
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_PROFILE_TEST_DEBUG: '0'
-      EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
-      EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
-      EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
-      EDGCPP_EDG_REVISION: b195677be8b9b56c8337afad6be8064d21a54082
+    timeout-minutes: 90
     steps:
-      - name: Check out shared ABI test harness
+      - name: Checkout compiler-ci test harness
         uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Check out exact compiler revision tested by Mini-C
+      - name: Checkout compiler source using existing read-only deploy key
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 058af60976a189d1f5ae7f1bfbdf303d0de21ab2
+          ref: ab15ab03f24e483ce6c0a58743f7472b4e4c29d5
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-
-      - name: Check out source headers matching upstream EDG release
-        uses: actions/checkout@v4
-        with:
-          repository: bingundu/edgcpp
-          ref: b195677be8b9b56c8337afad6be8064d21a54082
-          path: edgcpp
-          persist-credentials: false
-
-      - name: Assert source revisions and unmodified Hello World
-        run: |
-          set -euo pipefail
-          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
-          test "$(git -C edgcpp rev-parse HEAD)" = "$EDG_SOURCE_SHA"
-          printf 'Compiler SHA: %s\nEDG package SHA: %s\n' "$COMPILER_SHA" "$EDG_SOURCE_SHA" >>"$GITHUB_STEP_SUMMARY"
-
-      - name: Configure EDG header tooling without rebuilding full frontend
-        working-directory: edgcpp
+      - name: Identify exact source and validate cohort size
+        id: source
+        shell: bash
         env:
-          EDG_BASE: ${{ github.workspace }}/edgcpp/bases/docker/dev-env/gcc
+          SEED_COUNT: ${{ inputs.seed_count || '6' }}
         run: |
           set -euo pipefail
-          cmake --preset linux-gcc-release -DEDG_BUILD_LIB=OFF -DEDG_BUILD_CALLABLE_LIBRARY=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-          cmake --build build/gcc-release --target error-info --parallel 2
-          test -s build/gcc-release/src/includes/err_codes.h
-          test -s build/gcc-release/src/includes/err_data.h
-
-      - name: Restore checksummed upstream EDG callable release
-        working-directory: edgcpp
+          sha="$(git -C compiler rev-parse HEAD)"
+          [[ "$sha" == 'ab15ab03f24e483ce6c0a58743f7472b4e4c29d5' ]]
+          [[ "$SEED_COUNT" =~ ^[0-9]+$ ]]
+          (( 10#$SEED_COUNT >= 1 && 10#$SEED_COUNT <= 64 ))
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          test -s compiler/tools/mini-c-driver/tests/differential.py
+          test -s compiler/tools/mini-c-driver/Cargo.toml
+          echo "Compiler revision: $sha" >> "$GITHUB_STEP_SUMMARY"
+      - name: Make public Mini-C dependency accessible without another deploy key
+        shell: bash
         run: |
           set -euo pipefail
-          mkdir -p build/gcc-release/lib build/prebuilt-edg
-          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error --retry 4 --retry-delay 2 \
-            "https://github.com/bingundu/edgcpp/releases/download/$EDG_RELEASE_TAG/edgcpfe-ci-upstream-callable-edg-release-20261114-linux-x86_64.tar.gz" \
-            -o build/prebuilt-edg/archive.tar.gz
-          printf '%s  %s\n' "$EDG_RELEASE_SHA256" build/prebuilt-edg/archive.tar.gz | sha256sum -c -
-          tar -xzf build/prebuilt-edg/archive.tar.gz -C build/prebuilt-edg
-          grep -Fx "commit=$EDG_SOURCE_SHA" build/prebuilt-edg/BUILD-INFO.txt
-          grep -Fx 'platform=linux-x86_64' build/prebuilt-edg/BUILD-INFO.txt
-          test -s build/prebuilt-edg/lib/libedgcpfe.a
-          cp build/prebuilt-edg/lib/libedgcpfe.a build/gcc-release/lib/libedgcpfe.a
-
-      - name: Install pinned Rust toolchain
+          python3 - <<'PY'
+          from pathlib import Path
+          manifest=Path('compiler/tools/mini-c-driver/Cargo.toml')
+          text=manifest.read_text()
+          old='ssh://git@github.com/bingordo/mini-c.git'
+          assert text.count(old)==2, 'Mini-C dependency declaration changed'
+          manifest.write_text(text.replace(old,'https://github.com/bingordo/mini-c.git'))
+          PY
+      - name: Cache Rust objects and dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: mini-c-source-differential-v1
+          cache-workspace-crates: 'true'
+      - name: Build compiler-mini-c once
+        shell: bash
         run: |
           set -euo pipefail
-          if ! command -v cargo >/dev/null; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-              sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN_VERSION"
-          fi
-          export PATH="$HOME/.cargo/bin:$PATH"
-          rustup toolchain install "$RUST_TOOLCHAIN_VERSION" --profile minimal
-          rustup default "$RUST_TOOLCHAIN_VERSION"
-
-      - name: Build EDG native TypeId driver
+          timeout --signal=TERM --kill-after=10s 12m cargo build \
+            --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --bin compiler-mini-c \
+            2>&1 | tee "$RUNNER_TEMP/mini-c-build.log"
+          test -x compiler/tools/mini-c-driver/target/debug/compiler-mini-c
+      - name: Native bitfield and record-pointer ABI regression
+        shell: bash
         run: |
-          export PATH="$HOME/.cargo/bin:$PATH"
-          cargo build --manifest-path compiler/tools/edg-driver/Cargo.toml
-          test -x compiler/tools/edg-driver/target/debug/compiler-edg-driver
-      - name: Shared INTEGER and mixed aggregate EDG source planner unit tests
+          set -euo pipefail
+          cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --test bitfield_pointer_abi --test record_pointer_abi --test integer_union_abi
+      - name: Test shared frame, mixed aggregate ABI, and planner
         run: |
-          export PATH="$HOME/.cargo/bin:$PATH"
-          source edgcpp/build/gcc-release/environment.sh
-          cargo test --manifest-path compiler/tools/edg-driver/Cargo.toml --bin compiler-edg-driver c_integer_arguments
-          cat > "$RUNNER_TEMP/abi_tests.rs" <<EOF
-          #[path = "$PWD/compiler/crates/backend/src/abi_classify.rs"]
-          mod abi_classify;
-          #[path = "$PWD/compiler/crates/backend/src/abi_plan.rs"]
-          mod abi_plan;
-          EOF
-          rustc --edition=2021 --test "$RUNNER_TEMP/abi_tests.rs" -o "$RUNNER_TEMP/abi_tests"
-          "$RUNNER_TEMP/abi_tests"
+          set -euo pipefail
+          cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test shared_local_frame --test fp_mixed_abi --test fp_scalar --test sysv_memory_return
+          cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib aggregate_abi
+          python3 -m unittest discover -s compiler/tests/gcc -p 'test_*.py'
+      - name: Mixed-object differential with both frame modes
+        run: |
+          set -euo pipefail
+          for flag in "" "--mixed-frame-pointer"; do
+            python3 compiler/tools/mini-c-driver/tests/differential.py --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" --mixed-only $flag --timeout 15
+          done
