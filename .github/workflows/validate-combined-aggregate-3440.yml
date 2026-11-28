@@ -23,7 +23,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: edc2610488cd815fdcad3e39ac90ac09e6b7016c
+          ref: 49299426523bb5c00279ca45a74abbb43d7d5b56
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -35,7 +35,7 @@ jobs:
         run: |
           set -euo pipefail
           sha="$(git -C compiler rev-parse HEAD)"
-          [[ "$sha" == 'edc2610488cd815fdcad3e39ac90ac09e6b7016c' ]]
+          [[ "$sha" == '49299426523bb5c00279ca45a74abbb43d7d5b56' ]]
           [[ "$SEED_COUNT" =~ ^[0-9]+$ ]]
           (( 10#$SEED_COUNT >= 1 && 10#$SEED_COUNT <= 64 ))
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
@@ -327,7 +327,6 @@ jobs:
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           source edgcpp/build/gcc-release/environment.sh
-          cargo test --manifest-path compiler/tools/edg-driver/Cargo.toml --bin compiler-edg-driver long_logical_tests
           cargo test --manifest-path compiler/tools/edg-driver/Cargo.toml --bin compiler-edg-driver c_integer_arguments
           cat > "$RUNNER_TEMP/abi_tests.rs" <<EOF
           #[path = "$PWD/compiler/crates/backend/src/abi_classify.rs"]
@@ -411,6 +410,38 @@ jobs:
           print('EDG_MIXED_ARGUMENT_COUNTS',dict(counts))
           for reason,count in reasons.most_common(): print('EDG_MIXED_REJECTION',count,reason)
           PY
+      - name: Summarize upstream rejection classes for both frontends
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, os, collections, re
+          from pathlib import Path
+          p=Path(os.environ['RUNNER_TEMP'])/'gcc-shared-abi/report.json'
+          if not p.exists(): raise SystemExit('no ABI report produced')
+          groups=collections.defaultdict(set)
+          examples={}
+          for r in json.loads(p.read_text())['records']:
+              if r['case'].startswith('probe-'): continue
+              for name,entry in r.get('frontends',{}).items():
+                  for role,b in entry.get('builds',{}).items():
+                      if b['status']=='PASS':continue
+                      msg=b.get('result',{}).get('stderr','')
+                      lines=[x.strip() for x in msg.splitlines() if x.strip()]
+                      cause=next((x for x in lines if 'compiler-mini-c:' in x or 'compiler-edg-driver:' in x), lines[-1] if lines else b['status'])
+                      cause=re.sub(r'\b[0-9]+\b','N',cause)[:350]
+                      key=(name,role,b['status'],cause)
+                      groups[key].add(r['case'])
+                      examples.setdefault(key,msg[:700])
+          for key,cases in sorted(groups.items(),key=lambda kv:(-len(kv[1]),kv[0]))[:80]:
+              print('UPSTREAM_REJECTION',len(cases),key,sorted(cases)[:8])
+              print('UPSTREAM_EXAMPLE',repr(examples[key]))
+          PY
+      - name: Long logical source regression and GCC side-effect oracle
+        if: always()
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source edgcpp/build/gcc-release/environment.sh
+          cargo test --manifest-path compiler/tools/edg-driver/Cargo.toml --bin compiler-edg-driver long_logical_tests
       - name: Preserve both frontend ABI reports
         if: always()
         uses: actions/upload-artifact@v4
