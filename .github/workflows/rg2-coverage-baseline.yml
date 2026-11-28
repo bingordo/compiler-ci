@@ -33,6 +33,98 @@ on:
         default: false
         type: boolean
       coverage:
+        description: Optional source coverage measurement (P1)
+        default: false
+        type: boolean
+permissions:
+  contents: read
+concurrency:
+  group: rg-regression-${{ github.ref }}-${{ github.event_name }}-${{ github.event.label.name || inputs.lane || 'smoke' }}-${{ inputs.source_ref || 'candidate' }}-${{ inputs.coverage || false }}
+  cancel-in-progress: true
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+jobs:
+  doctest:
+    if: inputs.lane == 'doctest' || github.event.label.name == 'rg-doctest'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || 'main' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify RISC-V documentation examples
+        working-directory: compiler
+        run: |
+          git rev-parse HEAD
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text('[workspace]\nresolver = "2"\nmembers = ["crates/ir", "crates/backend", "crates/backend-riscv64"]\n')
+          PY
+          status=0
+          CARGO_TERM_COLOR=never cargo test -p compiler-backend-riscv64 --doc > "$RUNNER_TEMP/rg-doctest.log" 2>&1 || status=$?
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          log = (Path(os.environ["RUNNER_TEMP"]) / "rg-doctest.log").read_text(errors="replace")
+          results = re.findall(r"test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;", log)
+          print("Doctest aggregate:", results)
+          assert results and all(int(row[1]) == 0 for row in results)
+          PY
+          exit "$status"
+  core-build:
+    if: inputs.lane == 'core-build' || inputs.lane == 'core-tests' || github.event.label.name == 'rg-core-build' || github.event.label.name == 'rg-core-tests'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || 'main' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Isolate credential-independent core workspace
+        working-directory: compiler
+        run: |
+          git rev-parse HEAD
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text('''[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          ''')
+          PY
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/index.crates.io-*
+            ~/.cargo/registry/cache/index.crates.io-*
+          key: rg-public-registry-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('compiler/**/Cargo.toml', 'compiler/**/Cargo.lock') }}
+          restore-keys: |
+            rg-public-registry-v2-${{ runner.os }}-${{ runner.arch }}-
+      - name: Provision ordinary native test dependencies
+        if: inputs.lane == 'core-tests' || github.event.label.name == 'rg-core-tests'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends z3 gdb gcc-aarch64-linux-gnu qemu-user
+      - name: Run ordinary core tests with failure fingerprints
+        if: inputs.lane == 'core-tests' || github.event.label.name == 'rg-core-tests'
+        working-directory: compiler
+        run: |
+          CARGO_TERM_COLOR=never python3 tools/regression.py --profile core --suite cargo-tests --no-isolate-build-failures --output target/regression-core-tests
+      - name: Run compile-only core gate
+        if: inputs.lane == 'core-build' || github.event.label.name == 'rg-core-build'
+        working-directory: compiler
+        run: |
+          python3 -m unittest discover -s tools -p test_regression.py
+          CARGO_TERM_COLOR=never python3 tools/regression.py --profile core --suite cargo-build --output target/regression-build-preflight
+  coverage:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
