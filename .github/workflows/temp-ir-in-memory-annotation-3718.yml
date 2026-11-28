@@ -1,0 +1,49 @@
+name: Temporary in-memory annotation retirement acceptance
+on:
+  pull_request:
+    paths: ['.github/workflows/temp-ir-in-memory-annotation-3718.yml']
+permissions:
+  contents: read
+jobs:
+  annotation-retirement:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      SOURCE_SHA: 519b6499e707be7ee4a2b6a3ed0d5aab9162e1e8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and audit historical annotation callers
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          if git grep -nE 'TypeAnnotatedModule|FunctionValueTypes|from_annotated\(|value_types::|mod value_types;' -- '*.rs' '*.toml' ':!docs/archive'; then exit 1; fi
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/ir-macros", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f Cargo.lock
+      - name: Direct historical import and native replay
+        working-directory: compiler
+        run: cargo test -p compiler-ir --test ssa_typeids --test typed_ssa_body --test typed_module --test native_module_data --test typed_verifier_parity --test typed_verifier_generated
+      - name: IR unit regression
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo test -p compiler-ir --lib
+      - name: Downstream optimizer and historical backend imports
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: |
+          cargo check -p compiler-opt --all-targets
+          cargo test -p compiler-backend-x86 --lib --features historical-function-oracle
+      - name: Permanent production graph boundary
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: python3 tools/check_mixed_function_export_boundary.py
