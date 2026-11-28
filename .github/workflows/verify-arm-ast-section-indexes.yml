@@ -1,0 +1,79 @@
+name: Arm AST section index scaling
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-arm-ast-section-indexes.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 8fc4f20c19154b4123a3b4873b114f098ed6b67d
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 4b26bd269e2837f57d3705f2f83e7cf8840e935f
+          path: baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Run affected suites and inspect private helper callers
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "8fc4f20c19154b4123a3b4873b114f098ed6b67d"
+          for suite in test_aarch64_a32_ast_dependency_graph.py test_aarch64_a32_ast_section_map.py test_aarch64_a32_ast_original_section_frontier.py test_aarch64_a32_ast_original_decl_probe.py; do
+            python3 -m unittest discover -s tools -p "$suite" -v
+          done
+          git grep -n '_section_owner(' -- tools
+      - name: Verify exact parity and scaling
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          PYTHONPATH=tools python3 - <<'PY'
+          import importlib.util
+          from statistics import median
+          from time import perf_counter
+          import aarch64_a32_ast_dependency_graph as graph
+          import aarch64_a32_ast_original_section_frontier as frontier
+          import aarch64_a32_ast_original_decl_probe as probe
+          from test_aarch64_a32_ast_original_decl_probe import scenario
+          def old(name):
+              spec = importlib.util.spec_from_file_location("old_" + name, "../baseline/tools/" + name + ".py")
+              module = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(module)
+              return module
+          old_graph = old("aarch64_a32_ast_dependency_graph")
+          old_frontier = old("aarch64_a32_ast_original_section_frontier")
+          old_probe = old("aarch64_a32_ast_original_decl_probe")
+          source,root,inventory,edges,ids,_,meta = scenario()
+          assert old_probe.original_declaration_candidate(source,root,inventory,edges,ids,meta) == probe.original_declaration_candidate(source,root,inventory,edges,ids,meta)
+          def compare(label, count, before, after):
+              assert before() == after()
+              times = [[], []]
+              for _ in range(3):
+                  for f, samples in zip((before,after),times):
+                      start = perf_counter()
+                      f()
+                      samples.append(perf_counter()-start)
+              a,b = map(median,times)
+              print(f"AST_SCALE {label} sections={count} old={a:.6f} new={b:.6f} speedup={a/b:.2f}")
+          for count in (1000,4000,8000):
+              spans = [(i*4,i*4+2) for i in range(count*2)]
+              roots = list(range(0,count*2,2))
+              edges = b"".join(f"{i}\t{lo}\t{hi}\t{(i+1)%(count*2) if i%2 else '-'}\t{i%7}\n".encode() for i,(lo,hi) in enumerate(spans))
+              ids = b"".join(f"{i}\n".encode() for i in roots)
+              args = (edges,ids,spans,[spans[i] for i in roots],range(count),lambda lo,hi,required=False:lo//8)
+              compare("dependency",count,lambda:old_graph.audit(*args),lambda:graph.audit(*args))
+              spans = [(4*i,4*i+2) for i in range(count)]
+              coords = b"".join(f"{lo} {hi}\n".encode() for lo,hi in spans)
+              args = (coords,spans,[b"ab"]*count,set(range(count)))
+              compare("frontier",count,lambda:old_frontier.original_sections_for_root_fragments(*args),lambda:frontier.original_sections_for_root_fragments(*args))
+          print("ARM_AST_SECTION_EXACT_PARITY_OK")
+          PY
