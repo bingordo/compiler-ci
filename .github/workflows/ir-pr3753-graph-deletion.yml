@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
-      SOURCE_SHA: 162ba81d89c5a8dcd4cefb9f10957eea9fdc5e24
+      SOURCE_SHA: 42c5a7347bba5233d9f18fcadff5f742980dcaf0
       CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v4
@@ -81,59 +81,148 @@ jobs:
         run: cargo test -p compiler-opt --test alive_lite --no-fail-fast
   integrate-main:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 30
+    env:
+      SOURCE_SHA: 42c5a7347bba5233d9f18fcadff5f742980dcaf0
+      MAIN_SHA: 3924589ec937d2d55160f311e4ae63c955871cfe
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 7427d505310d4064dc388fce3d1b620b87a87e1e
+          ref: ${{ env.SOURCE_SHA }}
           fetch-depth: 0
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: true
           path: integrated
-      - name: Inspect three-way integration
+      - name: Integrate exact main revision
         working-directory: integrated
         run: |
-          git fetch origin 162ba81d89c5a8dcd4cefb9f10957eea9fdc5e24
-          if ! git -c user.name=ci -c user.email=ci@example.invalid merge --no-commit --no-ff FETCH_HEAD; then
-            # Only resolve conflicts proven to be the already adopted text API rename.
-            python3 - <<'PY'
-          import subprocess as sp
-          def git(*args): return sp.check_output(["git",*args],text=True)
-          base=git("merge-base","HEAD","FETCH_HEAD").strip()
-          for path in git("diff","--name-only","--diff-filter=U").splitlines():
-              original=git("show",f"{base}:{path}")
-              current=git("show",f"HEAD:{path}")
-              branch=git("show",f"FETCH_HEAD:{path}")
-              canonical=original.replace("typed_ssa_text","native_module_text_v3").replace("read_typed_ssa","read_native_module_text_v3").replace("write_typed_ssa","write_native_module_text_v3")
-              # Only the renamed serializer import may move or deduplicate.
-              def normal(s):
-                  imports = set()
-                  body = []
-                  for line in s.splitlines():
-                      compact = "".join(line.split())
-                      if compact.startswith("usecompiler_ir::native_module_text_v3::"):
-                          imports.add(compact)
-                      else:
-                          body.append(line)
-                  return sorted(imports), body
-              # Exact reviewed blob pairs cover formatting-only differences in these
-              # files; all other paths must pass the structural rename comparison.
-              reviewed = {
-                  "crates/opt/tests/typed_global_memory.rs": ("b669d0422a281556733323eb18a18de0c8bc9a38", "243ffe89ac93fb6f1a42b99a9bcf071b26b9bfb4"),
-                  "crates/opt/tests/typed_native_parity.rs": ("a157f27de91ad974afd67f14d3cd15f0145ff319", "1151766ee5fdabb1c4b19d92464a4e0530961488"),
-              }
-              actual = (git("rev-parse",f"HEAD:{path}").strip(), git("rev-parse",f"FETCH_HEAD:{path}").strip())
-              assert normal(current)==normal(canonical) or reviewed.get(path)==actual or (path in {"crates/ir/tests/typed_ssa_body.rs", "crates/opt/tests/support/alive_lite_typed_pipeline.rs"} and list(dict.fromkeys("".join(line.split()) for line in current.splitlines())) == list(dict.fromkeys("".join(line.split()) for line in canonical.splitlines()))), f"non-rename conflict: {path}"
-              assert "compiler_ir::typed_ssa_text" not in branch, path
-              sp.check_call(["git","checkout","--theirs","--",path])
-              sp.check_call(["git","add","--",path])
-              print("Resolved verified alias-only conflict:",path)
-          PY
-          fi
-          test -z "$(git diff --name-only --diff-filter=U)"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git fetch origin "$MAIN_SHA"
+          git -c user.name=ci -c user.email=ci@example.invalid merge --no-commit --no-ff FETCH_HEAD
           git write-tree
-          # Report the exact tree delta to the candidate; blob IDs already present
-          # on the two parents can be reused by the source repo merge commit.
-          git diff --cached --raw --no-abbrev --no-renames FETCH_HEAD
-          cargo check --workspace --all-targets --keep-going
+      - name: Configure frontend dependencies as in existing Oberon gate
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: integrated -> target
+          key: ir-graph-deletion-full
+      - name: Full workspace compilation
+        working-directory: integrated
+        run: cargo check --workspace --all-targets --keep-going
+      - name: Oberon native record-field and cross-module VAR differential
+        if: ${{ !cancelled() }}
+        working-directory: integrated
+        run: cargo test -p compiler --test oberon_record_field_var_native --test oberon_generated_module_var_native --no-fail-fast
+      - name: Mini-C native standalone library tests
+        if: ${{ !cancelled() }}
+        working-directory: integrated
+        run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib
+  edg-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container:
+      image: ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8
+    defaults:
+      run:
+        shell: edg-container-exec "bash -eo pipefail {0}"
+    env:
+      COMPILER_SHA: 42c5a7347bba5233d9f18fcadff5f742980dcaf0
+      EDG_SOURCE_SHA: b195677be8b9b56c8337afad6be8064d21a54082
+      EDG_RELEASE_TAG: edgcpfe-v2026.11.14-upstream-177765bb7731
+      EDG_RELEASE_SHA256: 1ce495b629924f31382ecccc891a7a72caae1014ddfa2ba7dd39b44d8b0a9526
+      RUST_TOOLCHAIN_VERSION: 1.99.1
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+      EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+      EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+      EDGCPP_EDG_REVISION: b195677be8b9b56c8337afad6be8064d21a54082
+    steps:
+      - name: Check out shared ABI test harness
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check out exact compiler revision tested by Mini-C
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 42c5a7347bba5233d9f18fcadff5f742980dcaf0
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+
+      - name: Check out source headers matching upstream EDG release
+        uses: actions/checkout@v4
+        with:
+          repository: bingundu/edgcpp
+          ref: b195677be8b9b56c8337afad6be8064d21a54082
+          path: edgcpp
+          persist-credentials: false
+
+      - name: Assert source revisions and unmodified Hello World
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          test "$(git -C edgcpp rev-parse HEAD)" = "$EDG_SOURCE_SHA"
+          printf 'Compiler SHA: %s\nEDG package SHA: %s\n' "$COMPILER_SHA" "$EDG_SOURCE_SHA" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Configure EDG header tooling without rebuilding full frontend
+        working-directory: edgcpp
+        env:
+          EDG_BASE: ${{ github.workspace }}/edgcpp/bases/docker/dev-env/gcc
+        run: |
+          set -euo pipefail
+          cmake --preset linux-gcc-release -DEDG_BUILD_LIB=OFF -DEDG_BUILD_CALLABLE_LIBRARY=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          cmake --build build/gcc-release --target error-info --parallel 2
+          test -s build/gcc-release/src/includes/err_codes.h
+          test -s build/gcc-release/src/includes/err_data.h
+
+      - name: Restore checksummed upstream EDG callable release
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          mkdir -p build/gcc-release/lib build/prebuilt-edg
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error --retry 4 --retry-delay 2 \
+            "https://github.com/bingundu/edgcpp/releases/download/$EDG_RELEASE_TAG/edgcpfe-ci-upstream-callable-edg-release-20261114-linux-x86_64.tar.gz" \
+            -o build/prebuilt-edg/archive.tar.gz
+          printf '%s  %s\n' "$EDG_RELEASE_SHA256" build/prebuilt-edg/archive.tar.gz | sha256sum -c -
+          tar -xzf build/prebuilt-edg/archive.tar.gz -C build/prebuilt-edg
+          grep -Fx "commit=$EDG_SOURCE_SHA" build/prebuilt-edg/BUILD-INFO.txt
+          grep -Fx 'platform=linux-x86_64' build/prebuilt-edg/BUILD-INFO.txt
+          test -s build/prebuilt-edg/lib/libedgcpfe.a
+          cp build/prebuilt-edg/lib/libedgcpfe.a build/gcc-release/lib/libedgcpfe.a
+
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          if ! command -v cargo >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN_VERSION"
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install "$RUST_TOOLCHAIN_VERSION" --profile minimal
+          rustup default "$RUST_TOOLCHAIN_VERSION"
+
+      - name: Build EDG native TypeId driver
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo build --manifest-path compiler/tools/edg-driver/Cargo.toml
+          test -x compiler/tools/edg-driver/target/debug/compiler-edg-driver
+      - name: Run EDG C and C++ native executable smoke oracles
+        run: |
+          set -euo pipefail
+          source edgcpp/build/gcc-release/environment.sh
+          driver="$PWD/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
+          version=$(gcc -dumpfullversion -dumpversion | awk -F. '{print $1*10000+$2*100+$3}')
+          mkdir -p "$RUNNER_TEMP/edg-cutover"
+          cd "$RUNNER_TEMP/edg-cutover"
+          printf '%s\n' 'int add(int a,int b){return a+b;}' > add.c
+          printf '%s\n' 'extern "C" int mul(int a,int b){return a*b;}' > mul.cpp
+          printf '%s\n' 'extern int add(int,int),mul(int,int); int main(void){return add(20,22)!=42 || mul(6,7)!=42;}' > check.c
+          "$driver" add.o --gcc --c11 --no_strict_gnu --gnu_version "$version" add.c
+          "$driver" mul.o --g++ --no_strict_gnu --gnu_version "$version" mul.cpp
+          cc check.c add.o mul.o -o check
+          ./check
