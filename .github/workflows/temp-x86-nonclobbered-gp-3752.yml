@@ -1,0 +1,56 @@
+name: Temporary x86 nonclobbered GP calls #3752
+# One-off exact-source validation, never a recurring workflow.
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temp-x86-nonclobbered-gp-3752.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  calls:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f315a0bc7b3114f60d97f1419714c4955e8e8367
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler revision
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "f315a0bc7b3114f60d97f1419714c4955e8e8367"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+      - name: Use backend-only workspace
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x86-nonclobbered-calls-3752
+      - name: Focused physical and native GCC ELF/GAS call oracle
+        working-directory: compiler
+        run: cargo test -p compiler-backend-x86 --lib nonclobbered_direct_call_tests -- --nocapture
+      - name: Complete affected backend and assembler
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend-x86 --test att_module
+          cargo check -p compiler-backend-x86 --no-default-features
+      - name: Strict scoped Clippy with existing helper-arity exception
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-x86 --lib --no-deps -- -D clippy::all -A clippy::too_many_arguments
