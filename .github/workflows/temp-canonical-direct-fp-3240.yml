@@ -140,6 +140,14 @@ jobs:
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
 
+      - name: Check out exact unmodified integration base for differential EDG tests
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c61c7fef6bc8b3162b8a71fd35852792b6f98d56
+          path: compiler-base
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
       - name: Check out source headers matching upstream EDG release
         uses: actions/checkout@v4
         with:
@@ -197,8 +205,54 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           cargo build --manifest-path compiler/tools/edg-driver/Cargo.toml
           test -x compiler/tools/edg-driver/target/debug/compiler-edg-driver
-      - name: Run existing native EDG driver tests
+      - name: Compare full EDG test results against exact unmodified base
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           source edgcpp/build/gcc-release/environment.sh
-          cargo test --manifest-path compiler/tools/edg-driver/Cargo.toml --bin compiler-edg-driver
+          test "$(git -C compiler-base rev-parse HEAD)" = 'c61c7fef6bc8b3162b8a71fd35852792b6f98d56'
+          set +e
+          cargo test --manifest-path compiler/tools/edg-driver/Cargo.toml --bin compiler-edg-driver -- --test-threads=2 > "$RUNNER_TEMP/edg-candidate.log" 2>&1
+          candidate=$?
+          cargo test --manifest-path compiler-base/tools/edg-driver/Cargo.toml --bin compiler-edg-driver -- --test-threads=2 > "$RUNNER_TEMP/edg-base.log" 2>&1
+          baseline=$?
+          set -e
+          cat "$RUNNER_TEMP/edg-candidate.log" "$RUNNER_TEMP/edg-base.log"
+          python3 - "$candidate" "$baseline" <<'PY'
+          import os, pathlib, re, sys
+          def results(name, status):
+              log=(pathlib.Path(os.environ["RUNNER_TEMP"])/name).read_text()
+              summary=re.search(r"test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed;",log)
+              assert summary, "test suite did not complete: "+name
+              tests=dict(re.findall(r"^test (\S+) \.\.\. (ok|FAILED|ignored)$",log,re.M))
+              failures={name for name,outcome in tests.items() if outcome=="FAILED"}
+              assert int(summary[2])==len(failures) and (int(status)==0)==(not failures), name
+              return tests, failures
+          candidate, cf=results("edg-candidate.log",sys.argv[1])
+          baseline, bf=results("edg-base.log",sys.argv[2])
+          assert candidate.keys()==baseline.keys(), "different test inventories"
+          print("Baseline failures:",sorted(bf))
+          print("Candidate failures:",sorted(cf))
+          assert cf<=bf, "new EDG failures: "+str(sorted(cf-bf))
+          PY
+      - name: Execute EDG canonical FP source calls against independent GCC
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source edgcpp/build/gcc-release/environment.sh
+          cat > "$RUNNER_TEMP/fp-source.c" <<'EOF'
+          extern double host(double, float);
+          double local(double x, float y) { return x + y; }
+          double forward(double x, float y) { return host(local(x,y),y); }
+          EOF
+          cat > "$RUNNER_TEMP/fp-oracle.c" <<'EOF'
+          extern double forward(double,float);
+          double host(double x,float y) { return x-y*2; }
+          int main(void) {
+            for(int i=-100;i<=100;i++)
+              if(forward(i*0.25,1.5f)!=i*0.25-1.5) return 1;
+            return 0;
+          }
+          EOF
+          v="$(gcc -dumpfullversion -dumpversion | awk -F. '{print $1*10000+$2*100+$3}')"
+          compiler/tools/edg-driver/target/debug/compiler-edg-driver "$RUNNER_TEMP/fp-source.o" --gcc --c11 --no_strict_gnu --gnu_version "$v" "$RUNNER_TEMP/fp-source.c"
+          gcc "$RUNNER_TEMP/fp-oracle.c" "$RUNNER_TEMP/fp-source.o" -o "$RUNNER_TEMP/fp-oracle"
+          "$RUNNER_TEMP/fp-oracle"
