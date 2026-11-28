@@ -1,0 +1,89 @@
+name: Intel worklist no family SHA
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-iform-no-family-sha.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ci
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: cd1d64db52e112c809a836f0d0e39507118192a2
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f48837b9b3557764cb869c2346d9f35f30aa45ef
+          path: baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check actual consumers in current tracked sources
+        run: |
+          set -euo pipefail
+          git -C compiler grep -l -w family_shape_key
+          test "$(git -C compiler grep -l -w family_shape_key)" = "$(printf '%s\n' tools/test_x86_iform_batch_worklist.py tools/x86_iform_batch_worklist.py)"
+          echo "CI consumers (if any)"
+          git -C ci grep -l -w family_shape_key -- . ':!.github/workflows/verify-iform-no-family-sha.yml' || test "$?" = 1
+          echo "Worklist module callers"
+          git -C compiler grep -n 'from x86_iform_batch_worklist import' -- tools
+      - name: Verify candidate and affected suites
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "cd1d64db52e112c809a836f0d0e39507118192a2"
+          for suite in test_x86_g10_catalog_census.py test_x86_g10_source_operand_shapes.py test_x86_iform_batch_worklist.py test_x86_s2_xed_variant_join.py test_x86_iform_helper_dependencies.py test_x86_iform_proof_work_dag.py; do
+            python3 -m unittest discover -s tools -p "$suite" -v
+          done
+      - name: Check unchanged identities and exact family membership
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          PYTHONPATH=tools python3 - <<'PY'
+          import importlib.util
+          import json
+          import tempfile
+          from pathlib import Path
+          from collections import defaultdict
+          from unittest.mock import patch
+          from test_x86_g10_catalog_census import populated
+          from test_x86_iform_batch_worklist import make_form
+          import x86_iform_batch_worklist as new
+          spec = importlib.util.spec_from_file_location("old_worklist", "../baseline/tools/x86_iform_batch_worklist.py")
+          old = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(old)
+          def project(report):
+              report = json.loads(json.dumps(report))
+              members = defaultdict(list)
+              for row in report["forms"]:
+                  members[row.pop("family_shape_key")].append(row["form_id"])
+              groups = []
+              for group in report.pop("family_shape_groups"):
+                  key = group.pop("family_shape_key")
+                  groups.append((members[key], group))
+              report["family_shape_groups"] = sorted(groups)
+              report["limitations"][0] = report["limitations"][0].split(";")[0].rstrip(".") + "."
+              return report
+          for duplicate in (False, True):
+              with tempfile.TemporaryDirectory() as tmp:
+                  src = populated(Path(tmp), duplicate=duplicate)
+                  if duplicate:
+                      (src / "EXTRA.xml").write_text("<instruction><iform-group>" + make_form("DUP", "03", "03 /r") * 128 + "</iform-group></instruction>")
+                  with patch.object(old, "_hash", wraps=old._hash) as before, patch.object(new, "_hash", wraps=new._hash) as after:
+                      a = old.worklist(src, shard_count=64)
+                      b = new.worklist(src, shard_count=64)
+                      assert project(a) == project(b)
+                      assert old.normalize_source_operand_shapes(a, src) == new.normalize_source_operand_shapes(b, src)
+                      assert before.call_count - after.call_count == len(b["family_shape_groups"])
+                      print("HASH_CALLS", len(b["forms"]), before.call_count, after.call_count)
+          print("EXACT_FAMILY_MEMBERSHIP_AND_NONFAMILY_PARITY_OK")
+          PY
