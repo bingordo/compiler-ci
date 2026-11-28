@@ -1,32 +1,24 @@
-name: EDG Rust standard back-end integration validation
-
+name: EDG FP backend scalability benchmark
 on:
-  # Validate the compiler-ci PR itself, without consuming source-repo minutes.
   push:
-    branches: ['validate-edg-*']
+    branches: [benchmark-edg-fp-scalability]
     paths: ['.github/workflows/validate-edgcpp-rust.yml']
   pull_request:
     branches: [main]
     paths: ['.github/workflows/validate-edgcpp-rust.yml']
   workflow_dispatch:
-    inputs:
-      source_ref:
-        description: 'bingordo/edgcpp-rust branch, tag, or commit SHA'
-        required: false
-        default: cranelift-codegen
-        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: edg-cfg-validation-${{ github.ref }}-${{ inputs.source_ref || 'pr86' }}
+  group: edg-fp-scalability-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  test:
+  compare:
     runs-on: ubuntu-24.04
-    timeout-minutes: 55
+    timeout-minutes: 40
     container:
       # Reuse the same pinned EDG CI environment as edg-yarpgen.yml.
       image: ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8
@@ -48,7 +40,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/edgcpp-rust
-          ref: ${{ inputs.source_ref || 'fc5adba5dc9061cc24517544c23ee92ab0151b5e' }}
+          ref: ${{ '799f496939d38d4894c4972467022fd2ec8923a6' }}
           path: edgcpp-rust
           persist-credentials: false
       - name: Record exact revision
@@ -58,9 +50,7 @@ jobs:
           sha=$(git rev-parse HEAD)
           test "${#sha}" -eq 40
           echo "EDG Rust commit: $sha" | tee -a "$GITHUB_STEP_SUMMARY"
-          if [[ "${{ github.event_name }}" != workflow_dispatch ]]; then
-            test "$sha" = fc5adba5dc9061cc24517544c23ee92ab0151b5e
-          fi
+          test "$sha" = 799f496939d38d4894c4972467022fd2ec8923a6
       - name: Check out source headers matching the pinned EDG library
         uses: actions/checkout@v4
         with:
@@ -107,289 +97,104 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           rustup toolchain install "$RUST_TOOLCHAIN_VERSION" --profile minimal
           rustup default "$RUST_TOOLCHAIN_VERSION"
-      - name: Restore Rust build cache
-        uses: actions/cache/restore@v4
-        id: rust-cache
-        with:
-          path: |
-            edgcpp-rust/target
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: edg-atomic-v1-${{ hashFiles('edgcpp-rust/Cargo.lock', 'edgcpp-rust/build.rs') }}-${{ github.sha }}
-          restore-keys: |
-            rust-edgcpp-cranelift-v1-
-      - name: Assert EDG back end has no source hooks
-        working-directory: edgcpp-rust
+      - name: Build both compiler revisions with identical release settings
         run: |
           set -euo pipefail
           export PATH="$HOME/.cargo/bin:$PATH"
-          cargo test --features codegen --test native_backend_contract -- --nocapture
-          cargo test --features codegen --lib retired_source_hook_wire_tests -- --nocapture
-          ! grep -Eq 'edgcpp_capture_|postlower_virtual_calls|prelower_virtual_calls' cpp/bridge.cpp
-          echo "Normal EDG back_end entry and IL traversal, no private lowering hooks" >> "$GITHUB_STEP_SUMMARY"
-      - name: Run focused pointer call compatibility audit tests
-        working-directory: edgcpp-rust
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/.cargo/bin:$PATH"
-          timeout --signal=TERM --kill-after=10s 20m \
-            cargo test --features codegen --lib audit_call_argument_shape_tests -- --nocapture \
-            2>&1 | tee "$RUNNER_TEMP/edg-cfg-targeted.log"
-          # A filtered-out zero-test run is not a successful targeted gate.
-          grep -Eq 'test result: ok[.] [1-9][0-9]* passed; 0 failed' "$RUNNER_TEMP/edg-cfg-targeted.log"
-      - name: Verify EDG lifetime ownership cardinalities and wire schema
-        working-directory: edgcpp-rust
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/.cargo/bin:$PATH"
-          python3 tools/gen_wire_schema.py --check
-          cargo test --features codegen --lib native_lifetime_owners_reject_missing_roots_scope_links_and_tail_scopes -- --nocapture
-          cargo test --features codegen --lib lifetime_child_counts_reject_dropped_subtrees_and_mismatched_owners -- --nocapture
-          cargo test --features codegen --lib native_declaration_counts_reject_lost_parameter_and_local_tail_records -- --nocapture
-
-      - name: Stress graph scope and lifetime indexing and profile construction
-        working-directory: edgcpp-rust
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/.cargo/bin:$PATH"
-          cargo test --lib --features codegen audit_indexed_scope_and_lifetime_validation_on_many_records -- --nocapture
-          cargo test --lib --features codegen audit_indexed_scope_lifetime_large_snapshot_corruptions -- --nocapture
-          cargo test --lib --features codegen audit_indexed_scope_lifetime_graph_scaling -- --ignored --nocapture \
-            2>&1 | tee "$RUNNER_TEMP/edg-graph-scope-scaling.log"
-          grep -q 'indexed-scope-lifetime from_il records=128' "$RUNNER_TEMP/edg-graph-scope-scaling.log"
-          grep -q 'indexed-scope-lifetime from_il records=256' "$RUNNER_TEMP/edg-graph-scope-scaling.log"
-          grep -q 'indexed-scope-lifetime from_il records=512' "$RUNNER_TEMP/edg-graph-scope-scaling.log"
-          grep 'indexed-scope-lifetime from_il records=' "$RUNNER_TEMP/edg-graph-scope-scaling.log" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Verify bounded resource policy and Clippy correctness
-        working-directory: edgcpp-rust
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/.cargo/bin:$PATH"
-          cargo test --features codegen --lib explicit_stack_slot_sum_checks_alignment_and_overflow -- --nocapture
-          cargo test --features codegen --lib aggregate_call_temporary_stack_slots_are_counted_even_when_nested -- --nocapture
-          cargo test --features codegen --lib aggregate_stack_budget_rejects_sum_of_individually_valid_objects -- --nocapture
-          cargo test --features codegen --lib array_layout_multiplication_checks_exact_boundaries -- --nocapture
-          cargo test --features codegen --lib fp_parameter_local_and_statement_limits_are_checked_independently -- --nocapture
-          cargo test --features codegen --lib aggregate_image_boundaries_are_checked -- --nocapture
-          cargo test --features codegen --lib exact_prototype_required_and_large_signatures_rejected -- --nocapture
-          rustup component add clippy
-          cargo clippy --features codegen --lib -- -D clippy::correctness
-      - name: Validate global materialization unknown high bit without stale mask
-        working-directory: edgcpp-rust
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/.cargo/bin:$PATH"
-          cargo test --features codegen --lib orphan_duplicate_and_unknown_native_property_bits_fail_closed -- --nocapture
-      - name: Probe source-owned deep C11 array types against pinned EDG and GCC
-        working-directory: edgcpp
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/.cargo/bin:$PATH"
-          source build/gcc-release/environment.sh
-          dims=""
-          for i in $(seq 1 40); do dims="${dims}[1]"; done
-          printf 'int deep_array%s;\nint main(void) { return sizeof deep_array != sizeof(int); }\n' "$dims" \
-            >build/gcc-release/deep-native-array-40.c
-          cd build/gcc-release
-          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" \
-            --example parse -- --c11 deep-native-array-40.c >"$RUNNER_TEMP/deep-native-array-40.log" 2>&1
-          grep -Fq 'EDG status: 0' "$RUNNER_TEMP/deep-native-array-40.log"
-          gcc -std=c11 -O0 -Wall -Wextra -Werror deep-native-array-40.c \
-            -o "$RUNNER_TEMP/deep-native-array-40"
-          "$RUNNER_TEMP/deep-native-array-40"
-          echo 'Pinned EDG and GCC accept a real 40-dimensional C11 array' >> "$GITHUB_STEP_SUMMARY"
-      - name: Verify deep record image and fail-closed deep array against EDG/GCC
-        working-directory: edgcpp
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/.cargo/bin:$PATH"
-          source build/gcc-release/environment.sh
-          a="$GITHUB_WORKSPACE/edgcpp-rust/tests/fixtures/audit_deep_designated_initializers.c"
-          b="$GITHUB_WORKSPACE/edgcpp-rust/tests/fixtures/audit_deep_designated_record.c"
-          gcc -std=c11 -O0 -Wall -Wextra -Werror "$a" -o "$RUNNER_TEMP/deep-designated-array"
-          gcc -std=c11 -O0 -Wall -Wextra -Werror "$b" -o "$RUNNER_TEMP/deep-designated-record"
-          "$RUNNER_TEMP/deep-designated-array"
-          "$RUNNER_TEMP/deep-designated-record"
-          cd build/gcc-release
-          array_ok=false
-          if EDG_DESIGNATED_CASE=array cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" --example audit_designated_images -- --c11 "$a" 2>&1 | tee "$RUNNER_TEMP/deep-designated-images.log"; then array_ok=true; fi
-          record_ok=false
-          if EDG_DESIGNATED_CASE=record cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" --example audit_designated_images -- --c11 "$b" 2>&1 | tee "$RUNNER_TEMP/deep-designated-record.log"; then record_ok=true; fi
-          echo "Native deep designated array image: $array_ok" >> "$GITHUB_STEP_SUMMARY"
-          echo "Native deep designated record image: $record_ok" >> "$GITHUB_STEP_SUMMARY"
-          # For this 40-dimensional array, either an exact native byte image
-          # or an explicit malformed/incomplete snapshot is admissible.
-          # Never treat missing/truncated image records as successful parsing.
-          if [ "$array_ok" = true ]; then
-            grep -Fq 'EDG_DEEP_DESIGNATOR_IMAGE name=deep_designated_array bytes=4 value=37' "$RUNNER_TEMP/deep-designated-images.log"
-          else
-            grep -Fq 'EDG compilation: MalformedCallback' "$RUNNER_TEMP/deep-designated-images.log"
-          fi
-          test "$record_ok" = true
-          grep -Fq 'EDG_DEEP_DESIGNATOR_IMAGE name=deep_designated_record bytes=4 value=53' "$RUNNER_TEMP/deep-designated-record.log"
-      - name: Check iterative Rust aggregate layout, copy and cycle boundaries
-        working-directory: edgcpp-rust
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/.cargo/bin:$PATH"
-          cargo test --lib --features codegen audit_deep_native_array_layout_tests -- --nocapture
-
-      - name: Check bounded deep singleton-record CFG layouts and copy offsets
-        working-directory: edgcpp-rust
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/.cargo/bin:$PATH"
-          cargo test --features codegen --lib audit_deep_singleton_record_layout_tests -- --nocapture
-      - name: Validate ordered EDG startup wire records
-        working-directory: edgcpp-rust
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/.cargo/bin:$PATH"
-          cargo test --features codegen --lib file_scope_init_schedule_wire_tests -- --nocapture
-          cargo test --features codegen --lib native_scope_asm_wire_tests -- --nocapture
-          python3 tools/gen_wire_schema.py --check
-      - name: Probe original C++ global constructor startup schedule
-        working-directory: edgcpp
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/.cargo/bin:$PATH"
-          source build/gcc-release/environment.sh
-          cat >build/gcc-release/global-init-probe.cpp <<'CPP'
-          struct Effectful {
-            int value;
-            explicit Effectful(int x) : value(x) {}
-            ~Effectful() { value = 0; }
-          };
-          Effectful global_effect(7);
-          int main() { return 0; }
-          CPP
-          cd build/gcc-release
-          version="$(g++ -dumpfullversion -dumpversion)"
-          IFS=. read -r major minor patch <<<"$version"
-          gnu_number=$((10#${major}*10000+10#${minor:-0}*100+10#${patch:-0}))
-          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" \
-            --example parse -- --g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number" \
-            global-init-probe.cpp >"$RUNNER_TEMP/edg-init-probe.log" 2>&1
-          grep -F 'file scope init scheduler available=' "$RUNNER_TEMP/edg-init-probe.log"
-          grep -F 'scope dynamic init entries=' "$RUNNER_TEMP/edg-init-probe.log"
-          # Source-owned generated-routine classification (not name-only proof).
-          grep -F 'routine attributes name=__sti__' "$RUNNER_TEMP/edg-init-probe.log" | head -n 30
-          grep -Eq 'routine attributes name=__sti__[^ ]+ .*generated=true defined=true' "$RUNNER_TEMP/edg-init-probe.log"
-          grep -F 'scope dynamic init scope=' "$RUNNER_TEMP/edg-init-probe.log" || true
-          grep -F 'file scope init root position=' "$RUNNER_TEMP/edg-init-probe.log" || true
-      - name: Probe EDG direct base offsets for C++17 std::cout and multiple inheritance
-        working-directory: edgcpp
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/.cargo/bin:$PATH"
-          source build/gcc-release/environment.sh
-          cat >build/gcc-release/base-offset-probe.cpp <<'CPP'
-          struct A { int a; };
-          struct B { int b; };
-          struct Derived : A, B { int c; };
-          int main() { Derived d{}; return d.b; }
-          CPP
-          cat >build/gcc-release/cout-base-offset.cpp <<'CPP'
-          #include <iostream>
-          int main() { std::cout << "Hello, world!"; }
-          CPP
-          cd build/gcc-release
-          version="$(g++ -dumpfullversion -dumpversion)"
-          IFS=. read -r major minor patch <<<"$version"
-          gnu_number=$((10#${major}*10000+10#${minor:-0}*100+10#${patch:-0}))
-          args=(--g++ --c++17 --no_strict_gnu --gnu_version "$gnu_number")
-          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" --example parse -- "${args[@]}" base-offset-probe.cpp >"$RUNNER_TEMP/base-offset-probe.log" 2>&1
-          grep -F 'EDG_BASE_OFFSET derived=' "$RUNNER_TEMP/base-offset-probe.log" | sed -n '1,20p'
-          g++ -std=c++17 -v -E -x c++ /dev/null >"$RUNNER_TEMP/cout-include-search.log" 2>&1
-          mapfile -t include_dirs < <(awk '/#include <\.\.\.> search starts here:/{active=1;next} /^End of search list/{active=0} active && /^ /{sub(/^[[:space:]]+/,"");print}' "$RUNNER_TEMP/cout-include-search.log")
-          test "${#include_dirs[@]}" -ge 3
-          include_flags=()
-          for dir in "${include_dirs[@]}"; do test -d "$dir" && include_flags+=("-I$dir"); done
-          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" --example parse -- "${args[@]}" "${include_flags[@]}" cout-base-offset.cpp >"$RUNNER_TEMP/cout-base-offset.log" 2>&1
-          grep -F 'EDG_BASE_OFFSET derived=' "$RUNNER_TEMP/cout-base-offset.log" | sed -n '1,35p'
-          # Exact original cout call-chain base identified by compiler-ci
-          # C++5 TypeId source admission, not from guessed class names.
-          grep -Fq 'EDG_BASE_OFFSET derived=118 base=119 position=0 virtual=false offset=Some(0)' "$RUNNER_TEMP/cout-base-offset.log"
-          grep -Fq 'EDG_BASE_OFFSET derived=115 base=118 position=0 virtual=true offset=None' "$RUNNER_TEMP/cout-base-offset.log"
-          echo 'Original std::cout inheritance base offset snapshot captured' >> "$GITHUB_STEP_SUMMARY"
-      - name: Verify C11 and C++20 source lifetime ownership against pinned EDG and GCC
-        working-directory: edgcpp
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/.cargo/bin:$PATH"
-          source build/gcc-release/environment.sh
-          cat >build/gcc-release/lifetime-owner-c11.c <<'C'
-          int owner_c(int x, int y, int z) {
-            int result = x + y + z;
-            { int nested = x + 3; result += nested; }
-            if (result > 0) { int last = result + 1; result = last; }
-            return result;
+          mkdir -p "$RUNNER_TEMP/fp-bench/bin"
+          cd edgcpp-rust
+          cat > examples/fp_bench.rs <<'RS'
+          use edgcpp::{compile, codegen::emit_edg_object};
+          use std::{time::Instant, hint::black_box};
+          fn main() {
+              let input=std::env::args().nth(1).expect("source file");
+              let start=Instant::now();
+              let parsed=compile(&["edgcpfe","--c11",input.as_str()]).unwrap();
+              assert_eq!(parsed.status,0);
+              let frontend=start.elapsed();
+              let start=Instant::now();
+              let object=emit_edg_object(black_box(&parsed.il)).unwrap();
+              let backend=start.elapsed();
+              assert_eq!(&object[..4],b"\x7fELF");
+              println!("FPBENCH,{},{},{}",frontend.as_nanos(),backend.as_nanos(),object.len());
           }
-          int main(void) { return owner_c(2, 3, 4) != 15; }
-          C
-          cat >build/gcc-release/lifetime-owner-cpp20.cpp <<'CPP'
-          struct Local {
-            int value;
-            explicit Local(int x) : value(x) {}
-            ~Local() { value = 0; }
-            int combine(int x, int y) {
-              int combined = x + y;
-              { int nested = combined; combined = nested; }
-              return value + combined;
-            }
-          };
-          int owner_cpp(int x, int y, int z) {
-            Local a{x};
-            { Local b{x + 1}; if (b.value != x + 1) return 97; }
-            return a.combine(y, z);
-          }
-          int main() { return owner_cpp(7, 3, 4) != 14; }
-          CPP
-          cd build/gcc-release
-          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" \
-            --example parse -- --c11 lifetime-owner-c11.c >"$RUNNER_TEMP/lifetime-c11.log" 2>&1
-          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" \
-            --example parse -- --c++20 lifetime-owner-cpp20.cpp >"$RUNNER_TEMP/lifetime-cpp20.log" 2>&1
-          grep -Fq 'EDG status: 0' "$RUNNER_TEMP/lifetime-c11.log"
-          grep -Fq 'EDG status: 0' "$RUNNER_TEMP/lifetime-cpp20.log"
-          gcc -std=c11 -O0 -Wall -Wextra -Werror lifetime-owner-c11.c -o "$RUNNER_TEMP/lifetime-c11"
-          g++ -std=c++20 -O0 -Wall -Wextra -Werror lifetime-owner-cpp20.cpp -o "$RUNNER_TEMP/lifetime-cpp20"
-          "$RUNNER_TEMP/lifetime-c11"
-          "$RUNNER_TEMP/lifetime-cpp20"
-          echo 'Pinned EDG C11/C++20 owner snapshots and GCC source oracles passed' >> "$GITHUB_STEP_SUMMARY"
-      - name: Run all Rust library tests with codegen
-        working-directory: edgcpp-rust
+          RS
+          cp examples/fp_bench.rs "$RUNNER_TEMP/fp-bench/harness.rs"
+          cargo build --locked --release --features codegen --example fp_bench
+          cp target/release/examples/fp_bench "$RUNNER_TEMP/fp-bench/bin/baseline"
+          git fetch --no-tags origin 6b15774ed266e08a46cc25c491826c920b25ca34
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = 6b15774ed266e08a46cc25c491826c920b25ca34
+          cp "$RUNNER_TEMP/fp-bench/harness.rs" examples/fp_bench.rs
+          cargo build --locked --release --features codegen --example fp_bench
+          cp target/release/examples/fp_bench "$RUNNER_TEMP/fp-bench/bin/candidate"
+      - name: Compare frontend and backend scaling on identical generated C
+        working-directory: edgcpp
         run: |
           set -euo pipefail
-          export PATH="$HOME/.cargo/bin:$PATH"
-          timeout --signal=TERM --kill-after=10s 20m \
-            cargo test --features codegen --lib \
-            2>&1 | tee "$RUNNER_TEMP/edg-cfg-library.log"
-          grep -Eq 'test result: ok' "$RUNNER_TEMP/edg-cfg-library.log"
-      - name: Summarize passing test logs
-        if: success()
-        run: |
-          echo "Atomic regression tests and full codegen library tests passed." >> "$GITHUB_STEP_SUMMARY"
-          grep 'test result: ok' "$RUNNER_TEMP/edg-cfg-targeted.log" >> "$GITHUB_STEP_SUMMARY"
-          grep 'test result: ok' "$RUNNER_TEMP/edg-cfg-library.log" >> "$GITHUB_STEP_SUMMARY"
-      - name: Upload validation logs
-        if: always()
-        uses: actions/upload-artifact@v4
+          source build/gcc-release/environment.sh
+          cd build/gcc-release
+          python3 - <<'PY'
+          import csv, os, pathlib, statistics, subprocess
+          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "fp-bench"
+          cases = []
+          for n in (64, 256, 512):
+              cases.append(("sparse_routines", n, "\n".join(
+                  f"double f{i}(double x) {{ return x+{i}.25; }}" for i in range(n))))
+              cases.append(("locals", n, "double f(double x) {\n" + "\n".join(
+                  f"double v{i} = " + ("x" if i == 0 else f"v{i-1}") + "+1.0;"
+                  for i in range(n)) + f"\nreturn v{n-1}; }}"))
+              cases.append(("globals", n, "\n".join(
+                  f"double g{i}={i}.25;" for i in range(n)) +
+                  f"\ndouble f(double x) {{ g0=x; return g0+g{n-1}; }}"))
+          for n in (8,16,32):
+              lines=[]
+              for i in range(1,n+1):
+                  types=",".join(["double"]*i)
+                  args=",".join(["x"]*i)
+                  lines.append(f"double f{i}(double (*p)({types}),double x) {{return p({args});}}")
+              cases.append(("callbacks", n, "\n".join(lines)))
+          def run(revision, source):
+              cmd=[str(root/"bin"/revision),str(source)]
+              completed=subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=120)
+              lines=[x for x in completed.stdout.splitlines() if x.startswith("FPBENCH,")]
+              if len(lines)!=1: raise RuntimeError(completed.stdout+completed.stderr)
+              return tuple(map(int,lines[0].split(",")[1:]))
+          rows=[]
+          report=["# FP backend scaling", "",
+                  "Baseline: 799f496939d38d4894c4972467022fd2ec8923a6",
+                  "Candidate: 6b15774ed266e08a46cc25c491826c920b25ca34", "",
+                  "Median of 5 interleaved trials after one warmup per revision; release builds, same runner.",
+                  "Backend includes IL validation, lowering, Cranelift and object serialization. Times in ms.", "",
+                  "| Workload | Size | Frontend old | Frontend new | Backend old | Backend new | Backend speedup |",
+                  "|---|---:|---:|---:|---:|---:|---:|"]
+          for case,n,text in cases:
+              source=root/f"{case}-{n}.c"
+              source.write_text(text)
+              subprocess.run(["gcc","-std=c11","-fsyntax-only",str(source)],check=True)
+              samples={"baseline":[],"candidate":[]}
+              for rev in samples: run(rev,source)
+              for trial in range(5):
+                  order=["baseline","candidate"] if trial%2==0 else ["candidate","baseline"]
+                  for rev in order:
+                      fe,be,size=run(rev,source)
+                      samples[rev].append((fe,be))
+                      rows.append((case,n,trial,rev,fe,be,size))
+              old,new=([statistics.median(x[i] for x in samples[rev])/1e6 for i in (0,1)]
+                       for rev in ("baseline","candidate"))
+              line=f"| {case} | {n} | {old[0]:.3f} | {new[0]:.3f} | {old[1]:.3f} | {new[1]:.3f} | {old[1]/new[1]:.2f}x |"
+              report.append(line)
+              print(line,flush=True)
+          with (root/"samples.csv").open("w",newline="") as f:
+              writer=csv.writer(f)
+              writer.writerow(["workload","size","trial","revision","frontend_ns","backend_ns","object_bytes"])
+              writer.writerows(rows)
+          (root/"report.md").write_text("\n".join(report)+"\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"],"a") as f: f.write("\n".join(report)+"\n")
+          PY
+      - uses: actions/upload-artifact@v4
         with:
-          name: edg-atomic-validation-logs
+          name: edg-fp-scalability-results
           path: |
-            ${{ runner.temp }}/edg-cfg-targeted.log
-            ${{ runner.temp }}/edg-cfg-library.log
-            ${{ runner.temp }}/edg-init-probe.log
-            ${{ runner.temp }}/base-offset-probe.log
-            ${{ runner.temp }}/cout-base-offset.log
-            ${{ runner.temp }}/cout-include-search.log
-            ${{ runner.temp }}/edg-graph-scope-scaling.log
-            ${{ runner.temp }}/deep-native-array-40.log
-            ${{ runner.temp }}/deep-designated-images.log
-            ${{ runner.temp }}/deep-designated-record.log
-            ${{ runner.temp }}/lifetime-c11.log
-            ${{ runner.temp }}/lifetime-cpp20.log
-          if-no-files-found: ignore
-          retention-days: 14
+            ${{ runner.temp }}/fp-bench/report.md
+            ${{ runner.temp }}/fp-bench/samples.csv
