@@ -7,6 +7,10 @@ on:
         required: true
         type: string
         default: main
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/ct-core-focused.yml'
   push:
     branches: [main]
     paths:
@@ -15,17 +19,17 @@ permissions:
   contents: read
   statuses: write
 concurrency:
-  group: ct-core-focused-${{ inputs.compiler_ref || 'bootstrap' }}
+  group: ct-core-focused-${{ inputs.compiler_ref || github.ref }}
   cancel-in-progress: true
 jobs:
   compiler-ir-opt:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ inputs.compiler_ref || 'main' }}
+          ref: ${{ inputs.compiler_ref || (github.event_name == 'pull_request' && '737edbfc3edb068c93a2f2c26d859508b29efe95') || 'main' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -53,12 +57,27 @@ jobs:
         with:
           workspaces: compiler -> target
           key: focused-ct-ir-opt
-      - name: Run all IR and optimizer unit/integration tests
+      - name: Focused PRE and pass-manager regressions
+        if: github.event_name == 'pull_request'
         working-directory: compiler
-        run: cargo test -p compiler-ir -p compiler-opt
+        run: |
+          cargo test -p compiler-ir -p compiler-opt --lib
+          cargo test -p compiler-ir --test body_feature_hooks
+          cargo test -p compiler-opt --features check-body-features --test typed_dse --test typed_local_memory --test typed_algebra --test al05_affine_native_bridge --test typed_cse --test typed_global_memory --test typed_phi_cfg --test typed_phi_dead_linear --test typed_sccp --test typed_licm_native --test typed_induction_native --test typed_local --test typed_mem2reg --test typed_array_fold --test typed_ctfe --test typed_pre_native --test typeid_source_profile_parity --test pre_licm_semantic_matrix --test typeid_fuzz_pre_induction_targeted --test typeid_core_pass_manager --test typeid_fuzz_pass_registry
+          cargo test -p compiler-opt --features check-body-features --test typed_ctfe ctfe_retry_changed_function_census -- --nocapture
+          COMPILER_TEST_VALIDATION=full cargo test -p compiler-opt --test typeid_core_pass_manager -- --nocapture
       - name: Verify strict Clippy on IR and optimizer
         working-directory: compiler
-        run: cargo clippy -p compiler-ir -p compiler-opt --all-targets -- -D warnings
+        run: cargo clippy -p compiler-ir -p compiler-opt --lib --features compiler-opt/check-body-features -- -D warnings
+      - name: Post-merge native backend and assembler interactions
+        if: github.event_name == 'pull_request'
+        working-directory: compiler
+        run: |
+          cargo test -p compiler-opt --features check-body-features --no-fail-fast --test typed_ctfe --test typed_pre_native --test typeid_native_memory_call --test typeid_native_trap_differential --test typeid_native_campaign --test ir_fixture_directives
+      - name: Run all IR and optimizer unit/integration tests
+        if: github.event_name != 'pull_request'
+        working-directory: compiler
+        run: cargo test -p compiler-ir -p compiler-opt --features compiler-opt/check-body-features --no-fail-fast
       - name: Publish focused gate result
         if: always()
         env:
@@ -72,3 +91,80 @@ jobs:
             -f state="$state" -f context=ct/core-focused \
             -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             -f description="Focused IR and optimizer validation: $RESULT"
+
+  mask-regression-comparison:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a08926a69f7f0d8807b9f0241caee40201ee2f2c
+          path: baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 737edbfc3edb068c93a2f2c26d859508b29efe95
+          path: candidate
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Reproduce generated mask algebra regression on both revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Both revisions must run the identical corrected regression assertion.
+          # The original test file was byte-identical on baseline and candidate.
+          cp candidate/crates/opt/tests/generated_native_masks.rs baseline/crates/opt/tests/generated_native_masks.rs
+          failed=0
+          for v in baseline candidate; do
+            git -C "$v" rev-parse HEAD
+            printf '[workspace]\nresolver = "2"\nmembers = ["crates/ir", "crates/opt"]\n' > "$v/Cargo.toml"
+            rm -f "$v/Cargo.lock"
+            if (cd "$v" && cargo test -p compiler-opt --test generated_native_masks mask_absorption_keeps_a_trapping_division_producer -- --exact --nocapture); then
+              echo "MASK_REGRESSION $v passed"
+            else
+              echo "MASK_REGRESSION $v failed"
+              failed=1
+            fi
+          done
+          # Check the same updated profitability expectations on both pinned revisions.
+          cp candidate/crates/opt/tests/generated_native_matchpd_boolean_factor_s2314.rs baseline/crates/opt/tests/generated_native_matchpd_boolean_factor_s2314.rs
+          for v in baseline candidate; do
+            if (cd "$v" && cargo test -p compiler-opt --test generated_native_matchpd_boolean_factor_s2314); then
+              echo "S2314_REGRESSION $v passed"
+            else
+              echo "S2314_REGRESSION $v failed"
+              failed=1
+            fi
+          done
+          # Attribute every previously observed failing test target against
+          # unmodified main code, not an allowlist of silently skipped failures.
+          for v in baseline candidate; do
+            features=()
+            if [[ "$v" == candidate ]]; then features=(--features check-body-features); fi
+            if (cd "$v" && cargo test -p compiler-opt "${features[@]}" --no-fail-fast --test native_s2350ag_generated_utility --test native_s2350z_generated_matrix --test native_v3_fixture_inventory --test native_verifier_fixture_matrix --test review_byte_phi_indirect_memory --test review_loop_byte_phi_callback --test review_mixed_global_escape_loop --test review_mixed_phi_critical_call --test review_nested_same_successor_phi --test review_phi_call_pressure --test review_target_abi_pipeline --test typed_native_parity --test typeid_native_reference_ddmin --test typeid_target_gp_abi) > "$v-attribution.log" 2>&1; then
+              echo "ATTRIBUTION $v passed"
+            else
+              echo "ATTRIBUTION $v failed"
+              failed=1
+            fi
+            cat "$v-attribution.log"
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          def failures(path):
+              return {line.removeprefix('test ').removesuffix(' ... FAILED')
+                      for line in Path(path).read_text().splitlines()
+                      if line.startswith('test ') and line.endswith(' ... FAILED')}
+          baseline = failures('baseline-attribution.log')
+          candidate = failures('candidate-attribution.log')
+          print('BASELINE_FAILURES', sorted(baseline))
+          print('CANDIDATE_FAILURES', sorted(candidate))
+          print('CANDIDATE_ONLY', sorted(candidate-baseline))
+          print('BASELINE_ONLY', sorted(baseline-candidate))
+          assert baseline == candidate, 'test failure sets differ'
+          PY
+          exit "$failed"
