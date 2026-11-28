@@ -1,0 +1,161 @@
+name: X7 pinned original VEX form contracts
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-x7-vex-original-form-contracts.yml']
+permissions:
+  contents: read
+jobs:
+  original-contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 4656803a9bfb6883485351fd4922200260782225
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact compiler source
+        run: test "$(git rev-parse HEAD)" = 4656803a9bfb6883485351fd4922200260782225
+      - uses: actions/cache/restore@v4
+        id: xed-cache
+        with:
+          path: /tmp/x7-xed-upstream.json
+          key: x7-xed-export-0bcb6237345c5066726dcc08b3d87928df3b5b26-1b437e409221a2b5703b4d8896baa20d43e4ba1a
+      - name: Build pinned upstream XED exporter
+        if: steps.xed-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/intelxed/xed.git /tmp/xed
+          git -C /tmp/xed checkout 0bcb6237345c5066726dcc08b3d87928df3b5b26
+          git clone --filter=blob:none https://github.com/intelxed/mbuild.git /tmp/mbuild
+          git -C /tmp/mbuild checkout 1b437e409221a2b5703b4d8896baa20d43e4ba1a
+          (cd /tmp/xed && ./mfile.py --no-encoder)
+          (cd /tmp && python3 /tmp/xed/pysrc/xed_to_db.py --xed-dgen /tmp/xed/obj/dgen --out /tmp/x7-xed-upstream.json --compact)
+      - uses: actions/cache/save@v4
+        if: steps.xed-cache.outputs.cache-hit != 'true'
+        with:
+          path: /tmp/x7-xed-upstream.json
+          key: x7-xed-export-0bcb6237345c5066726dcc08b3d87928df3b5b26-1b437e409221a2b5703b4d8896baa20d43e4ba1a
+      - name: Obtain pinned original Intel instruction XML
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --sparse https://github.com/intel/SDM.git /tmp/intel-sdm
+          git -C /tmp/intel-sdm fetch --depth 1 origin 35eface1b7ee003a1cda95005ec5fd83de658a64
+          git -C /tmp/intel-sdm checkout 35eface1b7ee003a1cda95005ec5fd83de658a64
+          git -C /tmp/intel-sdm sparse-checkout set data/instruction
+          test "$(git -C /tmp/intel-sdm rev-parse HEAD)" = 35eface1b7ee003a1cda95005ec5fd83de658a64
+      - name: Discover source forms and reject altered contracts
+        env:
+          X7_PINNED_INTEL_DIR: /tmp/intel-sdm/data/instruction
+          X7_PINNED_XED_JSON: /tmp/x7-xed-upstream.json
+        run: |
+          set -euo pipefail
+          python3 tools/x7_original_vex_form_contracts.py --xml-dir "$X7_PINNED_INTEL_DIR" --xed-json "$X7_PINNED_XED_JSON" --out /tmp/x7-vex-contracts.json
+          python3 -m unittest discover -s tools -p test_x7_original_vex_form_contracts.py -v
+      - uses: actions/cache/restore@v4
+        id: parser-cache
+        with:
+          path: /tmp/x7-parser
+          key: x7-isa-parser-ubuntu24-${{ runner.arch }}-16260979137c38339743a04b7fd5d9f0fa8a6ee5-ocaml5.4.1-${{ hashFiles('tools/x86_isl_ast_export.ml', 'tools/x86_isl_ast_json.ml') }}
+      - name: Install parser runtime libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libgmp-dev libz3-dev
+      - uses: ocaml/setup-ocaml@v3
+        if: steps.parser-cache.outputs.cache-hit != 'true'
+        with:
+          ocaml-compiler: 5.4.1
+      - name: Build pinned upstream Intel AST exporter
+        if: steps.parser-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libgmp-dev pkg-config cmake libz3-dev
+          git clone --filter=blob:none https://github.com/IntelLabs/isa-tools.git /tmp/isa-tools
+          git -C /tmp/isa-tools checkout 16260979137c38339743a04b7fd5d9f0fa8a6ee5
+          git -C /tmp/isa-tools submodule update --init --recursive
+          cp tools/x86_isl_ast_export.ml tools/x86_isl_ast_json.ml /tmp/isa-tools/bin/
+          cat >> /tmp/isa-tools/bin/dune <<'EOF'
+          (executable
+           (name x86_isl_ast_export)
+           (modules x86_isl_ast_export x86_isl_ast_json)
+           (libraries libISA yojson))
+          EOF
+          cd /tmp/isa-tools
+          opam install --switch="$GITHUB_WORKSPACE" . --deps-only --yes
+          opam exec --switch="$GITHUB_WORKSPACE" -- dune build bin/x86_isl_ast_export.exe
+
+      - name: Stage pinned parser binary
+        if: steps.parser-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /tmp/x7-parser
+          cp /tmp/isa-tools/_build/default/bin/x86_isl_ast_export.exe /tmp/x7-parser/export
+      - uses: actions/cache/save@v4
+        if: steps.parser-cache.outputs.cache-hit != 'true'
+        with:
+          path: /tmp/x7-parser
+          key: x7-isa-parser-ubuntu24-${{ runner.arch }}-16260979137c38339743a04b7fd5d9f0fa8a6ee5-ocaml5.4.1-${{ hashFiles('tools/x86_isl_ast_export.ml', 'tools/x86_isl_ast_json.ml') }}
+      - name: Check parser executable
+        run: |
+          test -x /tmp/x7-parser/export
+          sha256sum /tmp/x7-parser/export
+      - name: Batched independent semantic proof join
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/x7-z3
+          /tmp/x7-z3/bin/python -m pip install --disable-pip-version-check 'z3-solver==4.13.4.0'
+          export PATH=/tmp/x7-z3/bin:$PATH
+          python -m unittest discover -s tools -p test_x86_isl_operation_proof_worker.py -v
+          python -m unittest discover -s tools -p test_x7_vex_scalar_proof_batch.py -v
+          python -m unittest discover -s tools -p test_x86_isl_generic_bit_flags_smt.py -v
+          python -m unittest discover -s tools -p test_x7_generic_shift_semantics.py -v
+          python -m unittest discover -s tools -p test_x7_linear_integer_index.py -v
+          python -m unittest discover -s tools -p test_x7_static_dimension_helpers.py -v
+          python -m unittest discover -s tools -p test_x7_packed_corpus_accounting.py -v
+          python -m unittest discover -s tools -p test_x7_vex_native_receipt_bridge.py -v
+          python -m unittest discover -s tools -p test_x7_ip2_ir_equivalence.py -v
+          python -m unittest discover -s tools -p test_x86_isl_b3_record_worker.py -v
+          python tools/x7_vex_scalar_proof_batch.py --xml-dir /tmp/intel-sdm/data/instruction --xed-json /tmp/x7-xed-upstream.json --parser /tmp/x7-parser/export --cache-dir /tmp/x7-b3-parser-cache --workers 4 --model-workers 2 --out /tmp/x7-vex-proof-batch.json
+          python - <<'PY'
+          import json
+          r=json.load(open('/tmp/x7-vex-proof-batch.json'))
+          assert r['input_form_count']==22 and not r['source_form_blockers'],r
+          assert len(r['matched'])+len(r['blocked'])==22,r
+          assert len(r['proof_batches'])==2,r
+          assert r['new_production_rules']==0
+          assert r['matched'],r
+          PY
+      - name: Bridge original proofs and verify native register execution
+        run: |
+          set -euo pipefail
+          export PATH=/tmp/x7-z3/bin:$PATH
+          python tools/x7_vex_native_receipt_bridge.py --proof-batch /tmp/x7-vex-proof-batch.json --xed-json /tmp/x7-xed-upstream.json --out /tmp/x7-vex-native-bridge.json --native
+      - name: Render verified original rules and exercise real matcher and emitter
+        run: |
+          set -euo pipefail
+          python3 tools/x7_render_vex_matcher_validation.py --bridge /tmp/x7-vex-native-bridge.json --out crates/backend-x86/tests/unit/generated_x7_vex_validation_rules.rs
+          python3 tools/x7_render_vex_matcher_validation.py --bridge /tmp/x7-vex-native-bridge.json --select-iforms tools/x7_gp_production_iforms.json --out /tmp/x7-production-rules.rs --production-certificates /tmp/x7-production-certificates.rs
+          # Source verifier changed; freshly staged provenance diff reviewed after native gate.
+          # Source verifier changed; freshly staged provenance diff reviewed after native gate.
+          python3 tools/x7_render_vex_matcher_validation.py --bridge /tmp/x7-vex-native-bridge.json --stage-batch "$PWD"
+          git diff -- crates/backend-x86/src/generated_x7_gp_production_rules.rs crates/backend-x86/src/generated_x7_gp_production_certificates.rs tools/x7_gp_production_iforms.json > /tmp/x7-staged-production.patch
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/ir-macros", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f Cargo.lock
+          X7_REQUIRE_GENERATED_VEX=1 cargo test -p compiler-backend-x86 --lib generated_gp_matcher_tests -- --nocapture
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend-x86 --lib --no-default-features disabled_gp_feature_keeps_ordinary_selection_baseline
+          cargo check -p compiler-backend-x86 --no-default-features
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-vex-original-contracts
+          path: |
+            /tmp/x7-vex-contracts.json
+            /tmp/x7-vex-proof-batch.json
+            /tmp/x7-vex-native-bridge.json
+            /tmp/x7-staged-production.patch
