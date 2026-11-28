@@ -19,7 +19,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: mini-c-sema-${{ inputs.mini_c_sha || '2d16b6de72d0045ea1da6841dd32abd318f87387' }}
+  group: mini-c-sema-${{ inputs.mini_c_sha || 'a3ad4dd35cf503c6c1dbc10f40c3175051578768' }}
   cancel-in-progress: false
 
 jobs:
@@ -30,7 +30,7 @@ jobs:
       - name: Validate requested immutable revision
         shell: bash
         env:
-          MINI_C_SHA: ${{ inputs.mini_c_sha || '2d16b6de72d0045ea1da6841dd32abd318f87387' }}
+          MINI_C_SHA: ${{ inputs.mini_c_sha || 'a3ad4dd35cf503c6c1dbc10f40c3175051578768' }}
         run: |
           set -euo pipefail
           [[ "$MINI_C_SHA" =~ ^[0-9a-f]{40}$ ]] || {
@@ -41,13 +41,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/mini-c
-          ref: ${{ inputs.mini_c_sha || '2d16b6de72d0045ea1da6841dd32abd318f87387' }}
+          ref: ${{ inputs.mini_c_sha || 'a3ad4dd35cf503c6c1dbc10f40c3175051578768' }}
           path: mini-c
           persist-credentials: false
       - name: Confirm exact checkout
         shell: bash
         env:
-          MINI_C_SHA: ${{ inputs.mini_c_sha || '2d16b6de72d0045ea1da6841dd32abd318f87387' }}
+          MINI_C_SHA: ${{ inputs.mini_c_sha || 'a3ad4dd35cf503c6c1dbc10f40c3175051578768' }}
         run: |
           set -euo pipefail
           test "$(git -C mini-c rev-parse HEAD)" = "$MINI_C_SHA"
@@ -72,6 +72,47 @@ jobs:
           set -euo pipefail
           cargo test --manifest-path mini-c/Cargo.toml -p mini-c-sema --lib 2>&1 | tee -a "$RUNNER_TEMP/mini-c-sema-tests.log"
           echo "Mini-C semantic tests passed" >> "$GITHUB_STEP_SUMMARY"
+      - name: Full syntax and independent Cranelift regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path mini-c/Cargo.toml -p mini-c-syntax -p mini-c-cranelift --no-default-features
+      - name: Mini-C CLI regression
+        run: cargo test --manifest-path mini-c/Cargo.toml -p mini-c --no-default-features
+      - name: GCC differential byte-swap reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path mini-c/Cargo.toml -p mini-c-cranelift --no-default-features
+          cat > "$RUNNER_TEMP/swap.c" <<'C'
+          unsigned short swap16(unsigned int v) { return __builtin_bswap16(v); }
+          unsigned int swap32(unsigned int v) { return __builtin_bswap32(v); }
+          unsigned long swap64(unsigned long v) { return __builtin_bswap64(v); }
+          unsigned int once(unsigned int *p) { return __builtin_bswap16((*p)++); }
+          C
+          cat > "$RUNNER_TEMP/oracle.c" <<'C'
+          #include <stdint.h>
+          extern unsigned short swap16(unsigned int);
+          extern unsigned int swap32(unsigned int);
+          extern unsigned long swap64(unsigned long);
+          extern unsigned int once(unsigned int *);
+          int main(void) {
+              for (unsigned v=0; v<65536; ++v)
+                  if (swap16(v|0xabcd0000U)!=__builtin_bswap16(v)) return 1;
+              uint64_t v=0x0123456789abcdefUL;
+              for (unsigned i=0;i<1024;++i) {
+                  v=v*6364136223846793005UL+1;
+                  if (swap32((uint32_t)v)!=__builtin_bswap32((uint32_t)v)) return 2;
+                  if (swap64(v)!=__builtin_bswap64(v)) return 3;
+              }
+              unsigned n=0xfeed1234;
+              return once(&n)!=0x3412 || n!=0xfeed1235;
+          }
+          C
+          mini-c/target/debug/mini-c-cranelift -std=gnu11 --cpp=cc --emit-obj "$RUNNER_TEMP/swap.o" "$RUNNER_TEMP/swap.c"
+          gcc -O2 -no-pie "$RUNNER_TEMP/oracle.c" "$RUNNER_TEMP/swap.o" -o "$RUNNER_TEMP/swap-test"
+          "$RUNNER_TEMP/swap-test"
+          echo "CLIF_BSWAP_GCC_DIFFERENTIAL=pass"
       - name: Save diagnostic log on failure
         if: failure()
         uses: actions/upload-artifact@v4
