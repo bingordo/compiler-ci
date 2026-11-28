@@ -1,0 +1,598 @@
+name: Mini-C native mrustc generated-C probe
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/mrustc-minic-native.yml'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Compiler source branch, tag, or SHA'
+        required: false
+        default: main
+        type: string
+      edg_creduce:
+        description: 'Enable C-Reduce on exact generated C'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mrustc-minic-native-${{ github.head_ref || inputs.source_ref || 'main' }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    steps:
+      - name: Checkout compiler-ci smoke fixtures
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout compiler using existing read-only deploy key
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          # Test the merged source-verified TypeId adapter (not the old mixed-global
+          # branch) without changing compiler production history.
+          # Manual dispatch can still select any explicit source_ref.
+          ref: ${{ inputs.source_ref || '6c3a848c6c60d6bcd78fbf597bc7c2c01961287d' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+
+      - name: Checkout independently proven Rust-to-C input revision
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 9a0048acdb8b3b9b51e2caffcafdd9b088a50dfa
+          path: compiler-translation
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record independent translation and backend revisions
+        run: |
+          test "$(git -C compiler-translation rev-parse HEAD)" = 9a0048acdb8b3b9b51e2caffcafdd9b088a50dfa
+          echo "Translation source: $(git -C compiler-translation rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Backend source: $(git -C compiler rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          # The public smoke executable must use the same translation source.
+          sed -i 's|../../compiler/crates/ir|../../compiler-translation/crates/ir|' bootstrap/mrustc-gcc-smoke/Cargo.toml
+
+      - name: Resolve exact frontend source pins from checked-out compiler
+        id: frontend-pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          from pathlib import Path
+          import re
+          import tomllib
+
+          with Path("compiler/crates/driver/Cargo.toml").open("rb") as f:
+              driver = tomllib.load(f)["dependencies"]
+          with Path("compiler/tools/mini-c-driver/Cargo.toml").open("rb") as f:
+              mini = tomllib.load(f)["dependencies"]
+          # The Mini-C syntax/sema crates moved into a separate workspace.
+          # The main driver preprocessor may use a DIFFERENT pinned revision.
+          def pin(deps, crate, repo):
+              dep = deps[crate]
+              assert dep["git"] == f"ssh://git@github.com/bingordo/{repo}.git"
+              sha = dep["rev"]
+              assert re.fullmatch(r"[0-9a-f]{40}", sha), (crate, sha)
+              return sha
+          oberon = pin(driver, "oberon-front-ir", "oberon")
+          preprocessor = pin(driver, "mini-c-preprocess", "mini-c")
+          syntax = pin(mini, "mini-c-syntax", "mini-c")
+          sema = pin(mini, "mini-c-sema", "mini-c")
+          assert syntax == sema, "Mini-C syntax/sema must use one source revision"
+          assert driver["mini-c-preprocess"]["features"] == ["internal-rcc"]
+          print(f"oberon_sha={oberon}")
+          print(f"mini_c_frontend_sha={syntax}")
+          print(f"mini_c_preprocess_sha={preprocessor}")
+          PY
+
+      - name: Checkout pinned Oberon frontend source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/oberon
+          ref: ${{ steps.frontend-pins.outputs.oberon_sha }}
+          path: oberon
+          persist-credentials: false
+
+      - name: Checkout pinned Mini-C frontend source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: ${{ steps.frontend-pins.outputs.mini_c_preprocess_sha }}
+          path: mini-c
+          persist-credentials: false
+      - name: Checkout exact manifest-pinned Mini-C frontend
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: ${{ steps.frontend-pins.outputs.mini_c_frontend_sha }}
+          path: mini-c-compat
+          persist-credentials: false
+      - name: Checkout pinned mrustc
+        uses: actions/checkout@v4
+        with:
+          repository: thepowersgang/mrustc
+          ref: bd11a1a17d3f548e90c710dc247785073fdc8d28
+          path: mrustc
+          persist-credentials: false
+
+      - name: Identify mrustc cache revision
+        id: mrustc-revision
+        shell: bash
+        run: echo "sha=$(git -C mrustc rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore prebuilt mrustc and Rust 1.90 libraries
+        id: mrustc-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            mrustc/bin
+            mrustc/output-1.90.0
+          key: mrustc-bootstrap-v1-${{ runner.os }}-ubuntu2404-rust190-${{ steps.mrustc-revision.outputs.sha }}
+
+      - name: Install mrustc build dependencies when the toolchain needs building
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.mrustc-cache.outputs.cache-hit }}" == "true" ]] &&
+             [[ -x mrustc/bin/mrustc ]] &&
+             [[ -x mrustc/bin/minicargo ]] &&
+             [[ -f mrustc/output-1.90.0/libcore.rlib ]]; then
+            echo "Cached mrustc is complete; skipping apt install." >> "$GITHUB_STEP_SUMMARY"
+          else
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends build-essential zlib1g-dev pkg-config cmake curl python3 libssl-dev
+          fi
+          # GCC and Cargo are required even when mrustc itself came from cache.
+          command -v gcc
+          command -v cargo
+          command -v python3
+
+      - name: Record reproducibility inputs and target crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Compiler SHA: $(git -C compiler rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          echo "mrustc SHA: $(git -C mrustc rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Host: $(uname -m) / $(lsb_release -rs)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Rust crate editions:" >> "$GITHUB_STEP_SUMMARY"
+          grep -Rh '^edition[[:space:]]*=' compiler/crates/*/Cargo.toml | sort | uniq -c >> "$GITHUB_STEP_SUMMARY"
+          echo "First target: compiler-ir (no frontend dependency); then compiler-opt, backend, driver." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build mrustc and matching Rust 1.90 libraries
+        id: toolchain
+        shell: bash
+        working-directory: mrustc
+        env:
+          RUSTC_VERSION: '1.90.0'
+          MRUSTC_TARGET_VER: '1.90'
+          OUTDIR_SUF: '-1.90.0'
+          PARLEVEL: '2'
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.mrustc-cache.outputs.cache-hit }}" == "true" ]] && \
+             [[ -x bin/mrustc ]] && [[ -x bin/minicargo ]] && \
+             [[ -f output-1.90.0/libcore.rlib ]]; then
+            echo "Using cached mrustc toolchain and Rust libraries" >> "$GITHUB_STEP_SUMMARY"
+          else
+            # Missing/incomplete caches rebuild in this runner.
+            timeout --signal=TERM --kill-after=10s 20m make -j2
+            timeout --signal=TERM --kill-after=10s 10m make RUSTCSRC
+            timeout --signal=TERM --kill-after=10s 55m make -f minicargo.mk LIBS
+          fi
+          test -x bin/mrustc
+          test -x bin/minicargo
+          test -f output-1.90.0/libcore.rlib
+
+      - name: Cache validated mrustc toolchain
+        if: success() && steps.mrustc-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            mrustc/bin
+            mrustc/output-1.90.0
+          key: mrustc-bootstrap-v1-${{ runner.os }}-ubuntu2404-rust190-${{ steps.mrustc-revision.outputs.sha }}
+
+      - name: Snapshot C files before translation
+        shell: bash
+        run: |
+          find mrustc -type f -name '*.c' -printf '%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/mrustc-c-before.txt"
+
+      - name: Attempt compiler-ir Rust-to-C emission
+        id: translate
+        shell: bash
+        working-directory: mrustc
+        env:
+          RUSTC_VERSION: '1.90.0'
+          MRUSTC_TARGET_VER: '1.90'
+          OUTDIR_SUF: '-1.90.0'
+          PARLEVEL: '2'
+          CC: gcc
+        run: |
+          set -euo pipefail
+          # This is deliberately a bounded first-crate feasibility probe, not
+          # an assertion that the full Cargo workspace is supported.
+          set +e
+          # minicargo's positional argument is the crate DIRECTORY, not Cargo.toml.
+          # Share one fresh per-run directory across all compiler crate probes.
+          # minicargo can now reuse compiler-ir and other completed dependencies.
+          # Do not persist private generated C/rlibs in public Actions caches.
+          timeout --signal=TERM --kill-after=10s 20m bin/minicargo \
+            -L output-1.90.0 -o output-compiler-bootstrap \
+            ../compiler-translation/crates/ir > "$RUNNER_TEMP/mrustc-probe.log" 2>&1
+          rc=$?
+          set -e
+          echo "mrustc/minicargo exit code: $rc" >> "$GITHUB_STEP_SUMMARY"
+          find . -type f -name '*.c' -printf '%P\n' | LC_ALL=C sort > "$RUNNER_TEMP/mrustc-c-after.txt"
+          # Before-snapshot is relative to mrustc/; after-snapshot is also
+          # relative to mrustc/, avoiding false differences from prefix changes.
+          comm -13 "$RUNNER_TEMP/mrustc-c-before.txt" "$RUNNER_TEMP/mrustc-c-after.txt" > "$RUNNER_TEMP/mrustc-c-new.txt"
+          echo "New C files from attempted translation: $(wc -l < "$RUNNER_TEMP/mrustc-c-new.txt")" >> "$GITHUB_STEP_SUMMARY"
+          echo "All C files (includes prebuilt Rust stdlib): $(wc -l < "$RUNNER_TEMP/mrustc-c-after.txt")" >> "$GITHUB_STEP_SUMMARY"
+          # Do not print private compiler source or raw diagnostics into public CI.
+          python3 - "$RUNNER_TEMP/mrustc-probe.log" "$GITHUB_STEP_SUMMARY" <<'PY'
+          import pathlib, re, sys
+          log = pathlib.Path(sys.argv[1]).read_text(errors="replace")
+          categories = {
+              "manifest or dependency resolution": r"failed to (load|parse|select|resolve)|dependency|manifest",
+              "missing files or paths": r"No such file|not found|cannot open",
+              "unsupported Rust feature": r"unsupported|not implemented|unimplemented|TODO",
+              "type or parsing error": r"parse error|type error|error:|ERROR:",
+              "compiler crash": r"SIGSEGV|segmentation fault|panic|assertion failed",
+              "GCC diagnostic": r"gcc: error|fatal error:|compilation terminated",
+          }
+          print("Diagnostic categories (counts; non-exclusive):", file=open(sys.argv[2], "a"))
+          with open(sys.argv[2], "a") as out:
+              for name, pattern in categories.items():
+                  print(f"- {name}: {len(re.findall(pattern, log, re.I))}", file=out)
+          PY
+          echo "Target translation must succeed before GCC syntax and object tests run." >> "$GITHUB_STEP_SUMMARY"
+          if (( rc != 0 )); then
+            # Only show a bounded, non-source-bearing summary here. Private
+            # diagnostics remain in the runner temp log.
+            echo "minicargo failed; inspect diagnostic categories above." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "probe_exit=$rc" >> "$GITHUB_OUTPUT"
+          # A nonzero exit is a real failed acceptance gate, not a green probe.
+          exit "$rc"
+
+      - name: Generate small real mrustc compiler-ir executable C as reduction seed
+        if: always() && steps.translate.outcome == 'success'
+        shell: bash
+        working-directory: mrustc
+        env:
+          RUSTC_VERSION: '1.90.0'
+          MRUSTC_TARGET_VER: '1.90'
+          OUTDIR_SUF: '-1.90.0'
+          PARLEVEL: '2'
+          CC: gcc
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 15m bin/minicargo \
+            -L output-1.90.0 -o output-compiler-bootstrap \
+            ../bootstrap/mrustc-gcc-smoke > "$RUNNER_TEMP/mrustc-small-smoke.log" 2>&1
+          # The compiler-ir library alone emits a 65+ MB file. This
+          # source-owned public executable smoke emits a much smaller C unit
+          # without compiling the unrelated optimizer, backends, or driver.
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          from pathlib import Path
+          units=[p.stat().st_size for p in Path("output-compiler-bootstrap").rglob("*.c") if p.is_file() and p.stat().st_size]
+          assert len(units) >= 2, "expected library C plus executable C"
+          print("Generated-C unit count:", len(units))
+          print("Smallest generated-C bytes:", min(units))
+          assert min(units) < 1024*1024, "missing <1MiB executable seed"
+          PY
+
+
+      - name: Build production Mini-C TypeId driver
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Resolve exact syntax/sema checkout locally without changing production manifests.
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          p=Path("compiler/tools/mini-c-driver/Cargo.toml")
+          s=p.read_text()
+          for name,crate in [("mini-c-syntax","syntax"),("mini-c-sema","sema")]:
+              pattern=rf'(?m)^{name} = \{{[^\n]+\}}$'
+              path=(Path("mini-c-compat/crates")/crate).resolve()
+              assert (path/"Cargo.toml").is_file()
+              s,n=re.subn(pattern,f'{name} = {{ path = "{path}" }}',s)
+              assert n==1
+          p.write_text(s)
+          PY
+          set +e
+          cargo build --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml > "$RUNNER_TEMP/minic-build.log" 2>&1
+          rc=$?
+          set -e
+          echo "MINIC_BUILD_EXIT=$rc"
+          if (( rc != 0 )); then
+            python3 - "$RUNNER_TEMP/minic-build.log" <<'PY'
+          import re,sys
+          from pathlib import Path
+          s=Path(sys.argv[1]).read_text(errors="replace")
+          for code in sorted(set(re.findall(r'error\[(E[0-9]{4})\]',s))):print("MINIC_RUST_ERROR="+code)
+          # Build failures refer to compiler sources, not generated C.
+          for line in s.splitlines():
+              if re.match(r'^error\[E[0-9]{4}\]:|^\s*--> (?:crates|src|tools)/',line):
+                  print("MINIC_BUILD_DIAG="+line[:240])
+          PY
+          fi
+          exit "$rc"
+
+      # Full adapter and GCC ELF/GAS differential run independently in #2459.
+      - name: Build independent Cranelift reference on the identical frontend
+        id: clif_build
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path mini-c-compat/Cargo.toml -p mini-c-cranelift --no-default-features
+
+      # Reuse the exact candidate and release build; do not regenerate C for
+      # each public regression. Keep this result independent of replay.
+      - name: Focused public atomic and aggregate member regressions
+        id: focused
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release --manifest-path mini-c-compat/Cargo.toml -p mini-c-sema --lib scalar_gnu_atomic_address_buffers_use_checked_scalar_operations
+          cargo test --release --manifest-path mini-c-compat/Cargo.toml -p mini-c-sema --lib runtime_atomic_orders_strengthen_without_dropping_evaluation
+          cargo test --release --manifest-path mini-c-compat/Cargo.toml -p mini-c-sema --lib scalar_members_of_aggregate_calls_are_values_not_lvalues
+          cargo test --release --manifest-path mini-c-compat/Cargo.toml -p mini-c-sema --lib defined_internal_builtin_named_helpers_use_checked_calls
+          cargo test --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test gnu_atomic_address
+
+      - name: Attempt real generated C with production Mini-C and independent GCC
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os,re,subprocess,tempfile
+          from pathlib import Path
+          root=Path("mrustc/output-compiler-bootstrap").resolve()
+          driver=Path("compiler/tools/mini-c-driver/target/release/compiler-mini-c").resolve()
+          assert driver.is_file()
+          clif=Path("mini-c-compat/target/release/mini-c-cranelift").resolve()
+          units=sorted((p for p in root.rglob("*.c") if p.is_file() and p.stat().st_size),key=lambda p:p.stat().st_size)
+          assert units
+          def attempt(cmd, log, seconds):
+              with log.open("wb") as f:
+                  try:return subprocess.run(cmd,stdout=f,stderr=subprocess.STDOUT,timeout=seconds).returncode
+                  except subprocess.TimeoutExpired:return 124
+          with tempfile.TemporaryDirectory() as d:
+              tmp=Path(d)
+              # Small actual executable seed first; also try the largest generated library.
+              selected=list(dict.fromkeys([units[0],units[-1]]))
+              failures=0
+              for i,src in enumerate(selected):
+                  print(f"MINIC_SAMPLE={i} BYTES={src.stat().st_size}",flush=True)
+                  gcc=attempt(["gcc","-std=gnu11","-fsyntax-only",str(src)],tmp/"gcc.log",180)
+                  out=tmp/f"native{i}.o"
+                  rc=attempt([str(driver),str(src),"--emit","obj","-o",str(out)],tmp/"native.log",300)
+                  # Compare the reference backend using the very same generated input.
+                  if clif.is_file():
+                      clif_out=tmp/f"clif{i}.o"
+                      crc=attempt([str(clif),"-std=gnu11","--cpp=cc","--emit-obj",str(clif_out),str(src)],tmp/"clif.log",300)
+                      cmsg=(tmp/"clif.log").read_text(errors="replace")
+                      ccodes=sorted(set(re.findall(r'\b[PLST][0-9]{4}\b',cmsg)))
+                      print(f"CLIF_SAMPLE={i} EXIT={crc} ELF={int(clif_out.is_file() and clif_out.open('rb').read(4)==bytes([127,69,76,70]))} DIAG_IDS="+",".join(ccodes),flush=True)
+                      if i==0 and crc!=0:
+                          # Reparse GCC-preprocessed input; only public syntax
+                          # tokens, never source text, paths, or identifiers.
+                          pre=tmp/"private-preprocessed.c"
+                          with pre.open("wb") as dst, (tmp/"cpp.log").open("wb") as err:
+                              pp=subprocess.run(["gcc","-std=gnu11","-E","-P",str(src)],stdout=dst,stderr=err,timeout=180)
+                          if pp.returncode==0:
+                              replay=attempt([str(clif),"-std=gnu11","--cpp=none","--emit-obj",str(tmp/"replay.o"),str(pre)],tmp/"replay.log",180)
+                              raw=(tmp/"replay.log").read_text(errors="replace")
+                              m=re.search(r":(\d+):(\d+): error\[(S[0-9]{4})\]",raw)
+                              print("CLIF_RAW_EXIT="+str(replay)+" LOCATED="+str(int(m is not None)),flush=True)
+                              vocab=set("int long short signed unsigned char void float double struct union enum const volatile extern static typedef inline __attribute__ __attribute __extension__ __auto_type __typeof__ typeof __thread _Thread_local __asm__ __asm asm __aligned__ aligned __inline __inline__ _Noreturn __attribute __declspec __typeof __typeof__ __const __const__ __volatile __volatile__ __signed__ __signed __restrict__ __restrict _Float16 _Float32 _Float32x _Float64 _Float64x _Float128 __int128_t __uint128_t __builtin_offsetof __builtin_types_compatible_p __builtin_expect __builtin_unreachable __builtin_va_arg __builtin_va_start __builtin_va_end __builtin_va_copy __label__ __real__ __imag__ __complex__ _Complex _Generic __vector __vector__ __auto_type __alignof __alignof__ __builtin_va_list __int128 __float128 _Atomic _Alignas _Alignof __restrict __restrict__ if else for while return goto case default switch break continue".split())|set("(){}[];,=*&:+-/%<>!~?")
+                              expected=re.search(r"expected '([^'\n]*)', found '([^'\n]*)'",raw)
+                              if expected:
+                                  found=expected[2]
+                                  def token_class(s):
+                                      if s in vocab: return s
+                                      if re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*",s):
+                                          return "reserved-identifier" if s.startswith("__") else "identifier"
+                                      if s.startswith('"'): return "string"
+                                      if s.startswith("'"): return "character"
+                                      if s[:1].isdigit(): return "number"
+                                      return "other"
+                                  print("CLIF_EXPECTED="+token_class(expected[1])+" FOUND="+token_class(found),flush=True)
+                                  # Permit an exact spelling only if independently
+                                  # found in public GCC/system headers or mrustc's
+                                  # public code generator. Never emit private names.
+                                  if token_class(found)=="reserved-identifier":
+                                      public_paths=[Path("/usr/include"),Path("mrustc/src/trans/codegen_c.cpp")]
+                                      gcc_headers=subprocess.check_output(["gcc","-print-file-name=include"],text=True).strip()
+                                      public_paths.append(Path(gcc_headers))
+                                      for public_path in public_paths:
+                                          check=subprocess.run(["grep","-r","-l","-F","-w","--",found,str(public_path)],
+                                                               stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=25)
+                                          if check.returncode==0:
+                                              print("CLIF_PUBLIC_TOKEN="+found,flush=True)
+                                              break
+
+                              if m:
+                                  import itertools
+                                  ln,col=map(int,m.groups()[:2])
+                                  with pre.open(errors="replace") as f:
+                                      row=next(itertools.islice(f,ln-1,ln),"")
+                                  ts=list(re.finditer(r"[A-Za-z_][A-Za-z_0-9]*|[0-9]+|[^\s]",row))
+                                  k=next((j for j,t in enumerate(ts) if t.end()>=col),None)
+                                  if k is not None:
+                                      print("CLIF_TOKEN_SEQUENCE="+",".join(token_class(t.group()) if expected else (t.group() if t.group() in vocab else "other") for t in ts[max(0,k-4):k+6]),flush=True)
+                  # Only compiler-owned diagnostic IDs and fixed categories leave the runner.
+                  msg=(tmp/"native.log").read_text(errors="replace").split("\nusage:",1)[0]
+                  builtin=re.search(r"unsupported compiler builtin ([A-Za-z_][A-Za-z_0-9]*)",msg)
+                  if builtin:
+                      public={"__atomic_load","__atomic_store","__atomic_exchange","__atomic_compare_exchange","__atomic_load_n","__atomic_store_n","__atomic_exchange_n","__atomic_compare_exchange_n","__atomic_fetch_add","__atomic_fetch_sub","__atomic_fetch_and","__atomic_fetch_or","__atomic_fetch_xor","__atomic_is_lock_free","__atomic_always_lock_free","__atomic_test_and_set","__atomic_clear","__atomic_thread_fence","__atomic_signal_fence","__builtin_expect","__builtin_unreachable","__builtin_trap","__builtin_memcpy","__builtin_memset","__builtin_memmove","__builtin_add_overflow","__builtin_sub_overflow","__builtin_mul_overflow"}
+                      # Public GNU spellings not yet in the small historical list.
+                      public.update("__builtin_abort __builtin_alloca __builtin_alloca_with_align __builtin_assume_aligned __builtin_constant_p __builtin_object_size __builtin_dynamic_object_size __builtin_prefetch __builtin_bswap16 __builtin_bswap32 __builtin_bswap64 __builtin_clz __builtin_clzl __builtin_clzll __builtin_ctz __builtin_ctzl __builtin_ctzll __builtin_popcount __builtin_popcountl __builtin_popcountll __builtin_ffs __builtin_ffsl __builtin_ffsll __builtin_parity __builtin_parityl __builtin_parityll __builtin_memcmp __builtin_strlen __builtin_strcmp __builtin_memcpy_chk __builtin_memmove_chk __builtin_memset_chk __builtin_setjmp __builtin_longjmp __builtin_return_address __builtin_frame_address __builtin_va_start __builtin_va_end __builtin_va_copy __builtin_va_arg __builtin_types_compatible_p __builtin_choose_expr __builtin_offsetof __builtin_signbit __builtin_isfinite __builtin_isinf __builtin_isnan __builtin_nan __builtin_nanf __builtin_fabs __builtin_fabsf __builtin_copysign __builtin_copysignf __builtin_sqrt __builtin_sqrtf __builtin_fma __builtin_fmaf __builtin_add_overflow_p __builtin_sub_overflow_p __builtin_mul_overflow_p __builtin_sadd_overflow __builtin_saddl_overflow __builtin_saddll_overflow __builtin_uadd_overflow __builtin_uaddl_overflow __builtin_uaddll_overflow __builtin_ssub_overflow __builtin_ssubl_overflow __builtin_ssubll_overflow __builtin_usub_overflow __builtin_usubl_overflow __builtin_usubll_overflow __builtin_smul_overflow __builtin_smull_overflow __builtin_smulll_overflow __builtin_umul_overflow __builtin_umull_overflow __builtin_umulll_overflow __atomic_add_fetch __atomic_sub_fetch __atomic_and_fetch __atomic_or_fetch __atomic_xor_fetch __atomic_nand_fetch __atomic_fetch_nand __sync_bool_compare_and_swap __sync_val_compare_and_swap __sync_synchronize __sync_lock_test_and_set __sync_lock_release".split())
+                      name=builtin[1]
+                      # Never output an arbitrary private identifier. Verify
+                      # additional exact spellings against public inputs only.
+                      verified=name in public
+                      if not verified and re.fullmatch(r"(?:__builtin_|__atomic_|__sync_)[a-zA-Z0-9_]{1,100}",name):
+                          gcc_headers=Path(subprocess.check_output(["gcc","-print-file-name=include"],text=True).strip())
+                          for public_path in (Path("mrustc/src/trans/codegen_c.cpp"),gcc_headers,Path("/usr/include")):
+                              try:
+                                  check=subprocess.run(["grep","-r","-l","-F","-w","--",name,str(public_path)],
+                                                       stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=20)
+                                  if check.returncode==0:
+                                      verified=True
+                                      break
+                              except subprocess.TimeoutExpired:
+                                  pass
+                      print("NATIVE_UNSUPPORTED_BUILTIN="+(name if verified else "other"),flush=True)
+
+                  # Resolve errors to immutable compiler source locations by
+                  # matching compiler-owned diagnostic literals privately.
+                  # Report only known component IDs, hashed relative paths,
+                  # and line numbers; no message or private source is copied.
+                  if rc!=0 and msg:
+                      import hashlib
+                      matches=[]
+                      components={"syntax":Path("mini-c-compat/crates/syntax/src"),
+                                  "sema":Path("mini-c-compat/crates/sema/src"),
+                                  "native":Path("compiler/tools/mini-c-driver/src"),
+                                  "ir":Path("compiler/crates/ir/src"),
+                                  "backend":Path("compiler/crates/backend/src"),
+                                  "x86":Path("compiler/crates/backend-x86/src")}
+                      for component,directory in components.items():
+                          for path in directory.rglob("*.rs"):
+                              for line_no,line in enumerate(path.read_text(errors="replace").splitlines(),1):
+                                  for lit in re.findall(r'"((?:\\.|[^"\\])*)"',line):
+                                      # Format arguments are not diagnostic text.
+                                      pieces=re.split(r"\{[^{}]*\}",lit)
+                                      pieces=[part for part in pieces if len(part.strip())>=15]
+                                      if pieces and all(part in msg for part in pieces):
+                                          score=sum(len(part) for part in pieces)
+                                          if score>=20:
+                                              rel=str(path.relative_to(directory))
+                                              matches.append((score,component,hashlib.sha256(rel.encode()).hexdigest()[:12],line_no))
+                      for score,component,file_id,line_no in sorted(set(matches),reverse=True)[:8]:
+                          print(f"NATIVE_DIAGNOSTIC_SITE={component}:{file_id}:{line_no} MATCH_LENGTH={score}",flush=True)
+                      print("NATIVE_MESSAGE_BYTES="+str(len(msg.encode())),flush=True)
+
+                  # Check public headers independently using the same native driver.
+                  # These contain no private source; only stable categories are reported.
+                  if i==0:
+                      for header in ("stddef.h","stdint.h","stdatomic.h","stdlib.h"):
+                          fixture=tmp/"public-header.c"
+                          fixture.write_text("#include <"+header+">\nint bootstrap_header_probe(void){return 42;}\n")
+                          result=attempt([str(driver),str(fixture),"--emit","obj","-o",str(tmp/"header.o")],tmp/"header.log",60)
+                          raw=(tmp/"header.log").read_text(errors="replace").split("\nusage:",1)[0]
+                          print("PUBLIC_HEADER="+header+" EXIT="+str(result)+" DIAG_IDS="+",".join(sorted(set(re.findall(r'\b[PLST][0-9]{4}\b',raw)))))
+                          # Only isolated public fixtures: their diagnostics may be printed.
+                          for line in raw.splitlines()[:3]:
+                              print("PUBLIC_HEADER_DIAG="+line[:300],flush=True)
+                      for label,source in (
+                          ("TLS_UNUSED_EXTERN", "extern __thread int value; int f(void){return 42;}"),
+                          ("TLS_DEFINED", "__thread int value=7; int f(void){return ++value;}"),
+                          ("TLS_REFERENCED_EXTERN", "extern __thread int value; int f(void){return ++value;}"),
+                          ("TLS_C11", "static _Thread_local int value; int f(void){return ++value;}"),
+                      ):
+                          fixture=tmp/"public-tls.c"
+                          fixture.write_text(source)
+                          result=attempt([str(driver),str(fixture),"--emit","obj","-o",str(tmp/"tls.o")],tmp/"tls.log",60)
+                          print("PUBLIC_"+label+"_EXIT="+str(result),flush=True)
+                          for line in (tmp/"tls.log").read_text(errors="replace").splitlines()[:3]:
+                              print("PUBLIC_TLS_DIAG="+line[:300],flush=True)
+                      fixture=tmp/"public-layout.c"
+                      fixture.write_text("typedef struct { long long a __attribute__((aligned(__alignof__(long long)))); long double b __attribute__((aligned(__alignof__(long double)))); } Max;\nunsigned long layout_size(void){return sizeof(Max);}\n")
+                      harness=tmp/"public-harness.c"
+                      harness.write_text("extern unsigned long layout_size(void); int main(void){return layout_size()!=32;}\n")
+                      for name,cmd in [("gcc",["gcc","-c",str(fixture),"-o",str(tmp/"layout.o")]),("native",[str(driver),str(fixture),"--emit","obj","-o",str(tmp/"layout.o")])]:
+                          (tmp/"layout.o").unlink(missing_ok=True)
+                          result=attempt(cmd,tmp/"layout.log",60)
+                          print("PUBLIC_LAYOUT_"+name.upper()+"_COMPILE_EXIT="+str(result),flush=True)
+                          if result==0:
+                              link=attempt(["gcc",str(harness),str(tmp/"layout.o"),"-o",str(tmp/"layout")],tmp/"layout-link.log",60)
+                              print("PUBLIC_LAYOUT_"+name.upper()+"_LINK_EXIT="+str(link),flush=True)
+                              if link==0:
+                                  print("PUBLIC_LAYOUT_"+name.upper()+"_EXEC_EXIT="+str(attempt([str(tmp/"layout")],tmp/"layout-exec.log",10)),flush=True)
+                          else:
+                              for line in (tmp/"layout.log").read_text(errors="replace").splitlines()[:3]:
+                                  print("PUBLIC_LAYOUT_DIAG="+line[:300],flush=True)
+                  # The native bridge's errors need not carry a parser ID.
+                  # Export only fixed public attribute names and diagnostic classes.
+                  attr=re.search(r"unsupported GNU symbol attribute '([^'\n]+)'",msg)
+                  if attr:
+                      public=set("aligned packed section used unused weak visibility alias constructor destructor always_inline noinline cold hot noreturn returns_twice malloc format nonnull leaf nothrow access alloc_size alloc_align transparent_union vector_size mode may_alias deprecated externally_visible retain fallthrough cleanup sentinel warning error tls_model".split())
+                      name=attr[1].strip("_")
+                      print("NATIVE_UNSUPPORTED_GNU_ATTR="+(name if name in public else "other"),flush=True)
+                  for tag,phrase in {
+                      "non_natural_alignment":"non-natural declarator alignment",
+                      "alignment_layout":"aligned declarator requires complete layout",
+                      "alignment_function":"function alignment requires backend support",
+                      "atomic_duplicate":"duplicate C11 _Atomic qualification",
+                      "atomic_object_layout":"C11 _Atomic requires supported scalar or one-byte aggregate layout",
+                      "atomic_incomplete_scalar":"C11 _Atomic requires complete scalar storage",
+                      "atomic_natural_alignment":"C11 _Atomic requires naturally aligned storage",
+                      "atomic_width_alignment":"unsupported C11 _Atomic width or alignment",
+                      "atomic_aggregate_use":"atomic aggregate storage or executable use requires backend support",
+                      "atomic_aggregate_member":"member access of atomic aggregate is unsupported",
+                      "atomic_cast":"C11 _Atomic type is unsupported in casts",
+                      "atomic_native_scalar":"C11 _Atomic source requires a native LP64 qualified scalar",
+                      "atomic_scalar_representation":"unsupported C11 atomic scalar representation",
+                      "atomic_native_alignment":"C11 _Atomic requires naturally aligned 1/2/4/8-byte storage",
+                      "atomic_pointer_target":"GNU atomics require a checked 64-bit pointer target",
+                      "atomic_bitwise":"atomic bitwise fetch requires an integer object",
+                      "atomic_width":"unsupported atomic scalar width",
+                      "atomic_builtin_layout":"atomic object requires a naturally aligned 8/16/32/64-bit scalar",
+                      "atomic_expected_pointer":"atomic compare-exchange expected pointer requires matching writable scalar type",
+                      "atomic_pointer_offset":"atomic pointer fetch requires integer byte offset",
+                      "atomic_weak":"atomic compare-exchange weak flag must be 0 or 1",
+                      "atomic_order_constant":"requires an integer constant expression",
+                      "atomic_effect_type":"effect-only GNU atomic builtin has non-void result",
+                      "atomic_compare_type":"atomic compare-exchange result must have C _Bool type",
+                      "annotation_size":"GNU annotated source too large",
+                      "annotation_count":"too many GNU annotations",
+                      "annotation_mixed":"mixed GNU advisory and symbol binding",
+                      "annotation_orphan":"GNU annotation not attached",
+                      "annotation_ambiguous":"ambiguous GNU annotation span",
+                      "tls_definition":"TLS address",
+                      "expected_type":"expected type",
+                      "statement_transfer":"checked statement expression unexpectedly terminated",
+                      "frame_slot":"frame slot",
+                      "unsupported_storage":"unsupported local storage class",
+                  }.items():
+                      if phrase in msg:
+                          print("NATIVE_DETAIL="+tag,flush=True)
+                  # Emit only enumerated syntax tokens, never source identifiers or literals.
+                  allowed = {";",",","(",")","{","}","[","]","*","=","...",":","__attribute__","__aligned__","__alignof__","__extension__","__asm__","__typeof__","typeof","_Atomic","_Alignas","_Alignof","_Static_assert","__atomic_load_n","__atomic_store_n","__int128","__float128","__builtin_va_list","__restrict","__restrict__","volatile","const","struct","union","enum","typedef","inline","int","char","void","long","short","unsigned","signed","float","double"}
+                  m = re.search(r"expected '([^'\n]*)', found '([^'\n]*)'", msg)
+                  if m:
+                      print("TOKEN_EXPECTED="+(m[1] if m[1] in allowed else "other"),flush=True)
+                      print("TOKEN_FOUND="+(m[2] if m[2] in allowed else "other"),flush=True)
+                  elif "found end of input" in msg:
+                      print("TOKEN_FOUND=eof",flush=True)
+                  # Public header families and fixed diagnostic phrases only.
+                  for tag,pattern in {"stdatomic":r"\bstdatomic\.h\b","stddef":r"\bstddef\.h\b","stdint":r"\bstdint\.h\b","stdlib":r"\bstdlib\.h\b","atomic_type":r"atomic type|_Atomic","gnu_attribute":r"__attribute__|__aligned__","unsupported_type":r"unsupported (?:source |scalar |C )?type|type[^\n]{0,40}unsupported","unsupported_builtin":r"unsupported (?:compiler )?builtin","unsupported_declaration":r"unsupported declaration","unsupported_argument":r"unsupported (?:call )?argument","unsupported_parameter":r"unsupported (?:formal )?parameter","unsupported_global":r"unsupported global","unsupported_record":r"unsupported (?:record|aggregate)","unsupported_op":r"unsupported (?:operator|opcode|operation)","unknown_type":r"unknown type|unknown typedef"}.items():
+                      if re.search(pattern,msg,re.I):print("DIAG_TAG="+tag,flush=True)
+                  codes=sorted(set(re.findall(r'\b[PLST][0-9]{4}\b',msg)))
+                  cats={"preprocessor":r"preprocess", "atomic":r"atomic", "syntax":r"syntax|parse|unexpected token", "type":r"type|semantic", "unsupported":r"unsupported|not implemented", "abi":r"abi|calling convention", "panic":r"panicked|segmentation fault"}
+                  print(f"MINIC_SAMPLE={i} GCC_EXIT={gcc} NATIVE_EXIT={rc} ELF={int(out.is_file() and out.open('rb').read(4)==bytes([127,69,76,70]))}")
+                  print("MINIC_DIAG_IDS="+",".join(codes))
+                  print("MINIC_DIAG_CATEGORIES="+",".join(k for k,v in cats.items() if re.search(v,msg,re.I)))
+                  failures+=int(rc!=0 or not out.is_file() or gcc!=0)
+              raise SystemExit(int(failures!=0))
+          PY
+
+      - name: Enforce focused regression gate
+        if: always()
+        run: test "${{ steps.focused.outcome }}" = success
