@@ -1,0 +1,745 @@
+# Compiler-owned regression validation and optional coverage; no new recurring schedule.
+name: RG1 regression runner validation and optional coverage
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - '.github/workflows/rg2-coverage-baseline.yml'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Compiler source ref (defaults to current main)
+        default: main
+        type: string
+      lane:
+        description: Targeted campaign (PRs run core smoke only)
+        default: smoke
+        type: choice
+        options:
+          - smoke
+          - core-full
+          - infrastructure
+          - core-build
+          - core-tests
+          - doctest
+          - gcc
+          - minic
+          - native-smoke
+          - oberon
+          - edg
+          - all
+      isolate_build_failures:
+        description: Retry individual crates after aggregate compilation failure (expensive)
+        default: false
+        type: boolean
+      coverage:
+        description: Optional source coverage measurement (P1)
+        default: false
+        type: boolean
+permissions:
+  contents: read
+concurrency:
+  group: rg-regression-${{ github.ref }}-${{ github.event_name }}-${{ github.event.label.name || inputs.lane || 'smoke' }}-${{ inputs.source_ref || 'candidate' }}-${{ inputs.coverage || false }}
+  cancel-in-progress: true
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+jobs:
+  doctest:
+    if: inputs.lane == 'doctest' || github.event.label.name == 'rg-doctest'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || 'main' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify RISC-V documentation examples
+        working-directory: compiler
+        run: |
+          git rev-parse HEAD
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text('[workspace]\nresolver = "2"\nmembers = ["crates/ir", "crates/backend", "crates/backend-riscv64"]\n')
+          PY
+          status=0
+          CARGO_TERM_COLOR=never cargo test -p compiler-backend-riscv64 --doc > "$RUNNER_TEMP/rg-doctest.log" 2>&1 || status=$?
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          log = (Path(os.environ["RUNNER_TEMP"]) / "rg-doctest.log").read_text(errors="replace")
+          results = re.findall(r"test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;", log)
+          print("Doctest aggregate:", results)
+          assert results and all(int(row[1]) == 0 for row in results)
+          PY
+          exit "$status"
+  core-build:
+    if: inputs.lane == 'core-build' || inputs.lane == 'core-tests' || github.event.label.name == 'rg-core-build' || github.event.label.name == 'rg-core-tests'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || 'main' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Isolate credential-independent core workspace
+        working-directory: compiler
+        run: |
+          git rev-parse HEAD
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text('''[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          ''')
+          PY
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/index.crates.io-*
+            ~/.cargo/registry/cache/index.crates.io-*
+          key: rg-public-registry-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('compiler/**/Cargo.toml', 'compiler/**/Cargo.lock') }}
+          restore-keys: |
+            rg-public-registry-v2-${{ runner.os }}-${{ runner.arch }}-
+      - name: Provision ordinary native test dependencies
+        if: inputs.lane == 'core-tests' || github.event.label.name == 'rg-core-tests'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends z3 gdb gcc-aarch64-linux-gnu qemu-user
+      - name: Run ordinary core tests with failure fingerprints
+        if: inputs.lane == 'core-tests' || github.event.label.name == 'rg-core-tests'
+        working-directory: compiler
+        run: |
+          CARGO_TERM_COLOR=never python3 tools/regression.py --profile core --suite cargo-tests --no-isolate-build-failures --output target/regression-core-tests
+      - name: Run compile-only core gate
+        if: inputs.lane == 'core-build' || github.event.label.name == 'rg-core-build'
+        working-directory: compiler
+        run: |
+          python3 -m unittest discover -s tools -p test_regression.py
+          CARGO_TERM_COLOR=never python3 tools/regression.py --profile core --suite cargo-build --output target/regression-build-preflight
+  coverage:
+    if: (github.event_name == 'pull_request' && (github.event.action != 'labeled' || github.event.label.name == 'rg-core-full' || github.event.label.name == 'rg-all' || github.event.label.name == 'rg-infrastructure')) || inputs.lane == 'infrastructure' || inputs.lane == 'smoke' || inputs.lane == 'core-full' || inputs.lane == 'all' || inputs.coverage == true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout private compiler
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || 'main' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record exact revision and isolate core workspace
+        working-directory: compiler
+        run: |
+          git rev-parse HEAD
+          rustc -vV
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text('''[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          ''')
+          PY
+      - name: Restore public Cargo registry archives (no private Git sources or compiler artifacts)
+        id: public-registry
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/index.crates.io-*
+            ~/.cargo/registry/cache/index.crates.io-*
+          key: rg-public-registry-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('compiler/**/Cargo.toml', 'compiler/**/Cargo.lock') }}
+          restore-keys: |
+            rg-public-registry-v2-${{ runner.os }}-${{ runner.arch }}-
+      - name: Check runner orchestration
+        working-directory: compiler
+        run: |
+          python3 -m unittest discover -s tools -p test_regression.py
+          python3 -m unittest discover -s tools -p test_csmith_probe.py
+          python3 -m py_compile tools/mini-c-driver/tests/differential.py
+          python3 tools/regression.py --frontend-suite c --c-frontend minic --list
+          python3 tools/regression.py --frontend-suite minic-tests --frontend-suite edg-tests --list
+          python3 tools/regression.py --profile core --tier full --gcc-abi quick --frontend-suite c --frontend-suite minic-tests --c-frontend minic --list > "$RUNNER_TEMP/rg-combined-plan.txt"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          lines = (Path(os.environ["RUNNER_TEMP"]) / "rg-combined-plan.txt").read_text().splitlines()
+          names = [line.split()[0] for line in lines if line.split()]
+          for suite in ("cargo-build", "cargo-tests", "alive-solver", "aarch64-native",
+                        "frontend-minic-build", "gcc-fetch", "gcc-abi", "c-minic",
+                        "standalone-minic-tests"):
+              assert names.count(suite) == 1, (suite, names.count(suite))
+          assert "gcc-minic-build" not in names, "duplicate Mini-C build"
+          print("Combined regression plan retains all gates and one Mini-C driver build")
+          PY
+          python3 tools/regression.py --python tools/typeid-rule-gen/test_batch_distributive_carry.py --output target/regression-rule-generator
+          python3 tools/regression.py --profile core --coverage --list
+          python3 tools/regression.py --fixture 'cse_*.ir' --fixture 'dce_*.ir' --list
+          python3 tools/regression.py --package compiler-ir --package compiler-opt --lib --list
+          python3 tools/regression.py --python 'test_check_*.py' --list
+          python3 tools/regression.py --gcc-abi quick --gcc-prefix scalar-return- --gcc-adapters /tmp/adapters.json --list
+          python3 tools/regression.py --gcc-abi full --gcc-adapters /tmp/adapters.json --list
+          python3 tools/regression.py --gcc-abi quick --gcc-prefix scalar-by-value-2 --list
+          python3 tools/regression.py --profile core --generated 'typeid_fuzz_*' --smt --list
+          python3 tools/regression.py --python 'tests/gcc/test_*.py' --output target/regression-gcc-harness
+          python3 tools/regression.py --python 'test_check_*.py' --output target/regression-python-smoke
+          if python3 tools/regression.py --fixture 'nonexistent-fixture-*.ir' --list; then exit 1; fi
+      - name: Validate shared C reference corpus without building frontends
+        working-directory: compiler
+        run: |
+          status=0
+          python3 tools/mini-c-driver/tests/differential.py --shared-only --reference-only --artifacts target/regression-c-reference >target/shared-c-reference.log 2>&1 || status=$?
+          python3 - <<'PY'
+          import json
+          from collections import Counter
+          from pathlib import Path
+          rows = [json.loads(p.read_text()) for p in Path('target/regression-c-reference').glob('shared-*/run.json')]
+          expected = len(json.loads(Path('tests/c/fixtures/manifest.json').read_text()))
+          print('Shared C GCC-only reference results:', dict(Counter(row['status'] for row in rows)), 'expected:', expected)
+          assert len(rows) == expected
+          tally = json.loads(Path('target/regression-c-reference/summary.json').read_text())
+          assert tally['counts'].get('shared/reference-passed', 0) == expected
+          PY
+          exit "$status"
+      - name: Resolve canonical Mini-C corpus revision
+        id: minic-corpus
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import tomllib
+          from pathlib import Path
+          print("sha=" + tomllib.loads(Path("compiler/tools/mini-c-driver/Cargo.toml").read_text())["dependencies"]["mini-c-syntax"]["rev"])
+          PY
+      - name: Checkout exact Mini-C libc corpus and validator
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: ${{ steps.minic-corpus.outputs.sha }}
+          path: mini-c
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          sparse-checkout: |
+            /tests/fixtures/musl-s9/
+            /tests/fixtures/musl-s10/
+            /tools/test_musl_s10.py
+            /tools/test_cranelift.py
+            /tools/test_*_native.py
+          sparse-checkout-cone-mode: false
+      - name: Validate pinned musl and hosted glibc references without native frontend builds
+        working-directory: compiler
+        run: |
+          python3 tools/mini-c-driver/tests/s9_native.py --reference-only --corpus ../mini-c/tests/fixtures/musl-s9 --artifacts target/regression-musl-reference --report target/regression-musl-reference.json >target/musl-reference.log 2>&1
+          python3 tools/mini-c-driver/tests/s12_p4_native.py --reference-only --artifacts target/regression-glibc-reference >target/glibc-reference.log 2>&1
+          python3 tools/mini-c-driver/tests/s10_native.py --reference-only --minic-root ../mini-c --report target/regression-musl-s10-reference.json >target/musl-s10-reference.log 2>&1
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path('target/regression-musl-reference.json').read_text())
+          assert report['passed'] == report['total'] == 12
+          s10 = json.loads(Path('target/regression-musl-s10-reference.json').read_text())
+          assert s10['total'] == 24 and sum(s10['stages'].values()) == 24
+          print('Pinned musl S9 reference: 12/12; hosted glibc S12 reference: passed')
+          print('Pinned musl S10 acceptance reference audit:', s10['gcc_syntax'], 'syntax accepted;', s10['stages'])
+          PY
+      - name: Validate focused upstream C and callback references without native builds
+        working-directory: compiler
+        run: |
+          python3 tools/mini-c-driver/tests/three_way_parity.py --suite upstream --reference-only --cranelift-source-root ../mini-c --case 'c99_func_*' --case gcc_calls_mini_f64 --case mini_calls_gcc_variadic_fixed_sse_and_ellipsis --artifacts target/regression-upstream-reference >target/upstream-reference.log 2>&1
+          python3 tools/mini-c-driver/tests/s13_p5c_native.py --reference-only --artifacts target/regression-callback-reference >target/callback-reference.log 2>&1
+          python3 tools/mini-c-driver/tests/p5c_indirect_gp_native.py --reference-only >target/indirect-reference.log 2>&1
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path('target/regression-upstream-reference/summary.json').read_text())
+          assert report['total'] > 0 and report['counts'].get('pass', 0) == report['total']
+          print('Focused upstream C reference:', report['total'], 'passed; callback and indirect varargs references passed')
+          PY
+      - name: Validate selected specialized C99 reference contracts
+        working-directory: compiler
+        run: |
+          python3 tools/mini-c-driver/tests/three_way_parity.py --suite specialized --reference-only --cranelift-source-root ../mini-c --case 'compound:scalar_lvalue_address' --case 'ptrdiff:positive_negative_int_elements' --case 'goto:forward_branch' --case 'switch:fallthrough_and_default' --case 'bitfield:unsigned_adjacent' --case 'designated:sparse_auto_array_and_cursor' --case 'completed_tag_members:named_struct_by_value_auto' --case 'static_compound:global_scalar_address' --case 'bitfield_init:continue_global_elided_nested_struct' --artifacts target/regression-specialized-reference >target/specialized-reference.log 2>&1
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path('target/regression-specialized-reference/summary.json').read_text())
+          assert report['total'] == 9 and report['counts'].get('pass', 0) == 9
+          print('Specialized C99 reference cases: 9/9')
+          PY
+      - name: Provision native, solver and cross-target tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y z3
+          if [[ '${{ inputs.lane }}' == core-full || '${{ inputs.lane }}' == all || '${{ github.event.label.name == 'rg-core-full' || github.event.label.name == 'rg-all' }}' == true ]]; then
+            sudo apt-get install -y gdb gcc-aarch64-linux-gnu qemu-user
+          fi
+      - name: Validate focused IR fixture group and exact Rust test
+        working-directory: compiler
+        run: |
+          python3 tools/regression.py --profile core --fixture 'cse_*.ir' --fixture 'dce_*.ir'
+          python3 tools/regression.py --profile core --test compiler-opt:ir_fixture_directives --filter directives_reject_unsafe_and_ambiguous_cases --exact
+          if python3 tools/regression.py --profile core --test compiler-opt:ir_fixture_directives --filter nonexistent_test --exact; then exit 1; fi
+      - name: Run generated optimizer differential with optional SMT
+        working-directory: compiler
+        run: |
+          python3 tools/regression.py --profile core --generated generated_native_oracle --smt --output target/regression-generated
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          result = json.loads(Path('target/regression-generated/summary.json').read_text())
+          proof = next(row for row in result['suites'] if row['suite'] == 'generated-smt')
+          counts = proof['proof_counts']
+          assert sum(counts.values()) == 87, counts
+          assert counts['PROVEN'] > 0 and counts['COUNTEREXAMPLE'] == 0, counts
+          print('Generated proof coverage:', counts)
+          PY
+          pairs=$(python3 -c 'import json; print(json.load(open("target/regression-generated/summary.json"))["generated_proof_pairs"])')
+          python3 tools/regression.py --profile core --proof-pairs "$pairs" --proof-case 'ssa_5_0_opt' --output target/regression-proof-replay
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          result = json.loads(Path('target/regression-proof-replay/summary.json').read_text())
+          proof = next(row for row in result['suites'] if row['suite'] == 'generated-smt')
+          assert proof['proof_counts']['PROVEN'] == 1, proof['proof_counts']
+          print('Saved proof replay passed without rerunning generator')
+          PY
+      - name: Validate changed Rust test infrastructure only
+        if: github.event.label.name == 'rg-infrastructure' || inputs.lane == 'infrastructure'
+        working-directory: compiler
+        run: |
+          CARGO_TERM_COLOR=never python3 tools/regression.py --profile core --test compiler-opt:ir_fixture_directives --test compiler-opt:generated_native_oracle --test compiler-opt:alive_lite --output target/regression-infrastructure
+      - name: Run full-tier regression suite (P0)
+        if: inputs.lane == 'core-full' || inputs.lane == 'all' || github.event.label.name == 'rg-core-full' || github.event.label.name == 'rg-all'
+        working-directory: compiler
+        run: |
+          isolation=--no-isolate-build-failures
+          if [[ '${{ inputs.isolate_build_failures }}' == true ]]; then isolation=--isolate-build-failures; fi
+          python3 tools/regression.py --profile core --tier full "$isolation" --output target/regression-normal
+      - name: Restore public cargo-llvm-cov tool
+        if: inputs.coverage == true
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-llvm-cov
+          key: rg-public-llvm-cov-0.9.2-${{ runner.os }}-${{ runner.arch }}
+      - name: Provision source coverage tools (P1)
+        if: inputs.coverage == true
+        run: |
+          rustup component add llvm-tools-preview
+          if ! cargo llvm-cov --version | grep -Fxq 'cargo-llvm-cov 0.9.2'; then
+            cargo install cargo-llvm-cov --version 0.9.2 --locked --force
+          fi
+          cargo llvm-cov --version
+      - name: Instrument and run core regression suite
+        if: inputs.coverage == true
+        working-directory: compiler
+        run: python3 tools/regression.py --profile core --coverage
+      - name: Publish aggregate coverage and timing (no private file names or source)
+        if: always() && inputs.coverage == true
+        working-directory: compiler
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path('target/regression')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              if not (root / 'summary.json').is_file():
+                  print('Runner did not produce a summary; no coverage measurement.', file=summary)
+                  raise SystemExit(1)
+              result = json.loads((root / 'summary.json').read_text())
+              print('Compiler SHA:', result['source_sha'], file=summary)
+              print('Selected profile passed:', result['selected_passed'], file=summary)
+              for row in result['suites']:
+                  print(row['suite'], row['status'], row.get('seconds', ''), file=summary)
+              if not (root / 'coverage.json').is_file():
+                  print('No coverage report; measurement unavailable.', file=summary)
+                  raise SystemExit(1)
+              data = json.loads((root / 'coverage.json').read_text())
+              counts = {}
+              workspace = Path.cwd().resolve()
+              for unit in data['data']:
+                  for entry in unit['files']:
+                      path = Path(entry['filename']).resolve()
+                      if not path.is_relative_to(workspace):
+                          continue
+                      parts = path.relative_to(workspace).parts
+                      if len(parts) < 4 or parts[0] != 'crates' or parts[2] != 'src':
+                          continue
+                      row = counts.setdefault(parts[1], {})
+                      for key in ('lines', 'functions', 'regions'):
+                          metric = entry['summary'][key]
+                          total = row.setdefault(key, [0, 0])
+                          total[0] += metric['covered']
+                          total[1] += metric['count']
+              if not counts:
+                  print('No production-source coverage found.', file=summary)
+                  raise SystemExit(1)
+              expected = {'ir','opt','backend','backend-x86','backend-aarch64','backend-riscv64','backend-wasm'}
+              print('Missing crate coverage:', ', '.join(sorted(expected - counts.keys())) or 'none', file=summary)
+              for crate, metrics in sorted(counts.items()):
+                  line = crate + ': ' + ', '.join(f'{key} {hit}/{total} ({100*hit/total:.1f}%)' if total else f'{key} n/a' for key, (hit, total) in metrics.items())
+                  print(line, file=summary)
+                  print(line)
+              if expected - counts.keys():
+                  raise SystemExit(1)
+          PY
+
+      - name: Save public Cargo registry archives
+        if: always() && steps.public-registry.outcome == 'success' && steps.public-registry.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/index.crates.io-*
+            ~/.cargo/registry/cache/index.crates.io-*
+          key: ${{ steps.public-registry.outputs.cache-primary-key }}
+
+  gcc-smoke:
+    if: inputs.lane == 'gcc' || inputs.lane == 'minic' || inputs.lane == 'all' || github.event.label.name == 'rg-gcc' || github.event.label.name == 'rg-minic' || github.event.label.name == 'rg-all' || (inputs.lane == 'native-smoke' || github.event.label.name == 'rg-native-smoke')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || 'main' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - uses: actions/cache@v4
+        if: inputs.lane != 'minic' && github.event.label.name != 'rg-minic' && !(inputs.lane == 'native-smoke' || github.event.label.name == 'rg-native-smoke')
+        with:
+          path: compiler/target/gcc-source
+          key: gcc-corpus-1330eed38849ad186518f609c52bd5651c2bfdc1
+      - name: Restore public Cargo registry archives
+        id: public-registry
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/index.crates.io-*
+            ~/.cargo/registry/cache/index.crates.io-*
+          key: rg-public-registry-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('compiler/**/Cargo.toml', 'compiler/**/Cargo.lock') }}
+          restore-keys: |
+            rg-public-registry-v2-${{ runner.os }}-${{ runner.arch }}-
+      - name: Run one original upstream ABI case with automatic adapter
+        if: inputs.lane != 'minic' && github.event.label.name != 'rg-minic' && !(inputs.lane == 'native-smoke' || github.event.label.name == 'rg-native-smoke')
+        working-directory: compiler
+        run: |
+          python3 tools/regression.py --gcc-abi quick --gcc-prefix scalar-by-value-2 --output target/regression-gcc-smoke
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          summary = json.loads(Path('target/regression-gcc-smoke/summary.json').read_text())
+          report = json.loads((Path(summary['gcc_abi_work']) / 'report.json').read_text())
+          for opt in ('-O0', '-O2'):
+              assert any(r['case'] == 'scalar-by-value-2' and opt in r['gcc_flags']
+                         and r['frontends']['minic']['directions'].get('main', {}).get('status') == 'PASS'
+                         for r in report['records']), 'required known native direction did not pass'
+          print('GCC smoke: previously admitted mixed main directions passed at O0/O2')
+          PY
+
+      - name: Resolve canonical Mini-C corpus revision
+        id: minic-corpus
+        if: always() && ((inputs.lane == 'minic' || inputs.lane == 'all' || github.event.label.name == 'rg-minic' || github.event.label.name == 'rg-all') || (inputs.lane == 'native-smoke' || github.event.label.name == 'rg-native-smoke'))
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import tomllib
+          from pathlib import Path
+          print("sha=" + tomllib.loads(Path("compiler/tools/mini-c-driver/Cargo.toml").read_text())["dependencies"]["mini-c-syntax"]["rev"])
+          PY
+      - name: Checkout exact Mini-C libc corpus and validator
+        if: always() && ((inputs.lane == 'minic' || inputs.lane == 'all' || github.event.label.name == 'rg-minic' || github.event.label.name == 'rg-all') || (inputs.lane == 'native-smoke' || github.event.label.name == 'rg-native-smoke'))
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: ${{ steps.minic-corpus.outputs.sha }}
+          path: mini-c
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Build standalone source generator once for explicit Mini-C lane
+        if: always() && (inputs.lane == 'minic' || inputs.lane == 'all' || github.event.label.name == 'rg-minic' || github.event.label.name == 'rg-all')
+        run: |
+          cargo build --manifest-path mini-c/Cargo.toml -p mini-c-fuzz --bin mini-c-fuzz --target-dir "$RUNNER_TEMP/minic-generator" >"$RUNNER_TEMP/minic-generator-build.log" 2>&1
+      - name: Focused native Mini-C acceptance (one build)
+        if: (inputs.lane == 'native-smoke' || github.event.label.name == 'rg-native-smoke')
+        working-directory: compiler
+        run: |
+          python3 tools/regression.py --frontend-suite c --frontend-suite upstream-c --frontend-suite specialized-c --c-case aggregate_places --c-case fp_pointer_memory --c-case record_pointer_abi --upstream-case gcc_calls_mini_f64 --upstream-case mini_calls_gcc_variadic_fixed_sse_and_ellipsis --specialized-case compound:scalar_lvalue_address --specialized-case ptrdiff:positive_negative_int_elements --seed-count 1 --c-frontend minic --output target/regression-minic-native-smoke
+      - name: Provision Csmith for the explicit Mini-C campaign
+        if: always() && (inputs.lane == 'minic' || inputs.lane == 'all' || github.event.label.name == 'rg-minic' || github.event.label.name == 'rg-all')
+        id: minic-csmith
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y csmith libcsmith-dev
+          header="$(find /usr/include /usr/local/include -name csmith.h -print -quit)"
+          test -s "$header"
+          echo "include=$(dirname "$header")" >> "$GITHUB_OUTPUT"
+      - name: Run shared C and libc through the standalone Mini-C driver
+        if: always() && steps.minic-csmith.outcome == 'success' && (inputs.lane == 'minic' || inputs.lane == 'all' || github.event.label.name == 'rg-minic' || github.event.label.name == 'rg-all')
+        working-directory: compiler
+        run: |
+          python3 tools/regression.py --frontend-suite c --frontend-suite libc --frontend-suite upstream-c --frontend-suite specialized-c --frontend-suite upstream-fuzz --minic-fuzzer "$RUNNER_TEMP/minic-generator/debug/mini-c-fuzz" --frontend-suite csmith --csmith-include "${{ steps.minic-csmith.outputs.include }}" --c-frontend minic --seed-count 1 --output target/regression-minic-c
+      - name: Run standalone Mini-C Rust regression workspace
+        if: always() && (inputs.lane == 'minic' || inputs.lane == 'all' || github.event.label.name == 'rg-minic' || github.event.label.name == 'rg-all')
+        working-directory: compiler
+        run: python3 tools/regression.py --frontend-suite minic-tests --output target/regression-minic-rust
+      - name: Save public Cargo registry archives
+        if: always() && steps.public-registry.outcome == 'success' && steps.public-registry.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/index.crates.io-*
+            ~/.cargo/registry/cache/index.crates.io-*
+          key: ${{ steps.public-registry.outputs.cache-primary-key }}
+
+  oberon-regression:
+    if: inputs.lane == 'oberon' || inputs.lane == 'all' || github.event.label.name == 'rg-oberon' || github.event.label.name == 'rg-all'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || 'main' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Resolve pinned Oberon frontend
+        id: oberon
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import tomllib
+          from pathlib import Path
+          print("sha=" + tomllib.loads(Path("compiler/crates/driver/Cargo.toml").read_text())["dependencies"]["oberon-front-ir"]["rev"])
+          PY
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/oberon
+          ref: ${{ steps.oberon.outputs.sha }}
+          path: oberon
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Restore public Cargo registry archives
+        id: public-registry
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/index.crates.io-*
+            ~/.cargo/registry/cache/index.crates.io-*
+          key: rg-public-registry-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('compiler/**/Cargo.toml', 'compiler/**/Cargo.lock') }}
+          restore-keys: |
+            rg-public-registry-v2-${{ runner.os }}-${{ runner.arch }}-
+      - name: Build exact reference generators
+        run: |
+          cargo build --manifest-path oberon/oberon/Cargo.toml --bin obgen --bin obc
+      - name: Execute native and generated Oberon tests
+        working-directory: compiler
+        run: |
+          python3 tools/regression.py --frontend-suite oberon \
+            --obgen "$GITHUB_WORKSPACE/oberon/oberon/target/debug/obgen" \
+            --obc "$GITHUB_WORKSPACE/oberon/oberon/target/debug/obc" \
+            --seed-count 1 --output target/regression-oberon
+      - name: Save public Cargo registry archives
+        if: always() && steps.public-registry.outcome == 'success' && steps.public-registry.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/index.crates.io-*
+            ~/.cargo/registry/cache/index.crates.io-*
+          key: ${{ steps.public-registry.outputs.cache-primary-key }}
+
+  edg-regression:
+    if: inputs.lane == 'edg' || inputs.lane == 'all' || github.event.label.name == 'rg-edg' || github.event.label.name == 'rg-all' || (inputs.lane == 'native-smoke' || github.event.label.name == 'rg-native-smoke')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    container:
+      image: ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8
+    defaults:
+      run:
+        shell: edg-container-exec "bash -eo pipefail {0}"
+    env:
+      EDG_SOURCE_SHA: b195677be8b9b56c8337afad6be8064d21a54082
+      EDG_RELEASE_TAG: edgcpfe-v2026.11.14-upstream-177765bb7731
+      EDG_RELEASE_SHA256: 1ce495b629924f31382ecccc891a7a72caae1014ddfa2ba7dd39b44d8b0a9526
+      EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+      EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+      EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+      EDGCPP_EDG_REVISION: b195677be8b9b56c8337afad6be8064d21a54082
+      CARGO_PROFILE_DEV_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || 'main' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingundu/edgcpp
+          ref: b195677be8b9b56c8337afad6be8064d21a54082
+          path: edgcpp
+          persist-credentials: false
+      - name: Read compiler-pinned EDG bridge SHA
+        id: bridge
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import tomllib
+          from pathlib import Path
+          print("sha=" + tomllib.loads(Path("compiler/tools/edg-driver/Cargo.toml").read_text())["dependencies"]["edgcpp"]["rev"])
+          PY
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/edgcpp-rust
+          ref: ${{ steps.bridge.outputs.sha }}
+          path: edgcpp-rust
+          persist-credentials: false
+      - name: Restore verified public EDG archive download
+        id: edg-archive-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: edgcpp/build/prebuilt-edg/archive.tar.gz
+          key: rg-edg-public-archive-${{ env.EDG_RELEASE_SHA256 }}
+      - name: Restore verified public YARPGen archive download
+        if: ${{ !(inputs.lane == 'native-smoke' || github.event.label.name == 'rg-native-smoke') }}
+        id: yarpgen-archive-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/yarpgen/archive.tar.gz
+          key: rg-yarpgen-public-archive-fc3c7c80c10c67782c03f9d8b70c426f942332e78701397a14a5edff81cbc2e8
+      - name: Configure matching EDG headers and checked prebuilt callable archive
+        id: edg-archive-verified
+        working-directory: edgcpp
+        env:
+          EDG_BASE: ${{ github.workspace }}/edgcpp/bases/docker/dev-env/gcc
+        run: |
+          test "$(git rev-parse HEAD)" = "$EDG_SOURCE_SHA"
+          cmake --preset linux-gcc-release -DEDG_BUILD_LIB=OFF -DEDG_BUILD_CALLABLE_LIBRARY=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          cmake --build build/gcc-release --target error-info --parallel 2
+          mkdir -p build/gcc-release/lib build/prebuilt-edg
+          if ! printf '%s  %s\n' "$EDG_RELEASE_SHA256" build/prebuilt-edg/archive.tar.gz | sha256sum -c --status; then
+            curl --fail --location --silent --show-error --retry 4 \
+              "https://github.com/bingundu/edgcpp/releases/download/$EDG_RELEASE_TAG/edgcpfe-ci-upstream-callable-edg-release-20261114-linux-x86_64.tar.gz" \
+              -o build/prebuilt-edg/archive.tar.gz
+          fi
+          printf '%s  %s\n' "$EDG_RELEASE_SHA256" build/prebuilt-edg/archive.tar.gz | sha256sum -c -
+          tar -xzf build/prebuilt-edg/archive.tar.gz -C build/prebuilt-edg
+          grep -Fx "commit=$EDG_SOURCE_SHA" build/prebuilt-edg/BUILD-INFO.txt
+          cp build/prebuilt-edg/lib/libedgcpfe.a build/gcc-release/lib/libedgcpfe.a
+      - name: Save checksum-verified public EDG archive before native tests
+        if: steps.edg-archive-verified.outcome == 'success' && steps.edg-archive-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: edgcpp/build/prebuilt-edg/archive.tar.gz
+          key: ${{ steps.edg-archive-cache.outputs.cache-primary-key }}
+      - name: Build source-pinned native EDG driver and configure launcher
+        id: edg-build
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          if ! command -v cargo >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.99.1
+          fi
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
+          cargo build --manifest-path compiler/tools/edg-driver/Cargo.toml
+          test -x compiler/tools/edg-driver/target/debug/compiler-edg-driver
+          cat > "$RUNNER_TEMP/edg-launcher" <<'SH'
+          #!/usr/bin/env bash
+          set -e
+          cd "$GITHUB_WORKSPACE/edgcpp/build/gcc-release"
+          source environment.sh
+          exec "$GITHUB_WORKSPACE/compiler/tools/edg-driver/target/debug/compiler-edg-driver" "$@"
+          SH
+          chmod +x "$RUNNER_TEMP/edg-launcher"
+      - name: Resolve canonical Mini-C corpus revision
+        id: minic-corpus
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import tomllib
+          from pathlib import Path
+          print("sha=" + tomllib.loads(Path("compiler/tools/mini-c-driver/Cargo.toml").read_text())["dependencies"]["mini-c-syntax"]["rev"])
+          PY
+      - name: Checkout exact Mini-C libc corpus and validator
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: ${{ steps.minic-corpus.outputs.sha }}
+          path: mini-c
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Build standalone source generator once for explicit EDG lane
+        if: ${{ !(inputs.lane == 'native-smoke' || github.event.label.name == 'rg-native-smoke') }}
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo build --manifest-path mini-c/Cargo.toml -p mini-c-fuzz --bin mini-c-fuzz --target-dir "$RUNNER_TEMP/minic-generator" >"$RUNNER_TEMP/minic-generator-build.log" 2>&1
+      - name: Focused native EDG acceptance (one build)
+        if: (inputs.lane == 'native-smoke' || github.event.label.name == 'rg-native-smoke')
+        working-directory: compiler
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          python3 tools/regression.py --frontend-suite c --frontend-suite upstream-c --frontend-suite specialized-c --c-case aggregate_places --c-case fp_pointer_memory --c-case record_pointer_abi --upstream-case gcc_calls_mini_f64 --upstream-case mini_calls_gcc_variadic_fixed_sse_and_ellipsis --specialized-case compound:scalar_lvalue_address --specialized-case ptrdiff:positive_negative_int_elements --seed-count 1 --c-frontend edg --edg-driver "$RUNNER_TEMP/edg-launcher" --output target/regression-edg-native-smoke
+      - name: Run common portable C corpus using native EDG
+        if: ${{ !(inputs.lane == 'native-smoke' || github.event.label.name == 'rg-native-smoke') }}
+        working-directory: compiler
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          python3 tools/regression.py --frontend-suite c --frontend-suite libc --frontend-suite upstream-c --frontend-suite specialized-c --frontend-suite upstream-fuzz --minic-fuzzer "$RUNNER_TEMP/minic-generator/debug/mini-c-fuzz" --c-frontend edg --edg-driver "$RUNNER_TEMP/edg-launcher" --seed-count 1 --output target/regression-edg-c
+      - name: Run standalone EDG Rust regression workspace
+        if: always() && steps.edg-build.outcome == 'success' && !(inputs.lane == 'native-smoke' || github.event.label.name == 'rg-native-smoke')
+        working-directory: compiler
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          python3 tools/regression.py --frontend-suite edg-tests --output target/regression-edg-rust
+      - name: Provision existing Csmith and verified YARPGen
+        id: generators
+        if: always() && steps.edg-build.outcome == 'success' && !(inputs.lane == 'native-smoke' || github.event.label.name == 'rg-native-smoke')
+        run: |
+          if command -v apt-get >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y csmith libcsmith-dev gcc clang
+          elif command -v dnf >/dev/null; then
+            sudo dnf install -y csmith csmith-devel clang gcc
+          elif command -v zypper >/dev/null; then
+            sudo zypper --non-interactive install csmith clang gcc
+          else
+            echo 'Unsupported EDG container package manager'; cat /etc/os-release; exit 2
+          fi
+          header="$(find /usr/include /usr/local/include -name csmith.h -print -quit)"
+          test -s "$header"
+          echo "CSMITH_INCLUDE=$(dirname "$header")" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/yarpgen"
+          if ! printf '%s  %s\n' fc3c7c80c10c67782c03f9d8b70c426f942332e78701397a14a5edff81cbc2e8 "$RUNNER_TEMP/yarpgen/archive.tar.gz" | sha256sum -c --status; then
+            curl --fail --location --silent --show-error --retry 3 \
+              "https://github.com/bingundu/yarpgen/releases/download/yarpgen-binary-20261028-1/yarpgen-linux-x86_64.tar.gz" \
+              -o "$RUNNER_TEMP/yarpgen/archive.tar.gz"
+          fi
+          printf '%s  %s\n' fc3c7c80c10c67782c03f9d8b70c426f942332e78701397a14a5edff81cbc2e8 "$RUNNER_TEMP/yarpgen/archive.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/yarpgen/archive.tar.gz" -C "$RUNNER_TEMP/yarpgen"
+      - name: Save checksum-verified public YARPGen archive before native tests
+        if: always() && steps.generators.outcome == 'success' && steps.yarpgen-archive-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/yarpgen/archive.tar.gz
+          key: ${{ steps.yarpgen-archive-cache.outputs.cache-primary-key }}
+      - name: Run original Csmith and YARPGen against native EDG
+        if: always() && steps.generators.outcome == 'success'
+        working-directory: compiler
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          python3 tools/regression.py --frontend-suite csmith --frontend-suite yarpgen \
+            --c-frontend edg --edg-driver "$RUNNER_TEMP/edg-launcher" \
+            --edg-sha "${{ steps.bridge.outputs.sha }}" --edg-compiler-sha "$(git rev-parse HEAD)" \
+            --csmith-include "$CSMITH_INCLUDE" --seed-count 1 \
+            --yarpgen-harness "$GITHUB_WORKSPACE/edgcpp-rust/tools/yarpgen_smoke.py" \
+            --yarpgen-binary "$RUNNER_TEMP/yarpgen/yarpgen-linux-x86_64/yarpgen" \
+            --output target/regression-edg-generators
