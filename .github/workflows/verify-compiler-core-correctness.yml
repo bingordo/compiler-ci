@@ -1,97 +1,29 @@
 name: Compiler IR and native correctness (compiler-ci)
-
-# The source repository may have no remaining Actions minutes. Check its
-# immutable main SHA here instead; cached successes skip Cargo entirely.
+# Temporary focused validation for compiler PR 3815; do not merge.
 on:
-  workflow_dispatch:
-    inputs:
-      source_ref:
-        description: 'Compiler source ref (commit SHA, branch or tag)'
-        required: false
-        default: 'main'
-        type: string
-      force_recheck:
-        description: 'Rerun tests even if this source and workflow passed'
-        required: false
-        default: false
-        type: boolean
-  schedule:
-    - cron: '9,24,39,54 * * * *'
   pull_request:
     paths:
       - '.github/workflows/verify-compiler-core-correctness.yml'
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/verify-compiler-core-correctness.yml'
-
 permissions:
   contents: read
-
-concurrency:
-  # PR validations must not cancel scheduled/push verification of compiler main.
-  group: compiler-native-correctness-${{ github.event.pull_request.number || github.event.inputs.source_ref || 'main' }}
-  cancel-in-progress: true
-
 jobs:
-  native:
+  p16-timing:
     runs-on: ubuntu-24.04
-    timeout-minutes: 23
+    timeout-minutes: 20
     steps:
-      - name: Checkout workflow for cache-key versioning
-        uses: actions/checkout@v4
-      - name: Checkout private compiler source using read-only CI deploy key
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ inputs.source_ref || 'main' }}
+          ref: 709ff93698ece622ea877c9738ce24ad23ffc264
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Record exact source revision
-        id: source
-        shell: bash
+      - name: Verify source and isolate workspace
         working-directory: compiler
         run: |
           set -euo pipefail
-          sha="$(git rev-parse HEAD)"
-          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "Compiler source SHA: $sha"
-          # Fail rather than silently accepting a moved/absent test suite.
-          for test_source in \
-            crates/opt/tests/native_cfg_differential.rs \
-            crates/opt/tests/loop_trap_semantics.rs \
-            crates/opt/tests/memory_execution_oracle.rs \
-            crates/opt/tests/phi_native.rs \
-            crates/backend-x86/tests/division_native.rs \
-            crates/ir/tests/verifier_mutations.rs \
-            crates/opt/tests/alias_phi_exhaustive.rs \
-            crates/opt/tests/pre_licm_semantic_matrix.rs \
-            crates/opt/tests/induction_native.rs \
-            crates/opt/tests/mem2reg_native.rs; do
-            test -s "$test_source"
-          done
-      - name: Skip source revisions already proven by this workflow version
-        id: validated
-        uses: actions/cache/restore@v4
-        with:
-          path: .compiler-native-validated
-          key: compiler-native-v1-${{ hashFiles('.github/workflows/verify-compiler-core-correctness.yml') }}-${{ steps.source.outputs.sha }}
-          lookup-only: true
-      - name: Report existing passing evidence
-        if: steps.validated.outputs.cache-hit == 'true' && !inputs.force_recheck
-        env:
-          SOURCE_SHA: ${{ steps.source.outputs.sha }}
-        run: echo "Unchanged source commit $SOURCE_SHA already passed all native CFG correctness checks." >> "$GITHUB_STEP_SUMMARY"
-      - name: Use credential-independent source workspace
-        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
-        shell: bash
-        working-directory: compiler
-        run: |
-          set -euo pipefail
-          # The source Cargo workspace otherwise resolves private Oberon even
-          # for -p compiler-opt. This modifies only the runner checkout.
+          test "$(git rev-parse HEAD)" = 709ff93698ece622ea877c9738ce24ad23ffc264
+          git rev-parse HEAD
           python3 - <<'PY'
           from pathlib import Path
           Path('Cargo.toml').write_text("""[workspace]
@@ -99,444 +31,31 @@ jobs:
           members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
           """)
           PY
-      # Cargo may need to download a new dependency on a cold cache or after a lockfile change.
-      # Never force --offline: rust-cache is an optimization, not a correctness dependency.
-      - name: Reuse Rust compiler core object files
-        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
         with:
           workspaces: compiler -> target
-          key: native-cfg-correctness-v1
-          cache-workspace-crates: 'true'
-      - name: P18 x86 native mutant witness and no-op oracle sensitivity
-        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
-        shell: bash
+          key: p16-timing
+      - name: Compile harness separately
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test al05_p9_mixed_native_bridge --no-run
+      - name: Execute P14 P15 P16 x86 with phase timing
         working-directory: compiler
         run: |
           set -euo pipefail
-          timeout --signal=TERM --kill-after=10s 6m \
-            cargo test -p compiler-opt --test al05_p9_mixed_native_bridge \
-              al05_p18_native_sensitivity::al05_p18_native_x86_elf_gas_negative_oracle_sensitivity \
-              -- --exact --nocapture \
-            2>&1 | tee "$RUNNER_TEMP/al05-p18-x86.log"
-          grep -F 'test al05_p18_native_sensitivity::al05_p18_native_x86_elf_gas_negative_oracle_sensitivity ... ok' "$RUNNER_TEMP/al05-p18-x86.log"
+          for test in al05_p14_generated_dag_native_x86_elf_and_gas_match_c11 al05_p15_generated_phi_extremes_native_x86_elf_and_gas_match_c11 al05_p16_coverage_guided_native_x86_elf_gas_c11; do
+            cargo test -p compiler-opt --test al05_p9_mixed_native_bridge "$test" -- --exact --nocapture 2>&1 | tee -a "$RUNNER_TEMP/native-timing.log"
+            grep -F "test $test ... ok" "$RUNNER_TEMP/native-timing.log"
+          done
+          for phase in select-fixtures generate-and-cse emit-elf emit-gas compile-c11 link-elf link-gas execute-elf execute-gas native-total test-total; do
+            grep -F "AL05_TEST_TIMING family=P16 arch=x86_64 phase=$phase elapsed_us=" "$RUNNER_TEMP/native-timing.log"
+          done
           for format in elf gas; do
-            grep -F "AL05_P18_NATIVE_TARGET arch=x86_64 format=$format" "$RUNNER_TEMP/al05-p18-x86.log"
+            grep -F "AL05_P16_COVERAGE_NATIVE_TARGET arch=x86_64 format=$format functions=48 changed_cse=24 selected=24 modes=8 seeds=8 coefficients=5 comparisons=22416 traps=96 verdict=PASS" "$RUNNER_TEMP/native-timing.log"
           done
-
-      # P17 test must run before unrelated all-crate checks and fail closed.
-      # Source checkout, module parser and independent TypeId reference are
-      # the same production/test infrastructure as P16; no second generator.
-      - name: Validate P17 owned-TypeId mutations and JSON ledger
-        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
-        shell: bash
-        working-directory: compiler
-        run: |
-          set -euo pipefail
-          # Compile once, then measure both test executions without
-          # charging cold Cargo compilation to either one.
-          timeout --signal=TERM --kill-after=10s 6m \
-            cargo test -p compiler-opt --test al05_p9_mixed_native_bridge --no-run
-          p16_begin=$(date +%s%N)
-          timeout --signal=TERM --kill-after=10s 6m \
-            cargo test -p compiler-opt --test al05_p9_mixed_native_bridge \
-              al05_p16_coverage::tests::al05_p16_selector_is_order_independent_bounded_and_nontrivial \
-              -- --exact --nocapture \
-            2>&1 | tee "$RUNNER_TEMP/al05-p16-selector.log"
-          p16_end=$(date +%s%N)
-          p16_ms=$(( (p16_end - p16_begin) / 1000000 ))
-          grep -F "test al05_p16_coverage::tests::al05_p16_selector_is_order_independent_bounded_and_nontrivial ... ok" "$RUNNER_TEMP/al05-p16-selector.log"
-          p17_begin=$(date +%s%N)
-          timeout --signal=TERM --kill-after=10s 6m \
-            cargo test -p compiler-opt --test al05_p9_mixed_native_bridge \
-              al05_p17_selected_mutation_concrete_witnesses -- --exact --nocapture \
-            2>&1 | tee "$RUNNER_TEMP/al05-p17-ledger.log"
-          p17_end=$(date +%s%N)
-          elapsed_ms=$(( (p17_end - p17_begin) / 1000000 ))
-          # A relative ceiling plus small fixed launch/noise allowance:
-          # do not require unstable sub-second relative timing parity.
-          ceiling_ms=$(( p16_ms * 10 + 1500 ))
-          if (( elapsed_ms > ceiling_ms )); then
-            echo "P17 exceeded P16 selector cost ceiling: p16=${p16_ms}ms p17=${elapsed_ms}ms max=${ceiling_ms}ms" >&2
-            exit 1
-          fi
-          echo "AL05_P17_COST p16_selector_ms=${p16_ms} p17_mutations_ms=${elapsed_ms} ceiling_ms=${ceiling_ms} verdict=PASS"
-          python3 - "$RUNNER_TEMP/al05-p17-ledger.log" "$(git rev-parse HEAD)" <<'PY'
-          import collections, json, pathlib, sys
-          lines = pathlib.Path(sys.argv[1]).read_text(errors="replace").splitlines()
-          token = "AL05_P17_MUTATION_LEDGER "
-          rows = [json.loads(line.split(token, 1)[1])
-                  for line in lines if token in line]
-          assert len(rows) == 48, f"expected 48 records, got {len(rows)}"
-          assert len({(r["case_id"], r["mutation_kind"]) for r in rows}) == 48
-          assert len({r["case_id"] for r in rows}) == 24
-          assert collections.Counter(r["mutation_kind"] for r in rows) == {
-              "wrong-loop-phi": 24, "dropped-latch-divs": 24
-          }
-          for row in rows:
-              assert row["schema"] == "al05-p17-mutation-ledger-v1"
-              assert row["source_sha"] == sys.argv[2]
-              assert row["verifier"] == "PASS"
-              assert row["expected_oracle"] == "independent-host-i32-recurrence"
-              assert row["mutant_oracle"] == "bounded-typeid-reference"
-              assert row["witness"] is not None
-              assert row["semantics"] == "FS1-DRAFT-NON-NORMATIVE"
-              assert row["verdict"] == "BOUNDED"
-              expected = {"wrong-loop-phi": "wrong-return",
-                          "dropped-latch-divs": "missing-trap"}[row["mutation_kind"]]
-              assert row["expected_failure_class"] == expected
-              assert row["observed_failure_class"] == expected
-          assert any("AL05_P17_LEDGER_SUMMARY" in line and
-                     "weakened_selector=REJECTED" in line and
-                     "missing_family=REJECTED" in line and
-                     "missing_case=REJECTED" in line and
-                     "unknown=REJECTED" in line and
-                     "host_oracle=INDEPENDENT" in line for line in lines)
-          print("AL05_P17_LEDGER_VALIDATED records=48 cases=24 sha="+sys.argv[2])
-          PY
-          echo "AL05_P17_OWNED_TYPEID_FOCUSED sha=$(git rev-parse HEAD) p16_selector_ms=$p16_ms p17_mutations_ms=$elapsed_ms ceiling_ms=$ceiling_ms records=48 verdict=PASS" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: FS-1 draft pointer roots, effects and actual TypeId optimizer observation barriers
-        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
-        shell: bash
-        working-directory: compiler
-        run: |
-          set -euo pipefail
-          timeout --signal=TERM --kill-after=10s 5m \
-            cargo test -p compiler-ir \
-              --test semantics --test typed_memory_provenance -- --nocapture --test-threads=1 \
-            2>&1 | tee "$RUNNER_TEMP/fs1-pointer-effects-ir.log"
-          grep -F 'FS1_EFFECT_CLASS roots=9 offsets=8 checked=2 loads=5 stores=6 calls=5 pointer_cse_non_speculative=true unknown_calls=conservative verdict=PASS' \
-            "$RUNNER_TEMP/fs1-pointer-effects-ir.log"
-          grep -F 'FS1_POINTER_PROVENANCE valid=1 invalid=10 offset_mints_extent=false raw_pointer_mints_extent=false pointer_type_checks=6 verdict=PASS' \
-            "$RUNNER_TEMP/fs1-pointer-effects-ir.log"
-          timeout --signal=TERM --kill-after=10s 6m \
-            cargo test -p compiler-opt --test fs1_effect_preservation -- --nocapture \
-            2>&1 | tee "$RUNNER_TEMP/fs1-effect-preservation.log"
-          grep -E 'FS1_EFFECT_TRACE modes=2 stages=[1-9][0-9]* events=7 external_calls=3 store_barriers=2 load_barriers=2 mutants=4 verdict=PASS' \
-            "$RUNNER_TEMP/fs1-effect-preservation.log"
-          grep -E 'FS1_BOUNDED_EXTERNAL_MOCK cases=76 modes=2 stages=[1-9][0-9]* observations=3 object=frame0_slot1 uninitialized=UNKNOWN unknown_external=UNKNOWN mutants=7 verdict=PASS' \
-            "$RUNNER_TEMP/fs1-effect-preservation.log"
-          timeout --signal=TERM --kill-after=10s 4m \
-            cargo clippy -p compiler-ir --test semantics \
-              --test typed_memory_provenance -- -D warnings
-          timeout --signal=TERM --kill-after=10s 4m \
-            cargo clippy -p compiler-opt --test fs1_effect_preservation -- -D warnings
-
-      - name: Run native CFG and trap correctness tests
-        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
-        shell: bash
-        working-directory: compiler
-        run: |
-          set -euo pipefail
-          cargo test -p compiler-opt \
-            --test native_cfg_differential \
-            --test loop_trap_semantics \
-            --test memory_execution_oracle \
-            --test phi_native -- --nocapture \
-            2>&1 | tee "$RUNNER_TEMP/native-cfg-tests.log"
-          # Avoid reporting false-green jobs that executed zero meaningful tests.
-          grep -F 'test direct_elf_and_assembly_match_independent_trap_and_pointer_phi_oracles ... ok' "$RUNNER_TEMP/native-cfg-tests.log"
-          grep -F 'test actual_optimizer_passes_preserve_loop_trap_semantics ... ok' "$RUNNER_TEMP/native-cfg-tests.log"
-          cargo test -p compiler-backend-x86 --test division_native -- --nocapture \
-            2>&1 | tee "$RUNNER_TEMP/native-division-tests.log"
-          grep -F 'test signed_divide_quotient_remainder_and_register_lifetimes ... ok' "$RUNNER_TEMP/native-division-tests.log"
-      - name: FS-1 draft exact-width scalar semantics exhaustive and generated checks
-        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
-        shell: bash
-        working-directory: compiler
-        run: |
-          set -euo pipefail
-          timeout --signal=TERM --kill-after=10s 5m \
-            cargo test -p compiler-ir --test fs1_scalar_semantics -- --nocapture --test-threads=1 \
-            2>&1 | tee "$RUNNER_TEMP/fs1-scalar-semantics.log"
-          grep -F 'FS1_SCALAR_DRAFT exhaustive_i8_pairs=65536 signed_unsigned_division=checked' \
-            "$RUNNER_TEMP/fs1-scalar-semantics.log"
-          grep -F 'FS1_SCALAR_DRAFT widths=8,16,32,64,128 shift_modulo=true trap_edges=true' \
-            "$RUNNER_TEMP/fs1-scalar-semantics.log"
-          grep -F 'FS1_SCALAR_DRAFT generated_width_cases=5120' \
-            "$RUNNER_TEMP/fs1-scalar-semantics.log"
-          grep -F 'FS1_SCALAR_DRAFT invalid_is_not_trap=true production_op_flags=aligned' \
-            "$RUNNER_TEMP/fs1-scalar-semantics.log"
-          grep -F 'FS1_SCALAR_BOOL_SELECT cases=60 constbool=2 eager_precomputed_operands=true production_flags=aligned verdict=PASS' \
-            "$RUNNER_TEMP/fs1-scalar-semantics.log"
-          grep -F 'FS1_CTZ_NOT cases=1578 widths=8,16,32,64,128 ctz_zero=width not=masked invalid=rejected flags=aligned verdict=PASS' \
-            "$RUNNER_TEMP/fs1-scalar-semantics.log"
-          grep -F 'FS1_CAST_MATRIX valid_pairs=30 invalid_pairs=45 observations=7950 widths=8,16,32,64,128 sign=host_i128 invalid=rejected verdict=PASS' \
-            "$RUNNER_TEMP/fs1-scalar-semantics.log"
-          timeout --signal=TERM --kill-after=10s 4m \
-            cargo clippy -p compiler-ir --test fs1_scalar_semantics -- -D warnings
-
-      - name: Verify SSA structural mutations and invalid IR are rejected
-        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
-        shell: bash
-        working-directory: compiler
-        run: |
-          set -euo pipefail
-          timeout --signal=TERM --kill-after=10s 4m \
-            cargo test -p compiler-ir --test verifier_mutations -- --nocapture \
-            2>&1 | tee "$RUNNER_TEMP/ssa-verifier-tests.log"
-          grep -F 'test verifier_rejects_deterministic_cfg_corruptions_without_panicking ... ok' "$RUNNER_TEMP/ssa-verifier-tests.log"
-          grep -F 'test pointer_phi_and_allocation_provenance_negative_matrix ... ok' "$RUNNER_TEMP/ssa-verifier-tests.log"
-      - name: Verify loop, alias, PRE, induction, and mem2reg correctness
-        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
-        shell: bash
-        working-directory: compiler
-        run: |
-          set -euo pipefail
-          # Run the four current regression binaries in one Cargo invocation.
-          # These test IR equivalence, native outputs, and explicit refusal of
-          # unsafe transforms; do not add performance timings to this gate.
-          timeout --signal=TERM --kill-after=10s 9m \
-            cargo test -p compiler-opt \
-              --test alias_phi_exhaustive \
-              --test pre_licm_semantic_matrix \
-              --test induction_native \
-              --test mem2reg_native \
-              -- --nocapture \
-            2>&1 | tee "$RUNNER_TEMP/extended-opt-tests.log"
-          grep -F 'test exhaustive_small_phi_hulls_never_miss_real_may_alias ... ok' "$RUNNER_TEMP/extended-opt-tests.log"
-          grep -F 'test pre_licm_mixed_order_semantics_matrix ... ok' "$RUNNER_TEMP/extended-opt-tests.log"
-          grep -F 'test native_multilatch_induction_analysis_recognizes_consistent_steps_only ... ok' "$RUNNER_TEMP/extended-opt-tests.log"
-          grep -F 'test native_assembly_and_elf_match_independent_unsigned_c_reference ... ok' "$RUNNER_TEMP/extended-opt-tests.log"
-          grep -F 'test native_i64_pre_critical_edge_interpreter_agrees_before_and_after ... ok' "$RUNNER_TEMP/extended-opt-tests.log"
-          grep -F 'test promoted_loop_and_mixed_array_execute_identically_from_both_native_formats ... ok' "$RUNNER_TEMP/extended-opt-tests.log"
-      - name: AL-05 cross toolchain for native ELF/GAS differential
-        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo timeout --signal=TERM --kill-after=10s 3m apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=45 update -qq
-          sudo DEBIAN_FRONTEND=noninteractive timeout --signal=TERM --kill-after=10s 8m apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=45 install -y --no-install-recommends \
-            gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
-          aarch64-linux-gnu-gcc --version
-          qemu-aarch64 --version
-      - name: P18 AArch64 QEMU native mutant witness and no-op oracle sensitivity
-        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
-        shell: bash
-        working-directory: compiler
-        env:
-          AL05_REQUIRE_AARCH64: '1'
-        run: |
-          set -euo pipefail
-          timeout --signal=TERM --kill-after=10s 9m \
-            cargo test -p compiler-opt --test al05_p9_mixed_native_bridge \
-              al05_p18_native_sensitivity::al05_p18_native_aarch64_elf_gas_negative_oracle_sensitivity \
-              -- --exact --ignored --nocapture \
-            2>&1 | tee "$RUNNER_TEMP/al05-p18-aarch64.log"
-          grep -F 'test al05_p18_native_sensitivity::al05_p18_native_aarch64_elf_gas_negative_oracle_sensitivity ... ok' "$RUNNER_TEMP/al05-p18-aarch64.log"
-          for format in elf gas; do
-            grep -F "AL05_P18_NATIVE_TARGET arch=aarch64 format=$format" "$RUNNER_TEMP/al05-p18-aarch64.log"
-          done
-          python3 - "$RUNNER_TEMP/al05-p18-x86.log" "$RUNNER_TEMP/al05-p18-aarch64.log" "$(git rev-parse HEAD)" <<'PY'
-          import collections,json,pathlib,sys
-          records=[]
-          for filename in sys.argv[1:3]:
-              for line in pathlib.Path(filename).read_text().splitlines():
-                  if "AL05_P18_NATIVE_LEDGER " in line:
-                      records.append(json.loads(line.split("AL05_P18_NATIVE_LEDGER ",1)[1]))
-          assert len(records)==8, f"expected 8 source-bound records, got {len(records)}"
-          assert {r["source_sha"] for r in records}=={sys.argv[3]}
-          assert len({r["case_id"] for r in records})==1
-          assert {(r["arch"],r["format"],r["mutation_kind"]) for r in records} == {
-              (a,f,k) for a in ("x86_64","aarch64")
-              for f in ("elf","gas")
-              for k in ("wrong-loop-phi","dropped-latch-divs")}
-          assert all(r["verifier"]=="PASS" and r["detected"] is True
-              and r["no_op_control"]=="REJECTED"
-              and r["host_oracle"]=="shared-p16-independent-c11"
-              and r["native_oracle"]=="actual-elf-gas"
-              and r["semantics"]=="FS1-DRAFT-NON-NORMATIVE"
-              and r["verdict"]=="BOUNDED" for r in records)
-          print("AL05_P18_NATIVE_LEDGER_VALIDATED records=8 case=1 arches=2 formats=2 families=2 controls=8 verdict=PASS")
-          PY
-
-      - name: AL-05 native x86 and AArch64 ELF/GAS with strict C11 oracle
-        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
-        shell: bash
-        working-directory: compiler
-        env:
-          AL05_REQUIRE_AARCH64: '1'
-        run: |
-          set -euo pipefail
-          timeout --signal=TERM --kill-after=10s 9m \
-            cargo test -p compiler-opt --test al05_native_bridge -- --include-ignored --nocapture \
-            2>&1 | tee "$RUNNER_TEMP/al05-native-bridge.log"
-          for arch in x86_64 aarch64; do
-            for format in elf gas; do
-              grep -F "AL05_NATIVE_TARGET arch=$arch format=$format functions=8 changed_cse=4 comparisons=3736 traps=16 verdict=PASS" \
-                "$RUNNER_TEMP/al05-native-bridge.log"
-            done
-          done
-
-      - name: AL-05 affine TypeId native x86/AArch64 ELF and GAS C11 differential
-        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
-        shell: bash
-        working-directory: compiler
-        env:
-          AL05_REQUIRE_AARCH64: '1'
-        run: |
-          set -euo pipefail
-          timeout --signal=TERM --kill-after=10s 9m \
-            cargo test -p compiler-opt --test al05_affine_native_bridge -- --include-ignored --nocapture \
-            2>&1 | tee "$RUNNER_TEMP/al05-affine-native-bridge.log"
-          for arch in x86_64 aarch64; do
-            for format in elf gas; do
-              grep -F "AL05_AFFINE_NATIVE_TARGET arch=$arch format=$format functions=8 changed_cse=4 comparisons=3736 traps=16 verdict=PASS" \
-                "$RUNNER_TEMP/al05-affine-native-bridge.log"
-            done
-          done
-
-      - name: Permanent AL-05.P3 native x86/AArch64 TypeId ELF/GAS + independent C11
-        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
-        shell: bash
-        working-directory: compiler
-        env:
-          AL05_REQUIRE_AARCH64: '1'
-        run: |
-          set -euo pipefail
-          timeout --signal=TERM --kill-after=10s 9m \
-            cargo test -p compiler-opt --test al05_parameterized_native_bridge -- --include-ignored --nocapture \
-            2>&1 | tee "$RUNNER_TEMP/al05-param-native-bridge.log"
-          for arch in x86_64 aarch64; do
-            for format in elf gas; do
-              grep -F "AL05_PARAM_NATIVE_TARGET arch=$arch format=$format functions=8 changed_cse=4 comparisons=3736 traps=16 verdict=PASS" \
-                "$RUNNER_TEMP/al05-param-native-bridge.log"
-            done
-          done
-
-      # Permanent AL-05.P6 split-body native ELF/GAS C11 differential.
-      - name: AL-05.P6 split-body TypeId x86/AArch64 ELF/GAS native C11 differential
-        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
-        shell: bash
-        working-directory: compiler
-        env:
-          AL05_REQUIRE_AARCH64: '1'
-        run: |
-          set -euo pipefail
-          timeout --signal=TERM --kill-after=10s 9m \
-            cargo test -p compiler-opt --test al05_linear_native_bridge -- --include-ignored --nocapture \
-            2>&1 | tee "$RUNNER_TEMP/al05-linear-native-bridge.log"
-          for arch in x86_64 aarch64; do
-            for format in elf gas; do
-              grep -F "AL05_LINEAR_NATIVE_TARGET arch=$arch format=$format functions=8 changed_cse=4 comparisons=3736 traps=16 verdict=PASS" \
-                "$RUNNER_TEMP/al05-linear-native-bridge.log"
-            done
-          done
-
-      # Permanent AL-05.P7 x86/AArch64 TypeId diamond C11 differential.
-      - name: AL-05.P7 diamond x86/AArch64 direct ELF/GAS native C11 differential
-        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
-        shell: bash
-        working-directory: compiler
-        env:
-          AL05_REQUIRE_AARCH64: '1'
-        run: |
-          set -euo pipefail
-          timeout --signal=TERM --kill-after=10s 9m \
-            cargo test -p compiler-opt --test al05_diamond_native_bridge -- --include-ignored --nocapture \
-            2>&1 | tee "$RUNNER_TEMP/al05-diamond-native-bridge.log"
-          for arch in x86_64 aarch64; do
-            for format in elf gas; do
-              grep -F "AL05_DIAMOND_NATIVE_TARGET arch=$arch format=$format functions=8 changed_cse=4 comparisons=3736 traps=16 verdict=PASS" \
-                "$RUNNER_TEMP/al05-diamond-native-bridge.log"
-            done
-          done
-
-      # Recheck merged compiler source after ELF strict-Clippy compatibility fix f159a14640d87213b713bf0213ca5b190c7536a3.
-      # Permanent AL-05.P8 x86/AArch64 two-diamond C11 native differential.
-      - name: AL-05.P8 two-diamond x86/AArch64 ELF/GAS native C11 differential
-        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
-        shell: bash
-        working-directory: compiler
-        env:
-          AL05_REQUIRE_AARCH64: '1'
-        run: |
-          set -euo pipefail
-          timeout --signal=TERM --kill-after=10s 9m \
-            cargo test -p compiler-opt --test al05_dag_native_bridge -- --include-ignored --nocapture \
-            2>&1 | tee "$RUNNER_TEMP/al05-p8-native-dag.log"
-          for arch in x86_64 aarch64; do
-            for format in elf gas; do
-              grep -F "AL05_DAG_NATIVE_TARGET arch=$arch format=$format functions=8 changed_cse=4 comparisons=3736 traps=16 verdict=PASS" \
-                "$RUNNER_TEMP/al05-p8-native-dag.log"
-            done
-          done
-
-      # Permanent AL-05.P11 finite FS-1-draft and owned TypeId CFG correspondence.
-      - name: AL-05.P11 FS1 draft scalar and TypeId P9 concrete correspondence
-        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
-        shell: bash
-        working-directory: compiler
-        run: |
-          set -euo pipefail
-          timeout --signal=TERM --kill-after=15s 4m cargo clippy -p compiler-opt --test al05_p9_mixed_native_bridge -- -D warnings
-          timeout --signal=TERM --kill-after=15s 4m cargo test -p compiler-opt --test al05_p9_mixed_native_bridge al05_p11_fs1_draft_recurrence_and_typeid_cfg_correspondence -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/al05-p11-concrete-correspondence.log"
-          grep -E 'AL05_P11_FS1_DRAFT_CORRESPONDENCE functions=4 changed_cse=4 triples=1296 observations=2592 normal=[0-9]+ traps=[0-9]+ wrong_phi=4 dropped_trap=4 fs1=fs1-scalar-cfg-draft-1 normative=NO verdict=PASS' "$RUNNER_TEMP/al05-p11-concrete-correspondence.log"
-
-      # Permanent AL-05.P9/P14/P15/P16 generated DAG native C11 differential.
-      # Recheck merged source after AArch64 selector Clippy fix 5983a2588751db7c2ff1b3071d5b32e697aea3fd.
-      - name: AL-05.P9 mixed eight/six-path x86/AArch64 ELF/GAS native C11
-        if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
-        shell: bash
-        working-directory: compiler
-        env:
-          AL05_REQUIRE_AARCH64: '1'
-        run: |
-          set -euo pipefail
-          timeout --signal=TERM --kill-after=10s 9m \
-            cargo test -p compiler-opt --test al05_p9_mixed_native_bridge -- --include-ignored --nocapture \
-            2>&1 | tee "$RUNNER_TEMP/al05-p9-mixed-native.log"
-          for arch in x86_64 aarch64; do
-            for format in elf gas; do
-              grep -F "AL05_P9_MIXED_NATIVE_TARGET arch=$arch format=$format functions=8 changed_cse=4 comparisons=3736 traps=16 verdict=PASS" \
-                "$RUNNER_TEMP/al05-p9-mixed-native.log"
-              grep -F "AL05_P14_GENERATED_NATIVE_TARGET arch=$arch format=$format functions=16 changed_cse=8 modes=8 comparisons=7472 traps=32 verdict=PASS" \
-                "$RUNNER_TEMP/al05-p9-mixed-native.log"
-              grep -F "AL05_P15_GENERATED_NATIVE_TARGET arch=$arch format=$format functions=32 changed_cse=16 modes=8 seeds=2,6 coefficients=2 comparisons=14944 traps=64 verdict=PASS" \
-                "$RUNNER_TEMP/al05-p9-mixed-native.log"
-              grep -F "AL05_P16_COVERAGE_NATIVE_TARGET arch=$arch format=$format functions=48 changed_cse=24 selected=24 modes=8 seeds=8 coefficients=5 comparisons=22416 traps=96 verdict=PASS" \
-                "$RUNNER_TEMP/al05-p9-mixed-native.log"
-            done
-          done
-
-      - name: Record successful exact source SHA
-        if: success() && (steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck)
-        shell: bash
-        env:
-          SOURCE_SHA: ${{ steps.source.outputs.sha }}
-        run: |
-          mkdir -p .compiler-native-validated
-          printf '%s\n' "$SOURCE_SHA" > .compiler-native-validated/source-sha.txt
-          printf 'SSA verifier, alias PHIs, nested/loop PRE, induction, mem2reg, CFG traps, pointer PHIs, signed division verified: %s\n' "$SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
-      - name: Cache successful evidence for the exact source revision
-        if: success() && steps.validated.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+          grep -F AL05_TEST_TIMING "$RUNNER_TEMP/native-timing.log" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          path: .compiler-native-validated
-          key: compiler-native-v1-${{ hashFiles('.github/workflows/verify-compiler-core-correctness.yml') }}-${{ steps.source.outputs.sha }}
-      - name: Preserve native differential failure logs and reproducers
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: compiler-native-cfg-failures
-          path: |
-            ${{ runner.temp }}/native-cfg-tests.log
-            ${{ runner.temp }}/native-division-tests.log
-            ${{ runner.temp }}/ssa-verifier-tests.log
-            ${{ runner.temp }}/fs1-scalar-semantics.log
-            ${{ runner.temp }}/fs1-pointer-effects-ir.log
-            ${{ runner.temp }}/fs1-effect-preservation.log
-            ${{ runner.temp }}/extended-opt-tests.log
-            ${{ runner.temp }}/al05-native-bridge.log
-            ${{ runner.temp }}/al05-affine-native-bridge.log
-            ${{ runner.temp }}/al05-param-native-bridge.log
-            ${{ runner.temp }}/al05-linear-native-bridge.log
-            ${{ runner.temp }}/al05-diamond-native-bridge.log
-            ${{ runner.temp }}/al05-p8-native-dag.log
-            /tmp/al05-native-*/
-            /tmp/al05-affine-native-*/
-            /tmp/al05-param-native-*/
-            /tmp/compiler-native-cfg-differential-*/
-          if-no-files-found: ignore
-          retention-days: 14
+          name: native-phase-timing
+          path: ${{ runner.temp }}/native-timing.log
+          retention-days: 90
