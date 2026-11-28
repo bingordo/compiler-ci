@@ -1,0 +1,74 @@
+# Temporary deletion-first compile inventory, never merge.
+name: Mini-C clobber repair and parity integration
+on:
+  pull_request:
+    paths: ['.github/workflows/ir-pr3753-graph-deletion.yml']
+permissions:
+  contents: read
+jobs:
+  parity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      SOURCE_SHA: 1af8364db53500e3971b95e718557b285d00b3b6
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - name: Verify graph deletion and inventory direct dependents
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          if git grep -nE '^pub struct (Function|Block|Instruction|Parameter|ModuleSnapshot|TypedModule|TypeAnnotatedModule)\b' -- crates/ir/src; then exit 1; else test "$?" -eq 1; fi
+          echo 'Remaining historical graph dependencies grouped by file:'
+          git grep -l -E 'legacy-ssa-oracle|historical-function-oracle|ModuleSnapshot|TypeAnnotatedModule|FunctionValueTypes|from_annotated|project_legacy_compat_function|\.to_legacy\(|TypedSsaModule::from_legacy|compiler_ir::\{[^}]*\b(Function|Block|Instruction|Parameter)\b|compiler_ir::(Function|Block|Instruction|Parameter)\b' -- '*.rs' '*.toml' | sort || test "$?" -eq 1
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/ir-macros", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm", "crates/lto-plugin-core"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-graph-deletion
+      - name: Run complete native parity suite
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typed_native_parity --no-fail-fast
+  mini-c:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      SOURCE_SHA: 1af8364db53500e3971b95e718557b285d00b3b6
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - name: Verify exact source and configure frontend dependencies
+        working-directory: compiler
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: mini-c-clobber-fix
+      - name: Full standalone Mini-C library regression
+        working-directory: compiler
+        run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib --no-fail-fast
+      - name: Opaque GNU GP and memory source tests
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test asm3_p06_opaque_gnu_gp_source_oracle --test asm3_p06_opaque_source_native --test asm3_p07_opaque_two_inputs_native --no-fail-fast
