@@ -75,7 +75,24 @@ jobs:
           assert text.count(old)==1
           p.write_text(text.replace(old,"default = []"))
           PY
-          git -C compiler diff -- crates/opt/Cargo.toml
+          # Trace the actual pass that returns an invalid-SSA diagnostic.
+          # All original verifiers remain enabled. Do not merge this instrumentation.
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("compiler/crates/opt/src/typed_pass_manager.rs")
+          text=p.read_text()
+          old="return Err(error);"
+          assert text.count(old)==2
+          text=text.replace(old,'return Err(format!("pass {}.{}: {error}",self.phase,pass.name()));')
+          old="        let started = (self.timed && timing.is_some()).then(Instant::now);"
+          assert text.count(old)==2
+          text=text.replace(old,'        eprintln!("STAGE_START {}.{}", self.phase, pass.name());\n'+old)
+          old="        self.finish(pass, module, timing, started, observer)?;"
+          assert text.count(old)==2
+          text=text.replace(old,old+'\n        eprintln!("STAGE_DONE {}.{}", self.phase, pass.name());')
+          p.write_text(text)
+          PY
+          git -C compiler diff -- crates/opt/Cargo.toml crates/opt/src/typed_pass_manager.rs
       - name: Build diagnostic native driver without generated rewrites in release mode with profiling symbols
         env:
           CARGO_PROFILE_RELEASE_DEBUG: '1'
@@ -118,7 +135,7 @@ jobs:
             status=$?
             set -e
             echo "PROFILE_EXIT $seed $status"
-            head -c 4000 "$p.log"
+            grep -E "STAGE_START|STAGE_DONE|compiler-mini-c:" "$p.log" | tail -100 || true
             if [ "$status" = 0 ]; then
               gcc -O2 -w "$out/case-$seed.i" -o "$p.gcc"
               gcc "$p.o" -o "$p.exe"
