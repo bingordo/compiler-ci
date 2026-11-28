@@ -1,131 +1,121 @@
-name: Checked Oberon and Mini-C optimizer stage profile
+name: Checked source CSE scope stack paired profile
 on:
-  workflow_dispatch:
-    inputs:
-      source_ref:
-        description: Compiler branch or exact commit to profile
-        required: true
-        type: string
-        default: main
-      repetitions:
-        description: Timed samples per checked source (3-21)
-        required: false
-        type: string
-        default: '7'
-  # Run once when the opt-in profiling workflow itself changes, so the
-  # current compiler main revision has fresh baseline stage timings.
-  # The workflow still has no recurring/scheduled profiling trigger.
-  push:
+  pull_request:
     branches: [main]
-    paths:
-      - '.github/workflows/checked-source-optimizer-profile.yml'
+    paths: ['.github/workflows/checked-source-optimizer-profile.yml']
 permissions:
   contents: read
 concurrency:
-  group: checked-source-optimizer-profile
+  group: checked-cse-scope-stack-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  oberon:
+  profile:
+    strategy:
+      fail-fast: false
+      matrix:
+        frontend: [mini-c]
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 40
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
       CARGO_INCREMENTAL: '0'
-      OPT_PROFILE_REPETITIONS: ${{ inputs.repetitions || '7' }}
+      OPT_PROFILE_REPETITIONS: '7'
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ inputs.source_ref || 'main' }}
-          path: compiler
+          ref: d6c712ac05dba42072cc713941cd1a866048edc2
+          path: baseline
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Fetch public pinned Oberon dependency over HTTPS
-        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v4
         with:
-          workspaces: compiler -> target
-          key: checked-oberon-stage-profile
-      - name: Profile checked Oberon source through optimizer and native emitter (release)
+          repository: bingordo/compiler
+          ref: 0a539d8a2b02c03378d696840d8eca386442a779
+          path: candidate
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Prepare matched release test binaries
         shell: bash
+        env:
+          FRONTEND: ${{ matrix.frontend }}
         run: |
           set -euo pipefail
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
           mkdir -p results
-          rustc --version
-          lscpu | grep -E '^(Model name|CPU\\(s\\)):' || true
-          git -C compiler rev-parse HEAD | tee results/compiler-sha.txt
-          cargo test --release --manifest-path compiler/Cargo.toml -p compiler --bin compiler full_optimizer_stage_profile_oberon -- --ignored --nocapture 2>&1 | tee results/oberon.log
+          rustc --version | tee results/runner.txt
+          lscpu | tee -a results/runner.txt
+          if [[ "$FRONTEND" == mini-c ]]; then
+            manifest=tools/mini-c-driver/Cargo.toml
+            args=(-p compiler-mini-c --lib)
+          else
+            manifest=Cargo.toml
+            args=(-p compiler --bin compiler)
+          fi
+          # Export existing per-case expected IR/ELF outside the timed loop.
+          python3 - <<'PY'
+          from pathlib import Path
+          for v in ("baseline","candidate"):
+              p=Path(v)/"tools/mini-c-driver/tests/unit/lib.rs"
+              s=p.read_text()
+              start=s.index("fn full_optimizer_stage_profile_mini_c()")
+              pos=s.index("            let mut frontend=Vec::new();",start)
+              s=s[:pos]+'''            if let Ok(out)=std::env::var("PROFILE_OUT") {
+                          std::fs::create_dir_all(&out).unwrap();
+                          std::fs::write(format!("{out}/{name}.ir"),
+                              compiler_ir::native_module_text_v3::write_native_module_text_v3(&baseline).unwrap()).unwrap();
+                          if let Some(bytes)=&expected {
+                              std::fs::write(format!("{out}/{name}.o"),bytes).unwrap();
+                          }
+                      }
+          '''+s[pos:]
+              p.write_text(s)
+          PY
+          for v in baseline candidate; do
+            git -C "$v" rev-parse HEAD | tee "results/$v.sha"
+            CARGO_TARGET_DIR="$PWD/$v/target-profile" cargo test --release --manifest-path "$v/$manifest" "${args[@]}" --no-run --message-format=json > "results/$v-build.jsonl"
+            python3 - "$v" <<'PY'
+          import json, sys
+          from pathlib import Path
+          v=sys.argv[1]
+          records=[json.loads(line) for line in Path(f"results/{v}-build.jsonl").read_text().splitlines()]
+          executables={r["executable"] for r in records if r.get("reason")=="compiler-artifact" and r.get("executable") and r.get("profile",{}).get("test")}
+          assert len(executables)==1, executables
+          Path(f"results/{v}.exe").write_text(executables.pop())
+          PY
+          done
+      - name: ABBA source optimizer profiles on the same runner
+        shell: bash
+        env:
+          FRONTEND: ${{ matrix.frontend }}
+        run: |
+          set -euo pipefail
+          if [[ "$FRONTEND" == mini-c ]]; then
+            test_name=full_optimizer_stage_profile_mini_c
+            cwd=tools/mini-c-driver
+          else
+            test_name=full_optimizer_stage_profile_oberon
+            cwd=crates/driver
+          fi
+          root="$PWD"
+          for v in baseline candidate; do
+            exe=$(cat "results/$v.exe")
+            (cd "$v/$cwd" && PROFILE_OUT="$root/results/$v-output" "$exe" "$test_name" --ignored --nocapture) > "results/$v-warmup.log" 2>&1
+            grep -q '1 passed; 0 failed' "results/$v-warmup.log"
+          done
+          diff -r results/baseline-output results/candidate-output
+          echo "CSE_SOURCE_CANONICAL_AND_ELF_PARITY"
+          i=0
+          for v in baseline candidate candidate baseline; do
+            i=$((i+1))
+            exe=$(cat "results/$v.exe")
+            (cd "$v/$cwd" && /usr/bin/time -f 'elapsed_s=%e peak_rss_kib=%M' -o "$root/results/$i-$v.time" "$exe" "$test_name" --ignored --nocapture) 2>&1 | tee "results/$i-$v.log"
+            grep -q '1 passed; 0 failed' "results/$i-$v.log"
+            cat "results/$i-$v.time"
+          done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: checked-oberon-profile
+          name: checked-cse-scope-stack-${{ matrix.frontend }}
           path: results/
-          retention-days: 30
-          overwrite: true
-  mini-c:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 25
-    env:
-      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
-      CARGO_INCREMENTAL: '0'
-      OPT_PROFILE_REPETITIONS: ${{ inputs.repetitions || '7' }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: bingordo/compiler
-          ref: ${{ inputs.source_ref || 'main' }}
-          path: compiler
-          ssh-key: ${{ secrets.CI_KEY }}
-          persist-credentials: false
-      - name: Fetch public pinned Mini-C dependency over HTTPS
-        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: compiler/tools/mini-c-driver -> target
-          key: checked-mini-c-stage-profile
-      - name: Profile checked Mini-C source through optimizer and native emitter (release)
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p results
-          rustc --version
-          lscpu | grep -E '^(Model name|CPU\\(s\\)):' || true
-          git -C compiler rev-parse HEAD | tee results/compiler-sha-mini-c.txt
-          cargo test --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib full_optimizer_stage_profile_mini_c -- --ignored --nocapture 2>&1 | tee results/mini_c.log
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: checked-mini-c-profile
-          path: results/
-          retention-days: 30
-          overwrite: true
-  summarize:
-    needs: [oberon, mini-c]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: bingordo/compiler
-          ref: ${{ inputs.source_ref || 'main' }}
-          path: compiler
-          ssh-key: ${{ secrets.CI_KEY }}
-          persist-credentials: false
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: checked-*-profile
-          merge-multiple: true
-          path: results
-      - name: Produce checked-source summary
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 compiler/tools/source_optimizer_profile_summary.py \
-            --oberon results/oberon.log --mini-c results/mini_c.log \
-            --output results/optimizer-source-profile.md | tee -a "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: checked-source-optimizer-summary
-          path: results/
-          retention-days: 30
-          overwrite: true
+          retention-days: 14
