@@ -1,0 +1,66 @@
+name: Arm source archive streaming validation
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-arm-archive-streaming.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 896df1ec1ab1a95f90b89f8c4c40c090a989de7f
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 3cb6cd14c66813faa0cc4b077c6d6707d4fc6095
+          path: baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify candidate and affected suites
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "896df1ec1ab1a95f90b89f8c4c40c090a989de7f"
+          for suite in test_aarch64_a32_asl_source_links.py test_aarch64_a32_aslref_compat.py test_aarch64_a32_full_source_catalog.py test_aarch64_a32_batch_plan.py; do
+            python3 -m unittest discover -s tools -p "$suite" -v
+          done
+      - name: Exact archive output parity and isolated verification peak RSS
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          PYTHONPATH=tools python3 - <<'PY'
+          import io, tarfile, random, hashlib
+          from pathlib import Path
+          from test_aarch64_a32_asl_source_links import xml
+          from aarch64_a32_asl_source_links import ROOT
+          path = Path("/tmp/arm-fixture.tgz")
+          with tarfile.open(path, "w:gz", compresslevel=1) as tar:
+              for i in range(32):
+                  data = random.Random(i).randbytes(1024*1024)
+                  member = tarfile.TarInfo(f"ignored-{i}.bin")
+                  member.size = len(data)
+                  tar.addfile(member, io.BytesIO(data))
+              for name, data in (("shared_pseudocode.xml", b"<instructionsection/>"), ("add.xml", xml())):
+                  member = tarfile.TarInfo(ROOT + name)
+                  member.size = len(data)
+                  tar.addfile(member, io.BytesIO(data))
+          Path("/tmp/arm-fixture.sha").write_text(hashlib.sha256(path.read_bytes()).hexdigest())
+          PY
+          cat >/tmp/check-arm.py <<'PY'
+          import json
+          from pathlib import Path
+          import aarch64_a32_asl_source_links as source
+          source.ISA_XML_ARCHIVE_SHA256 = Path("/tmp/arm-fixture.sha").read_text()
+          print(json.dumps(source.source_entries(Path("/tmp/arm-fixture.tgz")), sort_keys=True))
+          PY
+          PYTHONPATH=../baseline/tools /usr/bin/time -v python3 /tmp/check-arm.py >/tmp/baseline-arm.json
+          PYTHONPATH=tools /usr/bin/time -v python3 /tmp/check-arm.py >/tmp/candidate-arm.json
+          cmp /tmp/baseline-arm.json /tmp/candidate-arm.json
+          echo ARM_ARCHIVE_EXACT_REPORT_PARITY_OK
