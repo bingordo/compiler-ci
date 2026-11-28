@@ -1,4 +1,4 @@
-name: One-off Csmith backend pass timing without generated rewrites
+name: One-off Csmith layout and interference timing
 on:
   pull_request:
     branches: [main]
@@ -23,15 +23,34 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 8effc959e1f5de1785c6bb2731b0fe50ee24bd02
+          ref: 23668b729b2579bd33ad807203fd907f62a43a1a
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 55a70b8f7896396aadcb302bd4af8eb45278fd3b
+          path: interference
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Integrate independent same-base interference candidate
+        run: |
+          set -euo pipefail
+          git -C compiler rev-parse HEAD
+          git -C interference rev-parse HEAD
+          for p in crates/backend/src/regalloc.rs crates/backend/tests/unit/regalloc.rs; do
+            cp "interference/$p" "compiler/$p"
+          done
+          git -C compiler diff --stat
+          git -C compiler diff | sha256sum
       - name: Prepare toolchain and source
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/csmith-bench"
           git -C compiler rev-parse HEAD | tee "$RUNNER_TEMP/csmith-bench/compiler-sha"
+          git -C interference rev-parse HEAD | tee "$RUNNER_TEMP/csmith-bench/interference-sha"
+          git -C compiler diff > "$RUNNER_TEMP/csmith-bench/integration.patch"
           # The preserved .i files are already preprocessed. No Csmith
           # installation or package repository refresh is needed.
           gcc --version > "$RUNNER_TEMP/csmith-bench/gcc.txt"
@@ -57,8 +76,13 @@ jobs:
         run: |
           set -euo pipefail
           git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
-          cargo test --release -p compiler-opt --lib
-          cargo clippy -p compiler-opt --lib -- -D warnings
+          cargo test --release -p compiler-backend --lib
+          cargo test --release -p compiler-backend-x86 --lib reverse_branch_normalization_matches_original_fixed_point
+          cargo test --release -p compiler-backend-x86 --lib many_fallthrough_jumps_compact_without_shifting_tail
+          cargo test --release -p compiler-backend-x86 --lib flags::
+          cargo test --release -p compiler-backend-x86 --test backend_pass_timing --test mixed_frame_native
+          cargo check --workspace
+          cargo clippy -p compiler-backend -p compiler-backend-x86 --lib -- -D warnings
       - name: Diagnostic-only disable generated rewrite group after normal unit tests
         run: |
           python3 - <<'PY'
