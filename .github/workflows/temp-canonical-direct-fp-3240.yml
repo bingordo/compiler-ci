@@ -1,0 +1,258 @@
+name: TEMP canonical direct FP source calls
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temp-canonical-direct-fp-3240.yml'
+permissions:
+  contents: read
+jobs:
+  fp-conservative-source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Authorize pinned Mini-C frontend
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - name: Checkout exact FP optimizer candidate
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b2d86860ff7f609c2c51a6d8dc768c711d2f10bd
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Assert exact compiler source
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 'b2d86860ff7f609c2c51a6d8dc768c711d2f10bd'
+          echo "FP optimizer compiler source $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: temp-fp-conservative-optimizer-20261123
+      - name: Inventory obsolete FP call consumers for removal
+        working-directory: compiler
+        shell: bash
+        run: |
+          git grep -nE 'FpOp::Call(Indirect)?(Variadic)?([[:space:]]*[{]|[[:space:]]*\\|)' -- '*.rs' || true
+          git grep -nE 'fp[._](call|call_indirect|call_variadic|call_indirect_variadic)' -- '*.ir' '*.md' || true
+      - name: New source FP optimizer transactional SSA and independent GCC fenv oracle
+        working-directory: compiler
+        run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test fp_optimizer_admission -- --nocapture
+      - name: Original numeric FP source, mixed ABI, pointer memory, globals and CFG oracle
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for target in fp_scalar fp_mixed_abi fp_mixed_module fp_mixed_ssa fp_pointer_memory fp_scalar_globals; do
+            cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test "$target"
+          done
+      - name: Strict production Mini-C code
+        working-directory: compiler
+        run: RUSTFLAGS='-Dwarnings' cargo check --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib
+      - name: Targeted FP Clippy (independent of preceding build check)
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          # These two longstanding style warnings are unrelated to FP and
+          # the existing ASM2/ASM3 test regressions are separately tracked.
+          cargo clippy --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib --test fp_optimizer_admission -- -D warnings -A clippy::match_like_matches_macro -A clippy::too_many_arguments
+      - name: Existing compiler-opt library regressions in isolated core workspace
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The stand-alone Mini-C workspace owns only compiler-mini-c;
+          # compiler-opt's dev tests require the native core workspace.
+          # Isolate it without changing the pinned compiler sources.
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-wasm"]
+          EOF
+          rm -f Cargo.lock
+          cargo test -p compiler-backend-x86 --lib mixed_body_canonical_fp_indirect_value_and_void_calls -- --nocapture
+          cargo test -p compiler-opt -p compiler-ir -p compiler-backend-x86 --lib -- --test-threads=2
+      - name: Verify no obsolete FP call opcode references remain
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: |
+          if git grep -nE 'Fp(Op|OpKind|OpcodeKind)::Call(Indirect)?(Variadic)?\b' -- '*.rs'; then exit 1; fi
+      - name: Canonical FP text and binary roundtrip
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo test -p compiler-ir --test native_fp_opcode_roundtrip
+      - name: AArch64 FP call and memory ELF GAS regression suites
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo test -p compiler-backend-aarch64 --test typeid_fp_direct_call_native --test typeid_fp_indirect_call_native --test typeid_fp_globals_native --test typeid_fp_memory_native
+      - name: Wasm scalar FP runtime and validation
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo test --manifest-path crates/backend-wasm/Cargo.toml --test scalar_fp
+      - name: Summary
+        run: echo "PASS FP optimizer transaction, strict IEEE C11 fenv 4-mode x86 ELF/GAS PIC, previous source FP tests and warnings-denied build" >> "$GITHUB_STEP_SUMMARY"
+
+  edg-fp:
+
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    container:
+      image: ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8
+    defaults:
+      run:
+        shell: edg-container-exec "bash -eo pipefail {0}"
+    env:
+      COMPILER_SHA: b2d86860ff7f609c2c51a6d8dc768c711d2f10bd
+      EDG_SOURCE_SHA: b195677be8b9b56c8337afad6be8064d21a54082
+      EDG_RELEASE_TAG: edgcpfe-v2026.11.14-upstream-177765bb7731
+      EDG_RELEASE_SHA256: 1ce495b629924f31382ecccc891a7a72caae1014ddfa2ba7dd39b44d8b0a9526
+      RUST_TOOLCHAIN_VERSION: 1.99.1
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
+      EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
+      EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
+      EDGCPP_EDG_REVISION: b195677be8b9b56c8337afad6be8064d21a54082
+    steps:
+      - name: Check out shared ABI test harness
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check out exact compiler revision tested by Mini-C
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: b2d86860ff7f609c2c51a6d8dc768c711d2f10bd
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+
+      - name: Check out exact unmodified integration base for differential EDG tests
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c61c7fef6bc8b3162b8a71fd35852792b6f98d56
+          path: compiler-base
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Check out source headers matching upstream EDG release
+        uses: actions/checkout@v4
+        with:
+          repository: bingundu/edgcpp
+          ref: b195677be8b9b56c8337afad6be8064d21a54082
+          path: edgcpp
+          persist-credentials: false
+
+      - name: Assert source revisions and unmodified Hello World
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
+          test "$(git -C edgcpp rev-parse HEAD)" = "$EDG_SOURCE_SHA"
+          printf 'Compiler SHA: %s\nEDG package SHA: %s\n' "$COMPILER_SHA" "$EDG_SOURCE_SHA" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Configure EDG header tooling without rebuilding full frontend
+        working-directory: edgcpp
+        env:
+          EDG_BASE: ${{ github.workspace }}/edgcpp/bases/docker/dev-env/gcc
+        run: |
+          set -euo pipefail
+          cmake --preset linux-gcc-release -DEDG_BUILD_LIB=OFF -DEDG_BUILD_CALLABLE_LIBRARY=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          cmake --build build/gcc-release --target error-info --parallel 2
+          test -s build/gcc-release/src/includes/err_codes.h
+          test -s build/gcc-release/src/includes/err_data.h
+
+      - name: Restore checksummed upstream EDG callable release
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          mkdir -p build/gcc-release/lib build/prebuilt-edg
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error --retry 4 --retry-delay 2 \
+            "https://github.com/bingundu/edgcpp/releases/download/$EDG_RELEASE_TAG/edgcpfe-ci-upstream-callable-edg-release-20261114-linux-x86_64.tar.gz" \
+            -o build/prebuilt-edg/archive.tar.gz
+          printf '%s  %s\n' "$EDG_RELEASE_SHA256" build/prebuilt-edg/archive.tar.gz | sha256sum -c -
+          tar -xzf build/prebuilt-edg/archive.tar.gz -C build/prebuilt-edg
+          grep -Fx "commit=$EDG_SOURCE_SHA" build/prebuilt-edg/BUILD-INFO.txt
+          grep -Fx 'platform=linux-x86_64' build/prebuilt-edg/BUILD-INFO.txt
+          test -s build/prebuilt-edg/lib/libedgcpfe.a
+          cp build/prebuilt-edg/lib/libedgcpfe.a build/gcc-release/lib/libedgcpfe.a
+
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          if ! command -v cargo >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN_VERSION"
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install "$RUST_TOOLCHAIN_VERSION" --profile minimal
+          rustup default "$RUST_TOOLCHAIN_VERSION"
+
+      - name: Build EDG native TypeId driver
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo build --manifest-path compiler/tools/edg-driver/Cargo.toml
+          test -x compiler/tools/edg-driver/target/debug/compiler-edg-driver
+      - name: Compare full EDG test results against exact unmodified base
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source edgcpp/build/gcc-release/environment.sh
+          test "$(git -C compiler-base rev-parse HEAD)" = 'c61c7fef6bc8b3162b8a71fd35852792b6f98d56'
+          set +e
+          cargo test --manifest-path compiler/tools/edg-driver/Cargo.toml --bin compiler-edg-driver -- --test-threads=2 > "$RUNNER_TEMP/edg-candidate.log" 2>&1
+          candidate=$?
+          cargo test --manifest-path compiler-base/tools/edg-driver/Cargo.toml --bin compiler-edg-driver -- --test-threads=2 > "$RUNNER_TEMP/edg-base.log" 2>&1
+          baseline=$?
+          set -e
+          cat "$RUNNER_TEMP/edg-candidate.log" "$RUNNER_TEMP/edg-base.log"
+          python3 - "$candidate" "$baseline" <<'PY'
+          import os, pathlib, re, sys
+          def results(name, status):
+              log=(pathlib.Path(os.environ["RUNNER_TEMP"])/name).read_text()
+              summary=re.search(r"test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed;",log)
+              assert summary, "test suite did not complete: "+name
+              tests=dict(re.findall(r"^test (\S+) \.\.\. (ok|FAILED|ignored)$",log,re.M))
+              failures={name for name,outcome in tests.items() if outcome=="FAILED"}
+              assert int(summary[2])==len(failures) and (int(status)==0)==(not failures), name
+              return tests, failures
+          candidate, cf=results("edg-candidate.log",sys.argv[1])
+          baseline, bf=results("edg-base.log",sys.argv[2])
+          assert candidate.keys()==baseline.keys(), "different test inventories"
+          print("Baseline failures:",sorted(bf))
+          print("Candidate failures:",sorted(cf))
+          assert cf<=bf, "new EDG failures: "+str(sorted(cf-bf))
+          PY
+      - name: Execute EDG canonical FP source calls against independent GCC
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source edgcpp/build/gcc-release/environment.sh
+          cat > "$RUNNER_TEMP/fp-source.c" <<'EOF'
+          extern double host(double, float);
+          double local(double x, float y) { return x + y; }
+          double forward(double x, float y) { return host(local(x,y),y); }
+          EOF
+          cat > "$RUNNER_TEMP/fp-oracle.c" <<'EOF'
+          extern double forward(double,float);
+          double host(double x,float y) { return x-y*2; }
+          int main(void) {
+            for(int i=-100;i<=100;i++)
+              if(forward(i*0.25,1.5f)!=i*0.25-1.5) return 1;
+            return 0;
+          }
+          EOF
+          v="$(gcc -dumpfullversion -dumpversion | awk -F. '{print $1*10000+$2*100+$3}')"
+          compiler/tools/edg-driver/target/debug/compiler-edg-driver "$RUNNER_TEMP/fp-source.o" --gcc --c11 --no_strict_gnu --gnu_version "$v" "$RUNNER_TEMP/fp-source.c"
+          gcc "$RUNNER_TEMP/fp-oracle.c" "$RUNNER_TEMP/fp-source.o" -o "$RUNNER_TEMP/fp-oracle"
+          "$RUNNER_TEMP/fp-oracle"
