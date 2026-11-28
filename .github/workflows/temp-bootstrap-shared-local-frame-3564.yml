@@ -1,0 +1,81 @@
+# Temporary exact-source validation; do not merge.
+name: Native Mini-C GNU statement expression and shared frame candidate
+on:
+  pull_request:
+    paths: ['.github/workflows/temp-bootstrap-shared-local-frame-3564.yml']
+permissions:
+  contents: read
+  statuses: write
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: c8680de0cec57c46f92eb7b3e5db177e94cdb50d
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Confirm exact source and candidate frontend pin
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = c8680de0cec57c46f92eb7b3e5db177e94cdb50d
+          grep -F 'a3ad4dd35cf503c6c1dbc10f40c3175051578768' tools/mini-c-driver/Cargo.toml
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tools/mini-c-driver/target/debug
+          key: mini-c-typeid-shared-frame-3564
+          restore-keys: |
+            mini-c-typeid-
+      - name: Focused GCC ELF and GAS differential
+        run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml --test shared_local_frame --test gnu_atomic_address -- --nocapture
+      - name: Focused scalable annotation bridge regressions
+        run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib m48_source::tests
+      - name: Full adapter regression and unchanged exact-parent comparison
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$PWD/tools/mini-c-driver/target"
+          set +e
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib 2>&1 | tee "$RUNNER_TEMP/candidate.log"
+          candidate_status=${PIPESTATUS[0]}
+          set -e
+          git fetch --no-tags --depth=1 ssh://git@github.com/bingordo/compiler.git a4257dc6567b93bb1888d07a62731201f0943fc4
+          git checkout --detach a4257dc6567b93bb1888d07a62731201f0943fc4
+          test "$(git rev-parse HEAD)" = a4257dc6567b93bb1888d07a62731201f0943fc4
+          set +e
+          cargo test --manifest-path tools/mini-c-driver/Cargo.toml --lib 2>&1 | tee "$RUNNER_TEMP/parent.log"
+          parent_status=${PIPESTATUS[0]}
+          set -e
+          echo "CANDIDATE_EXIT=$candidate_status PARENT_EXIT=$parent_status"
+          for name in candidate parent; do
+            grep -E '^test .* \.\.\. FAILED$' "$RUNNER_TEMP/$name.log" | sort > "$RUNNER_TEMP/$name.failed" || true
+            grep -E '^test result:' "$RUNNER_TEMP/$name.log"
+          done
+          echo "Candidate-only failures:"
+          comm -23 "$RUNNER_TEMP/candidate.failed" "$RUNNER_TEMP/parent.failed"
+          echo "Parent-only failures:"
+          comm -13 "$RUNNER_TEMP/candidate.failed" "$RUNNER_TEMP/parent.failed"
+          test "$candidate_status" = 0
+      - name: Publish exact workflow status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ job.status }}
+        shell: bash
+        run: |
+          state="$RESULT"
+          if [ "$state" != success ]; then state=failure; fi
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/${{ github.event.pull_request.head.sha }}" \
+            -f state="$state" -f context="native-gnu-atomic-address-3723" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
