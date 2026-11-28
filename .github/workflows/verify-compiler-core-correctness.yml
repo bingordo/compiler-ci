@@ -42,7 +42,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: af1a8f4c52987db5f14ff9273e29ce3849d20601
+          ref: f4fa96967cec96564300f59326e06da4b4a19edb
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -56,7 +56,7 @@ jobs:
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "Compiler source SHA: $sha"
-          [[ "$sha" == "af1a8f4c52987db5f14ff9273e29ce3849d20601" ]] || { echo "P18 24-case wrong compiler source revision"; exit 1; }
+          [[ "$sha" == "f4fa96967cec96564300f59326e06da4b4a19edb" ]] || { echo "P18 24-case wrong compiler source revision"; exit 1; }
           # Fail rather than silently accepting a moved/absent test suite.
           for test_source in \
             crates/opt/tests/native_cfg_differential.rs \
@@ -650,3 +650,60 @@ jobs:
             /tmp/compiler-native-cfg-differential-*/
           if-no-files-found: ignore
           retention-days: 14
+
+  p18-native-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f4fa96967cec96564300f59326e06da4b4a19edb
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify native ARM64 host and exact source
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          test "$(git rev-parse HEAD)" = f4fa96967cec96564300f59326e06da4b4a19edb
+          rustc -vV
+          cc --version
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          """)
+          PY
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: p18-native-arm64-v1
+      - name: Native ARM64 selected mutation campaign
+        working-directory: compiler
+        env:
+          AL05_REQUIRE_AARCH64: '1'
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test al05_p9_mixed_native_bridge --no-run
+          timeout --kill-after=10s 4m cargo test -p compiler-opt --test al05_p9_mixed_native_bridge al05_p18_native_sensitivity::al05_p18_native_aarch64_selected_24_case_elf_gas_sensitivity -- --exact --ignored --nocapture 2>&1 | tee "$RUNNER_TEMP/p18-arm64.log"
+          python3 - "$RUNNER_TEMP/p18-arm64.log" "$(git rev-parse HEAD)" <<'PY'
+          import json, pathlib, sys
+          log = pathlib.Path(sys.argv[1]).read_text()
+          rows = [json.loads(line.split("AL05_P18_NATIVE_LEDGER ", 1)[1]) for line in log.splitlines() if "AL05_P18_NATIVE_LEDGER " in line]
+          cases = {r["case_id"] for r in rows}
+          assert len(rows) == 96 and len(cases) == 24
+          assert {(r["case_id"], r["format"], r["mutation_kind"]) for r in rows} == {(c, f, k) for c in cases for f in ("elf", "gas") for k in ("wrong-loop-phi", "dropped-latch-divs")}
+          assert all(r["source_sha"] == sys.argv[2] and r["arch"] == "aarch64" and r["verifier"] == "PASS" and r["detected"] is True and r["no_op_control"] == "REJECTED" for r in rows)
+          print("Native ARM64: 96/96 mutation records and controls verified")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: p18-native-arm64-evidence
+          path: |
+            ${{ runner.temp }}/p18-arm64.log
+            /tmp/al05-p9-mixed-dag-native-p18-aarch64-*/
+          if-no-files-found: warn
