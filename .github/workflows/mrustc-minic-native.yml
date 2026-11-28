@@ -340,6 +340,19 @@ jobs:
           set -euo pipefail
           cargo build --release --manifest-path mini-c-compat/Cargo.toml -p mini-c-cranelift --no-default-features
 
+      # Reuse the exact candidate and release build; do not regenerate C for
+      # each public regression. Keep this result independent of replay.
+      - name: Focused public atomic and aggregate member regressions
+        id: focused
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release --manifest-path mini-c-compat/Cargo.toml -p mini-c-sema --lib scalar_gnu_atomic_address_buffers_use_checked_scalar_operations
+          cargo test --release --manifest-path mini-c-compat/Cargo.toml -p mini-c-sema --lib runtime_atomic_orders_strengthen_without_dropping_evaluation
+          cargo test --release --manifest-path mini-c-compat/Cargo.toml -p mini-c-sema --lib scalar_members_of_aggregate_calls_are_values_not_lvalues
+          cargo test --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test gnu_atomic_address
+
       - name: Attempt real generated C with production Mini-C and independent GCC
         shell: bash
         run: |
@@ -426,7 +439,24 @@ jobs:
                   builtin=re.search(r"unsupported compiler builtin ([A-Za-z_][A-Za-z_0-9]*)",msg)
                   if builtin:
                       public={"__atomic_load","__atomic_store","__atomic_exchange","__atomic_compare_exchange","__atomic_load_n","__atomic_store_n","__atomic_exchange_n","__atomic_compare_exchange_n","__atomic_fetch_add","__atomic_fetch_sub","__atomic_fetch_and","__atomic_fetch_or","__atomic_fetch_xor","__atomic_is_lock_free","__atomic_always_lock_free","__atomic_test_and_set","__atomic_clear","__atomic_thread_fence","__atomic_signal_fence","__builtin_expect","__builtin_unreachable","__builtin_trap","__builtin_memcpy","__builtin_memset","__builtin_memmove","__builtin_add_overflow","__builtin_sub_overflow","__builtin_mul_overflow"}
-                      print("NATIVE_UNSUPPORTED_BUILTIN="+(builtin[1] if builtin[1] in public else "other"),flush=True)
+                      # Public GNU spellings not yet in the small historical list.
+                      public.update("__builtin_abort __builtin_alloca __builtin_alloca_with_align __builtin_assume_aligned __builtin_constant_p __builtin_object_size __builtin_dynamic_object_size __builtin_prefetch __builtin_bswap16 __builtin_bswap32 __builtin_bswap64 __builtin_clz __builtin_clzl __builtin_clzll __builtin_ctz __builtin_ctzl __builtin_ctzll __builtin_popcount __builtin_popcountl __builtin_popcountll __builtin_ffs __builtin_ffsl __builtin_ffsll __builtin_parity __builtin_parityl __builtin_parityll __builtin_memcmp __builtin_strlen __builtin_strcmp __builtin_memcpy_chk __builtin_memmove_chk __builtin_memset_chk __builtin_setjmp __builtin_longjmp __builtin_return_address __builtin_frame_address __builtin_va_start __builtin_va_end __builtin_va_copy __builtin_va_arg __builtin_types_compatible_p __builtin_choose_expr __builtin_offsetof __builtin_signbit __builtin_isfinite __builtin_isinf __builtin_isnan __builtin_nan __builtin_nanf __builtin_fabs __builtin_fabsf __builtin_copysign __builtin_copysignf __builtin_sqrt __builtin_sqrtf __builtin_fma __builtin_fmaf __builtin_add_overflow_p __builtin_sub_overflow_p __builtin_mul_overflow_p __builtin_sadd_overflow __builtin_saddl_overflow __builtin_saddll_overflow __builtin_uadd_overflow __builtin_uaddl_overflow __builtin_uaddll_overflow __builtin_ssub_overflow __builtin_ssubl_overflow __builtin_ssubll_overflow __builtin_usub_overflow __builtin_usubl_overflow __builtin_usubll_overflow __builtin_smul_overflow __builtin_smull_overflow __builtin_smulll_overflow __builtin_umul_overflow __builtin_umull_overflow __builtin_umulll_overflow __atomic_add_fetch __atomic_sub_fetch __atomic_and_fetch __atomic_or_fetch __atomic_xor_fetch __atomic_nand_fetch __atomic_fetch_nand __sync_bool_compare_and_swap __sync_val_compare_and_swap __sync_synchronize __sync_lock_test_and_set __sync_lock_release".split())
+                      name=builtin[1]
+                      # Never output an arbitrary private identifier. Verify
+                      # additional exact spellings against public inputs only.
+                      verified=name in public
+                      if not verified and re.fullmatch(r"(?:__builtin_|__atomic_|__sync_)[a-zA-Z0-9_]{1,100}",name):
+                          gcc_headers=Path(subprocess.check_output(["gcc","-print-file-name=include"],text=True).strip())
+                          for public_path in (Path("mrustc/src/trans/codegen_c.cpp"),gcc_headers,Path("/usr/include")):
+                              try:
+                                  check=subprocess.run(["grep","-r","-l","-F","-w","--",name,str(public_path)],
+                                                       stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=20)
+                                  if check.returncode==0:
+                                      verified=True
+                                      break
+                              except subprocess.TimeoutExpired:
+                                  pass
+                      print("NATIVE_UNSUPPORTED_BUILTIN="+(name if verified else "other"),flush=True)
 
                   # Resolve errors to immutable compiler source locations by
                   # matching compiler-owned diagnostic literals privately.
@@ -562,3 +592,6 @@ jobs:
               raise SystemExit(int(failures!=0))
           PY
 
+      - name: Enforce focused regression gate
+        if: always()
+        run: test "${{ steps.focused.outcome }}" = success
