@@ -1,0 +1,48 @@
+name: Verify shared scalar IR corpus on both native targets
+on:
+  pull_request:
+    paths: ['.github/workflows/check-shared-t5-scalar-3791.yml']
+permissions:
+  contents: read
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            package: compiler-backend-x86
+            test: t5_x86_semantics
+          - runner: ubuntu-24.04-arm
+            package: compiler-backend-aarch64
+            test: shared_t5_scalar
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: f334893d106c084fee4a17a6120e0ceb2e895255
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and isolate compiler-core workspace
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = f334893d106c084fee4a17a6120e0ceb2e895255
+          git rev-parse HEAD
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/ir-macros", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: shared-t5-scalar-${{ matrix.runner }}
+      - name: Install Z3 for existing x86 SMT obligations
+        if: matrix.package == 'compiler-backend-x86'
+        run: |
+          command -v z3 || { sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends z3; }
+      - name: Verify shared fixture with native C oracle
+        run: |
+          set -euo pipefail
+          cargo test -p ${{ matrix.package }} --test ${{ matrix.test }} -- --include-ignored --nocapture
