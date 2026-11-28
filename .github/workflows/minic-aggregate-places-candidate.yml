@@ -1,0 +1,265 @@
+name: Mini-C merged storage and bitfield ABI batch
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/minic-aggregate-places-candidate.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  candidate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a1f0b1e6af70dd339b44e3457798feb75dc273d8
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Source pins
+        run: |
+          git -C compiler rev-parse HEAD
+          grep 'rev =' compiler/tools/mini-c-driver/Cargo.toml
+          sed -i 's|ssh://git@github.com/bingordo/mini-c.git|https://github.com/bingordo/mini-c.git|g' compiler/tools/mini-c-driver/Cargo.toml
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: 09d03a1cb068bc6c3f993493a268e45c16c509f1
+          path: frontend-candidate
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Validate qualified aggregate frontend candidate
+        run: |
+          git -C frontend-candidate rev-parse HEAD
+          cargo test --manifest-path frontend-candidate/Cargo.toml -p mini-c-sema
+          test $(grep -c 'rev = "09d03a1cb068bc6c3f993493a268e45c16c509f1"' compiler/tools/mini-c-driver/Cargo.toml) -eq 2
+          grep 'rev =' compiler/tools/mini-c-driver/Cargo.toml
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: minic-native-hexfloat
+      - name: Probe unit tests
+        run: cd compiler/tools && python3 -m unittest test_csmith_probe
+      - name: GCC mixed shared bitfield INTEGER ABI
+        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test bitfield_integer_abi --test mixed_bitfield_storage --test integer_union_abi -- --nocapture
+      - name: Existing adapter suite
+        if: success() || failure()
+        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib
+      - name: Build driver
+        if: success() || failure()
+        run: cargo build --manifest-path compiler/tools/mini-c-driver/Cargo.toml --bin compiler-mini-c
+      - uses: actions/download-artifact@v4
+        if: success() || failure()
+        with:
+          name: minic-bitfield-abi-evidence-bitfield-abi
+          run-id: '46045840708'
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/storage-replay
+      - name: Replay exact original bitfield inputs
+        if: success() || failure()
+        env:
+          INPUTS: ${{ runner.temp }}/storage-replay
+        run: |
+          set -euo pipefail
+          PYTHONPATH=compiler/tools python3 - <<'PY'
+          import hashlib,json,os,pathlib,subprocess
+          root=pathlib.Path(os.environ["INPUTS"])/"restricted-bitfields"/"results"
+          driver=pathlib.Path("compiler/tools/mini-c-driver/target/debug/compiler-mini-c").resolve()
+          rows=[json.loads(x) for x in (root/"results.jsonl").read_text().splitlines()]
+          passed=0
+          for row in rows:
+              seed=row["seed"]
+              pre=root/f"case-{seed}"/"candidate.i"
+              assert hashlib.sha256(pre.read_bytes()).hexdigest()==row["preprocessed_sha256"]
+              work=pre.parent
+              obj=work/"new.o"
+              exe=work/"new.bin"
+              ref=work/"ref.bin"
+              subprocess.run(["gcc","-std=c99","-w","-O2",str(pre),"-o",str(ref)],check=True,timeout=30)
+              expect=subprocess.run([str(ref)],capture_output=True,check=True,timeout=5).stdout
+              assert b"checksum" in expect
+              result=subprocess.run([str(driver),str(pre),"--omit-unreferenced-static-bodies","--emit","obj","-o",str(obj)],capture_output=True,timeout=30)
+              if result.returncode:
+                  message=result.stderr.decode(errors="replace").splitlines()[0]
+                  print("BITFIELD_REPLAY",seed,"rejected",message,flush=True)
+                  assert seed==10 and "16 physical slots" in message, (seed,message)
+                  continue
+              subprocess.run(["gcc",str(obj),"-o",str(exe)],check=True,timeout=30)
+              actual=subprocess.run([str(exe)],capture_output=True,check=True,timeout=5).stdout
+              assert actual==expect, (seed,actual,expect)
+              passed+=1
+              print("BITFIELD_REPLAY",seed,"passed",flush=True)
+          print("BITFIELD_TOTAL",passed,len(rows))
+          assert passed==16
+          PY
+      - uses: actions/download-artifact@v4
+        if: success() || failure()
+        with:
+          name: postmerge-bitfield-storage-evidence
+          run-id: '46099963961'
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/strict-replay
+      - name: Exact strict hosted linker triage
+        if: success() || failure()
+        env:
+          INPUTS: ${{ runner.temp }}/strict-replay
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,subprocess
+          root=pathlib.Path(os.environ["INPUTS"])/"restricted-observable"/"results"
+          driver=pathlib.Path("compiler/tools/mini-c-driver/target/debug/compiler-mini-c").resolve()
+          for row in map(json.loads,(root/"results.jsonl").read_text().splitlines()):
+              seed=row["seed"]
+              pre=root/f"case-{seed}"/"candidate.i"
+              assert hashlib.sha256(pre.read_bytes()).hexdigest()==row["preprocessed_sha256"]
+              print("STRICT_PREVIOUS_LINK",seed,row.get("compiler_link"),flush=True)
+              obj=pre.parent/"strict.o"
+              exe=pre.parent/"strict.bin"
+              p=subprocess.run([str(driver),str(pre),"--emit","obj","-o",str(obj)],capture_output=True,timeout=30)
+              if p.returncode:
+                  print("STRICT_BUILD",seed,p.returncode,p.stderr.decode(errors="replace")[:2000],flush=True)
+                  continue
+              print("STRICT_UNDEFINED",seed,subprocess.check_output(["nm","-u",str(obj)],text=True),flush=True)
+              ref=pre.parent/"strict-ref.bin"
+              subprocess.run(["gcc","-std=c99","-w","-O2",str(pre),"-o",str(ref)],check=True,timeout=30)
+              expected=subprocess.run([str(ref)],capture_output=True,check=True,timeout=5).stdout
+              for libs in ([],["-lm"]):
+                  p=subprocess.run(["gcc",str(obj),"-o",str(exe),*libs],capture_output=True,timeout=30)
+                  print("STRICT_LINK",seed,libs,p.returncode,p.stderr.decode(errors="replace")[:4000],flush=True)
+                  if not p.returncode:
+                      actual=subprocess.run([str(exe)],capture_output=True,timeout=5)
+                      print("STRICT_OUTPUT",seed,libs,actual.returncode,actual.stdout==expected,flush=True)
+          PY
+      - name: Broad postmerge Csmith campaign
+        if: success() || failure()
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y --no-install-recommends csmith libcsmith-dev gcc clang
+          header=$(dpkg -L libcsmith-dev | grep '/csmith.h$' | head -n1)
+          compiler_sha=$(git -C compiler rev-parse HEAD)
+          manifest=compiler/tools/mini-c-driver/Cargo.toml
+          frontend=$(PYTHONPATH=compiler/tools python3 -c 'from csmith_probe import pinned_frontend_revision; import sys; print(pinned_frontend_revision(open(sys.argv[1]).read()))' "$manifest")
+          evidence="$RUNNER_TEMP/postmerge-evidence"
+          failure=0
+          for profile in restricted-combined restricted-widths restricted-control restricted-storage restricted-arrays restricted-pointers restricted-structs restricted-compound restricted-observable restricted-bitfields restricted-unions restricted-volatile; do
+            extra=(--omit-unreferenced-static-bodies)
+            count=16
+            minimum=0
+            case "$profile" in restricted-arrays|restricted-pointers) count=32; minimum=32;; restricted-structs|restricted-compound) count=32; minimum=31;; restricted-bitfields) minimum=16;; restricted-unions) minimum=16;; restricted-volatile) minimum=3;; restricted-combined|restricted-widths) minimum=16;; restricted-control) minimum=14;; restricted-storage) minimum=1;; restricted-observable) count=8; minimum=8; extra=();; esac
+            cases="$evidence/$profile/cases"
+            results="$evidence/$profile/results"
+            python3 compiler/tools/csmith_probe.py --generate --cases-dir "$cases" --csmith csmith --seed-base 1 --seed-count "$count" --profile "$profile"
+            python3 compiler/tools/csmith_probe.py --probe --cases-dir "$cases" --artifacts-dir "$results" --include-dir "$(dirname "$header")" --preprocess-c --driver "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" --compiler-sha "$compiler_sha" --frontend-sha "$frontend" --minimum-native "$minimum" --compile-timeout 30 --run-timeout 5 --max-wall-seconds 240 "${extra[@]}" || failure=1
+          done
+          exit "$failure"
+      - name: Expanded strict hosted campaign (64 seeds)
+        if: success() || failure()
+        run: |
+          set -euo pipefail
+          header=$(dpkg -L libcsmith-dev | grep '/csmith.h$' | head -n1)
+          compiler_sha=$(git -C compiler rev-parse HEAD)
+          frontend=$(PYTHONPATH=compiler/tools python3 -c 'from csmith_probe import pinned_frontend_revision; import sys; print(pinned_frontend_revision(open(sys.argv[1]).read()))' compiler/tools/mini-c-driver/Cargo.toml)
+          evidence="$RUNNER_TEMP/postmerge-evidence/strict-64"
+          python3 compiler/tools/csmith_probe.py --generate --cases-dir "$evidence/cases" --csmith csmith --seed-base 1 --seed-count 64 --profile restricted-observable
+          python3 compiler/tools/csmith_probe.py --probe --cases-dir "$evidence/cases" --artifacts-dir "$evidence/results" --include-dir "$(dirname "$header")" --preprocess-c --driver "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" --compiler-sha "$compiler_sha" --frontend-sha "$frontend" --minimum-native 63 --compile-timeout 30 --run-timeout 5 --max-wall-seconds 360
+      - uses: actions/download-artifact@v4
+        if: success() || failure()
+        with:
+          name: postmerge-bitfield-storage-evidence
+          run-id: '46163897711'
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/unrestricted-replay
+      - name: Exact unrestricted source replay with frontend candidate
+        if: success() || failure()
+        env:
+          INPUTS: ${{ runner.temp }}/unrestricted-replay
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,subprocess
+          root=pathlib.Path(os.environ["INPUTS"])/"unrestricted"
+          driver=pathlib.Path("compiler/tools/mini-c-driver/target/debug/compiler-mini-c").resolve()
+          for seed in (3,5,13,14,16):
+              work=root/f"seed-{seed}"/"results"/f"case-{seed}"
+              row=json.loads((work.parent/"results.jsonl").read_text())
+              pre=work/"candidate.i"
+              assert hashlib.sha256(pre.read_bytes()).hexdigest()==row["preprocessed_sha256"]
+              obj=work/"new.o"
+              p=subprocess.run([str(driver),str(pre),"--emit","obj","-o",str(obj)],capture_output=True,timeout=30)
+              print("EXACT_UNRESTRICTED",seed,p.returncode,p.stderr.decode(errors="replace")[:1600],flush=True)
+              if p.returncode:
+                  assert seed in (3,16) and p.returncode==1
+                  continue
+              exe=work/"new.bin"
+              ref=work/"ref.bin"
+              subprocess.run(["gcc",str(obj),"-o",str(exe),"-lm"],check=True,timeout=30)
+              subprocess.run(["gcc","-std=c99","-w","-O2",str(pre),"-o",str(ref),"-lm"],check=True,timeout=30)
+              assert subprocess.check_output([str(exe)],timeout=5)==subprocess.check_output([str(ref)],timeout=5)
+              print("EXACT_UNRESTRICTED_PASS",seed,flush=True)
+          PY
+      - name: Unrestricted default Csmith (16 independent seeds)
+        if: success() || failure()
+        run: |
+          set -euo pipefail
+          header=$(dpkg -L libcsmith-dev | grep '/csmith.h$' | head -n1)
+          compiler_sha=$(git -C compiler rev-parse HEAD)
+          frontend=$(PYTHONPATH=compiler/tools python3 -c 'from csmith_probe import pinned_frontend_revision; import sys; print(pinned_frontend_revision(open(sys.argv[1]).read()))' compiler/tools/mini-c-driver/Cargo.toml)
+          evidence="$RUNNER_TEMP/postmerge-evidence/unrestricted"
+          failure=0
+          for seed in $(seq 1 16); do
+            dir="$evidence/seed-$seed"
+            if ! python3 compiler/tools/csmith_probe.py --generate --cases-dir "$dir/cases" --csmith csmith --seed-base "$seed" --seed-count 1 --profile unrestricted; then
+              echo "UNRESTRICTED_GENERATION_FAILURE $seed"
+              failure=1
+              continue
+            fi
+            python3 compiler/tools/csmith_probe.py --probe --cases-dir "$dir/cases" --artifacts-dir "$dir/results" --include-dir "$(dirname "$header")" --preprocess-c --driver "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" --compiler-sha "$compiler_sha" --frontend-sha "$frontend" --minimum-native 0 --compile-timeout 30 --run-timeout 5 --max-wall-seconds 120 || failure=1
+          done
+          python3 - "$evidence" <<'PY'
+          import json,pathlib,sys,collections
+          root=pathlib.Path(sys.argv[1])
+          totals=collections.Counter()
+          for seed in range(1,17):
+              summary=root/f"seed-{seed}"/"results"/"summary.json"
+              if not summary.exists():
+                  totals["missing-summary"]+=1
+                  continue
+              data=json.loads(summary.read_text())
+              totals.update(data["counts"])
+              totals["reference-agreed"]+=data["reference_agreed"]
+          print("UNRESTRICTED_TOTAL",dict(totals),flush=True)
+          PY
+          exit "$failure"
+      - name: Inventory remaining sema failures from original inputs
+        if: always()
+        env:
+          EVIDENCE: ${{ runner.temp }}/postmerge-evidence
+        run: |
+          python3 - <<'PY'
+          import json,os,pathlib
+          root=pathlib.Path(os.environ["EVIDENCE"])
+          for profile in ("restricted-storage","restricted-volatile","restricted-observable","unrestricted"):
+              cases=root/profile/"results"
+              results=cases/"results.jsonl"
+              if not results.exists(): continue
+              for row in map(json.loads,results.read_text().splitlines()):
+                  if row.get("classification")=="passed": continue
+                  seed=row["seed"]
+                  print("GAP",profile,seed,row.get("frontend_diagnostic"),row.get("compiler_link"),flush=True)
+                  if "operator requires compatible integer operands" not in str(row): continue
+                  p=cases/f"case-{seed}"/"candidate.i"
+                  if not p.exists(): continue
+                  lines=p.read_text().splitlines()
+                  for i,line in enumerate(lines):
+                      if i>1000 and "volatile" in line and not line.startswith("#"):
+                          print("VOLATILE_SOURCE",seed,i+1,line[:500],flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: postmerge-bitfield-storage-evidence
+          path: ${{ runner.temp }}/postmerge-evidence
+          retention-days: 14
