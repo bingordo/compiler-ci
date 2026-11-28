@@ -6,10 +6,10 @@ on:
   workflow_dispatch:
     inputs:
       compiler_sha:
-        description: 'Exact bingordo/compiler revision (defaults to verified baseline)'
+        description: 'Compiler revision (defaults to main; actual SHA recorded)'
         required: false
         type: string
-        default: '41ba00f60b00adc58d969df85c4ac44d34094a1f'
+        default: 'main'
   pull_request:
     paths: ['.github/workflows/verify-external-cmake-cjson.yml']
 permissions:
@@ -22,19 +22,50 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ inputs.compiler_sha || '41ba00f60b00adc58d969df85c4ac44d34094a1f' }}
+          ref: ${{ inputs.compiler_sha || 'main' }}
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.CI_KEY }}
-      - name: Build source-pinned main TypeId compiler
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+      - name: Build resolved TypeId compiler revision
         shell: bash
         run: |
           set -euo pipefail
+          echo "COMPILER_SHA=$(git -C compiler rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
           timeout --signal=TERM --kill-after=10s 14m \
             cargo build -p compiler --bin compiler --manifest-path compiler/Cargo.toml
+      - name: Verify native export-dynamic linking against GCC
+        shell: bash
+        run: |
+          set -euo pipefail
+          c="$PWD/compiler/target/debug/compiler"
+          d="$(mktemp -d)"
+          trap 'rm -rf "$d"' EXIT
+          cd "$d"
+          cat > export.c <<'EOF'
+          int exported_probe(void) { return 42; }
+          int main(void) { return exported_probe() != 42; }
+          EOF
+          gcc -rdynamic export.c -o gcc-export
+          "$c" --gcc-driver -rdynamic export.c -o native-export
+          "$c" --gcc-driver -c export.c -o native.o
+          "$c" --gcc-driver -rdynamic native.o -o native-object-export
+          "$c" --gcc-driver native.o -o native-no-export
+          for exe in gcc-export native-export native-object-export; do
+            "./$exe"
+            nm -D --defined-only "$exe" | grep -E '[[:space:]]T[[:space:]]exported_probe$'
+          done
+          ./native-no-export
+          if nm -D --defined-only native-no-export | grep -E '[[:space:]]T[[:space:]]exported_probe$'; then
+            echo 'unexpected dynamic export without -rdynamic' >&2
+            exit 1
+          fi
+          echo 'GCC_RDYNAMIC_SOURCE_AND_OBJECT_LINK=PASS' >> "$GITHUB_STEP_SUMMARY"
       - name: Fetch pinned upstream cJSON v1.7.19 without source changes
         shell: bash
         run: |
@@ -143,7 +174,7 @@ jobs:
           if test "$configure_rc" -eq 0 && test "$build_rc" -ne 0; then
             if grep -Fq "unsupported GNU symbol attribute '__mode__'" typeid-build.log; then
               echo 'first_blocker=gnu_mode_attribute' >> cjson-result.txt
-            elif grep -Eq 'unsupported|error:|fatal error:' typeid-build.log; then
+            elif grep -Eq '^compiler:|unsupported|error:|fatal error:' typeid-build.log; then
               echo 'first_blocker=other_compiler_diagnostic' >> cjson-result.txt
             else
               echo 'first_blocker=unclassified_build_failure' >> cjson-result.txt
@@ -155,7 +186,17 @@ jobs:
           else
             echo 'first_blocker=none' >> cjson-result.txt
           fi
+          if test "$build_rc" -ne 0 && test -f typeid-build.log; then
+            grep -m 1 '^compiler:' typeid-build.log | sed 's/^/first_diagnostic=/' >> cjson-result.txt || true
+          fi
+          if test "$configure_rc" -ne 0; then
+            grep -m 1 'compiler: ' typeid-configure.log | sed 's/^/first_diagnostic=/' >> cjson-result.txt || true
+          fi
           cat cjson-result.txt
+          if grep -Fq 'unsupported GCC linker option: -rdynamic' typeid-configure.log; then
+            echo 'Known -rdynamic regression remains' >&2
+            exit 1
+          fi
           if test "$configure_rc" -ne 0; then
             echo "TYPEID_CJSON_STAGE=configure"
           elif test "$build_rc" -ne 0; then
