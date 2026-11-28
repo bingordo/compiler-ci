@@ -1,4 +1,4 @@
-name: One-off Csmith layout and interference timing
+name: One-off merged Csmith optimizer and backend timings
 on:
   pull_request:
     branches: [main]
@@ -23,24 +23,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: d132bd97b17dc493f964ab5b6842034b20841728
+          ref: 0955fe0022ba3130e084f6382d1ece19c300c835
           path: compiler
-          ssh-key: ${{ secrets.CI_KEY }}
-          persist-credentials: false
-      - uses: actions/checkout@v4
-        with:
-          repository: bingordo/compiler
-          ref: 23668b729b2579bd33ad807203fd907f62a43a1a
-          fetch-depth: 5
-          path: layout
-          ssh-key: ${{ secrets.CI_KEY }}
-          persist-credentials: false
-      - uses: actions/checkout@v4
-        with:
-          repository: bingordo/compiler
-          ref: 55a70b8f7896396aadcb302bd4af8eb45278fd3b
-          fetch-depth: 3
-          path: interference
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - name: Prepare toolchain and source
@@ -48,8 +32,6 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/csmith-bench"
           git -C compiler rev-parse HEAD | tee "$RUNNER_TEMP/csmith-bench/compiler-sha"
-          git -C interference rev-parse HEAD | tee "$RUNNER_TEMP/csmith-bench/interference-sha"
-          git -C layout rev-parse HEAD | tee "$RUNNER_TEMP/csmith-bench/layout-sha"
           # The preserved .i files are already preprocessed. No Csmith
           # installation or package repository refresh is needed.
           gcc --version > "$RUNNER_TEMP/csmith-bench/gcc.txt"
@@ -70,32 +52,7 @@ jobs:
         with:
           workspaces: compiler/tools/mini-c-driver -> target
           key: mini-c-release-csmith-profile-v1
-      - name: Attribute existing strict x86 Clippy diagnostics on exact current-main baseline
-        working-directory: compiler
-        run: |
-          set -euo pipefail
-          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
-          out="$RUNNER_TEMP/csmith-bench"
-          set +e
-          cargo clippy -p compiler-backend-x86 --lib --message-format=json -- -D warnings >"$out/clippy-base.jsonl" 2>"$out/clippy-base.stderr"
-          code=$?
-          set -e
-          echo "BASE_CLIPPY_EXIT $code"
-          cat "$out/clippy-base.stderr"
-      - name: Apply both disjoint candidate patches to latest main
-        run: |
-          set -euo pipefail
-          out="$RUNNER_TEMP/csmith-bench"
-          base=5a1aa5deefef6687460ad185b1d0e48788d673b6
-          for candidate in layout interference; do
-            git -C "$candidate" diff "$base" HEAD > "$out/$candidate.patch"
-            git -C compiler apply --check "$out/$candidate.patch"
-            git -C compiler apply "$out/$candidate.patch"
-          done
-          git -C compiler diff --stat
-          git -C compiler diff > "$out/integration.patch"
-          sha256sum "$out/integration.patch"
-      - name: Validate integrated backend
+      - name: Validate merged backend and middle-end integration
         working-directory: compiler
         run: |
           set -euo pipefail
@@ -105,35 +62,9 @@ jobs:
           cargo test --release -p compiler-backend-x86 --lib many_fallthrough_jumps_compact_without_shifting_tail
           cargo test --release -p compiler-backend-x86 --lib flags::
           cargo test --release -p compiler-backend-x86 --test backend_pass_timing --test mixed_frame_native
+          cargo test --release -p compiler-opt --lib
           cargo check --workspace
           cargo clippy -p compiler-backend --lib -- -D warnings
-          out="$RUNNER_TEMP/csmith-bench"
-          set +e
-          cargo clippy -p compiler-backend-x86 --lib --message-format=json -- -D warnings >"$out/clippy-candidate.jsonl" 2>"$out/clippy-candidate.stderr"
-          code=$?
-          set -e
-          echo "CANDIDATE_CLIPPY_EXIT $code"
-          cat "$out/clippy-candidate.stderr"
-          python3 - "$out" "$code" <<'PY'
-          import collections, json, pathlib, sys
-          root=pathlib.Path(sys.argv[1])
-          def errors(name):
-              result=collections.Counter()
-              for line in (root/f"clippy-{name}.jsonl").read_text().splitlines():
-                  row=json.loads(line)
-                  if row.get("reason")!="compiler-message": continue
-                  m=row["message"]
-                  if m["level"]!="error": continue
-                  spans=tuple(s["file_name"] for s in m["spans"] if s["is_primary"])
-                  code=(m.get("code") or {}).get("code")
-                  result[(code,m["message"],spans)]+=1
-              return result
-          base, candidate=errors("base"),errors("candidate")
-          print("BASE_CLIPPY_DIAGNOSTICS",base)
-          print("CANDIDATE_CLIPPY_DIAGNOSTICS",candidate)
-          assert int(sys.argv[2])==0 or candidate, "Unattributed Clippy failure"
-          assert not candidate-base, f"New Clippy errors: {candidate-base}"
-          PY
       - name: Diagnostic-only disable generated rewrite group after normal unit tests
         run: |
           python3 - <<'PY'
@@ -144,7 +75,37 @@ jobs:
           assert text.count(old)==1
           p.write_text(text.replace(old,"default = []"))
           PY
-          git -C compiler diff -- crates/opt/Cargo.toml
+          # Opt-in diagnostic bridge to the EXISTING owned-source optimizer
+          # profile, not the cloning transactional profiling entry point.
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("compiler/crates/opt/src/typed_pipeline.rs")
+          s=p.read_text()
+          old="        CheckedSourceScope::Core =>\n            optimize_typeid_source_impl(module,options,None,None,TypeIdOptimizationLevel::O2,owned).map(|_| ()),"
+          new="""        CheckedSourceScope::Core => {
+              let mut profile=crate::native_integer_algebra::NativeIntegerPhaseProfile::default();
+              let result=optimize_typeid_source_impl(module,options,Some(&mut profile),None,TypeIdOptimizationLevel::O2,owned);
+              for (name,ns) in [
+                  ("input_validation",profile.source_input_validation_ns),
+                  ("clone",profile.source_clone_ns),
+                  ("core",profile.source_core_ns),
+                  ("ctfe",profile.source_ctfe_ns),
+                  ("retry",profile.source_core_retry_ns),
+                  ("native_integer",profile.source_integer_ns),
+                  ("output_validation",profile.source_output_validation_ns),
+                  ("commit",profile.source_commit_ns),
+              ] { eprintln!("OPT_TIME_PHASE\\t{name}\\t{ns}"); }
+              for (i,name) in TYPED_CORE_PASS_NAMES.iter().enumerate() {
+                  eprintln!("OPT_TIME_PASS\\t{name}\\t{}\\t{}",profile.source_core_pass_ns[i],profile.source_core_retry_pass_ns[i]);
+              }
+              eprintln!("OPT_TIME_PRE_DETAIL\\t{:?}\\t{:?}",profile.source_pre_phase,profile.source_retry_pre_phase);
+              result.map(|_| ())
+          },"""
+          assert s.count(old)==1
+          p.write_text(s.replace(old,new))
+          PY
+          git -C compiler diff -- crates/opt/Cargo.toml crates/opt/src/typed_pipeline.rs > "$RUNNER_TEMP/csmith-bench/diagnostic.patch"
+          cat "$RUNNER_TEMP/csmith-bench/diagnostic.patch"
       - name: Build diagnostic native driver in ordinary release mode
         run: |
           set -euo pipefail
