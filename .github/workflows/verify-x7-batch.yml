@@ -1,97 +1,95 @@
-name: X7 batched compiler candidate validation
-# Reusable manual gate: supply the exact compiler commit SHA on dispatch.
-# This workflow never enables its experimental feature in default codegen.
+name: X7 explicit target feature validation
 on:
-  workflow_dispatch:
-    inputs:
-      source_ref:
-        description: "Exact compiler candidate SHA (40 hex digits)"
-        required: true
-        type: string
+  pull_request:
+    paths: ['.github/workflows/verify-x7-batch.yml']
 permissions:
   contents: read
-concurrency:
-  group: x7-batch-${{ inputs.source_ref }}
-  cancel-in-progress: true
 jobs:
-  physical-ctz:
-    name: Physical CTZ ${{ matrix.variant }}
+  target-ctz:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         variant: [baseline, probe]
-    env:
-      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-      CARGO_INCREMENTAL: "0"
-      SOURCE_REF: "${{ inputs.source_ref }}"
     steps:
-      - name: Validate source-ref shape
-        shell: bash
-        run: |
-          set -euo pipefail
-          [[ "$SOURCE_REF" =~ ^[0-9a-f]{40}$ ]] || { echo "Full exact SHA required" >&2; exit 1; }
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: ${{ env.SOURCE_REF }}
+          ref: 47116005e1aaef7c5bb12a8418002723a6a8fb3b
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Verify exact candidate and configure public git dependencies
-        shell: bash
+      - name: Verify exact source and restrict workspace
         run: |
           set -euo pipefail
-          sha="$(git -C compiler rev-parse HEAD)"
-          test "$sha" = "$SOURCE_REF"
-          echo "X7 tested compiler SHA: $sha, mode: ${{ matrix.variant }}" >> "$GITHUB_STEP_SUMMARY"
+          test "$(git -C compiler rev-parse HEAD)" = 47116005e1aaef7c5bb12a8418002723a6a8fb3b
           git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
           git config --global --add url."https://github.com/".insteadOf "git@github.com:"
-      - name: Restrict workspace to core source crates
-        shell: bash
-        run: |
           cat > compiler/Cargo.toml <<'EOF'
           [workspace]
           resolver = "2"
-          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          members = ["crates/ir", "crates/ir-macros", "crates/opt", "crates/backend", "crates/backend-x86"]
           EOF
           rm -f compiler/Cargo.lock
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: compiler -> target
           key: x7-batch-${{ matrix.variant }}
-      - name: Native TypeId CTZ independent C11 GAS/ELF oracle
-        shell: bash
+      - name: Explicit target TypeId GAS/ELF and narrow fallback oracles
         working-directory: compiler
         run: |
           set -euo pipefail
+          args=()
           if test "${{ matrix.variant }}" = probe; then
-            cargo test -p compiler-backend-x86 --test x7_ctz_bsf_zeroing_probe --features x7-bsf-zeroing-probe -- --nocapture
-          else
-            cargo test -p compiler-backend-x86 --test x7_ctz_bsf_zeroing_probe -- --nocapture
+            args+=(--features x7-tzcnt-native-probe)
           fi
-      - name: Existing narrow CTZ regression and measured dependency tests
-        shell: bash
+          cargo test -p compiler-backend-x86 "${args[@]}" --test x86_tzcnt_typeid_native --test review_narrow_compare_ctz_oracle -- --nocapture
+          cargo check -p compiler-backend-x86 --no-default-features "${args[@]}"
+          cargo test -p compiler-backend-x86 "${args[@]}" --lib generated_feature_requirements_gate_real_match_and_never_bypass_certificate -- --nocapture
+
+  driver:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 47116005e1aaef7c5bb12a8418002723a6a8fb3b
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x7-target-driver
+      - name: Build real driver and test explicit source/replay target options
         working-directory: compiler
         run: |
           set -euo pipefail
-          if test "${{ matrix.variant }}" = probe; then
-            cargo test -p compiler-backend-x86 --test review_narrow_compare_ctz_oracle --features x7-bsf-zeroing-probe
-            cargo test -p compiler-backend-x86 --test x7_measured_bsf_dependencies --features x7-bsf-zeroing-probe
-          else
-            cargo test -p compiler-backend-x86 --test review_narrow_compare_ctz_oracle
-            cargo test -p compiler-backend-x86 --test x7_measured_bsf_dependencies
-          fi
-      - name: Backend normal and no-default build checks
-        shell: bash
-        working-directory: compiler
-        run: |
-          set -euo pipefail
-          if test "${{ matrix.variant }}" = probe; then
-            cargo check -p compiler-backend-x86 --features x7-bsf-zeroing-probe
-            cargo check -p compiler-backend-x86 --no-default-features --features x7-bsf-zeroing-probe
-          else
-            cargo check -p compiler-backend-x86
-            cargo check -p compiler-backend-x86 --no-default-features
-          fi
+          test "$(git rev-parse HEAD)" = 47116005e1aaef7c5bb12a8418002723a6a8fb3b
+          cargo build -p compiler --bin compiler --features compiler-backend-x86/x7-tzcnt-native-probe
+          bin=target/debug/compiler
+          fixture=crates/backend-x86/tests/fixtures/x86_selector_ctz_legacy_casts_v3.ir
+          export COMPILER_X86_TZCNT_TARGET=unsupported
+          for target in baseline bmi1 popcnt,lzcnt bmi1,popcnt; do
+            "$bin" --load-ir "$fixture" --x86-features "$target" --emit asm -o /tmp/target.s
+            "$bin" --load-ir "$fixture" --x86-features "$target" --emit obj -o /tmp/target.o
+            objdump -dr /tmp/target.o >/tmp/target.dump
+            if [[ "$target" == bmi1* ]]; then
+              test "$(grep -Ec '^[[:space:]]*tzcnt[lq][[:space:]]' /tmp/target.s)" = 2
+              test "$(grep -Ec '[[:space:]]tzcnt[[:space:]]' /tmp/target.dump)" = 2
+            else
+              test "$(grep -Ec '^[[:space:]]*bsf[lq][[:space:]]' /tmp/target.s)" = 2
+              test "$(grep -Ec '[[:space:]]bsf[[:space:]]' /tmp/target.dump)" = 2
+            fi
+          done
+          printf 'int f(int x) { return x+1; }\n' >/tmp/target.c
+          "$bin" /tmp/target.c --language mini-c --x86-features bmi1 --emit obj -o /tmp/source.o
+          for invalid in '' native unknown bmi1,bmi1 baseline,bmi1; do
+            if "$bin" --load-ir "$fixture" --x86-features "$invalid" --emit obj -o /tmp/reject.o; then exit 1; fi
+          done
+          if "$bin" --load-ir "$fixture" --target aarch64 --x86-features bmi1 --emit obj -o /tmp/reject.o; then exit 1; fi
