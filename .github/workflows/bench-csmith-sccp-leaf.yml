@@ -1,4 +1,4 @@
-name: One-off Csmith paged SSA and batched identical merges
+name: One-off matched mem2reg store-kind gate comparison
 on:
   pull_request:
     branches: [main]
@@ -23,7 +23,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 3b5b452134bc53724b6c579adf935d79efd2c55e
+          ref: c8fa58d599f7bb4b1686f7008cceaeb29de61780
+          fetch-depth: 3
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -57,17 +58,10 @@ jobs:
         run: |
           set -euo pipefail
           git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
-          cargo test --release -p compiler-backend --lib
-          cargo test --release -p compiler-backend-x86 --lib reverse_branch_normalization_matches_original_fixed_point
-          cargo test --release -p compiler-backend-x86 --lib many_fallthrough_jumps_compact_without_shifting_tail
-          cargo test --release -p compiler-backend-x86 --lib flags::
-          cargo test --release -p compiler-backend-x86 --test backend_pass_timing --test mixed_frame_native
-          cargo test --release -p compiler-ir --lib
           cargo test --release -p compiler-opt --lib
-          cargo test --release -p compiler-opt --test typed_identical_merges --test typed_if_conversion_native --test typed_if_conversion_pure
-          cargo clippy -p compiler-ir --lib -- -D warnings
+          cargo test --release -p compiler-opt --test typed_mem2reg --test mem2reg_native
+          cargo clippy -p compiler-opt --lib -- -D warnings
           cargo check --workspace
-          cargo clippy -p compiler-backend --lib -- -D warnings
       - name: Diagnostic-only disable generated rewrite group after normal unit tests
         run: |
           python3 - <<'PY'
@@ -102,6 +96,7 @@ jobs:
                   eprintln!("OPT_TIME_PASS\\t{name}\\t{}\\t{}",profile.source_core_pass_ns[i],profile.source_core_retry_pass_ns[i]);
               }
               eprintln!("OPT_TIME_PRE_DETAIL\\t{:?}\\t{:?}",profile.source_pre_phase,profile.source_retry_pre_phase);
+              eprintln!("OPT_TIME_PROMOTION_DETAIL\\t{:?}\\t{:?}",profile.source_core_promotion_phase,profile.source_retry_promotion_phase);
               result.map(|_| ())
           },"""
           assert s.count(old)==1
@@ -113,7 +108,15 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c 2>&1 | tee "$RUNNER_TEMP/csmith-bench/build.log"
-          sha256sum compiler/tools/mini-c-driver/target/release/compiler-mini-c > "$RUNNER_TEMP/csmith-bench/driver-sha256"
+          out="$RUNNER_TEMP/csmith-bench"
+          bin=compiler/tools/mini-c-driver/target/release/compiler-mini-c
+          cp "$bin" "$out/candidate-driver"
+          # Revert only the changed production file to the exact PR base.
+          # Both binaries share all other code and diagnostic settings.
+          git -C compiler show 4d9e292e7011d04986b74efb29b436e53bbe3ca9:crates/opt/src/mem2reg_core.rs > compiler/crates/opt/src/mem2reg_core.rs
+          cargo build --release --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c 2>&1 | tee "$out/build-base.log"
+          cp "$bin" "$out/base-driver"
+          sha256sum "$out/"*-driver > "$out/driver-sha256"
       - name: Time exact Csmith inputs with backend pass report
         run: |
           set -euo pipefail
@@ -132,28 +135,23 @@ jobs:
               print("VERIFIED_INPUT",seed,case["lines"],case["preprocessed_sha256"])
           PY
           lscpu > "$out/host.txt"
-          bin="$PWD/compiler/tools/mini-c-driver/target/release/compiler-mini-c"
           for seed in 1001 1002; do
-            p="$out/timing-$seed"
-            set +e
-            COMPILER_BACKEND_TIME_REPORT=1 /usr/bin/time -f 'wall=%e user=%U sys=%S maxrss_kib=%M' -o "$p.time" timeout --kill-after=5s 900s "$bin" "$out/case-$seed.i" --emit obj -o "$p.o" --omit-unreferenced-static-bodies >"$p.log" 2>&1
-            status=$?
-            set -e
-            echo "NATIVE_EXIT $seed $status"
-            cat "$p.time"
-            cat "$p.log"
-            if [ "$status" = 0 ]; then
-              for level in 0 2 3; do
-                /usr/bin/time -f 'wall=%e user=%U sys=%S maxrss_kib=%M' -o "$p.gcc-O$level.time" gcc -O"$level" -w -c "$out/case-$seed.i" -o "$p.gcc-O$level.o"
-                echo "GCC_TIME $seed O$level"
-                cat "$p.gcc-O$level.time"
-              done
-              gcc "$p.gcc-O2.o" -o "$p.gcc"
+            gcc -O2 -w "$out/case-$seed.i" -o "$out/gcc-$seed"
+            timeout 20s "$out/gcc-$seed" > "$out/gcc-$seed.checksum"
+            order="base candidate"
+            if [ "$seed" = 1002 ]; then order="candidate base"; fi
+            for variant in $order; do
+              p="$out/$variant-$seed"
+              COMPILER_BACKEND_TIME_REPORT=1 /usr/bin/time -f 'wall=%e user=%U sys=%S maxrss_kib=%M' -o "$p.time" timeout --kill-after=5s 600s "$out/$variant-driver" "$out/case-$seed.i" --emit obj -o "$p.o" --omit-unreferenced-static-bodies >"$p.log" 2>&1
+              echo "TIMING $variant $seed"
+              cat "$p.time" "$p.log"
               gcc "$p.o" -o "$p.exe"
-              timeout 20s "$p.gcc" > "$p.gcc.checksum"
-              timeout 20s "$p.exe" > "$p.native.checksum"
-              cmp "$p.gcc.checksum" "$p.native.checksum" && echo "CHECKSUM_MATCH $seed"
-            fi
+              timeout 20s "$p.exe" > "$p.checksum"
+              cmp "$out/gcc-$seed.checksum" "$p.checksum"
+              echo "CHECKSUM_MATCH $variant $seed"
+            done
+            cmp "$out/base-$seed.o" "$out/candidate-$seed.o"
+            echo "OBJECT_MATCH $seed"
           done
       - uses: actions/upload-artifact@v4
         if: always()
