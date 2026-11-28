@@ -1,0 +1,56 @@
+name: One-off backend pass manager validation
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/bench-backend-pass-timing.yml'
+permissions:
+  contents: read
+jobs:
+  validate:
+    if: github.head_ref == 'bench/backend-pass-timing' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 0e6a0763240b9a568a86dd596792bca685c0d4b8
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            compiler -> target
+            compiler/tools/mini-c-driver -> target
+          key: backend-pass-manager
+      - name: Validate exact candidate
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          cargo test --release -p compiler-backend --lib
+          cargo test --release -p compiler-backend-x86 --test backend_pass_timing --test mixed_frame_native
+          cargo check --workspace
+          cargo clippy -p compiler-backend --lib -- -D warnings
+      - name: Exercise report through standalone Mini-C driver
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c
+          bin=tools/mini-c-driver/target/release/compiler-mini-c
+          printf 'int add_values(int a, int b) { return a + b; }\n' > "$RUNNER_TEMP/sample.c"
+          "$bin" "$RUNNER_TEMP/sample.c" --emit obj -o "$RUNNER_TEMP/normal.o"
+          COMPILER_BACKEND_TIME_REPORT=1 "$bin" "$RUNNER_TEMP/sample.c" --emit obj -o "$RUNNER_TEMP/timed.o" 2>"$RUNNER_TEMP/report.tsv"
+          cmp "$RUNNER_TEMP/normal.o" "$RUNNER_TEMP/timed.o"
+          cat "$RUNNER_TEMP/report.tsv"
+          python3 - "$RUNNER_TEMP/report.tsv" <<'PY'
+          import sys
+          rows=[line.split("\t") for line in open(sys.argv[1]) if line.startswith("BACKEND_TIME\t")]
+          total=next(int(line.split("\t")[1]) for line in open(sys.argv[1]) if line.startswith("BACKEND_TIME_TOTAL\t"))
+          assert rows and sum(int(row[4]) for row in rows)==total
+          assert any(row[1]=="shared.regalloc.interference" for row in rows)
+          assert any(row[1]=="x86.object_emit" for row in rows)
+          PY
