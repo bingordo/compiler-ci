@@ -1,0 +1,59 @@
+# One-off candidate validation; do not merge.
+name: IR legacy oracle feature retirement
+on:
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/ir-pr3785-oracle-retirement.yml']
+permissions:
+  contents: read
+jobs:
+  core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      SOURCE_SHA: 9da7354436a71dcc203eed5cf3ff01a6657d6242
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          path: ci-main
+          persist-credentials: false
+      - name: Exact source and live caller audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "Verified source $SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
+          echo 'Compiler Rust and manifest references (must be empty)'
+          if git -C compiler grep -nE 'legacy-ssa-oracle|loop_quality_metrics|native_memory_fixture|ct03_pre\.rs|mod ct03_pre\b' -- '*.rs' '*.toml'; then exit 1; else test "$?" -eq 1; fi
+          echo 'Diagnostic counter callers'
+          git -C compiler grep -nE 'verify_counts::(count|reset)|legacy_verifier_calls' -- '*.rs' '*.py' '*.yml' '*.yaml' || test "$?" -eq 1
+          git -C ci-main grep -nE 'CT03_VERIFY_COUNT|legacy_verifier_calls|CT03_TYPEID_VALIDATION|verify_counts::(count|reset)' -- '*.rs' '*.py' '*.yml' '*.yaml' || test "$?" -eq 1
+          echo 'Compiler workflow/tool and external CI references (review before merge)'
+          git -C compiler grep -nE 'legacy-ssa-oracle|x86_t5_bridge_selector|historical-function-oracle' -- '*.yml' '*.yaml' '*.py' '*.sh' || test "$?" -eq 1
+          git -C ci-main grep -nE 'legacy-ssa-oracle|x86_t5_bridge_selector|historical-function-oracle' -- '*.yml' '*.yaml' '*.py' '*.sh' '*.toml' || test "$?" -eq 1
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/ir-macros", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm", "crates/lto-plugin-core"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-graph-deletion
+      - name: Core all-target build and native tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          python3 tools/test_check_mixed_function_export_boundary.py
+          python3 tools/check_mixed_function_export_boundary.py
+          python3 tools/check_bt4_backend_boundary.py
