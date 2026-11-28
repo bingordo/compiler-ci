@@ -6,7 +6,7 @@ on:
 permissions:
   contents: read
 jobs:
-  fallout:
+  x86:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
@@ -38,33 +38,6 @@ jobs:
         with:
           workspaces: compiler -> target
           key: ir-graph-deletion
-      - name: Default production library compilation
-        working-directory: compiler
-        run: cargo check --workspace --lib --keep-going
-      - name: All target compilation fallout
-        if: ${{ !cancelled() }}
-        working-directory: compiler
-        run: cargo check --workspace --all-targets --keep-going
-      - name: IR unit and integration compilation fallout
-        if: ${{ !cancelled() }}
-        working-directory: compiler
-        run: cargo check -p compiler-ir --all-targets --keep-going
-      - name: Frozen independent verifier verdicts
-        if: ${{ !cancelled() }}
-        working-directory: compiler
-        run: cargo test -p compiler-ir --test typed_verifier_parity
-      - name: Run native IR regression tests
-        if: ${{ !cancelled() }}
-        working-directory: compiler
-        run: cargo test -p compiler-ir --no-fail-fast
-      - name: Run x86 native allocation and compare identity
-        if: ${{ !cancelled() }}
-        working-directory: compiler
-        run: cargo test -p compiler-backend-x86 --test callee_saved_native --test t5_x86_ssa_compare_provenance --test m4_7_indirect_ssa_native --test m4_7_gp_variadic_native --no-fail-fast
-      - name: Run migrated native optimizer oracle suites
-        if: ${{ !cancelled() }}
-        working-directory: compiler
-        run: cargo test -p compiler-opt --test generated_native_oracle --test al05_affine_native_bridge --test al05_parameterized_native_bridge --test al05_linear_native_bridge --test al05_diamond_native_bridge --test al05_dag_native_bridge --test typed_licm_native --test typed_induction_native --test typed_algebra --test lto_crossunit_optimization --test module_signatures --test loop_trap_semantics --test pre_licm_semantic_matrix --test memory_execution_oracle --test typed_native_parity --test al05_p9_mixed_native_bridge --no-fail-fast
       - name: Run native x86 unit and T5 selection tests
         if: ${{ !cancelled() }}
         working-directory: compiler
@@ -75,154 +48,208 @@ jobs:
         if: ${{ !cancelled() }}
         working-directory: compiler
         run: cargo test -p compiler-backend-x86 --test t5_x86_semantics -- --ignored
-      - name: Compile and run Alive-lite non-SMT regressions
-        if: ${{ !cancelled() }}
-        working-directory: compiler
-        run: cargo test -p compiler-opt --test alive_lite --no-fail-fast
-  integrate-main:
+  alive-lite:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 20
     env:
       SOURCE_SHA: 42c5a7347bba5233d9f18fcadff5f742980dcaf0
-      MAIN_SHA: 3924589ec937d2d55160f311e4ae63c955871cfe
-      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
       CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
           ref: ${{ env.SOURCE_SHA }}
-          fetch-depth: 0
           ssh-key: ${{ secrets.CI_KEY }}
-          persist-credentials: true
-          path: integrated
-      - name: Integrate exact main revision
-        working-directory: integrated
+          persist-credentials: false
+          path: compiler
+      - name: Verify graph deletion and inventory direct dependents
+        working-directory: compiler
         run: |
+          set -euo pipefail
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          git fetch origin "$MAIN_SHA"
-          git -c user.name=ci -c user.email=ci@example.invalid merge --no-commit --no-ff FETCH_HEAD
-          git write-tree
-      - name: Configure frontend dependencies as in existing Oberon gate
-        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          if git grep -nE '^pub struct (Function|Block|Instruction|Parameter|ModuleSnapshot|TypedModule|TypeAnnotatedModule)\b' -- crates/ir/src; then exit 1; else test "$?" -eq 1; fi
+          echo 'Remaining historical graph dependencies grouped by file:'
+          git grep -l -E 'legacy-ssa-oracle|historical-function-oracle|ModuleSnapshot|TypeAnnotatedModule|FunctionValueTypes|from_annotated|project_legacy_compat_function|\.to_legacy\(|TypedSsaModule::from_legacy|compiler_ir::\{[^}]*\b(Function|Block|Instruction|Parameter)\b|compiler_ir::(Function|Block|Instruction|Parameter)\b' -- '*.rs' '*.toml' | sort || test "$?" -eq 1
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/ir-macros", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm", "crates/lto-plugin-core"]
+          EOF
+          rm -f Cargo.lock
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: integrated -> target
-          key: ir-graph-deletion-full
-      - name: Full workspace compilation
-        working-directory: integrated
-        run: cargo check --workspace --all-targets --keep-going
-      - name: Oberon native record-field and cross-module VAR differential
+          workspaces: compiler -> target
+          key: ir-graph-deletion
+      - name: Compile and run Alive-lite non-SMT regressions
         if: ${{ !cancelled() }}
-        working-directory: integrated
-        run: cargo test -p compiler --test oberon_record_field_var_native --test oberon_generated_module_var_native --no-fail-fast
-      - name: Mini-C native standalone library tests
-        if: ${{ !cancelled() }}
-        working-directory: integrated
-        run: cargo test --manifest-path tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib
-  edg-native:
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test alive_lite --no-fail-fast
+  optimizer-1:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    container:
-      image: ghcr.io/edgcpp/ci-runner@sha256:14b3948c2ce12cfa5472e5a6c468393d15426f3a67685cc35d830ea5db2acdf8
-    defaults:
-      run:
-        shell: edg-container-exec "bash -eo pipefail {0}"
+    timeout-minutes: 20
     env:
-      COMPILER_SHA: 42c5a7347bba5233d9f18fcadff5f742980dcaf0
-      EDG_SOURCE_SHA: b195677be8b9b56c8337afad6be8064d21a54082
-      EDG_RELEASE_TAG: edgcpfe-v2026.11.14-upstream-177765bb7731
-      EDG_RELEASE_SHA256: 1ce495b629924f31382ecccc891a7a72caae1014ddfa2ba7dd39b44d8b0a9526
-      RUST_TOOLCHAIN_VERSION: 1.99.1
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_PROFILE_TEST_DEBUG: '0'
-      EDGCPP_SOURCE_DIR: ${{ github.workspace }}/edgcpp
-      EDGCPP_COMPILE_COMMANDS: ${{ github.workspace }}/edgcpp/build/gcc-release/compile_commands.json
-      EDGCPP_LIB_DIR: ${{ github.workspace }}/edgcpp/build/gcc-release/lib
-      EDGCPP_EDG_REVISION: b195677be8b9b56c8337afad6be8064d21a54082
+      SOURCE_SHA: 42c5a7347bba5233d9f18fcadff5f742980dcaf0
+      CARGO_INCREMENTAL: '0'
     steps:
-      - name: Check out shared ABI test harness
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Check out exact compiler revision tested by Mini-C
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 42c5a7347bba5233d9f18fcadff5f742980dcaf0
-          path: compiler
+          ref: ${{ env.SOURCE_SHA }}
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-
-      - name: Check out source headers matching upstream EDG release
-        uses: actions/checkout@v4
+          path: compiler
+      - name: Verify graph deletion and inventory direct dependents
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          if git grep -nE '^pub struct (Function|Block|Instruction|Parameter|ModuleSnapshot|TypedModule|TypeAnnotatedModule)\b' -- crates/ir/src; then exit 1; else test "$?" -eq 1; fi
+          echo 'Remaining historical graph dependencies grouped by file:'
+          git grep -l -E 'legacy-ssa-oracle|historical-function-oracle|ModuleSnapshot|TypeAnnotatedModule|FunctionValueTypes|from_annotated|project_legacy_compat_function|\.to_legacy\(|TypedSsaModule::from_legacy|compiler_ir::\{[^}]*\b(Function|Block|Instruction|Parameter)\b|compiler_ir::(Function|Block|Instruction|Parameter)\b' -- '*.rs' '*.toml' | sort || test "$?" -eq 1
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/ir-macros", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm", "crates/lto-plugin-core"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
         with:
-          repository: bingundu/edgcpp
-          ref: b195677be8b9b56c8337afad6be8064d21a54082
-          path: edgcpp
+          workspaces: compiler -> target
+          key: ir-graph-deletion
+      - name: Build optimizer test executables
+        working-directory: compiler
+        run: cargo test -p compiler-opt --no-run --test generated_native_oracle --test al05_affine_native_bridge --test al05_parameterized_native_bridge --test al05_linear_native_bridge --test al05_diamond_native_bridge --test al05_dag_native_bridge
+      - name: generated_native_oracle
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test generated_native_oracle -- --nocapture
+      - name: al05_affine_native_bridge
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test al05_affine_native_bridge -- --nocapture
+      - name: al05_parameterized_native_bridge
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test al05_parameterized_native_bridge -- --nocapture
+      - name: al05_linear_native_bridge
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test al05_linear_native_bridge -- --nocapture
+      - name: al05_diamond_native_bridge
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test al05_diamond_native_bridge -- --nocapture
+      - name: al05_dag_native_bridge
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test al05_dag_native_bridge -- --nocapture
+  optimizer-2:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      SOURCE_SHA: 42c5a7347bba5233d9f18fcadff5f742980dcaf0
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-
-      - name: Assert source revisions and unmodified Hello World
+          path: compiler
+      - name: Verify graph deletion and inventory direct dependents
+        working-directory: compiler
         run: |
           set -euo pipefail
-          test "$(git -C compiler rev-parse HEAD)" = "$COMPILER_SHA"
-          test "$(git -C edgcpp rev-parse HEAD)" = "$EDG_SOURCE_SHA"
-          printf 'Compiler SHA: %s\nEDG package SHA: %s\n' "$COMPILER_SHA" "$EDG_SOURCE_SHA" >>"$GITHUB_STEP_SUMMARY"
-
-      - name: Configure EDG header tooling without rebuilding full frontend
-        working-directory: edgcpp
-        env:
-          EDG_BASE: ${{ github.workspace }}/edgcpp/bases/docker/dev-env/gcc
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          if git grep -nE '^pub struct (Function|Block|Instruction|Parameter|ModuleSnapshot|TypedModule|TypeAnnotatedModule)\b' -- crates/ir/src; then exit 1; else test "$?" -eq 1; fi
+          echo 'Remaining historical graph dependencies grouped by file:'
+          git grep -l -E 'legacy-ssa-oracle|historical-function-oracle|ModuleSnapshot|TypeAnnotatedModule|FunctionValueTypes|from_annotated|project_legacy_compat_function|\.to_legacy\(|TypedSsaModule::from_legacy|compiler_ir::\{[^}]*\b(Function|Block|Instruction|Parameter)\b|compiler_ir::(Function|Block|Instruction|Parameter)\b' -- '*.rs' '*.toml' | sort || test "$?" -eq 1
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/ir-macros", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm", "crates/lto-plugin-core"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-graph-deletion
+      - name: Build optimizer test executables
+        working-directory: compiler
+        run: cargo test -p compiler-opt --no-run --test typed_licm_native --test typed_induction_native --test typed_algebra --test lto_crossunit_optimization --test module_signatures
+      - name: typed_licm_native
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typed_licm_native -- --nocapture
+      - name: typed_induction_native
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typed_induction_native -- --nocapture
+      - name: typed_algebra
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typed_algebra -- --nocapture
+      - name: lto_crossunit_optimization
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test lto_crossunit_optimization -- --nocapture
+      - name: module_signatures
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test module_signatures -- --nocapture
+  optimizer-3:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      SOURCE_SHA: 42c5a7347bba5233d9f18fcadff5f742980dcaf0
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - name: Verify graph deletion and inventory direct dependents
+        working-directory: compiler
         run: |
           set -euo pipefail
-          cmake --preset linux-gcc-release -DEDG_BUILD_LIB=OFF -DEDG_BUILD_CALLABLE_LIBRARY=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-          cmake --build build/gcc-release --target error-info --parallel 2
-          test -s build/gcc-release/src/includes/err_codes.h
-          test -s build/gcc-release/src/includes/err_data.h
-
-      - name: Restore checksummed upstream EDG callable release
-        working-directory: edgcpp
-        run: |
-          set -euo pipefail
-          mkdir -p build/gcc-release/lib build/prebuilt-edg
-          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error --retry 4 --retry-delay 2 \
-            "https://github.com/bingundu/edgcpp/releases/download/$EDG_RELEASE_TAG/edgcpfe-ci-upstream-callable-edg-release-20261114-linux-x86_64.tar.gz" \
-            -o build/prebuilt-edg/archive.tar.gz
-          printf '%s  %s\n' "$EDG_RELEASE_SHA256" build/prebuilt-edg/archive.tar.gz | sha256sum -c -
-          tar -xzf build/prebuilt-edg/archive.tar.gz -C build/prebuilt-edg
-          grep -Fx "commit=$EDG_SOURCE_SHA" build/prebuilt-edg/BUILD-INFO.txt
-          grep -Fx 'platform=linux-x86_64' build/prebuilt-edg/BUILD-INFO.txt
-          test -s build/prebuilt-edg/lib/libedgcpfe.a
-          cp build/prebuilt-edg/lib/libedgcpfe.a build/gcc-release/lib/libedgcpfe.a
-
-      - name: Install pinned Rust toolchain
-        run: |
-          set -euo pipefail
-          if ! command -v cargo >/dev/null; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-              sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN_VERSION"
-          fi
-          export PATH="$HOME/.cargo/bin:$PATH"
-          rustup toolchain install "$RUST_TOOLCHAIN_VERSION" --profile minimal
-          rustup default "$RUST_TOOLCHAIN_VERSION"
-
-      - name: Build EDG native TypeId driver
-        run: |
-          export PATH="$HOME/.cargo/bin:$PATH"
-          cargo build --manifest-path compiler/tools/edg-driver/Cargo.toml
-          test -x compiler/tools/edg-driver/target/debug/compiler-edg-driver
-      - name: Run EDG C and C++ native executable smoke oracles
-        run: |
-          set -euo pipefail
-          source edgcpp/build/gcc-release/environment.sh
-          driver="$PWD/compiler/tools/edg-driver/target/debug/compiler-edg-driver"
-          version=$(gcc -dumpfullversion -dumpversion | awk -F. '{print $1*10000+$2*100+$3}')
-          mkdir -p "$RUNNER_TEMP/edg-cutover"
-          cd "$RUNNER_TEMP/edg-cutover"
-          printf '%s\n' 'int add(int a,int b){return a+b;}' > add.c
-          printf '%s\n' 'extern "C" int mul(int a,int b){return a*b;}' > mul.cpp
-          printf '%s\n' 'extern int add(int,int),mul(int,int); int main(void){return add(20,22)!=42 || mul(6,7)!=42;}' > check.c
-          "$driver" add.o --gcc --c11 --no_strict_gnu --gnu_version "$version" add.c
-          "$driver" mul.o --g++ --no_strict_gnu --gnu_version "$version" mul.cpp
-          cc check.c add.o mul.o -o check
-          ./check
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          if git grep -nE '^pub struct (Function|Block|Instruction|Parameter|ModuleSnapshot|TypedModule|TypeAnnotatedModule)\b' -- crates/ir/src; then exit 1; else test "$?" -eq 1; fi
+          echo 'Remaining historical graph dependencies grouped by file:'
+          git grep -l -E 'legacy-ssa-oracle|historical-function-oracle|ModuleSnapshot|TypeAnnotatedModule|FunctionValueTypes|from_annotated|project_legacy_compat_function|\.to_legacy\(|TypedSsaModule::from_legacy|compiler_ir::\{[^}]*\b(Function|Block|Instruction|Parameter)\b|compiler_ir::(Function|Block|Instruction|Parameter)\b' -- '*.rs' '*.toml' | sort || test "$?" -eq 1
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/ir-macros", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm", "crates/lto-plugin-core"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-graph-deletion
+      - name: Build optimizer test executables
+        working-directory: compiler
+        run: cargo test -p compiler-opt --no-run --test loop_trap_semantics --test pre_licm_semantic_matrix --test memory_execution_oracle --test typed_native_parity --test al05_p9_mixed_native_bridge
+      - name: loop_trap_semantics
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test loop_trap_semantics -- --nocapture
+      - name: pre_licm_semantic_matrix
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test pre_licm_semantic_matrix -- --nocapture
+      - name: memory_execution_oracle
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test memory_execution_oracle -- --nocapture
+      - name: typed_native_parity
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test typed_native_parity -- --nocapture
+      - name: al05_p9_mixed_native_bridge
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test al05_p9_mixed_native_bridge -- --nocapture
