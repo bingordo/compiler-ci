@@ -1,0 +1,113 @@
+name: Candidate all-backend physical streaming 3299
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-a64-rv64-stream-physical-3299.yml']
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 60cc492f5a5b64d5eec1917cabb6029efffc95c0
+          path: baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 7b8a3283bcf17eb4d5653da1ca2a5296101e876b
+          path: candidate
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact revisions and isolate workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C baseline rev-parse HEAD)" = "60cc492f5a5b64d5eec1917cabb6029efffc95c0"
+          test "$(git -C candidate rev-parse HEAD)" = "7b8a3283bcf17eb4d5653da1ca2a5296101e876b"
+          for tree in baseline candidate; do
+            git -C "$tree" rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
+            cat > "$tree/Cargo.toml" <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm"]
+          exclude = ["tools/mini-c-driver"]
+          EOF
+            rm -f "$tree/Cargo.lock"
+          done
+      - name: Repair three stale baseline x86 callers (same fixes in candidate)
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          fixes = [
+              ("crates/backend-x86/src/x7_ip10_encoded_ab.rs", "preserve_frame_pointer,&HashSet::new(),None,Some(&mut physical))?;", "preserve_frame_pointer,&HashSet::new(),None,Some(&mut physical),None)?;"),
+              ("crates/backend-x86/tests/att_section_cursor.rs", "unowned_symbols: Vec::new(),", "unowned_symbols: Vec::new(),\n        relocations32: Vec::new(),"),
+              ("crates/backend-x86/tests/att_unowned_symbols.rs", "placements:Vec::new(),unowned_symbols:vec![symbol.clone()],", "placements:Vec::new(),unowned_symbols:vec![symbol.clone()],\n        relocations32:Vec::new(),"),
+          ]
+          for path, old, new in fixes:
+              p = Path("baseline") / path
+              source = p.read_text()
+              if new in source:
+                  continue
+              assert source.count(old) == 1, path
+              p.write_text(source.replace(old, new))
+          PY
+          git -C baseline diff
+      - name: New streaming regressions and workspace compilation
+        working-directory: candidate
+        run: |
+          cargo check --workspace
+          cargo test -p compiler-backend --test stream_scalar_legalization
+          cargo test -p compiler-backend-x86 -p compiler-backend-aarch64 -p compiler-backend-riscv64 --test stream_physical_emission
+          cargo check -p compiler-backend-x86 --no-default-features
+          cargo check -p compiler-backend-x86 --no-default-features --features x7-production-generated-add
+          cargo check -p compiler-backend-x86 --features x7-typeid-source-dag-optin
+      - name: Full backend tests on both revisions (baseline test-only repairs above)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for tree in baseline candidate; do
+            for package in compiler-backend compiler-backend-x86 compiler-backend-aarch64 compiler-backend-riscv64 compiler-backend-wasm; do
+              set +e
+              (cd "$tree"; cargo test -p "$package" --no-fail-fast) 2>&1 | tee "$RUNNER_TEMP/$tree-$package.log"
+              result=${PIPESTATUS[0]}
+              set -e
+              echo "$result" > "$RUNNER_TEMP/$tree-$package.status"
+            done
+          done
+      - name: Compare failed names, distinguishing doctest failures from build errors
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import os, pathlib, re
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          problems = []
+          print("| Crate | Baseline failed | Candidate failed | New failures |")
+          print("|---|---:|---:|---:|")
+          for package in ("compiler-backend", "compiler-backend-x86", "compiler-backend-aarch64", "compiler-backend-riscv64", "compiler-backend-wasm"):
+              failures = {}
+              for tree in ("baseline", "candidate"):
+                  log = (root / f"{tree}-{package}.log").read_text(errors="replace")
+                  status = int((root / f"{tree}-{package}.status").read_text())
+                  failed = set(re.findall(r"^test (.*?) \.\.\. FAILED\s*$", log, re.M))
+                  failures[tree] = failed
+                  # Rustdoc prints compiler diagnostics for failed examples;
+                  # only Cargo's build-failure marker is a build error.
+                  if re.search(r"(?m)^error: could not compile", log) or (status != 0 and not failed) or (status == 0 and failed) or not re.search(r"(?m)^test result: ", log):
+                      problems.append(f"{tree} {package}: incomplete or inconsistent test execution (exit {status})")
+              new = failures["candidate"] - failures["baseline"]
+              print(f"| {package} | {len(failures['baseline'])} | {len(failures['candidate'])} | {len(new)} |")
+              if new:
+                  problems.append(f"{package}: new failures: {sorted(new)}")
+              print(f"Baseline failures: {sorted(failures['baseline'])}")
+              print(f"Candidate failures: {sorted(failures['candidate'])}")
+          for problem in problems: print(problem)
+          assert not problems, "new failures or incomplete tests"
+          PY
