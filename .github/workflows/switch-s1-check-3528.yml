@@ -35,12 +35,21 @@ jobs:
               return subprocess.check_output(["git", *args], text=True)
           files = git("diff", "--name-only", "--diff-filter=U").splitlines()
           expected = {"crates/opt/src/induction_analysis.rs", "crates/opt/src/memory_alias_analysis.rs", "crates/opt/src/sccp_solver.rs", "crates/opt/tests/support/alive_lite_typeid_wide.rs"}
-          assert set(files) <= expected, files
+          expected.update({"crates/backend/src/lib.rs", "crates/backend/src/native_integer.rs"})
+          if not set(files) <= expected:
+              subprocess.run(["git", "diff", "--cc"], check=True)
+              raise AssertionError(files)
           pattern = re.compile(r"^<<<<<<< HEAD\n(.*?)^=======\n(.*?)^>>>>>>> [^\n]*\n", re.M | re.S)
           for name in files:
               path = Path(name)
               def resolve(m):
                   ours, theirs = m.groups()
+                  if name == "crates/backend/src/lib.rs":
+                      assert "mod switch_lowering;" in ours and "pub mod pass_manager;" in theirs, (ours, theirs)
+                      return "mod switch_lowering;\n"+theirs
+                  if name == "crates/backend/src/native_integer.rs":
+                      assert "lower_switches" in ours and "drop(body_timer)" in theirs, (ours, theirs)
+                      return ours+theirs
                   if name.endswith("induction_analysis.rs"):
                       assert "pub(crate) fn acyclic" in ours and not theirs.strip()
                       return theirs
@@ -55,7 +64,11 @@ jobs:
                       return next(s+"\n" for s in ours.splitlines() if "Terminator::Switch" in s)+theirs
                   raise AssertionError(name)
               old=path.read_text()
-              new,count=pattern.subn(resolve,old)
+              try:
+                  new,count=pattern.subn(resolve,old)
+              except AssertionError:
+                  subprocess.run(["git", "diff", "--cc", "--", name], check=True)
+                  raise
               assert count and "<<<<<<<" not in new, name
               path.write_text(new)
               subprocess.check_call(["git","add",name])
@@ -82,9 +95,11 @@ jobs:
               original=subprocess.run(["git","rev-parse",f"{head}:{path}"],capture_output=True,text=True)
               print("MERGE_ENTRY "+json.dumps({"path":path,"mode":mode,"type":"blob","sha":sha,"novel":original.returncode!=0 or original.stdout.strip()!=sha}))
               if original.returncode!=0 or original.stdout.strip()!=sha:
-                  data=Path(path).read_text()
-                  for i in range(0,len(data),3000):
-                      print("MERGE_CONTENT "+json.dumps([path,data[i:i+3000]],ensure_ascii=True))
+                  # Export compact patches relative to main, rather than logging
+                  # the entire contents of large backend and optimizer files.
+                  patch=git("diff","--cached","--no-renames","--no-ext-diff","--unified=0",base,"--",path)
+                  for i in range(0,len(patch),3000):
+                      print("MERGE_PATCH "+json.dumps([path,patch[i:i+3000]],ensure_ascii=True))
           PY
       - name: Isolate frontend-independent workspace
         working-directory: compiler
