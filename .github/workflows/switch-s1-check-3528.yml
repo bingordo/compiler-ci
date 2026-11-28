@@ -1,0 +1,55 @@
+name: Temporary S2 switch plan validation
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/switch-s1-check-3528.yml'
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 425c1f965a51359710c892bb8c185f65b8487a5a
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact revision
+        working-directory: compiler
+        run: test "$(git rev-parse HEAD)" = '425c1f965a51359710c892bb8c185f65b8487a5a'
+      - name: Use public pinned Mini-C dependency
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: switch-source
+      - name: Verify shared dispatch tree
+        working-directory: compiler
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Cargo.toml")
+          s=p.read_text()
+          assert '"crates/driver", ' in s
+          p.write_text(s.replace('"crates/driver", ', ''))
+          PY
+          cargo test -p compiler-backend --lib switch_
+          cargo check --keep-going -p compiler-backend-x86 -p compiler-backend-aarch64 -p compiler-backend-riscv64 -p compiler-backend-wasm
+      - name: Verify canonical switch and real native execution
+        run: |
+          set -o pipefail
+          cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test switch_native --test goto_labels 2>&1 | tee /tmp/switch-check.log
+      - name: Preserve compiler diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: switch-compile-diagnostics
+          path: /tmp/switch-check.log
+          if-no-files-found: warn
+          retention-days: 7
