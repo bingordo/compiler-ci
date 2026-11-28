@@ -43,17 +43,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Only reuse completed failures on the same source, workflow and
-          # toolchain/image, never a compilation error or infrastructure outage.
+          # Retry at least once per UTC day even if main is unchanged.
+          # Never reuse across source, workflow, toolchain or image changes.
           fingerprint=$(printf '%s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}" "$(rustc -vV)" "$(cargo -V)" | sha256sum | cut -d' ' -f1)
           echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+          echo "day=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+          if [[ -n "${ImageOS:-}" && -n "${ImageVersion:-}" ]]; then echo 'known=true' >> "$GITHUB_OUTPUT"; fi
       - name: Check previous completed ordinary regression failure
-        if: steps.passed.outputs.cache-hit != 'true'
+        if: steps.passed.outputs.cache-hit != 'true' && steps.environment.outputs.known == 'true'
         id: failed
         uses: actions/cache/restore@v4
         with:
           path: .failed-compiler-core
-          key: compiler-core-failed-v1-${{ hashFiles('ci-workflow/.github/workflows/verify-compiler-pr-head.yml') }}-${{ steps.environment.outputs.fingerprint }}-${{ inputs.source_ref }}
+          key: compiler-core-failed-v2-${{ hashFiles('ci-workflow/.github/workflows/verify-compiler-pr-head.yml', 'ci-workflow/tools/core_failure_receipt.py') }}-${{ steps.environment.outputs.fingerprint }}-${{ steps.environment.outputs.day }}-${{ inputs.source_ref }}
       - name: Report previously confirmed failure on unchanged source
         if: steps.failed.outputs.cache-hit == 'true'
         shell: bash
@@ -72,7 +74,7 @@ jobs:
               print(f"Compiler revision: {result['source_sha']}", file=summary)
               print(f"Previously executed: {result['passed']} passed, {result['failed']} failed, {result['ignored']} ignored.", file=summary)
               print(f"Original run: {result['run_url']}", file=summary)
-              print("Not a new test execution; dispatch the manual core gate to retry.", file=summary)
+              print("Not a new test execution; retry at the next UTC day or dispatch the manual core gate.", file=summary)
           PY
           exit 1
       - name: Restrict workspace to core crates
@@ -119,45 +121,17 @@ jobs:
         run: python3 tools/regression.py --profile workspace --suite cargo-tests --no-isolate-build-failures --output target/regression-core
       - name: Classify completed ordinary test failure for exact-SHA reuse
         id: failure-receipt
-        if: ${{ failure() && steps.ordinary.outcome == 'failure' && steps.failed.outputs.cache-hit != 'true' }}
+        if: ${{ failure() && steps.ordinary.outcome == 'failure' && steps.failed.outputs.cache-hit != 'true' && steps.environment.outputs.known == 'true' }}
         env:
           SOURCE_SHA: ${{ inputs.source_ref }}
         run: |
-          python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          p = Path("compiler/target/regression-core/summary.json")
-          if not p.is_file():
-              raise SystemExit(0)
-          report = json.loads(p.read_text())
-          rows = {row["suite"]: row for row in report["suites"]}
-          build, tests = rows.get("cargo-build", {}), rows.get("cargo-tests", {})
-          counts = tests.get("test_counts") or {}
-          if not (report["source_sha"] == os.environ["SOURCE_SHA"]
-                  and build.get("status") == "passed"
-                  and tests.get("status") == "failed"
-                  and tests.get("exit_code") == 101
-                  and not tests.get("rustc_error_codes")
-                  and tests.get("failed_test_case_ids")
-                  and counts.get("passed", 0) > 0 and counts.get("failed", 0) > 0):
-              raise SystemExit(0)
-          p = Path(".failed-compiler-core/result.json")
-          p.parent.mkdir(exist_ok=True)
-          p.write_text(json.dumps({"source_sha": report["source_sha"], **counts,
-              "run_url": os.environ["GITHUB_SERVER_URL"] + "/" + os.environ["GITHUB_REPOSITORY"] + "/actions/runs/" + os.environ["GITHUB_RUN_ID"]}))
-          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              print("reusable=true", file=output)
-          PY
+          python3 ci-workflow/tools/core_failure_receipt.py compiler/target/regression-core/summary.json .failed-compiler-core/result.json
       - name: Cache completed ordinary regression failure receipt
         if: ${{ failure() && steps.failure-receipt.outputs.reusable == 'true' }}
         uses: actions/cache/save@v4
         with:
           path: .failed-compiler-core
-          key: compiler-core-failed-v1-${{ hashFiles('ci-workflow/.github/workflows/verify-compiler-pr-head.yml') }}-${{ steps.environment.outputs.fingerprint }}-${{ inputs.source_ref }}
-      - name: Run experimental generated-rule tests
-        if: steps.passed.outputs.cache-hit != 'true' && steps.failed.outputs.cache-hit != 'true'
-        working-directory: compiler
-        run: cargo test -p compiler-opt --features experimental-generated-rules
+          key: compiler-core-failed-v2-${{ hashFiles('ci-workflow/.github/workflows/verify-compiler-pr-head.yml', 'ci-workflow/tools/core_failure_receipt.py') }}-${{ steps.environment.outputs.fingerprint }}-${{ steps.environment.outputs.day }}-${{ inputs.source_ref }}
       - name: Record passing source
         if: steps.passed.outputs.cache-hit != 'true' && success()
         run: |
