@@ -125,7 +125,7 @@ jobs:
           python3 -m unittest discover -s tools -p test_regression.py
           CARGO_TERM_COLOR=never python3 tools/regression.py --profile core --suite cargo-build --output target/regression-build-preflight
   coverage:
-    if: (github.event_name == 'pull_request' && (github.event.action != 'labeled' || github.event.label.name == 'rg-core-full' || github.event.label.name == 'rg-all' || github.event.label.name == 'rg-infrastructure')) || inputs.lane == 'infrastructure' || inputs.lane == 'smoke' || inputs.lane == 'core-full' || inputs.lane == 'all' || inputs.coverage == true
+    if: (github.event_name == 'pull_request' && ((github.event.action != 'labeled' && github.event.action != 'synchronize') || github.event.label.name == 'rg-core-full' || github.event.label.name == 'rg-all' || github.event.label.name == 'rg-infrastructure')) || inputs.lane == 'infrastructure' || inputs.lane == 'smoke' || inputs.lane == 'core-full' || inputs.lane == 'all' || inputs.coverage == true
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -207,6 +207,24 @@ jobs:
           assert len(rows) == expected
           tally = json.loads(Path('target/regression-c-reference/summary.json').read_text())
           assert tally['counts'].get('shared/reference-passed', 0) == expected
+          PY
+          exit "$status"
+      - name: Verify four original Rust ELF and GAS regression targets
+        if: github.event_name == 'pull_request' && github.event.action == 'synchronize'
+        working-directory: compiler
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+        run: |
+          git rev-parse HEAD
+          status=0
+          CARGO_TERM_COLOR=never cargo test --manifest-path tools/mini-c-driver/Cargo.toml --release --no-fail-fast --test goto_labels --test discard_record_expressions --test native_float_literals --test record_argument_places > "$RUNNER_TEMP/rg3-original-tests.log" 2>&1 || status=$?
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          log = (Path(os.environ["RUNNER_TEMP"]) / "rg3-original-tests.log").read_text(errors="replace")
+          results = re.findall(r"test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;", log)
+          print("Original Rust ELF/GAS test aggregate:", results)
+          assert len(results) == 4 and all(tuple(map(int, row)) == (1, 0, 0) for row in results)
           PY
           exit "$status"
       - name: Resolve canonical Mini-C corpus revision
@@ -399,7 +417,7 @@ jobs:
           key: ${{ steps.public-registry.outputs.cache-primary-key }}
 
   gcc-smoke:
-    if: inputs.lane == 'gcc' || inputs.lane == 'minic' || inputs.lane == 'all' || github.event.label.name == 'rg-gcc' || github.event.label.name == 'rg-minic' || github.event.label.name == 'rg-all' || (inputs.lane == 'native-smoke' || github.event.label.name == 'rg-native-smoke')
+    if: (github.event_name == 'pull_request' && github.event.action == 'synchronize') || inputs.lane == 'gcc' || inputs.lane == 'minic' || inputs.lane == 'all' || github.event.label.name == 'rg-gcc' || github.event.label.name == 'rg-minic' || github.event.label.name == 'rg-all' || (inputs.lane == 'native-smoke' || github.event.label.name == 'rg-native-smoke')
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -429,7 +447,7 @@ jobs:
           restore-keys: |
             rg-public-registry-v2-${{ runner.os }}-${{ runner.arch }}-
       - name: Run one original upstream ABI case with automatic adapter
-        if: inputs.lane != 'minic' && github.event.label.name != 'rg-minic' && !(inputs.lane == 'native-smoke' || github.event.label.name == 'rg-native-smoke')
+        if: github.event.action != 'synchronize' && inputs.lane != 'minic' && github.event.label.name != 'rg-minic' && !(inputs.lane == 'native-smoke' || github.event.label.name == 'rg-native-smoke')
         working-directory: compiler
         run: |
           python3 tools/regression.py --gcc-abi quick --gcc-prefix scalar-by-value-2 --output target/regression-gcc-smoke
