@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
-      SOURCE_SHA: 8e47fcd39d8da3f05e60a01278acdef1e247b815
+      SOURCE_SHA: f4fdf030f7b41d606b8e409a925ca553406229b3
       CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v4
@@ -49,3 +49,36 @@ jobs:
         if: ${{ !cancelled() }}
         working-directory: compiler
         run: cargo check -p compiler-ir --all-targets --keep-going
+      - name: Native mutation verdict inventory
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo test -p compiler-ir --test typed_verifier_parity -- --nocapture --test-threads=1
+  reference-verdicts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 78473710b9f50aa169d1896a52da02a97bf8834e
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: reference
+      - name: Freeze old verifier acceptance outcomes
+        working-directory: reference
+        run: |
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/ir-macros"]
+          EOF
+          rm -f Cargo.lock
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("crates/ir/tests/typed_verifier_parity.rs")
+          s = p.read_text()
+          anchor = 'let executable = m.to_legacy().map(|_| ());'
+          assert s.count(anchor) == 1
+          p.write_text(s.replace(anchor, anchor + '\n    println!("IR_MUTATION_VERDICT\\t{case}\\t{}", executable.is_ok());'))
+          PY
+          cargo test -p compiler-ir --test typed_verifier_parity -- --nocapture --test-threads=1
