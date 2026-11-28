@@ -1,0 +1,58 @@
+name: Arm source slice scaling
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-arm-source-slice-scaling.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 66d9e92ca0c562aefa551512351bd7a90ed9a0de
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 74ea5ef2da122f837b289fa6ce49b1ee309eb048
+          path: baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Test candidate
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "66d9e92ca0c562aefa551512351bd7a90ed9a0de"
+          python3 -m unittest discover -s tools -p test_aarch64_a32_source_slice.py -v
+          python3 -m unittest discover -s tools -p test_aarch64_a32_ast_section_map.py -v
+      - name: Compare output and measure scaling
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          PYTHONPATH=tools python3 - <<'PY'
+          import importlib.util
+          from statistics import median
+          from time import perf_counter
+          from test_aarch64_a32_source_slice import fixture
+          import aarch64_a32_source_slice as new
+          spec = importlib.util.spec_from_file_location("old_slice", "../baseline/tools/aarch64_a32_source_slice.py")
+          old = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(old)
+          for count in (1000, 4000, 12000):
+              xml = fixture(*[f"func H{i}() => integer\nbegin return H{(i+1)%count}() + State; end;" for i in range(count)], "var State: integer;", "func H0(x: integer) => integer\nbegin return x; end;", "func Unused() => integer\nbegin return 1; end;")
+              assert old.slice_shared_xml(xml, "H0()") == new.slice_shared_xml(xml, "H0()")
+              times = [[], []]
+              for _ in range(3):
+                  for mod, samples in zip((old, new), times):
+                      start = perf_counter()
+                      mod.slice_shared_xml(xml, "H0()")
+                      samples.append(perf_counter()-start)
+              a,b = map(median,times)
+              print(f"SLICE_SCALE sections={count} old={a:.6f} new={b:.6f} speedup={a/b:.2f}")
+          print("ARM_SOURCE_SLICE_EXACT_PARITY_OK")
+          PY
