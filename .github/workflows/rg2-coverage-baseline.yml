@@ -175,7 +175,32 @@ jobs:
         working-directory: compiler
         run: |
           test "$(git rev-parse HEAD)" = a08926a69f7f0d8807b9f0241caee40201ee2f2c
-          python3 tools/regression.py --profile core --tier quick --coverage --suite cargo-coverage
+          # Use the same library profile, then accumulate WASM integration
+          # coverage in the same instrumented target/profile directory.
+          node --version
+          gcc --version | head -1
+          mkdir -p target/regression
+          status=0
+          CARGO_TERM_COLOR=never cargo llvm-cov --no-report --lib -p compiler-ir -p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 -p compiler-backend-riscv64 -p compiler-backend-wasm --no-fail-fast > "$RUNNER_TEMP/rg-coverage-lib.log" 2>&1 || status=$?
+          wasm_status=0
+          CARGO_TERM_COLOR=never cargo llvm-cov --no-report -p compiler-backend-wasm --tests --no-fail-fast > "$RUNNER_TEMP/rg-coverage-wasm.log" 2>&1 || wasm_status=$?
+          report_status=0
+          cargo llvm-cov report --json --output-path target/regression/coverage.json > "$RUNNER_TEMP/rg-coverage-report.log" 2>&1 || report_status=$?
+          python3 - "$status" "$wasm_status" "$report_status" <<'PY'
+          import os, sys, json, re, subprocess
+          from pathlib import Path
+          rows = []
+          for name, rc in zip(('lib', 'wasm', 'report'), map(int, sys.argv[1:])):
+              log = (Path(os.environ['RUNNER_TEMP']) / ('rg-coverage-' + name + '.log')).read_text(errors='replace')
+              counts = [tuple(map(int, m)) for m in re.findall(r'test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;', log)]
+              totals = dict(zip(('passed','failed','ignored'), (sum(c[i] for c in counts) for i in range(3))))
+              passed = rc == 0 and (name == 'report' or totals['passed'] > 0 and totals['failed'] == 0)
+              rows.append(dict(suite='coverage-' + name, status='passed' if passed else 'failed', test_counts=totals, diagnostic_codes=sorted(set(re.findall(r'error\[(E\d+)\]',log)))))
+          selected = all(r['status']=='passed' for r in rows)
+          Path('target/regression/summary.json').write_text(json.dumps(dict(source_sha=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),selected_passed=selected,suites=rows)))
+          print('Coverage execution outcomes:', rows)
+          assert selected
+          PY
       - name: Publish aggregate coverage and timing (no private file names or source)
         if: always()
         working-directory: compiler
