@@ -1,0 +1,215 @@
+name: GCC bootstrap external regression
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/gcc-bootstrap-external-regression.yml'
+      - 'bootstrap/compare-gcc-bootstrap-external.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: gcc-bootstrap-external-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Checkout exact previously successful full bootstrap source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: a7df946e2dad8ab4763e82b982116d6d4b8bae06
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Checkout exact historical Oberon
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/oberon
+          ref: 4b98c16d95cd7c75c16785f92863a637ff8ffa97
+          path: oberon
+          persist-credentials: false
+      - name: Checkout exact historical Mini-C
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: 66a8d2420ffbd3838b6bca2c4954d1d28e6b88e8
+          path: mini-c
+          persist-credentials: false
+      - name: Checkout pinned mrustc
+        uses: actions/checkout@v4
+        with:
+          repository: thepowersgang/mrustc
+          ref: 5205980b25d4d15494abdb45103e59e8dc309970
+          path: mrustc
+          persist-credentials: false
+
+      - name: Identify mrustc cache revision
+        id: mrustc-revision
+        shell: bash
+        run: echo "sha=$(git -C mrustc rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore prebuilt mrustc and Rust 1.90 libraries
+        id: mrustc-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            mrustc/bin
+            mrustc/output-1.90.0
+          key: mrustc-bootstrap-v1-${{ runner.os }}-ubuntu2404-rust190-${{ steps.mrustc-revision.outputs.sha }}
+
+      - name: Install mrustc build dependencies when the toolchain needs building
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.mrustc-cache.outputs.cache-hit }}" == "true" ]] &&
+             [[ -x mrustc/bin/mrustc ]] &&
+             [[ -x mrustc/bin/minicargo ]] &&
+             [[ -f mrustc/output-1.90.0/libcore.rlib ]]; then
+            echo "Cached mrustc is complete; skipping apt install." >> "$GITHUB_STEP_SUMMARY"
+          else
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends build-essential zlib1g-dev pkg-config cmake curl python3 libssl-dev
+          fi
+          # GCC and Cargo are required even when mrustc itself came from cache.
+          command -v gcc
+          command -v cargo
+          command -v python3
+
+      - name: Record reproducibility inputs and target crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Compiler SHA: $(git -C compiler rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          echo "mrustc SHA: $(git -C mrustc rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Host: $(uname -m) / $(lsb_release -rs)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Rust crate editions:" >> "$GITHUB_STEP_SUMMARY"
+          grep -Rh '^edition[[:space:]]*=' compiler/crates/*/Cargo.toml | sort | uniq -c >> "$GITHUB_STEP_SUMMARY"
+          echo "First target: compiler-ir (no frontend dependency); then compiler-opt, backend, driver." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build mrustc and matching Rust 1.90 libraries
+        id: toolchain
+        shell: bash
+        working-directory: mrustc
+        env:
+          RUSTC_VERSION: '1.90.0'
+          MRUSTC_TARGET_VER: '1.90'
+          OUTDIR_SUF: '-1.90.0'
+          PARLEVEL: '2'
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.mrustc-cache.outputs.cache-hit }}" == "true" ]] && \
+             [[ -x bin/mrustc ]] && [[ -x bin/minicargo ]] && \
+             [[ -f output-1.90.0/libcore.rlib ]]; then
+            echo "Using cached mrustc toolchain and Rust libraries" >> "$GITHUB_STEP_SUMMARY"
+          else
+            # Missing/incomplete caches rebuild in this runner.
+            timeout --signal=TERM --kill-after=10s 20m make -j2
+            timeout --signal=TERM --kill-after=10s 10m make RUSTCSRC
+            timeout --signal=TERM --kill-after=10s 55m make -f minicargo.mk LIBS
+          fi
+          test -x bin/mrustc
+          test -x bin/minicargo
+          test -f output-1.90.0/libcore.rlib
+
+      - name: Cache validated mrustc toolchain
+        if: success() && steps.mrustc-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            mrustc/bin
+            mrustc/output-1.90.0
+          key: mrustc-bootstrap-v1-${{ runner.os }}-ubuntu2404-rust190-${{ steps.mrustc-revision.outputs.sha }}
+
+
+      - name: Prepare pinned local frontend dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 bootstrap/prepare-gcc-bootstrap-historical-driver.py "$PWD"
+          seed="$RUNNER_TEMP/mrustc-vendor-seed"
+          mkdir -p "$seed/src"
+          cat > "$seed/Cargo.toml" <<'TOML'
+          [package]
+          name = "mrustc-vendor-seed"
+          version = "0.1.0"
+          edition = "2021"
+          [dependencies]
+          lalrpop-util = { version = "=0.23.1", default-features = false }
+          TOML
+          printf 'fn main() {}\n' > "$seed/src/main.rs"
+          cargo vendor --manifest-path "$seed/Cargo.toml" --versioned-dirs "$RUNNER_TEMP/mrustc-driver-vendor" > "$RUNNER_TEMP/vendor-config.txt"
+          test -f "$RUNNER_TEMP/mrustc-driver-vendor/lalrpop-util-0.23.1/Cargo.toml"
+
+      - name: Build same driver with host rustc
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! cargo build --release --manifest-path compiler/crates/driver/Cargo.toml --target-dir "$RUNNER_TEMP/host-target" > "$RUNNER_TEMP/host-build.log" 2>&1; then
+            echo "Host rustc build failed; private diagnostics withheld."
+            grep -oE 'error\[E[0-9]+\]' "$RUNNER_TEMP/host-build.log" | sort | uniq -c || true
+            exit 1
+          fi
+          test -x "$RUNNER_TEMP/host-target/release/compiler"
+
+      - name: Build full compiler driver using mrustc and GCC
+        shell: bash
+        working-directory: mrustc
+        env:
+          RUSTC_VERSION: '1.90.0'
+          MRUSTC_TARGET_VER: '1.90'
+          OUTDIR_SUF: '-1.90.0'
+          PARLEVEL: '2'
+          CC: gcc
+        run: |
+          set -euo pipefail
+          if ! timeout --signal=TERM --kill-after=10s 40m bin/minicargo \
+            --vendor-dir "$RUNNER_TEMP/mrustc-driver-vendor" \
+            -L output-1.90.0 -o output-compiler-bootstrap \
+            ../compiler/crates/driver > "$RUNNER_TEMP/mrustc-driver.log" 2>&1; then
+            echo "Historical full driver bootstrap failed; private diagnostics withheld."
+            exit 1
+          fi
+          test -x output-compiler-bootstrap/compiler
+          timeout 30s output-compiler-bootstrap/compiler --help > "$RUNNER_TEMP/bootstrap-help.txt"
+          grep -q 'Usage: compiler' "$RUNNER_TEMP/bootstrap-help.txt"
+
+      - name: Install public Csmith generator and runtime
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends csmith libcsmith-dev
+          csmith --version
+          header="$(dpkg -L libcsmith-dev | grep '/csmith.h$' | head -1)"
+          test -f "$header"
+          echo "CSMITH_INCLUDE=$(dirname "$header")" >> "$GITHUB_ENV"
+
+      - name: Execute external IR, generated ABI and Csmith differential
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 bootstrap/compare-gcc-bootstrap-external.py \
+            --host "$RUNNER_TEMP/host-target/release/compiler" \
+            --bootstrap mrustc/output-compiler-bootstrap/compiler \
+            --source compiler --csmith-include "$CSMITH_INCLUDE" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish workflow result
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ job.status }}
+        run: |
+          state="$RESULT"
+          if [ "$state" != success ]; then state=failure; fi
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$state" -f context="gcc-bootstrap-external-regression" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
