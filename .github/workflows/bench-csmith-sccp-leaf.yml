@@ -92,7 +92,48 @@ jobs:
           text=text.replace(old,old+'\n        eprintln!("STAGE_DONE {}.{}", self.phase, pass.name());')
           p.write_text(text)
           PY
-          git -C compiler diff -- crates/opt/Cargo.toml crates/opt/src/typed_pass_manager.rs
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("compiler/crates/opt/src/native_integer_algebra.rs")
+          s=p.read_text()
+          helper=r'''
+          fn diagnostic_ssa_order(f: &compiler_ir::typed_ssa::TypedFunction, stage: &str) -> Result<(), String> {
+              if f.name != "func_3" { return Ok(()); }
+              for block in &f.blocks {
+                  let positions = block.instructions.iter().enumerate().map(|(i,ins)|(ins.id,i)).collect::<std::collections::HashMap<_,_>>();
+                  for (i,ins) in block.instructions.iter().enumerate() {
+                      let mut bad = None;
+                      ins.op.for_each_use(|v| {
+                          if positions.get(&v).is_some_and(|&j| j>=i) {bad=Some(v);}
+                      });
+                      if let Some(v)=bad {
+                          let producer=&block.instructions[positions[&v]];
+                          return Err(format!("NATIVE_STAGE {stage} {} block {:?} consumer {:?} producer {:?}",f.name,block.id,ins,producer));
+                      }
+                  }
+              }
+              eprintln!("NATIVE_STAGE_OK {stage} {}",f.name);
+              Ok(())
+          }
+          '''
+          anchor="fn simplify_native_integer_prevalidated_profiled("
+          assert s.count(anchor)==1
+          s=s.replace(anchor,helper+anchor)
+          for stage, marker in [
+              ("input", "        let before=changes;"),
+              ("scalar_alias", "        changes = changes.checked_add(simplify_mask_chains(function))"),
+              ("mask", "        changes = changes.checked_add(simplify_shift_affine_chains(function))"),
+              ("shift_affine", "        // Every snapshot is immutable within one mutation phase."),
+              ("boolean", "        if boolean_changes != 0 {"),
+              ("matchpd", "        if matchpd_changes != 0 {"),
+              ("comparison", "        if changes != before {"),
+          ]:
+              start=s.index(anchor)
+              assert s[start:].count(marker)==1, (stage,marker)
+              s=s[:start]+s[start:].replace(marker,'        diagnostic_ssa_order(function, "'+stage+'")?;\n'+marker,1)
+          p.write_text(s)
+          PY
+          git -C compiler diff -- crates/opt/Cargo.toml crates/opt/src/typed_pass_manager.rs crates/opt/src/native_integer_algebra.rs
       - name: Build diagnostic native driver without generated rewrites in release mode with profiling symbols
         env:
           CARGO_PROFILE_RELEASE_DEBUG: '1'
@@ -135,7 +176,7 @@ jobs:
             status=$?
             set -e
             echo "PROFILE_EXIT $seed $status"
-            grep -E "STAGE_START|STAGE_DONE|compiler-mini-c:" "$p.log" | tail -100 || true
+            grep -E "STAGE_START|STAGE_DONE|NATIVE_STAGE|compiler-mini-c:" "$p.log" | tail -100 || true
             if [ "$status" = 0 ]; then
               gcc -O2 -w "$out/case-$seed.i" -o "$p.gcc"
               gcc "$p.o" -o "$p.exe"
