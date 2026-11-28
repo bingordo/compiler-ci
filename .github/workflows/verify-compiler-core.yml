@@ -21,8 +21,10 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: compiler-core-${{ github.event.inputs.source_ref || 'poll' }}
-  cancel-in-progress: true
+  # Scheduled runs can take longer than the poll interval. Do not starve
+  # the current-main gate or cancel it from a PR/manual validation.
+  group: compiler-core-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.event_name == 'workflow_dispatch' && format('manual-{0}', inputs.source_ref) || 'main' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   ir-production-boundary:
     runs-on: ubuntu-24.04
@@ -106,6 +108,8 @@ jobs:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    outputs:
+      source_sha: ${{ steps.core-source.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -115,7 +119,11 @@ jobs:
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - name: Report tested revision
-        run: git -C compiler rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
+        id: core-source
+        run: |
+          sha=$(git -C compiler rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Compiler source SHA: $sha" >> "$GITHUB_STEP_SUMMARY"
       - name: Restrict workspace to core crates
         shell: bash
         run: |
@@ -186,3 +194,42 @@ jobs:
     with:
       source_ref: ${{ matrix.source_ref }}
     secrets: inherit
+
+  publish-core-result:
+    # Publish the actual scheduled/push gate outcome, including failures and
+    # unexpected skips. PR-only plan checks and manual historical runs cannot
+    # replace evidence for the current-main gate.
+    if: ${{ always() && (github.event_name == 'schedule' || github.event_name == 'push') }}
+    needs: [discover, core, pr-core]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions:
+      statuses: write
+    steps:
+      - name: Publish core regression result and run link
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          DISCOVER_RESULT: ${{ needs.discover.result }}
+          DISCOVER_REFS: ${{ needs.discover.outputs.refs }}
+          SCHEDULE_RESULT: ${{ needs.pr-core.result }}
+          CORE_RESULT: ${{ needs.core.result }}
+          CORE_SHA: ${{ needs.core.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          state=failure
+          sha=unknown
+          if [[ "$EVENT" == schedule ]]; then
+            if [[ "$DISCOVER_RESULT" == success ]]; then
+              sha=$(jq -er 'if length == 1 then .[0] else empty end' <<< "$DISCOVER_REFS") || sha=unknown
+              if [[ "$sha" =~ ^[0-9a-f]{40}$ && "$SCHEDULE_RESULT" == success ]]; then state=success; fi
+            fi
+          else
+            sha="${CORE_SHA:-unknown}"
+            if [[ "$sha" =~ ^[0-9a-f]{40}$ && "$CORE_RESULT" == success ]]; then state=success; fi
+          fi
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$state" \
+            -f context="compiler/core-regression" \
+            -f description="Core gate $state; compiler $sha" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" >/dev/null
