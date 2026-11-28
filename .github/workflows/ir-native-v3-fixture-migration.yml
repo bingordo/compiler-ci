@@ -1,93 +1,59 @@
-# Validate fixed-graph TypeId v3 migrations in compiler-ci only.
-# The candidate SHA is intentionally immutable for reproducible acceptance.
+# One-shot PR validation; do not merge this candidate pin.
 name: IR native v3 fixture migration validation
 on:
-  push:
-    branches: [main]
+  pull_request:
     paths:
       - '.github/workflows/ir-native-v3-fixture-migration.yml'
   workflow_dispatch:
-
 permissions:
   contents: read
-
+  statuses: write
 jobs:
   native-v3-optimizer:
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 20
     env:
       CARGO_INCREMENTAL: '0'
-      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
-      SOURCE_SHA: 571fad9e7fa4617b504cbbd4214b6a53e35c047d
+      SOURCE_SHA: 6d91599769ac6310618eb3a88f794970cc8574f8
     steps:
-      - name: Check out exact compiler migration candidate
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 571fad9e7fa4617b504cbbd4214b6a53e35c047d
+          ref: 6d91599769ac6310618eb3a88f794970cc8574f8
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
-      - name: Verify source and isolate core workspace
-        shell: bash
+      - name: Verify exact source and isolate workspace
         run: |
           set -euo pipefail
+          git -C compiler rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
           test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
           cat > compiler/Cargo.toml <<'EOF'
           [workspace]
           resolver = "2"
-          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
           EOF
           rm -f compiler/Cargo.lock
-          rustc --version
-          cargo --version
-      - name: Cache core build
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
         with:
           workspaces: compiler -> target
           key: ir-v3-fixtures
-      - name: Run native fixture and optimizer regression tests
+      - name: Validate fixed native verifier fixtures and CLI
         working-directory: compiler
         run: |
-          set -euo pipefail
-          cargo test -p compiler-opt --test typed_array_fold -- --nocapture
-          cargo test -p compiler-opt --test typed_phi_cfg -- --nocapture
-          cargo test -p compiler-opt --test typed_phi_dead_linear -- --nocapture
-          cargo test -p compiler-opt --test typed_algebra -- --nocapture
-          cargo test -p compiler-opt --test typed_if_conversion_native -- --nocapture
-          cargo test -p compiler-opt --test if_conversion_typeid_x86 -- --nocapture
-          cargo test -p compiler-opt --test if_conversion_typeid_multimerge -- --nocapture
-          cargo test -p compiler-opt --lib typed_sccp -- --nocapture
-          cargo test -p compiler-opt --test typed_sccp -- --nocapture
-          cargo test -p compiler-opt --test ir_opt_native_v3_only -- --nocapture
-          cargo test -p compiler-opt --test native_ir_pass_replay -- --nocapture
-          cargo test -p compiler-ir --test native_module_text_v3 -- --nocapture
-          cargo test -p compiler-ir --test native_module_cli -- --nocapture
-          cargo test -p compiler-backend-x86 --test m4_not_native -- --nocapture
-          cargo test -p compiler-backend-x86 --test m4_global_data_only_native -- --nocapture
-          cargo test -p compiler-backend-x86 --test m4_global_external_native -- --nocapture
-          cargo test -p compiler-backend-x86 --test m4_global_definitions_native -- --nocapture
-          cargo test -p compiler-backend-x86 --test dead_function_relocation_native -- --nocapture
-          cargo test -p compiler-backend-x86 --test module_signatures -- --nocapture
-          cargo test -p compiler-backend-x86 --test lea_patterns_native -- --nocapture
-          cargo test -p compiler-backend-x86 --test lea_indexed_native -- --nocapture
-          cargo test -p compiler-backend-x86 --test lea_memory_native -- --nocapture
-          cargo test -p compiler-backend-x86 --test native_typeid_select_cmov -- --nocapture
-          cargo test -p compiler-backend-x86 --test native_typeid_fused_cmp_select -- --nocapture
-          cargo test -p compiler-backend-x86 --test compare_select_equality_native -- --nocapture
-          cargo test -p compiler-backend-x86 --test compare_select_relational_native -- --nocapture
-          cargo test -p compiler-backend-x86 --test shared_compare_select_native -- --nocapture
-          cargo test -p compiler-backend-x86 --test shared_compare_select_pressure_native -- --nocapture
-          cargo test -p compiler-backend-x86 --test native_typeid_direct -- --nocapture
-          cargo test -p compiler-backend-x86 --test native_typeid_function_signatures -- --nocapture
-          cargo test -p compiler-backend-x86 --test x7_shared_signed_index_native -- --nocapture
-          cargo test -p compiler-opt --lib dead_functions -- --nocapture
-          cargo test -p compiler-backend-x86 --test native_typeid_memory_calls -- --nocapture
-          cargo check -p compiler-backend-x86 --all-targets
-          cargo check -p compiler-opt --all-targets
-      - name: Check strict lint on migrated test suites
-        working-directory: compiler
+          cargo test --no-fail-fast -p compiler-ir --test native_module_cli --test native_fixed_verifier_fixtures --test native_fixture_text --test typed_module_abi --test typed_opcode_types --test pointer_offset_wide_typeid --test ctz_portable --test typed_integer_v2 --test typed_integer_constants_casts --test typed_value_flow --test typed_module
+      # Scope this temporary candidate lane to changed tests. Independent
+      # top-level inventory remains failing on #3260 (46112438943); no
+      # repository regression gate is changed or treated as green.
+      - name: Publish candidate result
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ job.status }}
         run: |
-          cargo clippy -p compiler-opt --lib -- -D warnings
-          cargo clippy -p compiler-opt --test typed_sccp --test ir_opt_native_v3_only --test if_conversion_typeid_x86 --test if_conversion_typeid_multimerge -- -D warnings
-          cargo clippy -p compiler-backend-x86 --test m4_not_native --test m4_global_data_only_native --test m4_global_external_native --test m4_global_definitions_native --test dead_function_relocation_native --test module_signatures --test lea_patterns_native --test lea_indexed_native --test lea_memory_native --test native_typeid_select_cmov --test native_typeid_fused_cmp_select --test compare_select_equality_native --test compare_select_relational_native --test shared_compare_select_native --test shared_compare_select_pressure_native -- -D warnings
+          state=failure
+          if [ "$RESULT" = success ]; then state=success; fi
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state="$state" -f context=ir/direct-fixture-migration \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            -f description="Compiler fixture validation: $RESULT"
