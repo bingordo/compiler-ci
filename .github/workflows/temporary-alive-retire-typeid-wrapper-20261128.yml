@@ -1,0 +1,64 @@
+# Temporary exact-source retired legacy-name fixture adapter acceptance gate.
+name: Temporary Alive retire typed-from-legacy wrapper
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temporary-alive-retire-typeid-wrapper-20261128.yml'
+permissions:
+  contents: read
+jobs:
+  retire-wrapper:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      SOURCE_SHA: f13d7af6473ccf943e75368fcfb414148c7b91cf
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - name: Checkout exact compiler source
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source and isolate optimizer
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "Exact compiler source SHA: $SOURCE_SHA"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: temporary-alive-retire-typeid-wrapper
+      - name: Focused Clippy
+        working-directory: compiler
+        run: cargo clippy -p compiler-opt --test alive_lite -- -D clippy::all -A clippy::too_many_arguments -A clippy::needless_lifetimes -A clippy::empty_line_after_doc_comments -A clippy::collapsible_if -A clippy::collapsible_match -A clippy::needless_range_loop -A clippy::needless_borrows_for_generic_args -A clippy::type_complexity -A clippy::unnecessary_lazy_evaluations -A clippy::duplicate_mod -A clippy::needless_borrow
+      - name: Ordinary Alive-lite including FS1 and AL05 replay/scope tests
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test alive_lite -- --nocapture
+      - name: Install Z3
+        run: sudo apt-get update -qq && sudo apt-get install -y z3
+      - name: Focused FS1 and AL05 archived replay Z3 proofs
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          for test in \
+            fs1_cfg_draft_typeid_smt_concrete_parity_cse_and_sat_mutants \
+            al05_replay_v1_rechecks_four_induction_snapshots_with_z3 \
+            al05_replay_v1_read_only_archived_files_with_z3 \
+            al05_replay_v2_affine_four_changed_typeid_snapshots_with_z3 \
+            al05_replay_v2_affine_read_only_saved_files_with_z3 \
+            al05_inferred_affine_changed_cse_and_wrong_rewrite_sat \
+            al05_parameterized_replay_v3_four_changed_cse_z3 \
+            al05_parameterized_replay_v3_read_only_z3 \
+            t5_typed_stage_by_stage_smt_proves_each_changed_transition; do
+            cargo test -p compiler-opt --test alive_lite "$test" -- --ignored --nocapture --test-threads=1
+          done
