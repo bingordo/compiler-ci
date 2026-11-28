@@ -15,7 +15,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 60248f2214c00ca2919498ab3099ee2f64ad2eda
+          ref: cdc97e0fc19192d54276206e1b18b42527b44481
           path: compiler
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -24,6 +24,19 @@ jobs:
           git -C compiler rev-parse HEAD
           grep 'rev =' compiler/tools/mini-c-driver/Cargo.toml
           sed -i 's|ssh://git@github.com/bingordo/mini-c.git|https://github.com/bingordo/mini-c.git|g' compiler/tools/mini-c-driver/Cargo.toml
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: ad3f2e003b77fde7790e712379300952da483311
+          path: frontend-candidate
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Validate qualified aggregate frontend candidate
+        run: |
+          git -C frontend-candidate rev-parse HEAD
+          cargo test --manifest-path frontend-candidate/Cargo.toml -p mini-c-sema
+          sed -i 's/db9530164b41696972c38b0479b9b77a15eea058/ad3f2e003b77fde7790e712379300952da483311/g' compiler/tools/mini-c-driver/Cargo.toml
+          grep 'rev =' compiler/tools/mini-c-driver/Cargo.toml
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: compiler/tools/mini-c-driver -> target
@@ -153,6 +166,40 @@ jobs:
           evidence="$RUNNER_TEMP/postmerge-evidence/strict-64"
           python3 compiler/tools/csmith_probe.py --generate --cases-dir "$evidence/cases" --csmith csmith --seed-base 1 --seed-count 64 --profile restricted-observable
           python3 compiler/tools/csmith_probe.py --probe --cases-dir "$evidence/cases" --artifacts-dir "$evidence/results" --include-dir "$(dirname "$header")" --preprocess-c --driver "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" --compiler-sha "$compiler_sha" --frontend-sha "$frontend" --minimum-native 63 --compile-timeout 30 --run-timeout 5 --max-wall-seconds 360
+      - uses: actions/download-artifact@v4
+        if: success() || failure()
+        with:
+          name: postmerge-bitfield-storage-evidence
+          run-id: '46163897711'
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/unrestricted-replay
+      - name: Exact unrestricted source replay with frontend candidate
+        if: success() || failure()
+        env:
+          INPUTS: ${{ runner.temp }}/unrestricted-replay
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,subprocess
+          root=pathlib.Path(os.environ["INPUTS"])/"unrestricted"
+          driver=pathlib.Path("compiler/tools/mini-c-driver/target/debug/compiler-mini-c").resolve()
+          for seed in (3,5,13,14,16):
+              work=root/f"seed-{seed}"/"results"/f"case-{seed}"
+              row=json.loads((work.parent/"results.jsonl").read_text())
+              pre=work/"candidate.i"
+              assert hashlib.sha256(pre.read_bytes()).hexdigest()==row["preprocessed_sha256"]
+              obj=work/"new.o"
+              p=subprocess.run([str(driver),str(pre),"--emit","obj","-o",str(obj)],capture_output=True,timeout=30)
+              print("EXACT_UNRESTRICTED",seed,p.returncode,p.stderr.decode(errors="replace")[:1600],flush=True)
+              if p.returncode:
+                  assert seed in (3,16) and p.returncode==1
+                  continue
+              exe=work/"new.bin"
+              ref=work/"ref.bin"
+              subprocess.run(["gcc",str(obj),"-o",str(exe),"-lm"],check=True,timeout=30)
+              subprocess.run(["gcc","-std=c99","-w","-O2",str(pre),"-o",str(ref),"-lm"],check=True,timeout=30)
+              assert subprocess.check_output([str(exe)],timeout=5)==subprocess.check_output([str(ref)],timeout=5)
+              print("EXACT_UNRESTRICTED_PASS",seed,flush=True)
+          PY
       - name: Unrestricted default Csmith (16 independent seeds)
         if: success() || failure()
         run: |
