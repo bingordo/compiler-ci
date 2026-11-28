@@ -1,16 +1,16 @@
 # Temporary deletion-first compile inventory, never merge.
-name: IR PR3753 legacy graph deletion
+name: IR PR3753 post-merge validation
 on:
   pull_request:
     paths: ['.github/workflows/ir-pr3753-graph-deletion.yml']
 permissions:
   contents: read
 jobs:
-  alive-lite:
+  core:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
-      SOURCE_SHA: 44fdabe8f24f96273096e5688f7f16d82e913d04
+      SOURCE_SHA: 659477f3aaead4de6f667469cf8b698c156be324
       CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v4
@@ -38,14 +38,19 @@ jobs:
         with:
           workspaces: compiler -> target
           key: ir-graph-deletion
-      - name: Run Alive-lite regressions
+      - name: Compile all core targets
         working-directory: compiler
-        run: cargo test -p compiler-opt --test alive_lite --no-fail-fast
-  native-parity:
+        run: cargo check --workspace --all-targets --keep-going
+      - name: Native IR and Alive-lite regression
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo test -p compiler-ir --no-fail-fast && cargo test -p compiler-opt --test alive_lite --no-fail-fast
+  workspace:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
-      SOURCE_SHA: 44fdabe8f24f96273096e5688f7f16d82e913d04
+      SOURCE_SHA: 659477f3aaead4de6f667469cf8b698c156be324
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
       CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v4
@@ -55,93 +60,19 @@ jobs:
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
           path: compiler
-      - name: Verify graph deletion and inventory direct dependents
+      - name: Verify exact merged source and configure frontend dependencies
         working-directory: compiler
         run: |
-          set -euo pipefail
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          if git grep -nE '^pub struct (Function|Block|Instruction|Parameter|ModuleSnapshot|TypedModule|TypeAnnotatedModule)\b' -- crates/ir/src; then exit 1; else test "$?" -eq 1; fi
-          echo 'Remaining historical graph dependencies grouped by file:'
-          git grep -l -E 'legacy-ssa-oracle|historical-function-oracle|ModuleSnapshot|TypeAnnotatedModule|FunctionValueTypes|from_annotated|project_legacy_compat_function|\.to_legacy\(|TypedSsaModule::from_legacy|compiler_ir::\{[^}]*\b(Function|Block|Instruction|Parameter)\b|compiler_ir::(Function|Block|Instruction|Parameter)\b' -- '*.rs' '*.toml' | sort || test "$?" -eq 1
-          cat > Cargo.toml <<'EOF'
-          [workspace]
-          resolver = "2"
-          members = ["crates/ir", "crates/ir-macros", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm", "crates/lto-plugin-core"]
-          EOF
-          rm -f Cargo.lock
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: compiler -> target
-          key: ir-graph-deletion
-      - name: Run parity alone
+          key: ir-graph-deletion-full
+      - name: Full workspace all-target check
         working-directory: compiler
-        run: cargo test -p compiler-opt --test typed_native_parity -- --nocapture
-  mixed-bridge:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    env:
-      SOURCE_SHA: 44fdabe8f24f96273096e5688f7f16d82e913d04
-      CARGO_INCREMENTAL: '0'
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: bingordo/compiler
-          ref: ${{ env.SOURCE_SHA }}
-          ssh-key: ${{ secrets.CI_KEY }}
-          persist-credentials: false
-          path: compiler
-      - name: Verify graph deletion and inventory direct dependents
+        run: cargo check --workspace --all-targets --keep-going
+      - name: Native Oberon regression
+        if: ${{ !cancelled() }}
         working-directory: compiler
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          if git grep -nE '^pub struct (Function|Block|Instruction|Parameter|ModuleSnapshot|TypedModule|TypeAnnotatedModule)\b' -- crates/ir/src; then exit 1; else test "$?" -eq 1; fi
-          echo 'Remaining historical graph dependencies grouped by file:'
-          git grep -l -E 'legacy-ssa-oracle|historical-function-oracle|ModuleSnapshot|TypeAnnotatedModule|FunctionValueTypes|from_annotated|project_legacy_compat_function|\.to_legacy\(|TypedSsaModule::from_legacy|compiler_ir::\{[^}]*\b(Function|Block|Instruction|Parameter)\b|compiler_ir::(Function|Block|Instruction|Parameter)\b' -- '*.rs' '*.toml' | sort || test "$?" -eq 1
-          cat > Cargo.toml <<'EOF'
-          [workspace]
-          resolver = "2"
-          members = ["crates/ir", "crates/ir-macros", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm", "crates/lto-plugin-core"]
-          EOF
-          rm -f Cargo.lock
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: compiler -> target
-          key: ir-graph-deletion
-      - name: Run mixed bridge alone
-        working-directory: compiler
-        run: cargo test -p compiler-opt --test al05_p9_mixed_native_bridge -- --nocapture
-  baseline-parity:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    env:
-      SOURCE_SHA: bb6518a9336f6186dc8b2c697afc3afa70d55ef6
-      CARGO_INCREMENTAL: '0'
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: bingordo/compiler
-          ref: ${{ env.SOURCE_SHA }}
-          ssh-key: ${{ secrets.CI_KEY }}
-          persist-credentials: false
-          path: compiler
-      - name: Verify graph deletion and inventory direct dependents
-        working-directory: compiler
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          echo 'Remaining historical graph dependencies grouped by file:'
-          git grep -l -E 'legacy-ssa-oracle|historical-function-oracle|ModuleSnapshot|TypeAnnotatedModule|FunctionValueTypes|from_annotated|project_legacy_compat_function|\.to_legacy\(|TypedSsaModule::from_legacy|compiler_ir::\{[^}]*\b(Function|Block|Instruction|Parameter)\b|compiler_ir::(Function|Block|Instruction|Parameter)\b' -- '*.rs' '*.toml' | sort || test "$?" -eq 1
-          cat > Cargo.toml <<'EOF'
-          [workspace]
-          resolver = "2"
-          members = ["crates/ir", "crates/ir-macros", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm", "crates/lto-plugin-core"]
-          EOF
-          rm -f Cargo.lock
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: compiler -> target
-          key: ir-graph-deletion
-      - name: Compare unchanged main parity
-        working-directory: compiler
-        run: cargo test -p compiler-opt --test typed_native_parity -- --nocapture
+        run: cargo test -p compiler --test oberon_record_field_var_native --test oberon_generated_module_var_native --no-fail-fast
