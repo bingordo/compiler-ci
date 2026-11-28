@@ -48,7 +48,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: bingordo/edgcpp-rust
-          ref: ${{ inputs.source_ref || 'fc5adba5dc9061cc24517544c23ee92ab0151b5e' }}
+          ref: ${{ inputs.source_ref || '5e6a618d1e37ea23c11542cb28d7f9de849cc026' }}
           path: edgcpp-rust
           persist-credentials: false
       - name: Record exact revision
@@ -59,7 +59,7 @@ jobs:
           test "${#sha}" -eq 40
           echo "EDG Rust commit: $sha" | tee -a "$GITHUB_STEP_SUMMARY"
           if [[ "${{ github.event_name }}" != workflow_dispatch ]]; then
-            test "$sha" = fc5adba5dc9061cc24517544c23ee92ab0151b5e
+            test "$sha" = 5e6a618d1e37ea23c11542cb28d7f9de849cc026
           fi
       - name: Check out source headers matching the pinned EDG library
         uses: actions/checkout@v4
@@ -127,6 +127,26 @@ jobs:
           cargo test --features codegen --lib retired_source_hook_wire_tests -- --nocapture
           ! grep -Eq 'edgcpp_capture_|postlower_virtual_calls|prelower_virtual_calls' cpp/bridge.cpp
           echo "Normal EDG back_end entry and IL traversal, no private lowering hooks" >> "$GITHUB_STEP_SUMMARY"
+      - name: Verify qualified scope chain cycles and deep native namespace names
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          g++ -std=c++11 -Wall -Wextra -Werror "$GITHUB_WORKSPACE/edgcpp-rust/tests/qualified_scope_prefix.cpp" -o "$RUNNER_TEMP/qualified-scope-prefix"
+          "$RUNNER_TEMP/qualified-scope-prefix"
+          g++ -std=c++11 -Wall -Wextra -Werror "$GITHUB_WORKSPACE/edgcpp-rust/tests/scope_tree.cpp" -o "$RUNNER_TEMP/scope-tree"
+          "$RUNNER_TEMP/scope-tree"
+          g++ -std=c++11 -Wall -Wextra -Werror "$GITHUB_WORKSPACE/edgcpp-rust/tests/expression_tree.cpp" -o "$RUNNER_TEMP/expression-tree"
+          "$RUNNER_TEMP/expression-tree"
+          g++ -std=c++11 -Wall -Wextra -Werror "$GITHUB_WORKSPACE/edgcpp-rust/tests/ordinal_path.cpp" -o "$RUNNER_TEMP/ordinal-path"
+          "$RUNNER_TEMP/ordinal-path"
+          source build/gcc-release/environment.sh
+          cd build/gcc-release
+          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" --example parse -- --c++20 "$GITHUB_WORKSPACE/edgcpp-rust/tests/fixtures/namespaces.cpp" >"$RUNNER_TEMP/namespace-probe.log" 2>&1
+          grep -Fq 'EDG status: 0' "$RUNNER_TEMP/namespace-probe.log"
+          grep -Fq 'variable outer::inner::nested' "$RUNNER_TEMP/namespace-probe.log"
+          prefix=$(printf 'deep_%s::' $(seq 0 135))
+          grep -Fq "variable ${prefix}depth_value" "$RUNNER_TEMP/namespace-probe.log"
       - name: Run focused pointer call compatibility audit tests
         working-directory: edgcpp-rust
         run: |
@@ -199,6 +219,48 @@ jobs:
             -o "$RUNNER_TEMP/deep-native-array-40"
           "$RUNNER_TEMP/deep-native-array-40"
           echo 'Pinned EDG and GCC accept a real 40-dimensional C11 array' >> "$GITHUB_STEP_SUMMARY"
+      - name: Probe deep declaration scopes against pinned EDG and GCC
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source build/gcc-release/environment.sh
+          cd build/gcc-release
+          {
+            for i in $(seq 0 249); do echo "namespace nest_$i {"; done
+            echo 'int terminal_value = 37;'
+            for i in $(seq 0 249); do echo '}'; done
+            printf 'int main() { return '
+            printf 'nest_%s::' $(seq 0 249)
+            echo 'terminal_value != 37; }'
+          } > deep-declaration-scopes.cpp
+          g++ -std=c++20 -O0 -Wall -Wextra -Werror deep-declaration-scopes.cpp -o "$RUNNER_TEMP/deep-declaration-scopes"
+          "$RUNNER_TEMP/deep-declaration-scopes"
+          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" --example parse -- --c++20 deep-declaration-scopes.cpp >"$RUNNER_TEMP/deep-declaration-scopes.log" 2>&1
+          grep -Fq 'EDG status: 0' "$RUNNER_TEMP/deep-declaration-scopes.log"
+          prefix=$(printf 'nest_%s::' $(seq 0 249))
+          grep -Fq "variable ${prefix}terminal_value" "$RUNNER_TEMP/deep-declaration-scopes.log"
+      - name: Probe deep native type chains and recursive record references
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source build/gcc-release/environment.sh
+          cd build/gcc-release
+          dims=""
+          for i in $(seq 1 96); do dims="${dims}[1]"; done
+          {
+            printf 'int deep_type%s;\n' "$dims"
+            echo 'struct recursive_b;'
+            echo 'struct recursive_a { struct recursive_b *next; int value; };'
+            echo 'struct recursive_b { struct recursive_a *prev; };'
+            echo 'struct recursive_a node_a; struct recursive_b node_b;'
+            echo 'int main(void) { node_a.next=&node_b; node_b.prev=&node_a; return sizeof deep_type != sizeof(int) || node_a.next->prev != &node_a; }'
+          } > deep-native-types.c
+          gcc -std=c11 -O0 -Wall -Wextra -Werror deep-native-types.c -o "$RUNNER_TEMP/deep-native-types"
+          "$RUNNER_TEMP/deep-native-types"
+          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" --example parse -- --c11 deep-native-types.c >"$RUNNER_TEMP/deep-native-types.log" 2>&1
+          grep -Fq 'EDG status: 0' "$RUNNER_TEMP/deep-native-types.log"
       - name: Verify deep record image and fail-closed deep array against EDG/GCC
         working-directory: edgcpp
         run: |
@@ -358,6 +420,26 @@ jobs:
           "$RUNNER_TEMP/lifetime-c11"
           "$RUNNER_TEMP/lifetime-cpp20"
           echo 'Pinned EDG C11/C++20 owner snapshots and GCC source oracles passed' >> "$GITHUB_STEP_SUMMARY"
+      - name: Probe deep native statement paths against pinned EDG and GCC
+        working-directory: edgcpp
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          source build/gcc-release/environment.sh
+          cd build/gcc-release
+          {
+            echo 'int deep_statements(volatile int *p) {'
+            for i in $(seq 0 79); do echo "if (*p != $i) {"; done
+            echo 'return 7;'
+            for i in $(seq 0 79); do echo '}'; done
+            echo 'return 9; }'
+            echo 'int main(void) { int x = 100; return deep_statements(&x) != 7; }'
+          } > deep-statements.c
+          gcc -std=c11 -O0 -Wall -Wextra -Werror deep-statements.c -o "$RUNNER_TEMP/deep-statements"
+          "$RUNNER_TEMP/deep-statements"
+          cargo run --quiet --manifest-path "$GITHUB_WORKSPACE/edgcpp-rust/Cargo.toml" --example parse -- --c11 deep-statements.c >"$RUNNER_TEMP/deep-statements.log" 2>&1
+          grep -Fq 'EDG status: 0' "$RUNNER_TEMP/deep-statements.log"
+          awk '/^statement deep_statements path=/{n=split($3,p,"[.]"); if(n>max)max=n} END{print "deep statement path components:",max; exit !(max>128)}' "$RUNNER_TEMP/deep-statements.log"
       - name: Run all Rust library tests with codegen
         working-directory: edgcpp-rust
         run: |
