@@ -1,0 +1,135 @@
+name: X7 arithmetic scalar semantic census
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-x7-cross-scope-census.yml']
+permissions:
+  contents: read
+jobs:
+  census:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 04db0bdaab5e1960cca49c5de6d6a4868e765a2b
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify exact source
+        run: test "$(git rev-parse HEAD)" = 04db0bdaab5e1960cca49c5de6d6a4868e765a2b
+      - name: Obtain pinned original Intel instruction XML
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --sparse https://github.com/intel/SDM.git /tmp/intel-sdm
+          git -C /tmp/intel-sdm fetch --depth 1 origin 35eface1b7ee003a1cda95005ec5fd83de658a64
+          git -C /tmp/intel-sdm checkout 35eface1b7ee003a1cda95005ec5fd83de658a64
+          git -C /tmp/intel-sdm sparse-checkout set data/instruction
+          test "$(git -C /tmp/intel-sdm rev-parse HEAD)" = 35eface1b7ee003a1cda95005ec5fd83de658a64
+      - uses: actions/cache/restore@v4
+        id: parser-cache
+        with:
+          path: /tmp/x7-parser
+          key: x7-isa-parser-ubuntu24-${{ runner.arch }}-16260979137c38339743a04b7fd5d9f0fa8a6ee5-ocaml5.4.1-${{ hashFiles('tools/x86_isl_ast_export.ml', 'tools/x86_isl_ast_json.ml') }}
+      - name: Install parser runtime libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libgmp-dev libz3-dev
+      - uses: ocaml/setup-ocaml@v3
+        if: steps.parser-cache.outputs.cache-hit != 'true'
+        with:
+          ocaml-compiler: 5.4.1
+      - name: Build pinned upstream Intel AST exporter
+        if: steps.parser-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libgmp-dev pkg-config cmake libz3-dev
+          git clone --filter=blob:none https://github.com/IntelLabs/isa-tools.git /tmp/isa-tools
+          git -C /tmp/isa-tools checkout 16260979137c38339743a04b7fd5d9f0fa8a6ee5
+          git -C /tmp/isa-tools submodule update --init --recursive
+          cp tools/x86_isl_ast_export.ml tools/x86_isl_ast_json.ml /tmp/isa-tools/bin/
+          cat >> /tmp/isa-tools/bin/dune <<'EOF'
+          (executable
+           (name x86_isl_ast_export)
+           (modules x86_isl_ast_export x86_isl_ast_json)
+           (libraries libISA yojson))
+          EOF
+          cd /tmp/isa-tools
+          opam install --switch="$GITHUB_WORKSPACE" . --deps-only --yes
+          opam exec --switch="$GITHUB_WORKSPACE" -- dune build bin/x86_isl_ast_export.exe
+
+      - name: Stage pinned parser binary
+        if: steps.parser-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /tmp/x7-parser
+          cp /tmp/isa-tools/_build/default/bin/x86_isl_ast_export.exe /tmp/x7-parser/export
+      - uses: actions/cache/save@v4
+        if: steps.parser-cache.outputs.cache-hit != 'true'
+        with:
+          path: /tmp/x7-parser
+          key: x7-isa-parser-ubuntu24-${{ runner.arch }}-16260979137c38339743a04b7fd5d9f0fa8a6ee5-ocaml5.4.1-${{ hashFiles('tools/x86_isl_ast_export.ml', 'tools/x86_isl_ast_json.ml') }}
+      - name: Check parser executable
+        run: |
+          test -x /tmp/x7-parser/export
+          sha256sum /tmp/x7-parser/export
+      - name: Validate new generic source semantics
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/x7-z3
+          /tmp/x7-z3/bin/python -m pip install --disable-pip-version-check 'z3-solver==4.13.4.0'
+          export PATH=/tmp/x7-z3/bin:$PATH
+          python -m unittest discover -s tools -p test_x7_integer_minmax.py -v
+          python -m unittest discover -s tools -p test_x7_signed_saturation.py -v
+          python -m unittest discover -s tools -p test_x7_arithmetic_tuple.py -v
+          python -m unittest discover -s tools -p test_x7_rotate.py -v
+          python -m unittest discover -s tools -p test_x86_iform_batch_worklist.py -v
+          python -m unittest discover -s tools -p test_x7_scalar_scope_coverage.py -v
+          python -m unittest discover -s tools -p test_x7_cross_scope_coverage.py -v
+      - name: Full original source corpus census at scalar widths only
+        run: |
+          set -euo pipefail
+          export PATH=/tmp/x7-z3/bin:$PATH
+          export PYTHONPATH="$PWD/tools"
+          mkdir -p /tmp/x7-full-census
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from x86_iform_helper_dependencies import build
+          from x86_iform_proof_work_dag import plan
+          from x86_isl_operation_proof_worker import OperationProofBatch
+          from x86_isl_operation_model_census import audit
+          root=Path('/tmp/x7-full-census')
+          xml=Path('/tmp/intel-sdm/data/instruction')
+          parser=Path('/tmp/x7-parser/export')
+          index=build(xml,shards=16)
+          queue=plan(index,shards=16)
+          prepared=OperationProofBatch(index,queue)
+          def save(name,value):
+              (root/name).write_text(json.dumps(value,sort_keys=True))
+          save('index.json',index)
+          save('queue.json',queue)
+          scopes=[(w,None) for w in (8,16,32,64)]
+          for width,lane in scopes:
+              scope=f'{width}-{lane or "scalar"}'
+              reports=[prepared.verify(xml,parser,width=width,element_width=lane,
+                         shard_index=shard,max_checks=256,timeout_ms=2000,
+                         workers=4,model_workers=2,cache_dir=Path('/tmp/x7-b3-parser-cache'))
+                       for shard in range(16)]
+              census=audit(index,queue,reports)
+              s=census['summary']
+              assert s['operations_accounted_for']==s['operations_indexed']==1641,s
+              assert s['source_models_reported_by_status'].get('deferred_by_model_check_budget',0)==0,s
+              assert census['source_form_impact']['summary']['original_source_iforms']==10859
+              save(scope+'.json',census)
+              print('X7_FULL_SCOPE',scope,json.dumps(s,sort_keys=True),flush=True)
+              for row in census['source_form_impact']['ranked_source_blockers'][:12]:
+                  print('X7_FULL_BLOCKER',scope,json.dumps(row,sort_keys=True),flush=True)
+          PY
+      - name: Deduplicate coverage and rank scalar blockers
+        run: |
+          /tmp/x7-z3/bin/python tools/x7_scalar_scope_coverage.py --xml-dir /tmp/intel-sdm/data/instruction --index /tmp/x7-full-census/index.json --census /tmp/x7-full-census/[0-9]*.json --out /tmp/x7-full-census/cross-scope.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: x7-post-merge-scalar-semantic-census
+          path: /tmp/x7-full-census
