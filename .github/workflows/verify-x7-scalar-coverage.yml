@@ -1,0 +1,52 @@
+name: X7 scoped scalar coverage
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-x7-scalar-coverage.yml']
+permissions:
+  contents: read
+  actions: read
+jobs:
+  scoped-coverage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: d99555fa4cc977aaef3b3c3c90af74495e857617
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Reuse audited original-source census (before signed/saturation batch)
+        uses: actions/download-artifact@v4
+        with:
+          name: x7-full-semantic-census
+          run-id: 46093056157
+          github-token: ${{ github.token }}
+          path: /tmp/x7-census
+      - name: Obtain exact original source metadata (no solver work)
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --sparse https://github.com/intel/SDM.git /tmp/intel-sdm
+          git -C /tmp/intel-sdm fetch --depth 1 origin 35eface1b7ee003a1cda95005ec5fd83de658a64
+          git -C /tmp/intel-sdm checkout 35eface1b7ee003a1cda95005ec5fd83de658a64
+          git -C /tmp/intel-sdm sparse-checkout set data/instruction
+          test "$(git -C /tmp/intel-sdm rev-parse HEAD)" = 35eface1b7ee003a1cda95005ec5fd83de658a64
+      - name: Validate conservative scalar shape classification and scoped census
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = d99555fa4cc977aaef3b3c3c90af74495e857617
+          python3 -m unittest discover -s tools -p test_x7_scalar_scope_coverage.py -v
+          python3 -m unittest discover -s tools -p test_x7_cross_scope_coverage.py -v
+          python3 tools/x7_scalar_scope_coverage.py --xml-dir /tmp/intel-sdm/data/instruction --index /tmp/x7-census/index.json --census /tmp/x7-census/{8,16,32,64}-scalar.json --out /tmp/x7-scalar-coverage.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          r=json.loads(Path('/tmp/x7-scalar-coverage.json').read_text())
+          assert r['full_source_forms']==10859==sum(r['scope_counts'].values()),r
+          assert r['scope_counts']['scalar_gp_control_explicit']>0,r
+          assert r['explicit_scalar_diagnostic']['source_forms']>0,r
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: x7-scalar-coverage
+          path: /tmp/x7-scalar-coverage.json
