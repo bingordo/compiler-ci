@@ -1,0 +1,60 @@
+name: Temporary post-retirement workflow references audit
+on:
+  pull_request:
+    paths: ['.github/workflows/temp-retirement-workflow-reference-audit.yml']
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    env:
+      SOURCE_SHA: ce42187be4fa4580bfb134bad4b8273555d3a312
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: compiler-ci
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Identify any workflow references to deleted legacy files/features
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "TESTED_COMPILER_SHA=$SOURCE_SHA"
+          pattern='bulk_zero_profile|experimental-generated-rules|experimental-s14-audit|legacy-experimental-ssa|compare_generated_rules|x7_g10_n10_ssa_adjacency_census|x7_g10_n11_cfg_spill_probe|x7_g10_n12_c_defined_native|x7_g10_n14_sub_native|x7_g10_n15_no_default_fallback|x7_g10_n16_bitwise_native|x7_g10_n19_64_native|x7_g10_n20_cfg_pressure_64_native|x7_g10_n20c_compile_benchmark|x7_g10_native_memory_oracle'
+          problems=0
+          for project in compiler compiler-ci; do
+            echo "::group::RETIRED_WORKFLOW_REFERENCES_$project"
+            (cd "$project"; git grep -nE "$pattern" -- .github/workflows) || true
+            if (cd "$project"; git grep -qE "$pattern" -- .github/workflows); then
+              echo "RETIRED_WORKFLOW_REFERENCES_$project FOUND"
+              problems=$((problems+1))
+            else
+              echo "RETIRED_WORKFLOW_REFERENCES_$project NONE"
+            fi
+            echo "::endgroup::"
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("compiler")
+          old=[
+              ".github/workflows/experimental-generated-ssa.yml",
+              ".github/workflows/expr-rule-s5-benchmark.yml",
+              ".github/workflows/publish-experimental-ssa.yml",
+              "crates/opt/tests/bulk_zero_profile.rs",
+              "crates/opt/examples/compare_generated_rules.rs",
+          ]
+          for name in old:
+              assert not (p/name).exists(), name
+          current=(p/".github/workflows/expr-rule-gen-binary.yml").read_text()
+          assert "cargo test --manifest-path tools/expr-rule-gen/Cargo.toml" in current
+          assert (p/"crates/opt/tests/ct03_typed_alias_epoch_native.rs").exists()
+          print("RETIRED_SOURCE_MISSING_AND_INDEPENDENT_GENERATOR_RETAINED")
+          PY
+          test "$problems" -eq 0
