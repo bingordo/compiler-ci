@@ -1,0 +1,78 @@
+name: Temporary compare pre-retirement and current compiler main
+on:
+  pull_request:
+    paths: ['.github/workflows/temp-main-retirement-regression.yml']
+permissions:
+  contents: read
+jobs:
+  regression:
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - label: before-retirement
+            sha: acdd17a380e854cb38f6cd202f271689d8b3765b
+          - label: main-after-retirement
+            sha: 88bb0908be56717d5e6f138f8d5e46166f139659
+    name: ${{ matrix.label }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SOURCE_SHA: ${{ matrix.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.CI_KEY }}
+      - name: Trust GitHub for git dependencies
+        run: ssh-keyscan github.com >> ~/.ssh/known_hosts
+      - name: Compare compilability and runtime checks on exact source
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -uo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA" || exit 2
+          echo "SOURCE_SHA=$SOURCE_SHA"
+          mkdir -p regression-logs
+          failures=0
+          check () {
+            label="$1"; shift
+            echo "::group::CHECK $label"
+            if "$@" >"regression-logs/$label.txt" 2>&1; then
+              echo "REGRESSION_CHECK $label PASS"
+              grep -E 'test result: ok|Finished .* profile' "regression-logs/$label.txt" | tail -5 || true
+            else
+              code=$?
+              failures=$((failures+1))
+              echo "REGRESSION_CHECK $label FAIL exit=$code"
+              grep -E 'error(\\[E[0-9]+\\])?:|FAILED|test result:|panicked at' "regression-logs/$label.txt" | tail -22 || true
+              tail -28 "regression-logs/$label.txt" || true
+            fi
+            echo "::endgroup::"
+          }
+          check workspace-all-targets cargo check --workspace --all-targets
+          check opt-lib cargo test -p compiler-opt --lib
+          check x86-lib cargo test -p compiler-backend-x86 --lib
+          check native-ct03 cargo test -p compiler-opt --test ct03_typed_alias_epoch_native
+          check driver-replay cargo test -p compiler --test typeid_ir_dump_replay
+          check native-x7-physical cargo test -p compiler-backend-x86 --features x7-native-form-validation --test x7_g10_late_selector_native
+          check x7-n7-baseline cargo test -p compiler-backend-x86 --features x7-native-form-validation --test x7_g10_n7_real_ssa_native
+          echo "HISTORICAL_REFERENCES_START"
+          git grep -nE 'bulk_zero_profile|experimental-generated-rules|experimental-s14-audit|legacy-experimental-ssa|x7_g10_n20c_compile_benchmark|x7_g10_n12_c_defined_native' -- .github crates tools | head -80 || true
+          echo "HISTORICAL_REFERENCES_END"
+          echo "REGRESSION_TOTAL_FAILED $failures"
+          test "$failures" -eq 0
+      - name: Keep individual command logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-${{ matrix.label }}
+          path: compiler/regression-logs/
+          retention-days: 3
