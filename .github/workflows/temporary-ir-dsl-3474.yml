@@ -1,0 +1,171 @@
+# Temporary exact-source candidate validation; do not merge.
+name: Native textual IR DSL candidate
+on:
+  pull_request:
+    paths: ['.github/workflows/temporary-ir-dsl-3474.yml']
+permissions:
+  contents: read
+jobs:
+  ir-dsl:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      SOURCE_SHA: cdb1031d16c79bbf7b4df42bb4783a9a666c9473
+      BASELINE_SHA: bdcd0cc6c14bceafbf7eee86dd1c1b34aaa8d680
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          fetch-depth: 3
+      - name: Verify exact source and isolate native workspace
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "Compiler source: $SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/ir-macros", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          EOF
+          rm -f compiler/Cargo.lock
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            compiler -> target
+            compiler/tools/mini-c-driver -> target
+          key: native-ir-dsl
+          cache-on-failure: true
+      - name: Focused DSL tests
+        working-directory: compiler
+        run: cargo test -p compiler-ir --test ir_dsl
+      - name: Native IR tests
+        working-directory: compiler
+        run: cargo test -p compiler-ir
+      - name: Check affected production libraries
+        working-directory: compiler
+        run: cargo check -p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --lib --keep-going
+      - name: Weighted fuzz generator tests and byte-identical baseline replay
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test typeid_fuzz_bias --test typeid_fuzz_corpus_reduce
+          cp Cargo.toml "$RUNNER_TEMP/dsl-workspace.toml"
+          cat > "$RUNNER_TEMP/fuzz-replay-test.rs" <<'EOF'
+
+          #[test]
+          fn dsl_migration_replay_bytes() {
+              use std::io::Write;
+              let mut out=std::fs::File::create(std::env::var("DSL_REPLAY_PATH").unwrap()).unwrap();
+              for shape in 0..4 {
+                  for mask in 0..64u32 {
+                      let flag=|n:u32| if mask & (1 << n)!=0 {16} else {0};
+                      let mut profile=Profile::default();
+                      profile.weights=Weights {
+                          linear:if shape==0 {16}else{0},
+                          diamond:if shape==1 {16}else{0},
+                          parallel_phi:if shape==2 {16}else{0},
+                          loop_backedge:if shape==3 {16}else{0},
+                          memory:flag(0), overwritten_store:flag(1), alias_store:flag(2),
+                          signed_div:flag(3), internal_call:flag(4), duplicate_add:flag(5),
+                      };
+                      for seed in 0..4 {
+                          let case=profile.generate(seed).unwrap();
+                          let text=write_native_module_text_v3(&case.module).unwrap();
+                          writeln!(out,"{shape} {mask} {seed} {}\n{text}",text.len()).unwrap();
+                      }
+                  }
+              }
+          }
+          EOF
+          test_file=crates/opt/tests/typeid_fuzz_bias.rs
+          cat "$RUNNER_TEMP/fuzz-replay-test.rs" >> "$test_file"
+          DSL_REPLAY_PATH="$RUNNER_TEMP/candidate-replay.txt" cargo test -p compiler-opt --test typeid_fuzz_bias dsl_migration_replay_bytes -- --exact
+          git checkout --force --detach "$BASELINE_SHA"
+          test "$(git rev-parse HEAD)" = "$BASELINE_SHA"
+          cp "$RUNNER_TEMP/dsl-workspace.toml" Cargo.toml
+          cat "$RUNNER_TEMP/fuzz-replay-test.rs" >> "$test_file"
+          DSL_REPLAY_PATH="$RUNNER_TEMP/baseline-replay.txt" cargo test -p compiler-opt --test typeid_fuzz_bias dsl_migration_replay_bytes -- --exact
+          cmp "$RUNNER_TEMP/candidate-replay.txt" "$RUNNER_TEMP/baseline-replay.txt"
+          echo "1024 generated cases: byte-identical candidate and baseline native-v3 IR." >> "$GITHUB_STEP_SUMMARY"
+          git checkout --force --detach "$SOURCE_SHA"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          cp "$RUNNER_TEMP/dsl-workspace.toml" Cargo.toml
+      - name: Compare broad consumer compilation with exact main baseline
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          # Compare machine-readable compiler diagnostics, not a blanket waiver
+          # for a failing candidate. Production libraries and IR tests above
+          # must succeed independently.
+          args=(-p compiler-opt -p compiler-backend -p compiler-backend-x86 -p compiler-backend-aarch64 --all-targets --keep-going --message-format=json)
+          set +e
+          cargo check "${args[@]}" > "$RUNNER_TEMP/dsl-candidate.jsonl"
+          candidate_status=$?
+          set -e
+          if [ "$candidate_status" -eq 0 ]; then
+            echo "All affected targets compile on the candidate." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          cp Cargo.toml "$RUNNER_TEMP/dsl-workspace.toml"
+          git checkout --force --detach "$BASELINE_SHA"
+          test "$(git rev-parse HEAD)" = "$BASELINE_SHA"
+          # This baseline already contains the merged macro crate.
+          cp "$RUNNER_TEMP/dsl-workspace.toml" Cargo.toml
+          set +e
+          cargo check "${args[@]}" > "$RUNNER_TEMP/dsl-baseline.jsonl"
+          baseline_status=$?
+          set -e
+          python3 - "$candidate_status" "$baseline_status" <<'PY'
+          import collections, json, os, pathlib, sys
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          def diagnostics(name):
+              errors = collections.Counter()
+              finished = []
+              for line in (root / ("dsl-" + name + ".jsonl")).read_text().splitlines():
+                  item = json.loads(line)
+                  if item.get("reason") == "build-finished":
+                      finished.append(item["success"])
+                  if item.get("reason") != "compiler-message":
+                      continue
+                  msg = item["message"]
+                  if msg["level"] != "error":
+                      continue
+                  code = (msg.get("code") or {}).get("code")
+                  spans = tuple(sorted({s["file_name"] for s in msg["spans"] if s["is_primary"]}))
+                  errors[(item["target"]["name"], code, msg["message"], spans)] += 1
+              if finished != [False] or not errors:
+                  raise SystemExit(f"{name}: incomplete failed-check evidence")
+              return errors
+          if int(sys.argv[1]) == 0 or int(sys.argv[2]) == 0:
+              raise SystemExit("Candidate failed but baseline did not")
+          candidate, baseline = diagnostics("candidate"), diagnostics("baseline")
+          new = candidate - baseline
+          for label, errors in (("candidate", candidate), ("baseline", baseline), ("new", new)):
+              print(label, errors)
+          if new:
+              raise SystemExit("New candidate consumer errors")
+          # Permit only the previously reproduced stale X7 matcher test
+          # compilation failures; never waive new candidate diagnostics.
+          allowed = {
+              ("crates/backend-x86/src/dag_match_tests.rs", "E0277"),
+              ("crates/backend-x86/src/dag_match_tests.rs", "E0061"),
+              ("crates/backend-x86/src/../tests/unit/x7_ip10_decision_receipts.rs", "E0277"),
+              ("crates/backend-x86/src/../tests/unit/x7_ip10_decision_receipts.rs", "E0061"),
+              ("crates/backend-x86/src/../tests/unit/x7_production_ctz_address.rs", "E0425"),
+              ("crates/backend-x86/src/../tests/unit/x7_production_ctz_address.rs", "E0614"),
+          }
+          for target, code, message, spans in candidate:
+              if target != "compiler_backend_x86" or not spans or not all((span, code) in allowed for span in spans):
+                  raise SystemExit(f"Unapproved baseline failure: {target}: {message}")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("Broad consumer check: pre-existing main errors reproduced; no new candidate errors.\n")
+              for target, code, message, spans in sorted(candidate):
+                  summary.write(f"- {target}: {code} {message}\n")
+          PY
