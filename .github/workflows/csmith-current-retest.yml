@@ -1,0 +1,144 @@
+name: Current Mini-C Csmith retest
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/csmith-current-retest.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  retest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        driver: [native-pinned, native-latest, cranelift-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1b3a00336b6fad5d2f4d7257e188ffb1acf64f41
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/mini-c
+          ref: e8c8a00e6a40729e691c1887835256d25fd994ca
+          path: mini-c
+          persist-credentials: false
+      - name: Record exact source and build configuration
+        shell: bash
+        env:
+          DRIVER_KIND: ${{ matrix.driver }}
+        run: |
+          set -euo pipefail
+          compiler_sha=$(git -C compiler rev-parse HEAD)
+          latest=$(git -C mini-c rev-parse HEAD)
+          manifest=compiler/tools/mini-c-driver/Cargo.toml
+          pinned=$(PYTHONPATH=compiler/tools python3 -c 'from csmith_probe import pinned_frontend_revision; import sys; print(pinned_frontend_revision(open(sys.argv[1]).read()))' "$manifest")
+          echo "DRIVER_KIND=$DRIVER_KIND" >> "$GITHUB_ENV"
+          echo "HARNESS_SHA=$compiler_sha" >> "$GITHUB_ENV"
+          if [[ "$DRIVER_KIND" == cranelift-latest ]]; then
+            echo "COMPILER_SHA=$latest" >> "$GITHUB_ENV"
+            echo "FRONTEND_SHA=$latest" >> "$GITHUB_ENV"
+          else
+            selected=$pinned
+            [[ "$DRIVER_KIND" != native-latest ]] || selected=$latest
+            python3 - "$manifest" "$pinned" "$selected" <<'PY'
+          import pathlib,sys
+          p=pathlib.Path(sys.argv[1])
+          t=p.read_text()
+          assert t.count('ssh://git@github.com/bingordo/mini-c.git') == 2
+          assert t.count(sys.argv[2]) == 2
+          p.write_text(t.replace('ssh://git@github.com/bingordo/mini-c.git','https://github.com/bingordo/mini-c.git').replace(sys.argv[2],sys.argv[3]))
+          PY
+            echo "COMPILER_SHA=$compiler_sha" >> "$GITHUB_ENV"
+            echo "FRONTEND_SHA=$selected" >> "$GITHUB_ENV"
+          fi
+          printf 'Compiler harness %s; Mini-C main %s; integrated pin %s\n' "$compiler_sha" "$latest" "$pinned" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            compiler/tools/mini-c-driver -> target
+            mini-c -> target
+          key: csmith-retest-${{ matrix.driver }}
+      - name: Build exact driver
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/csmith-evidence"
+          printf '%s\n' "driver=$DRIVER_KIND" "compiler=$COMPILER_SHA" "frontend=$FRONTEND_SHA" "harness=$HARNESS_SHA" > "$RUNNER_TEMP/csmith-evidence/provenance.txt"
+          if [[ "$DRIVER_KIND" == cranelift-latest ]]; then
+            cargo build --manifest-path mini-c/Cargo.toml -p mini-c-cranelift 2>&1 | tee "$RUNNER_TEMP/csmith-evidence/build.log"
+            export CRANELIFT_BIN="$PWD/mini-c/target/debug/mini-c-cranelift"
+            test -x "$CRANELIFT_BIN"
+            echo "CRANELIFT_BIN=$CRANELIFT_BIN" >> "$GITHUB_ENV"
+            cat > "$RUNNER_TEMP/cranelift-adapter" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          [[ $# == 5 && "$2" == -o && "$4" == --emit && "$5" == obj ]]
+          exec "$CRANELIFT_BIN" --cpp=none --emit-obj "$3" "$1"
+          SH
+            chmod +x "$RUNNER_TEMP/cranelift-adapter"
+            echo "DRIVER=$RUNNER_TEMP/cranelift-adapter" >> "$GITHUB_ENV"
+          else
+            cargo build --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --bin compiler-mini-c 2>&1 | tee "$RUNNER_TEMP/csmith-evidence/build.log"
+            echo "DRIVER=$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" >> "$GITHUB_ENV"
+          fi
+      - name: Install pinned generator and reference compilers
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y --no-install-recommends csmith libcsmith-dev gcc clang
+          version=$(dpkg-query -W -f='${Version}' csmith)
+          [[ "$version" == 2.3.0-* ]]
+          header=$(dpkg -L libcsmith-dev | grep '/csmith.h$' | head -n1)
+          test -s "$header"
+          echo "CSMITH_INCLUDE=$(dirname "$header")" >> "$GITHUB_ENV"
+      - name: Retest original programs against both references
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/csmith-evidence"
+          harness=compiler/tools/csmith_probe.py
+          failure=0
+          for variant in baseline restricted-observable restricted-observable-omit restricted-pointers restricted-pointers-omit restricted-arrays restricted-arrays-omit restricted-structs restricted-structs-omit; do
+            if [[ "$DRIVER_KIND" == cranelift-latest && "$variant" == *-omit ]]; then continue; fi
+            profile="${variant%-omit}"
+            cases="$evidence/cases-$profile"
+            if [[ ! -s "$cases/manifest.json" ]]; then
+              timeout 90s python3 "$harness" --generate --cases-dir "$cases" --csmith csmith --seed-base 1 --seed-count 8 --profile "$profile"
+            fi
+            flags=()
+            if [[ "$variant" == *-omit ]]; then flags=(--omit-unreferenced-static-bodies); fi
+            if ! timeout --kill-after=5s 150s python3 "$harness" --probe --cases-dir "$cases" --artifacts-dir "$evidence/results-$variant" --include-dir "$CSMITH_INCLUDE" --preprocess-c --driver "$DRIVER" --compiler-sha "$COMPILER_SHA" --frontend-sha "$FRONTEND_SHA" --minimum-native 0 --run-timeout 5 --max-wall-seconds 120 "${flags[@]}" 2>&1 | tee "$evidence/$variant.log"; then
+              failure=1
+            fi
+            if [[ -s "$evidence/results-$variant/summary.json" ]]; then
+              python3 - "$evidence/results-$variant/summary.json" <<'PY'
+          import json,os,sys,pathlib
+          summary=pathlib.Path(sys.argv[1])
+          d=json.load(summary.open())
+          for line in summary.with_name("results.jsonl").read_text().splitlines():
+              row=json.loads(line)
+              if row["classification"] != "passed":
+                  print("CSMITH_FIRST_FAILURE", summary.parent.name, json.dumps({k:row.get(k) for k in ("seed","classification","compiler","frontend_diagnostic","frontend_location","compiler_link")}))
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
+              print(f"{d['generator_profile']}: {d['passed']}/{d['total_seeds']} matching executions; {d['native_accepted']} accepted; {d['status']}; omit unused static bodies={d['omit_unreferenced_static_bodies']}",file=f)
+          PY
+            else
+              failure=1
+            fi
+          done
+          exit "$failure"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: csmith-current-${{ matrix.driver }}
+          path: ${{ runner.temp }}/csmith-evidence
+          retention-days: 14
