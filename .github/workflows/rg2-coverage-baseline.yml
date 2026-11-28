@@ -209,24 +209,6 @@ jobs:
           assert tally['counts'].get('shared/reference-passed', 0) == expected
           PY
           exit "$status"
-      - name: Verify four original Rust ELF and GAS regression targets
-        if: github.event_name == 'pull_request' && github.event.action == 'synchronize'
-        working-directory: compiler
-        env:
-          CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
-        run: |
-          git rev-parse HEAD
-          status=0
-          CARGO_TERM_COLOR=never cargo test --manifest-path tools/mini-c-driver/Cargo.toml --release --no-fail-fast --test goto_labels --test discard_record_expressions --test native_float_literals --test record_argument_places > "$RUNNER_TEMP/rg3-original-tests.log" 2>&1 || status=$?
-          python3 - <<'PY'
-          import os, re
-          from pathlib import Path
-          log = (Path(os.environ["RUNNER_TEMP"]) / "rg3-original-tests.log").read_text(errors="replace")
-          results = re.findall(r"test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;", log)
-          print("Original Rust ELF/GAS test aggregate:", results)
-          assert len(results) == 4 and all(tuple(map(int, row)) == (1, 0, 0) for row in results)
-          PY
-          exit "$status"
       - name: Resolve canonical Mini-C corpus revision
         id: minic-corpus
         run: |
@@ -426,6 +408,7 @@ jobs:
           repository: bingordo/compiler
           ref: ${{ github.event_name == 'pull_request' && '6332bfd50f08ab23a474eb9155577740a9a763fd' || inputs.source_ref || 'main' }}
           path: compiler
+          fetch-depth: 2
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - uses: webfactory/ssh-agent@v0.9.0
@@ -463,6 +446,29 @@ jobs:
           print('GCC smoke: previously admitted mixed main directions passed at O0/O2')
           PY
 
+      - name: Verify four original Rust ELF and GAS regression targets
+        if: github.event_name == 'pull_request' && github.event.action == 'synchronize'
+        working-directory: compiler
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+        run: |
+          test "$(git rev-parse HEAD)" = 6332bfd50f08ab23a474eb9155577740a9a763fd
+          git fetch --no-tags --depth=1 git@github.com:bingordo/compiler.git f4b140e5cb66d7aa89b6f7a9270140ca44dc3623
+          git checkout --detach f4b140e5cb66d7aa89b6f7a9270140ca44dc3623
+          git cherry-pick --no-commit 6332bfd50f08ab23a474eb9155577740a9a763fd
+          test "$(git diff --cached --name-only | wc -l)" -eq 13
+          echo "RG3 integrated main: $(git rev-parse HEAD); candidate: 6332bfd50f08ab23a474eb9155577740a9a763fd; tree: $(git write-tree)"
+          status=0
+          CARGO_TERM_COLOR=never cargo test --manifest-path tools/mini-c-driver/Cargo.toml --release --no-fail-fast --test goto_labels --test discard_record_expressions --test native_float_literals --test record_argument_places > "$RUNNER_TEMP/rg3-original-tests.log" 2>&1 || status=$?
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          log = (Path(os.environ["RUNNER_TEMP"]) / "rg3-original-tests.log").read_text(errors="replace")
+          results = re.findall(r"test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;", log)
+          print("Original Rust ELF/GAS test aggregate:", results)
+          assert len(results) == 4 and all(tuple(map(int, row)) == (1, 0, 0) for row in results)
+          PY
+          exit "$status"
       - name: Resolve canonical Mini-C corpus revision
         id: minic-corpus
         if: always() && ((inputs.lane == 'minic' || inputs.lane == 'all' || github.event.label.name == 'rg-minic' || github.event.label.name == 'rg-all') || (inputs.lane == 'native-smoke' || github.event.label.name == 'rg-native-smoke'))
