@@ -1,0 +1,51 @@
+# Temporary deletion-first compile inventory, never merge.
+name: IR PR3753 legacy graph deletion
+on:
+  pull_request:
+    paths: ['.github/workflows/ir-pr3753-graph-deletion.yml']
+permissions:
+  contents: read
+jobs:
+  fallout:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      SOURCE_SHA: ea2f230d2432f4a4877d7600905847c7d1d05ac3
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.SOURCE_SHA }}
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+          path: compiler
+      - name: Verify graph deletion and inventory direct dependents
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          if git grep -nE '^pub struct (Function|Block|Instruction|Parameter|ModuleSnapshot|TypedModule|TypeAnnotatedModule)\b' -- crates/ir/src; then exit 1; else test "$?" -eq 1; fi
+          echo 'Remaining historical graph dependencies grouped by file:'
+          git grep -l -E 'legacy-ssa-oracle|historical-function-oracle|ModuleSnapshot|TypeAnnotatedModule|FunctionValueTypes|from_annotated|project_legacy_compat_function|\.to_legacy\(|TypedSsaModule::from_legacy|compiler_ir::\{[^}]*\b(Function|Block|Instruction|Parameter)\b|compiler_ir::(Function|Block|Instruction|Parameter)\b' -- '*.rs' '*.toml' | sort || test "$?" -eq 1
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/ir-macros", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64", "crates/backend-riscv64", "crates/backend-wasm", "crates/lto-plugin-core"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-graph-deletion
+      - name: Default production library compilation
+        working-directory: compiler
+        run: cargo check --workspace --lib --keep-going
+      - name: All target compilation fallout
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo check --workspace --all-targets --keep-going
+      - name: IR unit and integration compilation fallout
+        if: ${{ !cancelled() }}
+        working-directory: compiler
+        run: cargo check -p compiler-ir --all-targets --keep-going
