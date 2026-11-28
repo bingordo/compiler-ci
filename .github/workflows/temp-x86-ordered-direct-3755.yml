@@ -1,0 +1,59 @@
+name: TEMP x86 ordered direct ABI copies #3755
+# Source-pinned, PR-only backend validation; close without merging.
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/temp-x86-ordered-direct-3755.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  ordered-abi:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 1e8bf8a8d3eccf968ba634530f0c74da3394e628
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify pinned compiler source and git
+        run: |
+          set -euo pipefail
+          test "$(git -C compiler rev-parse HEAD)" = "1e8bf8a8d3eccf968ba634530f0c74da3394e628"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+      - name: Scope workspace to shared backend and x86
+        run: |
+          cat > compiler/Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86"]
+          EOF
+          rm -f compiler/Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: x86-ordered-direct-3755
+      - name: Focused ABI ordering and GCC ELF GAS native oracles
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend-x86 --lib ordered_direct_call_tests -- --nocapture
+          cargo test -p compiler-backend-x86 --lib nonclobbered_direct_call_tests -- --nocapture
+      - name: Full affected backend and assembler tests
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-backend --lib
+          cargo test -p compiler-backend-x86 --lib
+          cargo test -p compiler-backend-x86 --test att_module
+          cargo check -p compiler-backend-x86 --no-default-features
+      - name: Scoped Clippy except unchanged helper-arity lint
+        working-directory: compiler
+        run: cargo clippy -p compiler-backend-x86 --lib --no-deps -- -D clippy::all -A clippy::too_many_arguments
