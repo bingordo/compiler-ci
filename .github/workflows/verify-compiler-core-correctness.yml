@@ -10,6 +10,11 @@ on:
         required: false
         default: 'main'
         type: string
+      slow_regressions:
+        description: 'Run occasional expensive native regression tests'
+        required: false
+        default: false
+        type: boolean
       force_recheck:
         description: 'Rerun tests even if this source and workflow passed'
         required: false
@@ -17,6 +22,7 @@ on:
         type: boolean
   schedule:
     - cron: '9,24,39,54 * * * *'
+    - cron: '17 11 * * *'
   pull_request:
     paths:
       - '.github/workflows/verify-compiler-core-correctness.yml'
@@ -30,11 +36,12 @@ permissions:
 
 concurrency:
   # PR validations must not cancel scheduled/push verification of compiler main.
-  group: compiler-native-correctness-${{ github.event.pull_request.number || github.event.inputs.source_ref || 'main' }}
+  group: compiler-native-correctness-${{ (github.event.schedule == '17 11 * * *' || inputs.slow_regressions) && 'slow' || 'normal' }}-${{ github.event.pull_request.number || github.event.inputs.source_ref || 'main' }}
   cancel-in-progress: true
 
 jobs:
   native:
+    if: github.event.schedule != '17 11 * * *' && !inputs.slow_regressions
     runs-on: ubuntu-24.04
     timeout-minutes: 23
     steps:
@@ -474,7 +481,7 @@ jobs:
           timeout --signal=TERM --kill-after=15s 4m cargo test -p compiler-opt --test al05_p9_mixed_native_bridge al05_p11_fs1_draft_recurrence_and_typeid_cfg_correspondence -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/al05-p11-concrete-correspondence.log"
           grep -E 'AL05_P11_FS1_DRAFT_CORRESPONDENCE functions=4 changed_cse=4 triples=1296 observations=2592 normal=[0-9]+ traps=[0-9]+ wrong_phi=4 dropped_trap=4 fs1=fs1-scalar-cfg-draft-1 normative=NO verdict=PASS' "$RUNNER_TEMP/al05-p11-concrete-correspondence.log"
 
-      # Permanent AL-05.P9/P14/P15/P16 generated DAG native C11 differential.
+      # Permanent AL-05.P9/P14/P15 (P16 runs in daily changed-source regression) generated DAG native C11 differential.
       # Recheck merged source after AArch64 selector Clippy fix 5983a2588751db7c2ff1b3071d5b32e697aea3fd.
       - name: AL-05.P9 mixed eight/six-path x86/AArch64 ELF/GAS native C11
         if: steps.validated.outputs.cache-hit != 'true' || inputs.force_recheck
@@ -485,7 +492,7 @@ jobs:
         run: |
           set -euo pipefail
           timeout --signal=TERM --kill-after=10s 9m \
-            cargo test -p compiler-opt --test al05_p9_mixed_native_bridge -- --include-ignored --nocapture \
+            cargo test -p compiler-opt --test al05_p9_mixed_native_bridge -- --include-ignored --nocapture --skip al05_p16_coverage_guided_native \
             2>&1 | tee "$RUNNER_TEMP/al05-p9-mixed-native.log"
           for arch in x86_64 aarch64; do
             for format in elf gas; do
@@ -494,8 +501,6 @@ jobs:
               grep -F "AL05_P14_GENERATED_NATIVE_TARGET arch=$arch format=$format functions=16 changed_cse=8 modes=8 comparisons=7472 traps=32 verdict=PASS" \
                 "$RUNNER_TEMP/al05-p9-mixed-native.log"
               grep -F "AL05_P15_GENERATED_NATIVE_TARGET arch=$arch format=$format functions=32 changed_cse=16 modes=8 seeds=2,6 coefficients=2 comparisons=14944 traps=64 verdict=PASS" \
-                "$RUNNER_TEMP/al05-p9-mixed-native.log"
-              grep -F "AL05_P16_COVERAGE_NATIVE_TARGET arch=$arch format=$format functions=48 changed_cse=24 selected=24 modes=8 seeds=8 coefficients=5 comparisons=22416 traps=96 verdict=PASS" \
                 "$RUNNER_TEMP/al05-p9-mixed-native.log"
             done
           done
@@ -540,3 +545,103 @@ jobs:
             /tmp/compiler-native-cfg-differential-*/
           if-no-files-found: ignore
           retention-days: 14
+
+  slow-native:
+    if: github.event.schedule == '17 11 * * *' || inputs.slow_regressions
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+            test: al05_p16_coverage_guided_native_x86_elf_gas_c11
+          - runner: ubuntu-24.04
+            arch: aarch64
+            test: al05_p16_coverage_guided_native_aarch64_qemu_elf_gas_c11
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout workflow for cache-key versioning
+        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ inputs.source_ref || 'main' }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record source and prepare workspace
+        id: slow-source
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          printf '%s\n' "$sha" | tee "$RUNNER_TEMP/slow-source-sha.txt"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('Cargo.toml').write_text("""[workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/opt", "crates/backend", "crates/backend-x86", "crates/backend-aarch64"]
+          """)
+          PY
+      - name: Check successful regression evidence for this source and workflow
+        id: slow-validated
+        uses: actions/cache/restore@v4
+        with:
+          path: .p16-slow-validated
+          key: p16-slow-v1-${{ matrix.arch }}-${{ hashFiles('.github/workflows/verify-compiler-core-correctness.yml') }}-${{ steps.slow-source.outputs.sha }}
+          lookup-only: true
+      - name: Report unchanged successful source
+        if: steps.slow-validated.outputs.cache-hit == 'true' && !inputs.force_recheck
+        run: echo "P16 ${{ matrix.arch }} already passed at ${{ steps.slow-source.outputs.sha }}; skipped unchanged source." >> "$GITHUB_STEP_SUMMARY"
+      - if: matrix.arch == 'aarch64' && (steps.slow-validated.outputs.cache-hit != 'true' || inputs.force_recheck)
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user
+      - uses: Swatinem/rust-cache@v2
+        if: steps.slow-validated.outputs.cache-hit != 'true' || inputs.force_recheck
+        with:
+          workspaces: compiler -> target
+          key: slow-native-${{ matrix.arch }}
+      - name: Build test separately
+        if: steps.slow-validated.outputs.cache-hit != 'true' || inputs.force_recheck
+        working-directory: compiler
+        run: cargo test -p compiler-opt --test al05_p9_mixed_native_bridge --no-run
+      - name: Run full P16 regression and record wall time
+        if: steps.slow-validated.outputs.cache-hit != 'true' || inputs.force_recheck
+        working-directory: compiler
+        env:
+          AL05_REQUIRE_AARCH64: '1'
+          TEST_NAME: ${{ matrix.test }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          start=$(date +%s%N)
+          set +e
+          cargo test -p compiler-opt --test al05_p9_mixed_native_bridge "$TEST_NAME" -- --exact --include-ignored --nocapture 2>&1 | tee "$RUNNER_TEMP/p16-slow.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          elapsed=$(( ($(date +%s%N) - start) / 1000000 ))
+          printf 'source=%s test=%s arch=%s elapsed_ms=%s exit=%s\n' "$(git rev-parse HEAD)" "$TEST_NAME" "$ARCH" "$elapsed" "$rc" | tee "$RUNNER_TEMP/p16-timing.txt" >> "$GITHUB_STEP_SUMMARY"
+          test "$rc" = 0
+          grep -F "test $TEST_NAME ... ok" "$RUNNER_TEMP/p16-slow.log"
+          for format in elf gas; do
+            grep -F "AL05_P16_COVERAGE_NATIVE_TARGET arch=$ARCH format=$format functions=48 changed_cse=24 selected=24 modes=8 seeds=8 coefficients=5 comparisons=22416 traps=96 verdict=PASS" "$RUNNER_TEMP/p16-slow.log"
+          done
+      - name: Record successful slow regression evidence
+        if: success() && steps.slow-validated.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .p16-slow-validated
+          cp "$RUNNER_TEMP/p16-timing.txt" .p16-slow-validated/timing.txt
+      - uses: actions/cache/save@v4
+        if: success() && steps.slow-validated.outputs.cache-hit != 'true'
+        with:
+          path: .p16-slow-validated
+          key: p16-slow-v1-${{ matrix.arch }}-${{ hashFiles('.github/workflows/verify-compiler-core-correctness.yml') }}-${{ steps.slow-source.outputs.sha }}
+      - uses: actions/upload-artifact@v4
+        if: always() && (steps.slow-validated.outputs.cache-hit != 'true' || inputs.force_recheck)
+        with:
+          name: slow-native-${{ matrix.arch }}-timing
+          path: |
+            ${{ runner.temp }}/p16-slow.log
+            ${{ runner.temp }}/p16-timing.txt
+            ${{ runner.temp }}/slow-source-sha.txt
+          retention-days: 90
