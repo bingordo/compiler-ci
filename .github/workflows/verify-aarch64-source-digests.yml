@@ -1,0 +1,65 @@
+name: AArch64 source fingerprint reuse
+on:
+  pull_request:
+    paths: ['.github/workflows/verify-aarch64-source-digests.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ddb02d427407d9fdab3bbce25a04fbd68d660771
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 29a4028d118d91da5f6f6987035ef9ff7a901e71
+          path: baseline
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify candidate and affected suites
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "ddb02d427407d9fdab3bbce25a04fbd68d660771"
+          for suite in test_aarch64_a32_helper_ownership.py test_aarch64_a32_ast_section_map.py test_aarch64_a32_ast_dependency_graph.py; do
+            python3 -m unittest discover -s tools -p "$suite" -v
+          done
+      - name: Compare complete source ownership and section mapping reports
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          PYTHONPATH=tools python3 - <<'PY'
+          import importlib.util
+          from unittest.mock import patch
+          import aarch64_a32_helper_ownership as ownership
+          import aarch64_a32_ast_section_map as mapper
+          from test_aarch64_a32_helper_ownership import sources
+          from test_aarch64_a32_ast_section_map import source
+          def old(name):
+              spec = importlib.util.spec_from_file_location("old_" + name, "../baseline/tools/" + name + ".py")
+              module = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(module)
+              return module
+          a = old("aarch64_a32_helper_ownership")
+          b = old("aarch64_a32_ast_section_map")
+          names = list("ABCDEFGH")
+          s = sources(shared=b"".join(f"func {name}()\n".encode() for name in names) + b"// filler\n" * 100000)
+          with patch.object(a, "digest", wraps=a.digest) as before, patch.object(ownership, "digest", wraps=ownership.digest) as after:
+              assert a.audit(names, s) == ownership.audit(names, s)
+              print("OWNERSHIP_HASH_CALLS", before.call_count, after.call_count)
+              assert before.call_count - after.call_count == 42
+          xml, asm, bodies, starts = source()
+          spans = "".join(f"{pos} {pos+7}\n" for pos in starts).encode()
+          with patch.object(b, "sha", wraps=b.sha) as before, patch.object(mapper, "sha", wraps=mapper.sha) as after:
+              assert b.map_ast_spans(xml, asm, spans, inventory_lines=spans) == mapper.map_ast_spans(xml, asm, spans, inventory_lines=spans)
+              print("SECTION_HASH_CALLS", before.call_count, after.call_count)
+              assert before.call_count - after.call_count == len(bodies)
+          print("AARCH64_SOURCE_REPORT_PARITY_OK")
+          PY
