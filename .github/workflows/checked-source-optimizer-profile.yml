@@ -24,14 +24,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: c5b22e798cf0e7530d36a42afe5b2bd2a76a551d
+          ref: 0c9828f9d685fe72d05f46dc0cb71d4e92a12267
           path: baseline
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
           repository: bingordo/compiler
-          ref: 21567ea5bc9e4c582322ceb7a38d0079a604848a
+          ref: a2de28eaac45aa123c182a6ed5c310b649d932a8
           path: candidate
           ssh-key: ${{ secrets.CI_KEY }}
           persist-credentials: false
@@ -52,6 +52,25 @@ jobs:
             manifest=Cargo.toml
             args=(-p compiler --bin compiler)
           fi
+          # Export existing per-case expected IR/ELF outside the timed loop.
+          python3 - <<'PY'
+          from pathlib import Path
+          for v in ("baseline","candidate"):
+              p=Path(v)/"tools/mini-c-driver/tests/unit/lib.rs"
+              s=p.read_text()
+              start=s.index("fn full_optimizer_stage_profile_mini_c()")
+              pos=s.index("            let mut frontend=Vec::new();",start)
+              s=s[:pos]+'''            if let Ok(out)=std::env::var("PROFILE_OUT") {
+                          std::fs::create_dir_all(&out).unwrap();
+                          std::fs::write(format!("{out}/{name}.ir"),
+                              compiler_ir::native_module_text_v3::write_native_module_text_v3(&baseline).unwrap()).unwrap();
+                          if let Some(bytes)=&expected {
+                              std::fs::write(format!("{out}/{name}.o"),bytes).unwrap();
+                          }
+                      }
+          '''+s[pos:]
+              p.write_text(s)
+          PY
           for v in baseline candidate; do
             git -C "$v" rev-parse HEAD | tee "results/$v.sha"
             CARGO_TARGET_DIR="$PWD/$v/target-profile" cargo test --release --manifest-path "$v/$manifest" "${args[@]}" --no-run --message-format=json > "results/$v-build.jsonl"
@@ -81,9 +100,11 @@ jobs:
           root="$PWD"
           for v in baseline candidate; do
             exe=$(cat "results/$v.exe")
-            (cd "$v/$cwd" && "$exe" "$test_name" --ignored --nocapture) > "results/$v-warmup.log" 2>&1
+            (cd "$v/$cwd" && PROFILE_OUT="$root/results/$v-output" "$exe" "$test_name" --ignored --nocapture) > "results/$v-warmup.log" 2>&1
             grep -q '1 passed; 0 failed' "results/$v-warmup.log"
           done
+          diff -r results/baseline-output results/candidate-output
+          echo "PHI_SOURCE_CANONICAL_AND_ELF_PARITY"
           i=0
           for v in baseline candidate candidate baseline; do
             i=$((i+1))
