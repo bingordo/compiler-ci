@@ -1,0 +1,56 @@
+# One-off exact source validation; close PR unmerged after verification.
+name: IR PR3746 native text API retirement
+on:
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/ir-pr3746-native-text-api.yml']
+permissions:
+  contents: read
+jobs:
+  native-text:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      COMPILER_SHA: 1940efb02267a80c419ddfd7a85d490097c14f04
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ${{ env.COMPILER_SHA }}
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Verify source and absence of old API
+        working-directory: compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$COMPILER_SHA"
+          echo "Verified compiler candidate: $COMPILER_SHA" >> "$GITHUB_STEP_SUMMARY"
+          if git grep -nE 'typed_ssa_text|read_typed_ssa|write_typed_ssa' -- '*.rs' '*.toml' '*.py'; then exit 1; else test "$?" -eq 1; fi
+          cat > Cargo.toml <<'EOF'
+          [workspace]
+          resolver = "2"
+          members = ["crates/ir", "crates/ir-macros", "crates/opt"]
+          EOF
+          rm -f Cargo.lock
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler -> target
+          key: ir-pr3746-native-text
+      - name: Build all affected targets
+        working-directory: compiler
+        run: cargo check -p compiler-ir -p compiler-opt --all-targets
+      - name: Native serialization and reducer replay
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-ir --test typed_ssa_body --test native_module_text_v3
+          cargo test -p compiler-opt --test typeid_delta_canonical_replay --test delta_reduce_ir --test typeid_delta_dominance --test typed_core_pipeline --test typed_core_inline_integration --test typed_algebra
+      - name: Alive-lite replay test discovery and optimizer unit suite
+        working-directory: compiler
+        run: |
+          set -euo pipefail
+          cargo test -p compiler-opt --test alive_lite -- --list
+          cargo test -p compiler-opt --lib
