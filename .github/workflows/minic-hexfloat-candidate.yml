@@ -1,0 +1,76 @@
+name: Mini-C merged record and pointer arrays
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/minic-hexfloat-candidate.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  candidate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: 326fb9d722b0ffbe8bbc6b3b89ea19dfc5734062
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Record exact source
+        run: |
+          git -C compiler rev-parse HEAD
+          grep 'rev =' compiler/tools/mini-c-driver/Cargo.toml
+          sed -i 's|ssh://git@github.com/bingordo/mini-c.git|https://github.com/bingordo/mini-c.git|g' compiler/tools/mini-c-driver/Cargo.toml
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: minic-native-hexfloat
+      - name: Probe unit tests
+        run: cd compiler/tools && python3 -m unittest test_csmith_probe
+      - name: GCC record and pointer array ELF and GAS oracles
+        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --test record_array_storage -- --nocapture
+      - name: Existing adapter unit suite
+        if: success() || failure()
+        run: cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml --lib
+      - name: Replay combined Csmith campaigns
+        if: success() || failure()
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y --no-install-recommends csmith libcsmith-dev gcc clang
+          header=$(dpkg -L libcsmith-dev | grep '/csmith.h$' | head -n1)
+          compiler_sha=$(git -C compiler rev-parse HEAD)
+          manifest=compiler/tools/mini-c-driver/Cargo.toml
+          frontend=$(PYTHONPATH=compiler/tools python3 -c 'from csmith_probe import pinned_frontend_revision; import sys; print(pinned_frontend_revision(open(sys.argv[1]).read()))' "$manifest")
+          cargo build --manifest-path "$manifest" --bin compiler-mini-c
+          evidence="$RUNNER_TEMP/strict-evidence"
+          failure=0
+          for profile in restricted-combined restricted-widths restricted-control restricted-storage restricted-structs restricted-arrays restricted-pointers restricted-compound; do
+            extra=()
+            count=16
+            case "$profile" in restricted-structs|restricted-arrays|restricted-pointers|restricted-compound) count=32;; esac
+            if [[ "$profile" == restricted-observable ]]; then
+              count=8
+            else
+              extra=(--omit-unreferenced-static-bodies)
+            fi
+            cases="$evidence/$profile/cases"
+            results="$evidence/$profile/results"
+            python3 compiler/tools/csmith_probe.py --generate --cases-dir "$cases" --csmith csmith --seed-base 1 --seed-count "$count" --profile "$profile"
+            python3 compiler/tools/csmith_probe.py --probe --cases-dir "$cases" --artifacts-dir "$results" --include-dir "$(dirname "$header")" --preprocess-c --driver "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" --compiler-sha "$compiler_sha" --frontend-sha "$frontend" --minimum-native 0 --run-timeout 5 --max-wall-seconds 240 "${extra[@]}" || failure=1
+            python3 - "$results/results.jsonl" "$profile" <<'PY'
+          import json,sys
+          for line in open(sys.argv[1]):
+              r=json.loads(line)
+              print("CAMPAIGN_RESULT",sys.argv[2],json.dumps({k:r.get(k) for k in ("seed","classification","compiler","frontend_diagnostic")}))
+          PY
+          done
+          exit "$failure"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: merged-array-csmith-evidence
+          path: ${{ runner.temp }}/strict-evidence
+          retention-days: 14
