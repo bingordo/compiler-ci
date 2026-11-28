@@ -1,0 +1,86 @@
+name: TEMP Mini-C final mixed ABI integration with shared frame
+on:
+  pull_request:
+    branches: [main]
+    paths: [.github/workflows/validate-abi-large-layout-3470.yml]
+permissions:
+  contents: read
+jobs:
+  minic-integration:
+    outputs:
+      compiler_sha: ${{ steps.source.outputs.sha }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout compiler-ci test harness
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Checkout compiler source using existing read-only deploy key
+        uses: actions/checkout@v4
+        with:
+          repository: bingordo/compiler
+          ref: ab15ab03f24e483ce6c0a58743f7472b4e4c29d5
+          path: compiler
+          ssh-key: ${{ secrets.CI_KEY }}
+          persist-credentials: false
+      - name: Identify exact source and validate cohort size
+        id: source
+        shell: bash
+        env:
+          SEED_COUNT: ${{ inputs.seed_count || '6' }}
+        run: |
+          set -euo pipefail
+          sha="$(git -C compiler rev-parse HEAD)"
+          [[ "$sha" == 'ab15ab03f24e483ce6c0a58743f7472b4e4c29d5' ]]
+          [[ "$SEED_COUNT" =~ ^[0-9]+$ ]]
+          (( 10#$SEED_COUNT >= 1 && 10#$SEED_COUNT <= 64 ))
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          test -s compiler/tools/mini-c-driver/tests/differential.py
+          test -s compiler/tools/mini-c-driver/Cargo.toml
+          echo "Compiler revision: $sha" >> "$GITHUB_STEP_SUMMARY"
+      - name: Make public Mini-C dependency accessible without another deploy key
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          manifest=Path('compiler/tools/mini-c-driver/Cargo.toml')
+          text=manifest.read_text()
+          old='ssh://git@github.com/bingordo/mini-c.git'
+          assert text.count(old)==2, 'Mini-C dependency declaration changed'
+          manifest.write_text(text.replace(old,'https://github.com/bingordo/mini-c.git'))
+          PY
+      - name: Cache Rust objects and dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler/tools/mini-c-driver -> target
+          key: mini-c-source-differential-v1
+          cache-workspace-crates: 'true'
+      - name: Build compiler-mini-c once
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 12m cargo build \
+            --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --bin compiler-mini-c \
+            2>&1 | tee "$RUNNER_TEMP/mini-c-build.log"
+          test -x compiler/tools/mini-c-driver/target/debug/compiler-mini-c
+      - name: Native bitfield and record-pointer ABI regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml \
+            -p compiler-mini-c --test bitfield_pointer_abi --test record_pointer_abi --test integer_union_abi
+      - name: Test shared frame, mixed aggregate ABI, and planner
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --test shared_local_frame --test fp_mixed_abi --test fp_scalar --test sysv_memory_return
+          cargo test --manifest-path compiler/tools/mini-c-driver/Cargo.toml -p compiler-mini-c --lib aggregate_abi
+          python3 -m unittest discover -s compiler/tests/gcc -p 'test_*.py'
+      - name: Mixed-object differential with both frame modes
+        run: |
+          set -euo pipefail
+          for flag in "" "--mixed-frame-pointer"; do
+            python3 compiler/tools/mini-c-driver/tests/differential.py --compiler "$PWD/compiler/tools/mini-c-driver/target/debug/compiler-mini-c" --mixed-only $flag --timeout 15
+          done
